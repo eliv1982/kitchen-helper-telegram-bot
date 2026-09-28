@@ -3,14 +3,7 @@ from typing import Any
 
 from openai import APIConnectionError, APIError, APITimeoutError, AsyncOpenAI, RateLimitError
 
-from config import (
-    MAX_TOKENS,
-    OPENAI_API_KEY,
-    OPENAI_MAX_RETRIES,
-    OPENAI_MODEL,
-    OPENAI_TIMEOUT_SECONDS,
-    TEMPERATURE,
-)
+import config
 
 logger = logging.getLogger(__name__)
 
@@ -28,11 +21,38 @@ class InvalidResponseError(Exception):
     """Raised when the OpenAI response is missing, empty, or otherwise unusable."""
 
 
-_client = AsyncOpenAI(
-    api_key=OPENAI_API_KEY,
-    timeout=OPENAI_TIMEOUT_SECONDS,
-    max_retries=OPENAI_MAX_RETRIES,
-)
+_client: AsyncOpenAI | None = None
+
+
+def get_client() -> AsyncOpenAI:
+    """Return the shared AsyncOpenAI client, creating it on first use.
+
+    Construction is deferred (rather than happening at import time) so a
+    missing or malformed API key is always caught by
+    config.validate_config() at startup, instead of a client getting built
+    before anyone has validated the settings it relies on.
+    """
+    global _client
+    if _client is None:
+        settings = config.get_settings()
+        _client = AsyncOpenAI(
+            api_key=settings.openai_api_key,
+            timeout=settings.openai_timeout_seconds,
+            max_retries=settings.openai_max_retries,
+        )
+    return _client
+
+
+async def close_client() -> None:
+    """Close the shared client's underlying HTTP resources, if it exists.
+
+    Safe to call even if a client was never created (e.g. the bot shut down
+    before handling any message).
+    """
+    global _client
+    if _client is not None:
+        await _client.close()
+        _client = None
 
 
 async def get_chat_response(
@@ -43,23 +63,25 @@ async def get_chat_response(
     """
     Send messages to OpenAI and return assistant text and optional usage stats.
     """
+    settings = config.get_settings()
     full_messages = [{"role": "system", "content": SYSTEM_MESSAGE}, *messages]
 
     logger.info(
         "OpenAI request: model=%s, temperature=%s, max_tokens=%s, user_id=%s, context_len=%s",
-        OPENAI_MODEL,
-        TEMPERATURE,
-        MAX_TOKENS,
+        settings.openai_model,
+        settings.temperature,
+        settings.max_tokens,
         user_id,
         context_len,
     )
 
+    client = get_client()
     try:
-        response = await _client.chat.completions.create(
-            model=OPENAI_MODEL,
+        response = await client.chat.completions.create(
+            model=settings.openai_model,
             messages=full_messages,
-            temperature=TEMPERATURE,
-            max_tokens=MAX_TOKENS,
+            temperature=settings.temperature,
+            max_tokens=settings.max_tokens,
         )
     except RateLimitError:
         logger.error("OpenAI rate limit exceeded for user_id=%s", user_id)

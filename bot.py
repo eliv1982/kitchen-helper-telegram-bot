@@ -10,8 +10,8 @@ from aiogram.utils.chat_action import ChatActionSender
 from openai import APIConnectionError, APIError, APITimeoutError, RateLimitError
 
 import api_client
+import config
 import context_manager
-from config import BOT_TOKEN, validate_config
 
 logging.basicConfig(
     level=logging.INFO,
@@ -20,6 +20,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 RESET_PHRASE = "очистить контекст"
+RESET_CONFIRMATION = "Контекст очищен. Можем начать с чистого листа!"
+
+# Application-level cap on a single incoming message, independent of
+# Telegram's own ~4096-character limit. Keeps a single request's OpenAI cost
+# and the context it adds predictable, regardless of how large a message a
+# user sends.
+MAX_INPUT_LENGTH = 2000
 
 dp = Dispatcher()
 
@@ -38,12 +45,20 @@ def _get_user_lock(user_id: int) -> asyncio.Lock:
     return lock
 
 
+async def _clear_user_context(user_id: int, source: str) -> None:
+    """Clear a user's conversation context. Caller must hold the user's lock."""
+    context_manager.clear_context(user_id)
+    logger.info("Context cleared via %s for user_id=%s", source, user_id)
+
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     await message.answer(
         "Привет! Я Kitchen Helper — помогу придумать простое блюдо из того, "
         "что есть дома.\n\n"
         "Напиши, какие продукты у тебя есть, и я предложу варианты.\n\n"
+        "Обрати внимание: текст твоих сообщений передаётся во внешний сервис "
+        "OpenAI для обработки и генерации ответа.\n\n"
         "Команды:\n"
         "/reset — очистить историю диалога\n"
         'или напиши «очистить контекст»'
@@ -52,11 +67,12 @@ async def cmd_start(message: Message) -> None:
 
 @dp.message(Command("reset"))
 async def cmd_reset(message: Message) -> None:
+    if not message.from_user:
+        return
     user_id = message.from_user.id
     async with _get_user_lock(user_id):
-        context_manager.clear_context(user_id)
-    logger.info("Context cleared via /reset for user_id=%s", user_id)
-    await message.answer("Контекст очищен. Можем начать с чистого листа!")
+        await _clear_user_context(user_id, "/reset")
+    await message.answer(RESET_CONFIRMATION)
 
 
 @dp.message(F.text)
@@ -69,9 +85,15 @@ async def handle_text(message: Message, bot: Bot) -> None:
 
     async with _get_user_lock(user_id):
         if text.lower() == RESET_PHRASE:
-            context_manager.clear_context(user_id)
-            logger.info("Context cleared via phrase for user_id=%s", user_id)
-            await message.answer("Контекст очищен. Можем начать с чистого листа!")
+            await _clear_user_context(user_id, "reset phrase")
+            await message.answer(RESET_CONFIRMATION)
+            return
+
+        if len(text) > MAX_INPUT_LENGTH:
+            await message.answer(
+                f"Сообщение слишком длинное (максимум {MAX_INPUT_LENGTH} символов). "
+                "Сократи запрос и отправь снова."
+            )
             return
 
         context_manager.add_message(user_id, "user", text)
@@ -116,6 +138,7 @@ async def handle_text(message: Message, bot: Bot) -> None:
             return
 
         context_manager.add_message(user_id, "assistant", reply)
+        context_manager.trim_history(user_id)
 
         try:
             await message.answer(reply)
@@ -125,18 +148,20 @@ async def handle_text(message: Message, bot: Bot) -> None:
 
 
 async def main() -> None:
-    errors = validate_config()
+    errors = config.validate_config()
     if errors:
         for err in errors:
             logger.error("Config error: %s", err)
         sys.exit(1)
 
-    bot = Bot(token=BOT_TOKEN)
+    settings = config.get_settings()
+    bot = Bot(token=settings.bot_token)
     logger.info("Kitchen Helper bot is starting...")
     try:
         await dp.start_polling(bot)
     finally:
         await bot.session.close()
+        await api_client.close_client()
 
 
 if __name__ == "__main__":

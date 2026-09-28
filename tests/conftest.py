@@ -1,14 +1,25 @@
 import os
 
-# Must run before config.py / api_client.py / bot.py are imported anywhere in
-# the test session, so tests never depend on a developer's real .env file and
-# never risk touching real credentials.
-os.environ.setdefault("OPENAI_API_KEY", "test-api-key")
-os.environ.setdefault("BOT_TOKEN", "test-bot-token")
+# Must be set before config.py / api_client.py / bot.py are imported anywhere
+# in the test session, so tests never depend on a developer's real .env file
+# (whatever it contains) and never risk touching real credentials.
+_TEST_ENV_DEFAULTS = {
+    "BOT_TOKEN": "test-bot-token",
+    "OPENAI_API_KEY": "test-api-key",
+    "OPENAI_MODEL": "gpt-4.1-mini",
+    "TEMPERATURE": "0.7",
+    "MAX_TOKENS": "600",
+    "OPENAI_TIMEOUT_SECONDS": "15",
+    "OPENAI_MAX_RETRIES": "1",
+}
+for _name, _value in _TEST_ENV_DEFAULTS.items():
+    os.environ.setdefault(_name, _value)
 
 import pytest
 
+import api_client
 import bot as bot_module
+import config
 import context_manager
 
 
@@ -16,6 +27,10 @@ import context_manager
 def _reset_module_state():
     context_manager._contexts.clear()
     bot_module._user_locks.clear()
+    api_client._client = None
+    config._settings = None
     yield
     context_manager._contexts.clear()
     bot_module._user_locks.clear()
+    api_client._client = None
+    config._settings = None
