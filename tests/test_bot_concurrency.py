@@ -8,6 +8,16 @@ import context_manager
 from tests.helpers import FakeBot, FakeMessage, make_rate_limit_error
 
 
+def _seed_full_history(user_id: int, pairs: int = 10) -> list[dict]:
+    """Directly seed `pairs` completed user/assistant exchanges (2*pairs
+    messages), landing exactly at MAX_HISTORY_MESSAGES (20) by default.
+    Returns a snapshot of the seeded history for later comparison."""
+    for i in range(1, pairs + 1):
+        context_manager.add_message(user_id, "user", f"seed-user-{i}")
+        context_manager.add_message(user_id, "assistant", f"seed-assistant-{i}")
+    return list(context_manager.get_context(user_id))
+
+
 @pytest.mark.asyncio
 async def test_different_users_are_processed_concurrently(monkeypatch):
     entered: list[int] = []
@@ -270,4 +280,147 @@ async def test_cancellation_during_exchange_rolls_back_pending_message(monkeypat
         {"role": "assistant", "content": "reply-to-первое"},
         {"role": "user", "content": "третье"},
         {"role": "assistant", "content": "reply-to-третье"},
+    ]
+
+
+# --- History-trimming transaction safety at the 20-message capacity boundary ---
+
+
+@pytest.mark.asyncio
+async def test_failure_at_full_capacity_preserves_all_prior_history(monkeypatch):
+    user_id = 201
+    original = _seed_full_history(user_id)
+    assert len(original) == context_manager.MAX_HISTORY_MESSAGES == 20
+
+    async def fake_get_chat_response(messages, user_id, context_len):
+        raise make_rate_limit_error()
+
+    monkeypatch.setattr(api_client, "get_chat_response", fake_get_chat_response)
+
+    fake_bot = FakeBot()
+    msg = FakeMessage(user_id=user_id, text="pending message")
+
+    await bot_module.handle_text(msg, fake_bot)
+
+    final = context_manager.get_context(user_id)
+    # Byte-for-byte/logically equivalent to the original 20-message history:
+    # the failed pending user turn is gone and nothing else changed.
+    assert final == original
+    assert len(final) == 20
+    assert final[0] == {"role": "user", "content": "seed-user-1"}
+    assert final[1] == {"role": "assistant", "content": "seed-assistant-1"}
+
+
+@pytest.mark.asyncio
+async def test_cancellation_at_full_capacity_preserves_all_prior_history(monkeypatch):
+    user_id = 202
+    original = _seed_full_history(user_id)
+    assert len(original) == 20
+
+    entered_openai = asyncio.Event()
+    never_released = asyncio.Event()
+
+    async def fake_get_chat_response(messages, user_id, context_len):
+        entered_openai.set()
+        await never_released.wait()
+        return "unused", None
+
+    monkeypatch.setattr(api_client, "get_chat_response", fake_get_chat_response)
+
+    fake_bot = FakeBot()
+    task = asyncio.create_task(
+        bot_module.handle_text(FakeMessage(user_id=user_id, text="pending"), fake_bot)
+    )
+    await asyncio.wait_for(entered_openai.wait(), timeout=2)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # CancelledError propagated; the pending turn is rolled back and all 20
+    # previously completed messages remain, untouched.
+    assert context_manager.get_context(user_id) == original
+
+    # The same-user lock was released normally.
+    lock = bot_module._get_user_lock(user_id)
+    assert not lock.locked()
+
+    # Later same-user processing still works.
+    async def fake_success(messages, user_id, context_len):
+        return "ok-after-cancel", None
+
+    monkeypatch.setattr(api_client, "get_chat_response", fake_success)
+
+    await bot_module.handle_text(FakeMessage(user_id=user_id, text="after"), fake_bot)
+
+    final = context_manager.get_context(user_id)
+    assert len(final) == 20
+    assert final[-2:] == [
+        {"role": "user", "content": "after"},
+        {"role": "assistant", "content": "ok-after-cancel"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_success_at_full_capacity_trims_oldest_pair_after_response(monkeypatch):
+    user_id = 203
+    original = _seed_full_history(user_id)
+
+    async def fake_get_chat_response(messages, user_id, context_len):
+        return "new-reply", None
+
+    monkeypatch.setattr(api_client, "get_chat_response", fake_get_chat_response)
+
+    fake_bot = FakeBot()
+    await bot_module.handle_text(FakeMessage(user_id=user_id, text="new-message"), fake_bot)
+
+    final = context_manager.get_context(user_id)
+    assert len(final) == 20
+
+    # Oldest completed exchange is gone.
+    assert {"role": "user", "content": "seed-user-1"} not in final
+    assert {"role": "assistant", "content": "seed-assistant-1"} not in final
+
+    # The remaining nine seeded exchanges shifted down untouched, and the
+    # newest exchange is appended after them.
+    assert final == original[2:] + [
+        {"role": "user", "content": "new-message"},
+        {"role": "assistant", "content": "new-reply"},
+    ]
+
+    # Role ordering remains valid: user, assistant, user, assistant, ...
+    for pos, entry in enumerate(final):
+        expected_role = "user" if pos % 2 == 0 else "assistant"
+        assert entry["role"] == expected_role
+
+
+@pytest.mark.asyncio
+async def test_repeated_successful_trimming_never_exceeds_capacity(monkeypatch):
+    user_id = 204
+    _seed_full_history(user_id)
+
+    reply_counter = {"n": 0}
+
+    async def fake_get_chat_response(messages, user_id, context_len):
+        reply_counter["n"] += 1
+        return f"reply-{reply_counter['n']}", None
+
+    monkeypatch.setattr(api_client, "get_chat_response", fake_get_chat_response)
+
+    fake_bot = FakeBot()
+    for i in range(1, 16):  # drive well past capacity, several trims triggered
+        await bot_module.handle_text(FakeMessage(user_id=user_id, text=f"msg-{i}"), fake_bot)
+
+        ctx = context_manager.get_context(user_id)
+        assert len(ctx) <= context_manager.MAX_HISTORY_MESSAGES
+        assert len(ctx) % 2 == 0
+        for pos, entry in enumerate(ctx):
+            expected_role = "user" if pos % 2 == 0 else "assistant"
+            assert entry["role"] == expected_role
+
+    final = context_manager.get_context(user_id)
+    assert len(final) == 20
+    assert final[-2:] == [
+        {"role": "user", "content": "msg-15"},
+        {"role": "assistant", "content": "reply-15"},
     ]

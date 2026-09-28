@@ -9,6 +9,14 @@ import config
 from tests.helpers import make_openai_response
 
 
+@pytest.fixture(autouse=True)
+def _ensure_client():
+    # The shared client is now created lazily; force its creation up front
+    # so the existing tests below can keep patching
+    # api_client._client.chat.completions.create directly.
+    api_client.get_client()
+
+
 @pytest.mark.asyncio
 async def test_get_chat_response_awaits_async_client_without_network():
     fake_response = make_openai_response("Свари яйца всмятку.")
@@ -178,10 +186,60 @@ def test_openai_timeout_and_retries_are_explicit_and_bounded():
     # A throwaway client with no explicit timeout shows the SDK default
     # (10 minutes read timeout) that this stage deliberately avoids relying on.
     default_client = AsyncOpenAI(api_key="unused-default-comparison-key")
+    settings = config.get_settings()
 
-    assert api_client._client.timeout == config.OPENAI_TIMEOUT_SECONDS
+    assert api_client._client.timeout == settings.openai_timeout_seconds
     assert api_client._client.timeout != default_client.timeout
     assert api_client._client.timeout <= 30
 
-    assert api_client._client.max_retries == config.OPENAI_MAX_RETRIES
+    assert api_client._client.max_retries == settings.openai_max_retries
     assert api_client._client.max_retries <= 2
+
+
+def test_client_is_not_created_until_first_use(monkeypatch):
+    monkeypatch.setattr(api_client, "_client", None)
+
+    assert api_client._client is None
+
+    client = api_client.get_client()
+
+    assert client is not None
+    assert api_client._client is client
+
+
+def test_get_client_reuses_the_same_instance():
+    first = api_client.get_client()
+    second = api_client.get_client()
+
+    assert first is second
+
+
+def test_get_client_raises_config_error_when_settings_invalid(monkeypatch):
+    monkeypatch.setattr(api_client, "_client", None)
+    monkeypatch.setattr(config, "_settings", None)
+    monkeypatch.setenv("TEMPERATURE", "not-a-number")
+
+    with pytest.raises(config.ConfigError):
+        api_client.get_client()
+
+    assert api_client._client is None
+
+
+@pytest.mark.asyncio
+async def test_close_client_is_safe_when_never_initialized(monkeypatch):
+    monkeypatch.setattr(api_client, "_client", None)
+
+    await api_client.close_client()
+
+    assert api_client._client is None
+
+
+@pytest.mark.asyncio
+async def test_close_client_closes_and_resets_the_shared_client(monkeypatch):
+    fake_client = SimpleNamespace(close=AsyncMock())
+    monkeypatch.setattr(api_client, "_client", fake_client)
+
+    await api_client.close_client()
+
+    fake_client.close.assert_awaited_once()
+    assert api_client._client is None
