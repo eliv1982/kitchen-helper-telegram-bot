@@ -1,9 +1,16 @@
 import logging
 from typing import Any
 
-from openai import APIConnectionError, APIError, APITimeoutError, OpenAI, RateLimitError
+from openai import APIConnectionError, APIError, APITimeoutError, AsyncOpenAI, RateLimitError
 
-from config import MAX_TOKENS, OPENAI_API_KEY, OPENAI_MODEL, TEMPERATURE
+from config import (
+    MAX_TOKENS,
+    OPENAI_API_KEY,
+    OPENAI_MAX_RETRIES,
+    OPENAI_MODEL,
+    OPENAI_TIMEOUT_SECONDS,
+    TEMPERATURE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -16,10 +23,19 @@ SYSTEM_MESSAGE = (
     "Не выдумывай наличие продуктов, которых пользователь не называл."
 )
 
-_client = OpenAI(api_key=OPENAI_API_KEY)
+
+class InvalidResponseError(Exception):
+    """Raised when the OpenAI response is missing, empty, or otherwise unusable."""
 
 
-def get_chat_response(
+_client = AsyncOpenAI(
+    api_key=OPENAI_API_KEY,
+    timeout=OPENAI_TIMEOUT_SECONDS,
+    max_retries=OPENAI_MAX_RETRIES,
+)
+
+
+async def get_chat_response(
     messages: list[dict[str, str]],
     user_id: int,
     context_len: int,
@@ -39,7 +55,7 @@ def get_chat_response(
     )
 
     try:
-        response = _client.chat.completions.create(
+        response = await _client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=full_messages,
             temperature=TEMPERATURE,
@@ -58,7 +74,7 @@ def get_chat_response(
         logger.error("OpenAI API error for user_id=%s: %s", user_id, exc)
         raise
 
-    content = response.choices[0].message.content or ""
+    content = _extract_content(response, user_id=user_id)
     usage = _extract_usage(response)
     if usage:
         logger.info(
@@ -71,11 +87,37 @@ def get_chat_response(
     return content, usage
 
 
+def _extract_content(response: Any, user_id: int) -> str:
+    choices = getattr(response, "choices", None)
+    if not choices:
+        logger.error("OpenAI response has no choices for user_id=%s", user_id)
+        raise InvalidResponseError("OpenAI response contains no choices")
+
+    message = getattr(choices[0], "message", None)
+    content = getattr(message, "content", None) if message else None
+
+    if not isinstance(content, str) or not content.strip():
+        logger.error(
+            "OpenAI response has empty or invalid content for user_id=%s", user_id
+        )
+        raise InvalidResponseError("OpenAI response content is empty or invalid")
+
+    return content
+
+
 def _extract_usage(response: Any) -> dict[str, int] | None:
-    if response.usage is None:
+    # Usage is metadata, not part of the success condition: a missing or
+    # malformed usage object must never turn a valid answer into an error,
+    # so any shape surprise here degrades to None instead of raising.
+    usage = getattr(response, "usage", None)
+    if usage is None:
         return None
-    return {
-        "input_tokens": response.usage.prompt_tokens,
-        "output_tokens": response.usage.completion_tokens,
-        "total_tokens": response.usage.total_tokens,
-    }
+    try:
+        return {
+            "input_tokens": usage.prompt_tokens,
+            "output_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens,
+        }
+    except AttributeError:
+        logger.warning("OpenAI usage metadata malformed; degrading to None")
+        return None

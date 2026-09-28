@@ -6,6 +6,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramAPIError, TelegramNetworkError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
+from aiogram.utils.chat_action import ChatActionSender
 from openai import APIConnectionError, APIError, APITimeoutError, RateLimitError
 
 import api_client
@@ -21,6 +22,20 @@ logger = logging.getLogger(__name__)
 RESET_PHRASE = "очистить контекст"
 
 dp = Dispatcher()
+
+# One lock per Telegram user id, created lazily. Guarantees that the whole
+# "user message -> context update -> OpenAI request -> assistant response /
+# rollback" transaction never overlaps for the same user, while different
+# users are still processed concurrently.
+_user_locks: dict[int, asyncio.Lock] = {}
+
+
+def _get_user_lock(user_id: int) -> asyncio.Lock:
+    lock = _user_locks.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _user_locks[user_id] = lock
+    return lock
 
 
 @dp.message(CommandStart())
@@ -38,60 +53,75 @@ async def cmd_start(message: Message) -> None:
 @dp.message(Command("reset"))
 async def cmd_reset(message: Message) -> None:
     user_id = message.from_user.id
-    context_manager.clear_context(user_id)
+    async with _get_user_lock(user_id):
+        context_manager.clear_context(user_id)
     logger.info("Context cleared via /reset for user_id=%s", user_id)
     await message.answer("Контекст очищен. Можем начать с чистого листа!")
 
 
 @dp.message(F.text)
-async def handle_text(message: Message) -> None:
+async def handle_text(message: Message, bot: Bot) -> None:
     if not message.text or not message.from_user:
         return
 
     user_id = message.from_user.id
     text = message.text.strip()
 
-    if text.lower() == RESET_PHRASE:
-        context_manager.clear_context(user_id)
-        logger.info("Context cleared via phrase for user_id=%s", user_id)
-        await message.answer("Контекст очищен. Можем начать с чистого листа!")
-        return
+    async with _get_user_lock(user_id):
+        if text.lower() == RESET_PHRASE:
+            context_manager.clear_context(user_id)
+            logger.info("Context cleared via phrase for user_id=%s", user_id)
+            await message.answer("Контекст очищен. Можем начать с чистого листа!")
+            return
 
-    context_manager.add_message(user_id, "user", text)
-    ctx_len = context_manager.context_length(user_id)
+        context_manager.add_message(user_id, "user", text)
+        ctx_len = context_manager.context_length(user_id)
 
-    try:
-        reply, usage = api_client.get_chat_response(
-            context_manager.get_context(user_id),
-            user_id=user_id,
-            context_len=ctx_len,
-        )
-    except RateLimitError:
-        context_manager.get_context(user_id).pop()
-        await message.answer(
-            "Сейчас слишком много запросов к AI. Подожди немного и попробуй снова."
-        )
-        return
-    except (APITimeoutError, APIConnectionError):
-        context_manager.get_context(user_id).pop()
-        await message.answer(
-            "Не удалось связаться с OpenAI. Проверь интернет и попробуй позже."
-        )
-        return
-    except APIError:
-        context_manager.get_context(user_id).pop()
-        await message.answer(
-            "Ошибка при обращении к OpenAI. Попробуй позже или проверь настройки API."
-        )
-        return
+        try:
+            async with ChatActionSender.typing(chat_id=message.chat.id, bot=bot):
+                reply, usage = await api_client.get_chat_response(
+                    context_manager.get_context(user_id),
+                    user_id=user_id,
+                    context_len=ctx_len,
+                )
+        except asyncio.CancelledError:
+            # The turn never completed: drop the pending user message so the
+            # conversation transaction invariant holds, then let cancellation
+            # propagate untouched (never convert it into an API error reply).
+            context_manager.remove_last_message(user_id)
+            raise
+        except RateLimitError:
+            context_manager.remove_last_message(user_id)
+            await message.answer(
+                "Сейчас слишком много запросов к AI. Подожди немного и попробуй снова."
+            )
+            return
+        except (APITimeoutError, APIConnectionError):
+            context_manager.remove_last_message(user_id)
+            await message.answer(
+                "Не удалось связаться с OpenAI. Проверь интернет и попробуй позже."
+            )
+            return
+        except api_client.InvalidResponseError:
+            context_manager.remove_last_message(user_id)
+            await message.answer(
+                "AI вернул пустой ответ. Попробуй переформулировать запрос или повторить позже."
+            )
+            return
+        except APIError:
+            context_manager.remove_last_message(user_id)
+            await message.answer(
+                "Ошибка при обращении к OpenAI. Попробуй позже или проверь настройки API."
+            )
+            return
 
-    context_manager.add_message(user_id, "assistant", reply)
+        context_manager.add_message(user_id, "assistant", reply)
 
-    try:
-        await message.answer(reply)
-    except (TelegramNetworkError, TelegramAPIError) as exc:
-        logger.error("Telegram error for user_id=%s: %s", user_id, exc)
-        await message.answer("Не удалось отправить ответ. Попробуй ещё раз.")
+        try:
+            await message.answer(reply)
+        except (TelegramNetworkError, TelegramAPIError) as exc:
+            logger.error("Telegram error for user_id=%s: %s", user_id, exc)
+            await message.answer("Не удалось отправить ответ. Попробуй ещё раз.")
 
 
 async def main() -> None:
