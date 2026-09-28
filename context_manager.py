@@ -20,5 +20,12 @@ def clear_context(user_id: int) -> None:
     _contexts[user_id] = []
 
 
+def remove_last_message(user_id: int) -> None:
+    """Remove the most recently added message, if any (used for rollback)."""
+    ctx = get_context(user_id)
+    if ctx:
+        ctx.pop()
+
+
 def context_length(user_id: int) -> int:
     return len(get_context(user_id))
