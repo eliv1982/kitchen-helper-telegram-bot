@@ -122,6 +122,27 @@ def test_validate_config_returns_concise_errors_when_invalid(monkeypatch):
     assert any("BOT_TOKEN" in err for err in errors)
 
 
+def test_validate_config_recovers_after_environment_correction(monkeypatch):
+    # Regression test: a failed validation must not leave the module in a
+    # state that prevents a later, corrected validation (and the settings
+    # access that follows it) from succeeding in the same process -- this
+    # matters because get_settings()/validate_config() cache into a module
+    # global, so a bug here would only show up across repeated calls.
+    monkeypatch.delenv("BOT_TOKEN", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "key")
+
+    errors = config.validate_config()
+    assert any("BOT_TOKEN" in err for err in errors)
+
+    monkeypatch.setenv("BOT_TOKEN", "token")
+    errors_after_fix = config.validate_config()
+    assert errors_after_fix == []
+
+    settings = config.get_settings()
+    assert settings.bot_token == "token"
+    assert settings.openai_api_key == "key"
+
+
 def test_get_settings_caches_after_first_successful_call(monkeypatch):
     monkeypatch.setenv("BOT_TOKEN", "token")
     monkeypatch.setenv("OPENAI_API_KEY", "key")

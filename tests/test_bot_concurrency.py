@@ -283,6 +283,58 @@ async def test_cancellation_during_exchange_rolls_back_pending_message(monkeypat
     ]
 
 
+@pytest.mark.asyncio
+async def test_unexpected_exception_rolls_back_pending_message_and_propagates(monkeypatch):
+    user_id = 104
+
+    async def fake_get_chat_response(messages, user_id, context_len):
+        return "reply-to-первое", None
+
+    monkeypatch.setattr(api_client, "get_chat_response", fake_get_chat_response)
+
+    fake_bot = FakeBot()
+
+    # A prior, fully completed turn that must survive untouched.
+    await bot_module.handle_text(FakeMessage(user_id=user_id, text="первое"), fake_bot)
+    original = list(context_manager.get_context(user_id))
+    assert original == [
+        {"role": "user", "content": "первое"},
+        {"role": "assistant", "content": "reply-to-первое"},
+    ]
+
+    async def fake_raise(messages, user_id, context_len):
+        raise RuntimeError("synthetic unexpected failure")
+
+    monkeypatch.setattr(api_client, "get_chat_response", fake_raise)
+
+    failing_msg = FakeMessage(user_id=user_id, text="второе")
+    with pytest.raises(RuntimeError, match="synthetic unexpected failure"):
+        await bot_module.handle_text(failing_msg, fake_bot)
+
+    # The pending "второе" turn is rolled back; the prior completed turn is
+    # untouched.
+    assert context_manager.get_context(user_id) == original
+
+    # An unexpected exception must never be converted into a friendly
+    # OpenAI-failure reply -- it propagates instead, so no answer is sent.
+    failing_msg.answer.assert_not_awaited()
+
+    # The lock was released normally, so a later same-user operation proceeds.
+    lock = bot_module._get_user_lock(user_id)
+    assert not lock.locked()
+
+    async def fake_success(messages, user_id, context_len):
+        return "reply-to-третье", None
+
+    monkeypatch.setattr(api_client, "get_chat_response", fake_success)
+    await bot_module.handle_text(FakeMessage(user_id=user_id, text="третье"), fake_bot)
+
+    assert context_manager.get_context(user_id) == original + [
+        {"role": "user", "content": "третье"},
+        {"role": "assistant", "content": "reply-to-третье"},
+    ]
+
+
 # --- History-trimming transaction safety at the 20-message capacity boundary ---
 
 
@@ -359,6 +411,31 @@ async def test_cancellation_at_full_capacity_preserves_all_prior_history(monkeyp
         {"role": "user", "content": "after"},
         {"role": "assistant", "content": "ok-after-cancel"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_unexpected_exception_at_full_capacity_preserves_all_prior_history(monkeypatch):
+    user_id = 205
+    original = _seed_full_history(user_id)
+    assert len(original) == context_manager.MAX_HISTORY_MESSAGES == 20
+
+    async def fake_raise(messages, user_id, context_len):
+        raise RuntimeError("synthetic unexpected failure")
+
+    monkeypatch.setattr(api_client, "get_chat_response", fake_raise)
+
+    fake_bot = FakeBot()
+    msg = FakeMessage(user_id=user_id, text="pending message")
+
+    with pytest.raises(RuntimeError, match="synthetic unexpected failure"):
+        await bot_module.handle_text(msg, fake_bot)
+
+    final = context_manager.get_context(user_id)
+    # No trimming/loss of prior completed history: byte-for-byte the same as
+    # before the unexpected failure, with the failed pending turn gone.
+    assert final == original
+    assert len(final) == 20
+    msg.answer.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -100,42 +100,49 @@ async def handle_text(message: Message, bot: Bot) -> None:
         ctx_len = context_manager.context_length(user_id)
 
         try:
-            async with ChatActionSender.typing(chat_id=message.chat.id, bot=bot):
-                reply, usage = await api_client.get_chat_response(
-                    context_manager.get_context(user_id),
-                    user_id=user_id,
-                    context_len=ctx_len,
-                )
+            # Single rollback point for the whole transaction: any exception
+            # at all -- a recognized OpenAI failure, cancellation, or a
+            # completely unexpected one -- means the turn never completed, so
+            # the pending user message always comes back out here before the
+            # exception is re-raised for the except clauses below (or the
+            # caller) to interpret.
+            try:
+                async with ChatActionSender.typing(chat_id=message.chat.id, bot=bot):
+                    reply, usage = await api_client.get_chat_response(
+                        context_manager.get_context(user_id),
+                        user_id=user_id,
+                        context_len=ctx_len,
+                    )
+            except BaseException:
+                context_manager.remove_last_message(user_id)
+                raise
         except asyncio.CancelledError:
-            # The turn never completed: drop the pending user message so the
-            # conversation transaction invariant holds, then let cancellation
-            # propagate untouched (never convert it into an API error reply).
-            context_manager.remove_last_message(user_id)
+            # Never convert cancellation into an API error reply -- just let
+            # it propagate untouched now that the rollback above has run.
             raise
         except RateLimitError:
-            context_manager.remove_last_message(user_id)
             await message.answer(
                 "Сейчас слишком много запросов к AI. Подожди немного и попробуй снова."
             )
             return
         except (APITimeoutError, APIConnectionError):
-            context_manager.remove_last_message(user_id)
             await message.answer(
                 "Не удалось связаться с OpenAI. Проверь интернет и попробуй позже."
             )
             return
         except api_client.InvalidResponseError:
-            context_manager.remove_last_message(user_id)
             await message.answer(
                 "AI вернул пустой ответ. Попробуй переформулировать запрос или повторить позже."
             )
             return
         except APIError:
-            context_manager.remove_last_message(user_id)
             await message.answer(
                 "Ошибка при обращении к OpenAI. Попробуй позже или проверь настройки API."
             )
             return
+        # Any other exception (not one of the recognized failure types above)
+        # is unexpected: it must propagate unchanged, never be swallowed or
+        # turned into a friendly reply. The rollback already happened above.
 
         context_manager.add_message(user_id, "assistant", reply)
         context_manager.trim_history(user_id)
