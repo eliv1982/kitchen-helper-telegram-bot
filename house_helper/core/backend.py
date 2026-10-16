@@ -8,6 +8,11 @@ backend errors below and leaves everything else alone.
 api_client.py stays where it is and is still the only code that talks to
 OpenAI; this module reaches it through the module attribute on every call, so
 replacing api_client.get_chat_response at runtime keeps working.
+
+api_client is imported when the adapter first runs, not when this module is
+imported: it pulls in config, which reads the .env file at import time, and
+merely importing the chat core (ChatService, the backend contract, the errors
+below) must not load provider configuration.
 """
 
 from dataclasses import dataclass
@@ -15,7 +20,6 @@ from typing import Protocol
 
 from openai import APIConnectionError, APIError, APITimeoutError, RateLimitError
 
-import api_client
 from house_helper.core.identity import ConversationKey
 
 
@@ -93,6 +97,8 @@ class OpenAIBackend:
         conversation: ConversationKey,
         context_len: int,
     ) -> BackendReply:
+        import api_client  # deferred on purpose, see the module docstring
+
         try:
             text, usage = await api_client.get_chat_response(
                 messages,
