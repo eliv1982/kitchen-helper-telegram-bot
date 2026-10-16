@@ -604,9 +604,15 @@ async def test_two_services_do_not_block_each_others_other_conversations():
     first_service = ChatService(FakeBackend())
     second_service = ChatService(FakeBackend(reply="свободно"))
 
-    async with first_service.turn(WEB):
+    async def use_second():
         async with second_service.turn(OTHER_WEB) as turn:
-            outcome = await asyncio.wait_for(turn.send("привет"), timeout=2)
+            return await turn.send("привет")
+
+    # The bound wraps the whole turn rather than one operation: on Python < 3.12
+    # wait_for runs what it is given in a new task, which a turn refuses (it
+    # belongs to the task that opened it).
+    async with first_service.turn(WEB):
+        outcome = await asyncio.wait_for(use_second(), timeout=2)
 
     assert outcome.status is OutcomeStatus.REPLIED
 
@@ -711,32 +717,229 @@ async def test_a_turn_from_an_earlier_scope_is_not_usable_in_a_later_one():
 
 @pytest.mark.asyncio
 async def test_a_turn_refuses_overlapping_operations():
-    in_backend = asyncio.Event()
-    release = asyncio.Event()
+    # Another task cannot overlap an operation (it is refused outright, see
+    # below), so the only overlap left is the owning task's own: here the backend
+    # call, which runs in that task, re-enters the turn while send() is in flight.
+    refused: list[str] = []
+    entered = False
 
-    async def gated(messages, conversation):
-        in_backend.set()
-        await release.wait()
+    async def reenter(messages, conversation):
+        nonlocal entered
+        if entered:  # a missing guard would let the nested send() recurse into here
+            return "вложенный"
+        entered = True
+        for attempt in (lambda: turn.send("два"), lambda: turn.reset(source="test")):
+            try:
+                await attempt()
+            except RuntimeError as exc:
+                refused.append(str(exc))
         return "ответ"
 
-    service = ChatService(HookBackend(gated))
+    service = ChatService(HookBackend(reenter))
 
     async with service.turn(WEB) as turn:
-        first = asyncio.create_task(turn.send("раз"))
-        await asyncio.wait_for(in_backend.wait(), timeout=2)
+        outcome = await turn.send("раз")
 
-        # Bounded, so a missing guard fails fast instead of queueing behind the
-        # gated backend call and hanging the suite.
-        with pytest.raises(RuntimeError, match="in progress"):
-            await asyncio.wait_for(turn.send("два"), timeout=1)
-        with pytest.raises(RuntimeError, match="in progress"):
-            await asyncio.wait_for(turn.reset(source="test"), timeout=1)
-
-        release.set()
-        assert (await first).status is OutcomeStatus.REPLIED
+        assert outcome.status is OutcomeStatus.REPLIED
+        assert len(refused) == 2
+        assert all("in progress" in message for message in refused)
         # The refused operations changed nothing, and the turn is usable again.
         assert seams.history_of(WEB) == [
             {"role": "user", "content": "раз"},
             {"role": "assistant", "content": "ответ"},
         ]
         assert (await turn.reset(source="test")).status is OutcomeStatus.CONTEXT_CLEARED
+
+
+# --- a turn belongs to the task that opened it ----------------------------------
+#
+# Found in review: nothing tied a Turn to the task that entered its scope, so a
+# child task could start send() inside the scope, outlive it, and commit to a
+# conversation that another operation had reset in the meantime.
+
+
+class BackgroundWorking:
+    """A `while_working` that runs a task of its own for as long as it is open,
+    the way aiogram's ChatActionSender keeps "typing..." going."""
+
+    def __init__(self) -> None:
+        self.ticks = 0
+        self.task: asyncio.Task | None = None
+
+    def __call__(self) -> "BackgroundWorking":
+        return self
+
+    async def __aenter__(self) -> "BackgroundWorking":
+        self.task = asyncio.create_task(self._tick())
+        return self
+
+    async def __aexit__(self, *exc_info) -> None:
+        self.task.cancel()
+        await asyncio.gather(self.task, return_exceptions=True)
+
+    async def _tick(self) -> None:
+        while True:
+            self.ticks += 1
+            await asyncio.sleep(0)
+
+
+TURN_OPERATIONS = [
+    pytest.param(lambda turn: turn.send("чужой вопрос"), id="send"),
+    pytest.param(lambda turn: turn.reset(source="чужой"), id="reset"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", TURN_OPERATIONS)
+@pytest.mark.parametrize("scope_is_open", [True, False], ids=["inside-scope", "after-scope"])
+async def test_another_task_cannot_use_a_turn(operation, scope_is_open):
+    backend = FakeBackend()
+    prior = seams.seed_conversation(WEB, [("user", "раньше"), ("assistant", "ответ")])
+    service = ChatService(backend)
+
+    async def from_another_task():
+        with pytest.raises(RuntimeError, match="another task"):
+            await asyncio.create_task(operation(turn))
+
+    async with service.turn(WEB) as turn:
+        if scope_is_open:
+            await from_another_task()
+    if not scope_is_open:
+        await from_another_task()
+
+    # Refused before anything was touched: no backend call, no history change.
+    assert backend.requests == []
+    assert seams.history_of(WEB) == prior
+
+
+@pytest.mark.asyncio
+async def test_an_escaped_task_cannot_commit_after_a_competing_reset():
+    # The scenario from the review. A child starts send() inside the scope and
+    # outlives it; the lock is free again, so a reset gets in; then the child's
+    # backend call finishes.
+    seams.seed_conversation(WEB, [("user", "раньше"), ("assistant", "ответ")])
+    release = asyncio.Event()
+
+    async def gated(messages, conversation):
+        await release.wait()
+        return "запоздалый ответ"
+
+    backend = HookBackend(gated)
+    service = ChatService(backend)
+
+    async with service.turn(WEB) as turn:
+        escaped = asyncio.create_task(turn.send("вопрос"))
+        await seams.settle()  # unguarded, the child is now inside the backend call
+
+    await asyncio.wait_for(service.reset(WEB, source="test"), timeout=2)
+    assert seams.history_of(WEB) == []
+
+    release.set()
+    [result] = await asyncio.wait_for(asyncio.gather(escaped, return_exceptions=True), timeout=2)
+
+    assert seams.history_of(WEB) == []  # the reset stands: no orphaned reply after it
+    assert backend.calls == []
+    assert isinstance(result, RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_an_escaped_task_cannot_roll_back_the_next_turns_pending_message():
+    # The same escape on the failure path: an unguarded child that fails would
+    # roll back "the last message", which by then is another turn's pending one.
+    fail_escaped = asyncio.Event()
+    release_second = asyncio.Event()
+
+    async def handler(messages, conversation):
+        if messages[-1]["content"] == "забытый":
+            await fail_escaped.wait()
+            raise BackendRateLimitedError("synthetic")
+        await release_second.wait()
+        return "ответ второго"
+
+    backend = HookBackend(handler)
+    service = ChatService(backend)
+
+    async def second_turn():
+        async with service.turn(WEB) as turn:
+            return await turn.send("второй")
+
+    async with service.turn(WEB) as turn:
+        escaped = asyncio.create_task(turn.send("забытый"))
+        await seams.settle()
+
+    second = asyncio.create_task(second_turn())
+    await seams.settle()  # the second turn's message is pending in the backend call
+
+    fail_escaped.set()
+    await asyncio.wait_for(asyncio.gather(escaped, return_exceptions=True), timeout=2)
+    release_second.set()
+    outcome = await asyncio.wait_for(second, timeout=2)
+
+    assert outcome == ChatOutcome(OutcomeStatus.REPLIED, reply="ответ второго")
+    assert seams.history_of(WEB) == [
+        {"role": "user", "content": "второй"},
+        {"role": "assistant", "content": "ответ второго"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_refused_call_from_another_task_leaves_the_turn_usable_by_its_owner():
+    service = ChatService(FakeBackend(reply="ответ"))
+
+    async with service.turn(WEB) as turn:
+        with pytest.raises(RuntimeError, match="another task"):
+            await asyncio.create_task(turn.send("чужой"))
+
+        outcome = await turn.send("свой")
+
+    assert outcome == ChatOutcome(OutcomeStatus.REPLIED, reply="ответ")
+    assert seams.history_of(WEB) == [
+        {"role": "user", "content": "свой"},
+        {"role": "assistant", "content": "ответ"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_owning_task_can_keep_using_its_turn():
+    service = ChatService(FakeBackend(reply="ответ"))
+
+    async def helper(turn, text):  # awaited, not spawned: still the owning task
+        return await turn.send(text)
+
+    async with service.turn(WEB) as turn:
+        first = await turn.send("раз")
+        second = await helper(turn, "два")
+        cleared = await turn.reset(source="test")
+        third = await helper(turn, "три")
+
+    assert [outcome.status for outcome in (first, second, cleared, third)] == [
+        OutcomeStatus.REPLIED,
+        OutcomeStatus.REPLIED,
+        OutcomeStatus.CONTEXT_CLEARED,
+        OutcomeStatus.REPLIED,
+    ]
+    assert seams.history_of(WEB) == [
+        {"role": "user", "content": "три"},
+        {"role": "assistant", "content": "ответ"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_background_task_of_while_working_does_not_disturb_the_turn():
+    async def handler(messages, conversation):
+        await seams.settle(3)  # long enough for the background task to run
+        return "ответ"
+
+    working = BackgroundWorking()
+    service = ChatService(HookBackend(handler))
+
+    async with service.turn(WEB) as turn:
+        outcome = await turn.send("вопрос", while_working=working)
+
+    assert outcome == ChatOutcome(OutcomeStatus.REPLIED, reply="ответ")
+    assert working.ticks > 0
+    assert working.task.done()
+    assert seams.history_of(WEB) == [
+        {"role": "user", "content": "вопрос"},
+        {"role": "assistant", "content": "ответ"},
+    ]

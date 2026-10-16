@@ -107,10 +107,13 @@ class Turn:
     """One conversation's locked stretch of work; obtained from
     ChatService.turn() and valid only inside that scope.
 
-    Operations are awaited one at a time. Using the turn after its scope has
-    exited, or starting an operation while another is still running, raises
-    RuntimeError: either would touch the history outside the lock or
-    interleave two transactions.
+    A turn belongs to the asyncio task that entered the scope, and operations
+    are awaited from that task one at a time. Using the turn from any other
+    task, after its scope has exited, or while another operation is still
+    running, raises RuntimeError: each would touch the history outside the lock
+    or interleave two transactions. In particular an operation must be awaited
+    directly, not handed to asyncio.create_task / gather / shield (or, before
+    Python 3.12, wait_for), all of which run it in a task of its own.
     """
 
     def __init__(
@@ -122,6 +125,8 @@ class Turn:
         self._key = key
         self._backend = backend
         self._max_input_length = max_input_length
+        # Built inside the scope's own __aenter__, so this is the entering task.
+        self._owner = asyncio.current_task()
         self._open = True
         self._busy = False
 
@@ -130,6 +135,12 @@ class Turn:
 
     @contextmanager
     def _operation(self) -> Iterator[None]:
+        # First, and before anything is touched: a task that does not own the
+        # turn must not get as far as the history or the backend, whether the
+        # scope is still open or (an escaped task) already over and its lock
+        # in someone else's hands.
+        if asyncio.current_task() is not self._owner:
+            raise RuntimeError("this turn belongs to another task")
         if not self._open:
             raise RuntimeError("this turn has ended: its scope has been exited")
         if self._busy:
