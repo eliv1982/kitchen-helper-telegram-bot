@@ -45,7 +45,7 @@ InvalidAiResponseError = api_client.InvalidResponseError
 def reset_state() -> None:
     """Drop all process-wide state so every test starts from a clean slate."""
     context_manager._contexts.clear()
-    bot_module._user_locks.clear()
+    context_manager._locks.clear()
     api_client._client = None
     config._settings = None
 
@@ -126,12 +126,12 @@ def set_max_input_length(monkeypatch, value: int) -> None:
 
 def lock_for(key: ConversationKey) -> asyncio.Lock:
     """The serialization lock guarding one conversation."""
-    return bot_module._get_user_lock(key)
+    return context_manager.get_lock(key)
 
 
 def lock_keys() -> set[ConversationKey]:
     """Every key for which a serialization lock has been created."""
-    return set(bot_module._user_locks)
+    return set(context_manager._locks)
 
 
 def is_user_busy(user_id: int) -> bool:

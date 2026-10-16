@@ -56,22 +56,6 @@ def _conversation_key(user_id: int) -> ConversationKey:
     return ConversationKey(TELEGRAM_CHANNEL, str(user_id))
 
 
-# One lock per conversation key (currently: per Telegram sender), created
-# lazily. Guarantees that the whole "user message -> context update -> OpenAI
-# request -> assistant response / rollback" transaction never overlaps for the
-# same conversation, while different conversations are still processed
-# concurrently.
-_user_locks: dict[ConversationKey, asyncio.Lock] = {}
-
-
-def _get_user_lock(key: ConversationKey) -> asyncio.Lock:
-    lock = _user_locks.get(key)
-    if lock is None:
-        lock = asyncio.Lock()
-        _user_locks[key] = lock
-    return lock
-
-
 async def _clear_user_context(user_id: int, source: str) -> None:
     """Clear a user's conversation context. Caller must hold the user's lock."""
     context_manager.clear_context(_conversation_key(user_id))
@@ -97,7 +81,7 @@ async def cmd_reset(message: Message) -> None:
     if not message.from_user:
         return
     user_id = message.from_user.id
-    async with _get_user_lock(_conversation_key(user_id)):
+    async with context_manager.get_lock(_conversation_key(user_id)):
         await _clear_user_context(user_id, "/reset")
     await message.answer(
         messages_ru.render(ChatOutcome(OutcomeStatus.CONTEXT_CLEARED))
@@ -113,7 +97,7 @@ async def handle_text(message: Message, bot: Bot) -> None:
     key = _conversation_key(user_id)
     text = message.text.strip()
 
-    async with _get_user_lock(key):
+    async with context_manager.get_lock(key):
         if text.lower() == RESET_PHRASE:
             await _clear_user_context(user_id, "reset phrase")
             await message.answer(

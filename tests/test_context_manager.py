@@ -110,3 +110,50 @@ def test_trim_history_is_a_no_op_under_the_bound(monkeypatch):
     context_manager.trim_history(key)
 
     assert context_manager.get_context(key) == [{"role": "user", "content": "hi"}]
+
+
+# --- the shared per-conversation lock registry ------------------------------
+
+
+def test_a_conversation_has_one_lock():
+    key = ConversationKey("telegram", "7")
+
+    assert context_manager.get_lock(key) is context_manager.get_lock(key)
+
+
+def test_an_equal_but_separately_built_key_reaches_the_same_lock():
+    first = context_manager.get_lock(ConversationKey("telegram", "8"))
+
+    assert context_manager.get_lock(ConversationKey("telegram", "8")) is first
+
+
+def test_different_conversations_get_different_locks():
+    telegram = ConversationKey("telegram", "9")
+
+    assert context_manager.get_lock(telegram) is not context_manager.get_lock(
+        ConversationKey("telegram", "10")
+    )
+    # The same subject on another channel is another conversation.
+    assert context_manager.get_lock(telegram) is not context_manager.get_lock(
+        ConversationKey("web", "9")
+    )
+
+
+def test_locks_are_created_lazily_per_key():
+    assert context_manager._locks == {}
+
+    key = ConversationKey("web", "11")
+    lock = context_manager.get_lock(key)
+
+    assert context_manager._locks == {key: lock}
+
+
+def test_clearing_and_rolling_back_history_keep_the_conversations_lock():
+    key = ConversationKey("telegram", "12")
+    lock = context_manager.get_lock(key)
+    context_manager.add_message(key, "user", "привет")
+
+    context_manager.remove_last_message(key)
+    context_manager.clear_context(key)
+
+    assert context_manager.get_lock(key) is lock

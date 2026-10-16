@@ -1,3 +1,4 @@
+import asyncio
 from typing import TypedDict
 
 from house_helper.core.identity import ConversationKey
@@ -19,6 +20,31 @@ MAX_HISTORY_MESSAGES = 20
 
 # conversation key -> list of chat messages (user/assistant only)
 _contexts: dict[ConversationKey, list[MessageDict]] = {}
+
+# conversation key -> the lock serializing that conversation, created lazily.
+# Guarantees that the whole "user message -> history update -> backend request
+# -> assistant response / rollback" transaction never overlaps for the same
+# conversation, while different conversations are still processed
+# concurrently.
+#
+# The lock lives next to the history it protects, and there is exactly one
+# registry per process: however many services or transports operate on a
+# conversation, they all contend on the same lock over the same history.
+_locks: dict[ConversationKey, asyncio.Lock] = {}
+
+
+def get_lock(key: ConversationKey) -> asyncio.Lock:
+    """The lock serializing a conversation (the same object for equal keys).
+
+    Never replaced or dropped when a conversation is cleared: a reset runs
+    under this lock, so swapping it out would let the next turn slip past a
+    queued one.
+    """
+    lock = _locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _locks[key] = lock
+    return lock
 
 
 def get_context(key: ConversationKey) -> list[MessageDict]:
