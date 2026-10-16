@@ -22,6 +22,22 @@ _TEST_ENV_DEFAULTS = {
 for _name, _value in _TEST_ENV_DEFAULTS.items():
     os.environ[_name] = _value
 
+import dotenv
+
+
+# config.py calls load_dotenv() when it is imported, and python-dotenv finds
+# the .env next to config.py. Forcing the variables above is not enough on its
+# own: the suite would still open the developer's real .env (and merge any
+# extra variable it defines into os.environ, e.g. an OpenAI base URL). Make the
+# loader inert before config is first imported -- config binds the name with
+# `from dotenv import load_dotenv`, so replacing the attribute here is what it
+# picks up. config.py itself is deliberately left untouched.
+def _load_dotenv_disabled(*args, **kwargs) -> bool:
+    return False
+
+
+dotenv.load_dotenv = _load_dotenv_disabled
+
 import pytest
 
 from tests import seams
