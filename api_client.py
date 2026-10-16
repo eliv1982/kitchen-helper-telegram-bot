@@ -57,7 +57,7 @@ async def close_client() -> None:
 
 async def get_chat_response(
     messages: list[dict[str, str]],
-    user_id: int,
+    user_id: int | str,
     context_len: int,
 ) -> tuple[str, dict[str, int] | None]:
     """
@@ -109,7 +109,7 @@ async def get_chat_response(
     return content, usage
 
 
-def _extract_content(response: Any, user_id: int) -> str:
+def _extract_content(response: Any, user_id: int | str) -> str:
     choices = getattr(response, "choices", None)
     if not choices:
         logger.error("OpenAI response has no choices for user_id=%s", user_id)

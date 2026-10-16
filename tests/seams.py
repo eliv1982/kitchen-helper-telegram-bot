@@ -33,7 +33,7 @@ import context_manager
 from house_helper.core.identity import ConversationKey
 
 ChatTurn = dict[str, str]
-AiHandler = Callable[[list[ChatTurn], int], Awaitable[str]]
+AiHandler = Callable[[list[ChatTurn], str], Awaitable[str]]
 
 # The error the AI layer raises for a missing/empty/unusable completion.
 InvalidAiResponseError = api_client.InvalidResponseError
@@ -156,7 +156,7 @@ async def settle(turns: int = 25) -> None:
 @dataclass
 class AiCall:
     history: list[ChatTurn]  # what was sent; ends with the pending user message
-    user_id: int
+    user_id: str  # the conversation's log label, e.g. "telegram:7"
 
 
 @dataclass
@@ -164,7 +164,9 @@ class RecordingAi:
     """Async AI stand-in that records every call it receives.
 
     `handler(history, user_id)` produces the reply text (or raises, to
-    simulate a failure). Without a handler it replies "ok-reply".
+    simulate a failure); `user_id` is the channel-qualified label the AI layer
+    logs the conversation under ("telegram:7"). Without a handler it replies
+    "ok-reply".
     """
 
     handler: AiHandler | None = None
@@ -174,7 +176,7 @@ class RecordingAi:
     def called(self) -> bool:
         return bool(self.calls)
 
-    async def __call__(self, history: list[ChatTurn], user_id: int) -> str:
+    async def __call__(self, history: list[ChatTurn], user_id: str) -> str:
         self.calls.append(AiCall(history=history, user_id=user_id))
         if self.handler is None:
             return "ok-reply"

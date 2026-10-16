@@ -58,7 +58,7 @@ async def test_plain_text_goes_to_the_ai_and_the_reply_to_the_originating_chat(m
     await wire.send("что приготовить?", user_id=7, chat_id=-100500)
 
     assert ai.calls[0].history == [{"role": "user", "content": "что приготовить?"}]
-    assert ai.calls[0].user_id == 7
+    assert ai.calls[0].user_id == "telegram:7"
     assert wire.sent_messages == [(-100500, "ok-reply")]
 
 

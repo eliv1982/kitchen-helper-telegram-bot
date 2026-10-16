@@ -1,12 +1,14 @@
 """Contract of the AI backend boundary (house_helper.core.backend).
 
-Covers the OpenAI adapter on its own, the log label it must keep producing,
-and a fake backend standing in for it. How the bot reacts to each failure kind
-is pinned end to end by the characterization suite; the injection tests here
-only show that the bot depends on the interface and nothing else.
+Covers the OpenAI adapter on its own, the channel-qualified log label it
+produces from a ConversationKey, and a fake backend standing in for it. How the
+bot reacts to each failure kind is pinned end to end by the characterization
+suite; the injection tests here only show that the bot depends on the
+interface and nothing else.
 """
 
 import asyncio
+import inspect
 import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
@@ -22,8 +24,10 @@ from house_helper.core.backend import (
     BackendError,
     BackendRateLimitedError,
     BackendReply,
+    ChatBackend,
     OpenAIBackend,
 )
+from house_helper.core.identity import ConversationKey
 from tests import expected_texts, seams
 from tests.helpers import (
     FakeBackend,
@@ -39,6 +43,7 @@ from tests.helpers import (
 
 USAGE = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
 MESSAGES = [{"role": "user", "content": "привет"}]
+CONVERSATION = ConversationKey("telegram", "7")
 
 
 class _FatalSignal(BaseException):
@@ -67,12 +72,12 @@ async def test_complete_returns_the_reply_and_forwards_the_call_unchanged(monkey
 
     monkeypatch.setattr(api_client, "get_chat_response", get_chat_response)
 
-    reply = await backend.complete(MESSAGES, user_id=7, context_len=1)
+    reply = await backend.complete(MESSAGES, conversation=CONVERSATION, context_len=1)
 
     assert reply == BackendReply(text="готово", usage=usage)
     assert len(calls) == 1
     assert calls[0][0] is MESSAGES  # passed through, not copied or rewritten
-    assert calls[0][1:] == (7, 1)
+    assert calls[0][1:] == ("telegram:7", 1)
 
 
 FAILURES = [
@@ -106,7 +111,7 @@ async def test_provider_failures_become_the_matching_backend_error(
     monkeypatch.setattr(api_client, "get_chat_response", _provider_raising(original))
 
     with pytest.raises(BackendError) as raised:
-        await OpenAIBackend().complete(MESSAGES, user_id=1, context_len=1)
+        await OpenAIBackend().complete(MESSAGES, conversation=CONVERSATION, context_len=1)
 
     assert type(raised.value) is expected_kind  # the exact kind, never a broader one
     assert raised.value.__cause__ is original
@@ -130,7 +135,7 @@ async def test_anything_unrecognized_propagates_untouched(monkeypatch, make_erro
     monkeypatch.setattr(api_client, "get_chat_response", _provider_raising(original))
 
     with pytest.raises(type(original)) as raised:
-        await OpenAIBackend().complete(MESSAGES, user_id=1, context_len=1)
+        await OpenAIBackend().complete(MESSAGES, conversation=CONVERSATION, context_len=1)
 
     assert raised.value is original
 
@@ -143,7 +148,30 @@ def test_the_specific_failure_kinds_are_distinct_backend_errors():
         assert not any(issubclass(kind, other) for other in kinds if other is not kind)
 
 
-# --- the user_id log label (kept for now) ---------------------------------------
+# --- the contract: a conversation key, not a Telegram user id -------------------
+
+
+@pytest.mark.parametrize(
+    "backend_type",
+    [ChatBackend, OpenAIBackend, FakeBackend],
+    ids=["protocol", "openai", "fake"],
+)
+def test_complete_takes_a_conversation_key_and_no_user_id(backend_type):
+    parameters = inspect.signature(backend_type.complete).parameters
+
+    assert list(parameters) == ["self", "messages", "conversation", "context_len"]
+    assert parameters["conversation"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters["context_len"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+@pytest.mark.parametrize("backend_type", [ChatBackend, OpenAIBackend], ids=["protocol", "openai"])
+def test_the_conversation_parameter_is_typed_as_a_conversation_key(backend_type):
+    parameters = inspect.signature(backend_type.complete, eval_str=True).parameters
+
+    assert parameters["conversation"].annotation is ConversationKey
+
+
+# --- the channel-qualified log label --------------------------------------------
 
 
 def _fake_openai_client(create):
@@ -151,29 +179,118 @@ def _fake_openai_client(create):
 
 
 @pytest.mark.asyncio
-async def test_request_and_success_logs_keep_the_user_id_label(monkeypatch, caplog):
+async def test_request_and_success_logs_carry_the_channel_qualified_label(monkeypatch, caplog):
     create = AsyncMock(return_value=make_openai_response("Свари яйца всмятку."))
     monkeypatch.setattr(api_client, "get_client", lambda: _fake_openai_client(create))
 
     with caplog.at_level(logging.INFO, logger="api_client"):
-        reply = await OpenAIBackend().complete(MESSAGES, user_id=7, context_len=3)
+        reply = await OpenAIBackend().complete(
+            MESSAGES, conversation=CONVERSATION, context_len=3
+        )
 
     assert reply == BackendReply(text="Свари яйца всмятку.", usage=USAGE)
     logged = [record.getMessage() for record in caplog.records]
-    assert any("user_id=7, context_len=3" in line for line in logged)
+    assert any("user_id=telegram:7, context_len=3" in line for line in logged)
 
 
 @pytest.mark.asyncio
-async def test_failure_logs_keep_the_user_id_label(monkeypatch, caplog):
+async def test_failure_logs_carry_the_channel_qualified_label(monkeypatch, caplog):
     create = AsyncMock(side_effect=make_rate_limit_error())
     monkeypatch.setattr(api_client, "get_client", lambda: _fake_openai_client(create))
 
     with caplog.at_level(logging.INFO, logger="api_client"):
         with pytest.raises(BackendRateLimitedError):
-            await OpenAIBackend().complete(MESSAGES, user_id=7, context_len=3)
+            await OpenAIBackend().complete(MESSAGES, conversation=CONVERSATION, context_len=3)
 
     logged = [record.getMessage() for record in caplog.records]
-    assert "OpenAI rate limit exceeded for user_id=7" in logged
+    assert "OpenAI rate limit exceeded for user_id=telegram:7" in logged
+
+
+# --- Telegram and Web conversations with the same subject -----------------------
+
+TELEGRAM_39 = ConversationKey("telegram", "39")
+WEB_39 = ConversationKey("web", "39")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("conversation", "label"),
+    [
+        pytest.param(TELEGRAM_39, "telegram:39", id="telegram"),
+        pytest.param(WEB_39, "web:39", id="web"),
+    ],
+)
+async def test_the_provider_layer_is_given_the_channel_qualified_label(
+    monkeypatch, conversation, label
+):
+    labels = []
+
+    async def get_chat_response(messages, user_id, context_len):
+        labels.append(user_id)
+        return "готово", None
+
+    monkeypatch.setattr(api_client, "get_chat_response", get_chat_response)
+
+    await OpenAIBackend().complete(MESSAGES, conversation=conversation, context_len=1)
+
+    assert labels == [label]
+
+
+@pytest.mark.asyncio
+async def test_one_subject_on_two_channels_reaches_the_provider_layer_as_two_labels(monkeypatch):
+    labels = []
+
+    async def get_chat_response(messages, user_id, context_len):
+        labels.append(user_id)
+        return "готово", None
+
+    monkeypatch.setattr(api_client, "get_chat_response", get_chat_response)
+    backend = OpenAIBackend()
+
+    await backend.complete(MESSAGES, conversation=TELEGRAM_39, context_len=1)
+    await backend.complete(MESSAGES, conversation=WEB_39, context_len=1)
+
+    assert labels == ["telegram:39", "web:39"]
+    assert len(set(labels)) == 2
+
+
+@pytest.mark.asyncio
+async def test_request_logs_tell_a_same_subject_conversation_on_each_channel_apart(
+    monkeypatch, caplog
+):
+    create = AsyncMock(return_value=make_openai_response("Свари яйца всмятку."))
+    monkeypatch.setattr(api_client, "get_client", lambda: _fake_openai_client(create))
+    backend = OpenAIBackend()
+
+    with caplog.at_level(logging.INFO, logger="api_client"):
+        await backend.complete(MESSAGES, conversation=TELEGRAM_39, context_len=3)
+        await backend.complete(MESSAGES, conversation=WEB_39, context_len=3)
+
+    logged = [record.getMessage() for record in caplog.records]
+    telegram_line, web_line = [line for line in logged if line.startswith("OpenAI request:")]
+    assert "user_id=telegram:39, context_len=3" in telegram_line
+    assert "user_id=web:39, context_len=3" in web_line
+    assert not any("user_id=39" in line for line in logged)  # never the bare subject
+
+
+@pytest.mark.asyncio
+async def test_failure_logs_tell_a_same_subject_conversation_on_each_channel_apart(
+    monkeypatch, caplog
+):
+    create = AsyncMock(side_effect=make_rate_limit_error())
+    monkeypatch.setattr(api_client, "get_client", lambda: _fake_openai_client(create))
+    backend = OpenAIBackend()
+
+    with caplog.at_level(logging.INFO, logger="api_client"):
+        for conversation in (TELEGRAM_39, WEB_39):
+            with pytest.raises(BackendRateLimitedError):
+                await backend.complete(MESSAGES, conversation=conversation, context_len=3)
+
+    logged = [record.getMessage() for record in caplog.records]
+    assert [line for line in logged if line.startswith("OpenAI rate limit exceeded")] == [
+        "OpenAI rate limit exceeded for user_id=telegram:39",
+        "OpenAI rate limit exceeded for user_id=web:39",
+    ]
 
 
 # --- a fake backend, offline ----------------------------------------------------
@@ -200,12 +317,33 @@ async def test_the_bot_answers_through_an_injected_backend(monkeypatch, no_provi
 
     assert msg.answer.await_args_list == [call("из фейка")]
     assert backend.requests == [
-        ([{"role": "user", "content": "что приготовить"}], 31, 1)
+        ([{"role": "user", "content": "что приготовить"}], seams.conversation_key(31), 1)
     ]
     assert seams.history(31) == [
         {"role": "user", "content": "что приготовить"},
         {"role": "assistant", "content": "из фейка"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_a_same_subject_web_conversation_is_neither_sent_nor_touched(
+    monkeypatch, no_provider
+):
+    web = ConversationKey("web", "33")
+    web_history = seams.seed_conversation(
+        web, [("user", "из веба"), ("assistant", "ответ в вебе")]
+    )
+    backend = FakeBackend(reply="из фейка")
+    seams.install_backend(monkeypatch, backend)
+
+    await seams.process_text(FakeMessage(user_id=33, text="привет"), FakeBot())
+
+    # The backend is asked about the Telegram conversation only, with only its history.
+    assert backend.requests == [
+        ([{"role": "user", "content": "привет"}], ConversationKey("telegram", "33"), 1)
+    ]
+    assert backend.requests[0][1] != web
+    assert seams.history_of(web) == web_history
 
 
 BACKEND_FAILURES = [

@@ -13,6 +13,7 @@ from openai import (
 )
 
 from house_helper.core.backend import BackendReply
+from house_helper.core.identity import ConversationKey
 
 
 class FakeUser:
@@ -87,16 +88,16 @@ class FakeBackend:
     """Offline ChatBackend: records each request and answers without a network.
 
     Replies `reply`, or raises `error` if one is given. `requests` holds a
-    snapshot of every call as (messages, user_id, context_len).
+    snapshot of every call as (messages, conversation, context_len).
     """
 
     def __init__(self, reply: str = "fake-reply", error: BaseException | None = None) -> None:
         self.reply = reply
         self.error = error
-        self.requests: list[tuple[list[dict[str, str]], int, int]] = []
+        self.requests: list[tuple[list[dict[str, str]], ConversationKey, int]] = []
 
-    async def complete(self, messages, *, user_id, context_len) -> BackendReply:
-        self.requests.append(([dict(turn) for turn in messages], user_id, context_len))
+    async def complete(self, messages, *, conversation, context_len) -> BackendReply:
+        self.requests.append(([dict(turn) for turn in messages], conversation, context_len))
         if self.error is not None:
             raise self.error
         return BackendReply(text=self.reply)

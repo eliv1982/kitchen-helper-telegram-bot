@@ -8,7 +8,7 @@ from tests.helpers import FakeBot, FakeMessage, make_rate_limit_error
 
 @pytest.mark.asyncio
 async def test_different_users_are_processed_concurrently(monkeypatch):
-    entered: list[int] = []
+    entered: list[str] = []
     release_event = asyncio.Event()
 
     async def fake_ai(messages, user_id):
@@ -36,9 +36,9 @@ async def test_different_users_are_processed_concurrently(monkeypatch):
         timeout=3,
     )
 
-    assert sorted(entered) == [1, 2]
-    msg_a.answer.assert_awaited_with("reply-1")
-    msg_b.answer.assert_awaited_with("reply-2")
+    assert sorted(entered) == ["telegram:1", "telegram:2"]
+    msg_a.answer.assert_awaited_with("reply-telegram:1")
+    msg_b.answer.assert_awaited_with("reply-telegram:2")
 
 
 @pytest.mark.asyncio
@@ -72,7 +72,7 @@ async def test_same_user_messages_are_serialized_and_ordered(monkeypatch):
 @pytest.mark.asyncio
 async def test_failed_request_rolls_back_only_its_own_message(monkeypatch):
     async def fake_ai(messages, user_id):
-        if user_id == 1:
+        if user_id == "telegram:1":
             return "ok-reply"
         raise make_rate_limit_error()
 

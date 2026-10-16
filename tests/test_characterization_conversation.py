@@ -332,7 +332,7 @@ async def test_ai_layer_is_told_the_sender_id_not_the_chat_id(monkeypatch):
 
     await seams.process_text(FakeMessage(user_id=24, text="привет", chat_id=-777), FakeBot())
 
-    assert ai.calls[0].user_id == 24
+    assert ai.calls[0].user_id == "telegram:24"
 
 
 @pytest.mark.asyncio
@@ -367,7 +367,7 @@ async def test_serialization_is_per_sender_not_per_chat(monkeypatch):
 @pytest.mark.asyncio
 async def test_different_senders_in_the_same_chat_are_not_serialized(monkeypatch):
     release = asyncio.Event()
-    entered: list[int] = []
+    entered: list[str] = []
 
     async def gated_ai(history, user_id):
         entered.append(user_id)
@@ -389,4 +389,4 @@ async def test_different_senders_in_the_same_chat_are_not_serialized(monkeypatch
         timeout=3,
     )
 
-    assert sorted(entered) == [26, 27]
+    assert sorted(entered) == ["telegram:26", "telegram:27"]

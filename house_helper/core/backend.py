@@ -16,6 +16,7 @@ from typing import Protocol
 from openai import APIConnectionError, APIError, APITimeoutError, RateLimitError
 
 import api_client
+from house_helper.core.identity import ConversationKey
 
 
 class BackendError(Exception):
@@ -51,8 +52,9 @@ class ChatBackend(Protocol):
 
     `messages` is the conversation so far, user and assistant turns only,
     ending with the pending user message; the system prompt is the backend's
-    own business. `user_id` and `context_len` are carried over from the
-    current call as-is: they only label the backend's log lines.
+    own business. `conversation` names the conversation being answered, on
+    whatever channel it lives; it and `context_len` are carried over from the
+    current call as-is and only label the backend's log lines.
 
     Recognized failures are raised as BackendError subclasses. Anything else,
     cancellation included, must propagate untouched.
@@ -62,9 +64,19 @@ class ChatBackend(Protocol):
         self,
         messages: list[dict[str, str]],
         *,
-        user_id: int,
+        conversation: ConversationKey,
         context_len: int,
     ) -> BackendReply: ...
+
+
+def _log_label(conversation: ConversationKey) -> str:
+    """The name a conversation is logged under, e.g. "telegram:39" or "web:39".
+
+    Channel-qualified, so the same subject on two channels never looks like one
+    conversation in the logs. A label for reading logs only: the key itself
+    stays the conversation's identity.
+    """
+    return f"{conversation.channel}:{conversation.subject}"
 
 
 class OpenAIBackend:
@@ -78,13 +90,13 @@ class OpenAIBackend:
         self,
         messages: list[dict[str, str]],
         *,
-        user_id: int,
+        conversation: ConversationKey,
         context_len: int,
     ) -> BackendReply:
         try:
             text, usage = await api_client.get_chat_response(
                 messages,
-                user_id=user_id,
+                user_id=_log_label(conversation),
                 context_len=context_len,
             )
         except RateLimitError as exc:

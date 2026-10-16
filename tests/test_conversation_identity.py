@@ -3,8 +3,9 @@
 Telegram conversations live under ConversationKey("telegram", str(sender id)).
 These tests pin that mapping and show it changes nothing about behavior:
 conversations are still scoped to the sending user (not the chat), the AI layer
-and logs still see the raw sender id, and a conversation from another channel
-with the same subject is a different conversation.
+sees the channel-qualified label ("telegram:<sender id>") while the bot's own
+log lines still report the raw sender id, and a conversation from another
+channel with the same subject is a different conversation.
 """
 
 import asyncio
@@ -98,14 +99,14 @@ async def test_reset_command_and_reset_phrase_act_on_the_same_key(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_the_ai_layer_still_receives_the_raw_sender_id(monkeypatch):
+async def test_the_ai_layer_receives_the_channel_qualified_label(monkeypatch):
     ai = seams.RecordingAi()
     seams.install_ai(monkeypatch, ai)
 
     await seams.process_text(FakeMessage(user_id=38, text="привет"), FakeBot())
 
-    assert ai.calls[0].user_id == 38
-    assert isinstance(ai.calls[0].user_id, int)
+    assert ai.calls[0].user_id == "telegram:38"
+    assert isinstance(ai.calls[0].user_id, str)
 
 
 @pytest.mark.asyncio

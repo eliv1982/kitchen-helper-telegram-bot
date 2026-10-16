@@ -146,7 +146,7 @@ async def handle_text(message: Message, bot: Bot) -> None:
                 async with ChatActionSender.typing(chat_id=message.chat.id, bot=bot):
                     backend_reply = await _backend.complete(
                         context_manager.get_context(key),
-                        user_id=user_id,
+                        conversation=key,
                         context_len=ctx_len,
                     )
                 reply = backend_reply.text
