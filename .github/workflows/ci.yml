@@ -27,7 +27,7 @@ jobs:
           pip install -r requirements-dev.txt
 
       - name: Check for syntax errors
-        run: python -m py_compile bot.py config.py api_client.py context_manager.py
+        run: python -m compileall -q bot.py config.py api_client.py context_manager.py house_helper
 
       - name: Run test suite
         run: pytest -v
