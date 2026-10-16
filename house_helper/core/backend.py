@@ -1,0 +1,98 @@
+"""The boundary between the chat core and the AI provider.
+
+The core talks to a ChatBackend and nothing else, so it can be exercised
+offline with a fake. OpenAIBackend is the only real implementation: a thin
+adapter over api_client that turns the provider's exceptions into the
+backend errors below and leaves everything else alone.
+
+api_client.py stays where it is and is still the only code that talks to
+OpenAI; this module reaches it through the module attribute on every call, so
+replacing api_client.get_chat_response at runtime keeps working.
+"""
+
+from dataclasses import dataclass
+from typing import Protocol
+
+from openai import APIConnectionError, APIError, APITimeoutError, RateLimitError
+
+import api_client
+
+
+class BackendError(Exception):
+    """The backend failed in a way the application recognizes.
+
+    Raised as-is for a provider API failure with no more specific kind. The
+    subclasses below are the specific kinds.
+    """
+
+
+class BackendRateLimitedError(BackendError):
+    """The provider is rate limiting requests."""
+
+
+class BackendConnectionError(BackendError):
+    """The provider could not be reached: a connection failure or a timeout."""
+
+
+class BackendEmptyResponseError(BackendError):
+    """The provider answered, but the response is missing, empty or unusable."""
+
+
+@dataclass(frozen=True)
+class BackendReply:
+    """What a backend returns for one request."""
+
+    text: str
+    usage: dict[str, int] | None = None
+
+
+class ChatBackend(Protocol):
+    """Anything that can answer a conversation.
+
+    `messages` is the conversation so far, user and assistant turns only,
+    ending with the pending user message; the system prompt is the backend's
+    own business. `user_id` and `context_len` are carried over from the
+    current call as-is: they only label the backend's log lines.
+
+    Recognized failures are raised as BackendError subclasses. Anything else,
+    cancellation included, must propagate untouched.
+    """
+
+    async def complete(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        user_id: int,
+        context_len: int,
+    ) -> BackendReply: ...
+
+
+class OpenAIBackend:
+    """ChatBackend backed by api_client.get_chat_response.
+
+    The failure kinds follow the order in which they were always checked, and
+    the original exception stays attached as __cause__.
+    """
+
+    async def complete(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        user_id: int,
+        context_len: int,
+    ) -> BackendReply:
+        try:
+            text, usage = await api_client.get_chat_response(
+                messages,
+                user_id=user_id,
+                context_len=context_len,
+            )
+        except RateLimitError as exc:
+            raise BackendRateLimitedError("OpenAI rate limit exceeded") from exc
+        except (APITimeoutError, APIConnectionError) as exc:
+            raise BackendConnectionError("OpenAI could not be reached") from exc
+        except api_client.InvalidResponseError as exc:
+            raise BackendEmptyResponseError("OpenAI response is unusable") from exc
+        except APIError as exc:
+            raise BackendError("OpenAI API error") from exc
+        return BackendReply(text=text, usage=usage)

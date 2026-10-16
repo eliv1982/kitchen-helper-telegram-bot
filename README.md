@@ -33,6 +33,7 @@ Kitchen Helper — Telegram-бот, который помогает быстро
 | `house_helper/core/identity.py` | `ConversationKey(channel, subject)` — идентификатор диалога; для Telegram это `("telegram", str(user_id))` |
 | `house_helper/core/outcomes.py` | `OutcomeStatus` и `ChatOutcome` — результат обработки одного сообщения на уровне приложения (без привязки к Telegram) |
 | `house_helper/core/messages_ru.py` | Каталог русских текстов для результатов обработки (`/start` и сообщение о сбое доставки остаются в `bot.py`) |
+| `house_helper/core/backend.py` | Интерфейс AI-бэкенда `ChatBackend` и адаптер `OpenAIBackend` поверх `api_client.py` (ошибки провайдера → `BackendError`); позволяет подменять бэкенд в тестах |
 | `api_client.py` | Ленивая инициализация клиента OpenAI, запросы, system prompt, логирование usage |
 | `tests/` | Автоматические тесты (без реальных сетевых запросов к Telegram/OpenAI) |
 | `requirements.txt` / `requirements-dev.txt` | Зависимости проекта (версии закреплены точно) |

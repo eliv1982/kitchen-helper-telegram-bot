@@ -12,6 +12,8 @@ from openai import (
     RateLimitError,
 )
 
+from house_helper.core.backend import BackendReply
+
 
 class FakeUser:
     def __init__(self, user_id: int) -> None:
@@ -79,6 +81,25 @@ def make_connection_error() -> APIConnectionError:
 
 def make_generic_api_error() -> APIError:
     return APIError("generic api error", _openai_request(), body=None)
+
+
+class FakeBackend:
+    """Offline ChatBackend: records each request and answers without a network.
+
+    Replies `reply`, or raises `error` if one is given. `requests` holds a
+    snapshot of every call as (messages, user_id, context_len).
+    """
+
+    def __init__(self, reply: str = "fake-reply", error: BaseException | None = None) -> None:
+        self.reply = reply
+        self.error = error
+        self.requests: list[tuple[list[dict[str, str]], int, int]] = []
+
+    async def complete(self, messages, *, user_id, context_len) -> BackendReply:
+        self.requests.append(([dict(turn) for turn in messages], user_id, context_len))
+        if self.error is not None:
+            raise self.error
+        return BackendReply(text=self.reply)
 
 
 def telegram_method() -> SendMessage:

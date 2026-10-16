@@ -7,12 +7,19 @@ from aiogram.exceptions import TelegramAPIError, TelegramNetworkError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
 from aiogram.utils.chat_action import ChatActionSender
-from openai import APIConnectionError, APIError, APITimeoutError, RateLimitError
 
 import api_client
 import config
 import context_manager
 from house_helper.core import messages_ru
+from house_helper.core.backend import (
+    BackendConnectionError,
+    BackendEmptyResponseError,
+    BackendError,
+    BackendRateLimitedError,
+    ChatBackend,
+    OpenAIBackend,
+)
 from house_helper.core.identity import ConversationKey
 from house_helper.core.outcomes import ChatOutcome, OutcomeStatus
 
@@ -33,6 +40,10 @@ MAX_INPUT_LENGTH = 2000
 dp = Dispatcher()
 
 TELEGRAM_CHANNEL = "telegram"
+
+# The AI backend every conversation is answered by. Stateless (the shared
+# OpenAI client lives in api_client), so tests may simply replace it.
+_backend: ChatBackend = OpenAIBackend()
 
 
 def _conversation_key(user_id: int) -> ConversationKey:
@@ -133,11 +144,12 @@ async def handle_text(message: Message, bot: Bot) -> None:
             # caller) to interpret.
             try:
                 async with ChatActionSender.typing(chat_id=message.chat.id, bot=bot):
-                    reply, usage = await api_client.get_chat_response(
+                    backend_reply = await _backend.complete(
                         context_manager.get_context(key),
                         user_id=user_id,
                         context_len=ctx_len,
                     )
+                reply = backend_reply.text
             except BaseException:
                 context_manager.remove_last_message(key)
                 raise
@@ -145,22 +157,22 @@ async def handle_text(message: Message, bot: Bot) -> None:
             # Never convert cancellation into an API error reply -- just let
             # it propagate untouched now that the rollback above has run.
             raise
-        except RateLimitError:
+        except BackendRateLimitedError:
             await message.answer(
                 messages_ru.render(ChatOutcome(OutcomeStatus.RATE_LIMITED))
             )
             return
-        except (APITimeoutError, APIConnectionError):
+        except BackendConnectionError:
             await message.answer(
                 messages_ru.render(ChatOutcome(OutcomeStatus.CONNECTION_FAILED))
             )
             return
-        except api_client.InvalidResponseError:
+        except BackendEmptyResponseError:
             await message.answer(
                 messages_ru.render(ChatOutcome(OutcomeStatus.EMPTY_RESPONSE))
             )
             return
-        except APIError:
+        except BackendError:
             await message.answer(
                 messages_ru.render(ChatOutcome(OutcomeStatus.API_ERROR))
             )

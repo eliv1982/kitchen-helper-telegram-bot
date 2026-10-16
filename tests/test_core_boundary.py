@@ -29,7 +29,7 @@ def _imported_roots(path: Path) -> set[str]:
 def test_the_scan_sees_the_core_modules():
     names = {path.name for path in CORE_DIR.glob("*.py")}
 
-    assert {"identity.py", "outcomes.py", "messages_ru.py"} <= names
+    assert {"identity.py", "outcomes.py", "messages_ru.py", "backend.py"} <= names
 
 
 def test_core_modules_do_not_import_the_telegram_transport():

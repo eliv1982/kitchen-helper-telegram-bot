@@ -195,6 +195,12 @@ def install_ai(monkeypatch, handler: AiHandler) -> None:
     monkeypatch.setattr(api_client, "get_chat_response", _adapter)
 
 
+def install_backend(monkeypatch, backend) -> None:
+    """Answer every conversation with `backend` (any ChatBackend) instead of
+    the OpenAI adapter. Unlike install_ai, nothing of api_client is involved."""
+    monkeypatch.setattr(bot_module, "_backend", backend)
+
+
 # --- Telegram handlers ------------------------------------------------------
 
 
