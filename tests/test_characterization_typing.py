@@ -13,6 +13,7 @@ from unittest.mock import call
 import pytest
 
 from aiogram.exceptions import TelegramNetworkError
+from aiogram.utils.chat_action import ChatActionSender
 
 from tests import seams
 from tests.helpers import FakeBot, FakeMessage, make_rate_limit_error, telegram_method
@@ -34,6 +35,25 @@ def _background_tasks() -> set:
     return asyncio.all_tasks() - {asyncio.current_task()}
 
 
+# What the indicator's background task is running; taken from the class so a
+# rename in aiogram fails loudly here instead of silently matching nothing.
+_TYPING_WORKER = ChatActionSender._worker.__qualname__
+
+
+def _typing_workers() -> list[asyncio.Task]:
+    """The indicator's own background tasks, and nothing else.
+
+    Counting every live task is wrong on Python < 3.12: asyncio.wait_for runs
+    its awaitable as a task of its own there, so while the worker waits out an
+    interval it owns a second, unrelated task.
+    """
+    return [
+        task
+        for task in asyncio.all_tasks()
+        if task.get_coro().__qualname__ == _TYPING_WORKER
+    ]
+
+
 @pytest.mark.asyncio
 async def test_typing_is_sent_to_the_originating_chat_while_the_ai_is_pending(monkeypatch):
     fake_bot = FakeBot()
@@ -43,7 +63,7 @@ async def test_typing_is_sent_to_the_originating_chat_while_the_ai_is_pending(mo
     async def ai(history, user_id):
         await asyncio.wait_for(typing_seen.wait(), timeout=2)
         during_ai["calls"] = list(fake_bot.send_chat_action.await_args_list)
-        during_ai["tasks"] = len(_background_tasks())
+        during_ai["workers"] = len(_typing_workers())
         return "ok-reply"
 
     seams.install_ai(monkeypatch, ai)
@@ -56,7 +76,8 @@ async def test_typing_is_sent_to_the_originating_chat_while_the_ai_is_pending(mo
     assert during_ai["calls"] == [
         call(chat_id=group_chat, action="typing", message_thread_id=None)
     ]
-    assert during_ai["tasks"] == 1  # the indicator's background task
+    assert during_ai["workers"] == 1  # exactly one indicator, running while the AI is pending
+    assert not _typing_workers()  # and it is gone once the exchange is over
 
 
 @pytest.mark.asyncio
