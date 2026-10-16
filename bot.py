@@ -12,7 +12,9 @@ from openai import APIConnectionError, APIError, APITimeoutError, RateLimitError
 import api_client
 import config
 import context_manager
+from house_helper.core import messages_ru
 from house_helper.core.identity import ConversationKey
+from house_helper.core.outcomes import ChatOutcome, OutcomeStatus
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,7 +23,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 RESET_PHRASE = "очистить контекст"
-RESET_CONFIRMATION = "Контекст очищен. Можем начать с чистого листа!"
 
 # Application-level cap on a single incoming message, independent of
 # Telegram's own ~4096-character limit. Keeps a single request's OpenAI cost
@@ -87,7 +88,9 @@ async def cmd_reset(message: Message) -> None:
     user_id = message.from_user.id
     async with _get_user_lock(_conversation_key(user_id)):
         await _clear_user_context(user_id, "/reset")
-    await message.answer(RESET_CONFIRMATION)
+    await message.answer(
+        messages_ru.render(ChatOutcome(OutcomeStatus.CONTEXT_CLEARED))
+    )
 
 
 @dp.message(F.text)
@@ -102,13 +105,19 @@ async def handle_text(message: Message, bot: Bot) -> None:
     async with _get_user_lock(key):
         if text.lower() == RESET_PHRASE:
             await _clear_user_context(user_id, "reset phrase")
-            await message.answer(RESET_CONFIRMATION)
+            await message.answer(
+                messages_ru.render(ChatOutcome(OutcomeStatus.CONTEXT_CLEARED))
+            )
             return
 
         if len(text) > MAX_INPUT_LENGTH:
             await message.answer(
-                f"Сообщение слишком длинное (максимум {MAX_INPUT_LENGTH} символов). "
-                "Сократи запрос и отправь снова."
+                messages_ru.render(
+                    ChatOutcome(
+                        OutcomeStatus.INPUT_TOO_LONG,
+                        max_input_length=MAX_INPUT_LENGTH,
+                    )
+                )
             )
             return
 
@@ -138,22 +147,22 @@ async def handle_text(message: Message, bot: Bot) -> None:
             raise
         except RateLimitError:
             await message.answer(
-                "Сейчас слишком много запросов к AI. Подожди немного и попробуй снова."
+                messages_ru.render(ChatOutcome(OutcomeStatus.RATE_LIMITED))
             )
             return
         except (APITimeoutError, APIConnectionError):
             await message.answer(
-                "Не удалось связаться с OpenAI. Проверь интернет и попробуй позже."
+                messages_ru.render(ChatOutcome(OutcomeStatus.CONNECTION_FAILED))
             )
             return
         except api_client.InvalidResponseError:
             await message.answer(
-                "AI вернул пустой ответ. Попробуй переформулировать запрос или повторить позже."
+                messages_ru.render(ChatOutcome(OutcomeStatus.EMPTY_RESPONSE))
             )
             return
         except APIError:
             await message.answer(
-                "Ошибка при обращении к OpenAI. Попробуй позже или проверь настройки API."
+                messages_ru.render(ChatOutcome(OutcomeStatus.API_ERROR))
             )
             return
         # Any other exception (not one of the recognized failure types above)
