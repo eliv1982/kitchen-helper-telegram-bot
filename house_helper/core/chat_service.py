@@ -24,6 +24,8 @@ History and locks live in context_manager and are shared by every service in
 the process, so two services over the same conversation still take turns.
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -72,7 +74,7 @@ class ChatService:
         self._backend = backend
         self._max_input_length = max_input_length
 
-    def turn(self, key: ConversationKey) -> AbstractAsyncContextManager["Turn"]:
+    def turn(self, key: ConversationKey) -> AbstractAsyncContextManager[Turn]:
         """Open a turn on a conversation.
 
         Entering waits for the conversation's lock and holds it until the
@@ -82,7 +84,7 @@ class ChatService:
         return self._open_turn(key)
 
     @asynccontextmanager
-    async def _open_turn(self, key: ConversationKey) -> AsyncIterator["Turn"]:
+    async def _open_turn(self, key: ConversationKey) -> AsyncIterator[Turn]:
         async with context_manager.get_lock(key):
             turn = Turn(key, self._backend, self._max_input_length)
             try:
