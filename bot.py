@@ -12,6 +12,7 @@ from openai import APIConnectionError, APIError, APITimeoutError, RateLimitError
 import api_client
 import config
 import context_manager
+from house_helper.core.identity import ConversationKey
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,24 +31,38 @@ MAX_INPUT_LENGTH = 2000
 
 dp = Dispatcher()
 
-# One lock per Telegram user id, created lazily. Guarantees that the whole
-# "user message -> context update -> OpenAI request -> assistant response /
-# rollback" transaction never overlaps for the same user, while different
-# users are still processed concurrently.
-_user_locks: dict[int, asyncio.Lock] = {}
+TELEGRAM_CHANNEL = "telegram"
 
 
-def _get_user_lock(user_id: int) -> asyncio.Lock:
-    lock = _user_locks.get(user_id)
+def _conversation_key(user_id: int) -> ConversationKey:
+    """The conversation a Telegram sender belongs to.
+
+    A conversation is scoped to the sending user, not to the chat: the same
+    user writing from a private chat and from a group shares one history and
+    one lock. The id is stored as a str so every channel's keys have one shape.
+    """
+    return ConversationKey(TELEGRAM_CHANNEL, str(user_id))
+
+
+# One lock per conversation key (currently: per Telegram sender), created
+# lazily. Guarantees that the whole "user message -> context update -> OpenAI
+# request -> assistant response / rollback" transaction never overlaps for the
+# same conversation, while different conversations are still processed
+# concurrently.
+_user_locks: dict[ConversationKey, asyncio.Lock] = {}
+
+
+def _get_user_lock(key: ConversationKey) -> asyncio.Lock:
+    lock = _user_locks.get(key)
     if lock is None:
         lock = asyncio.Lock()
-        _user_locks[user_id] = lock
+        _user_locks[key] = lock
     return lock
 
 
 async def _clear_user_context(user_id: int, source: str) -> None:
     """Clear a user's conversation context. Caller must hold the user's lock."""
-    context_manager.clear_context(user_id)
+    context_manager.clear_context(_conversation_key(user_id))
     logger.info("Context cleared via %s for user_id=%s", source, user_id)
 
 
@@ -70,7 +85,7 @@ async def cmd_reset(message: Message) -> None:
     if not message.from_user:
         return
     user_id = message.from_user.id
-    async with _get_user_lock(user_id):
+    async with _get_user_lock(_conversation_key(user_id)):
         await _clear_user_context(user_id, "/reset")
     await message.answer(RESET_CONFIRMATION)
 
@@ -81,9 +96,10 @@ async def handle_text(message: Message, bot: Bot) -> None:
         return
 
     user_id = message.from_user.id
+    key = _conversation_key(user_id)
     text = message.text.strip()
 
-    async with _get_user_lock(user_id):
+    async with _get_user_lock(key):
         if text.lower() == RESET_PHRASE:
             await _clear_user_context(user_id, "reset phrase")
             await message.answer(RESET_CONFIRMATION)
@@ -96,8 +112,8 @@ async def handle_text(message: Message, bot: Bot) -> None:
             )
             return
 
-        context_manager.add_message(user_id, "user", text)
-        ctx_len = context_manager.context_length(user_id)
+        context_manager.add_message(key, "user", text)
+        ctx_len = context_manager.context_length(key)
 
         try:
             # Single rollback point for the whole transaction: any exception
@@ -109,12 +125,12 @@ async def handle_text(message: Message, bot: Bot) -> None:
             try:
                 async with ChatActionSender.typing(chat_id=message.chat.id, bot=bot):
                     reply, usage = await api_client.get_chat_response(
-                        context_manager.get_context(user_id),
+                        context_manager.get_context(key),
                         user_id=user_id,
                         context_len=ctx_len,
                     )
             except BaseException:
-                context_manager.remove_last_message(user_id)
+                context_manager.remove_last_message(key)
                 raise
         except asyncio.CancelledError:
             # Never convert cancellation into an API error reply -- just let
@@ -144,8 +160,8 @@ async def handle_text(message: Message, bot: Bot) -> None:
         # is unexpected: it must propagate unchanged, never be swallowed or
         # turned into a friendly reply. The rollback already happened above.
 
-        context_manager.add_message(user_id, "assistant", reply)
-        context_manager.trim_history(user_id)
+        context_manager.add_message(key, "assistant", reply)
+        context_manager.trim_history(key)
 
         try:
             await message.answer(reply)

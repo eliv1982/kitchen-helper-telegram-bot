@@ -29,7 +29,8 @@ Kitchen Helper — Telegram-бот, который помогает быстро
 |------|------------|
 | `bot.py` | Точка входа: команды, обработка сообщений, запуск polling, корректное завершение работы |
 | `config.py` | Загрузка и валидация настроек из `.env` (единая точка проверки конфигурации) |
-| `context_manager.py` | Контекст диалога в памяти (один контекст на `user_id`), с ограничением длины истории |
+| `context_manager.py` | Контекст диалога в памяти (один контекст на `ConversationKey`; для Telegram — на отправителя), с ограничением длины истории |
+| `house_helper/core/identity.py` | `ConversationKey(channel, subject)` — идентификатор диалога; для Telegram это `("telegram", str(user_id))` |
 | `api_client.py` | Ленивая инициализация клиента OpenAI, запросы, system prompt, логирование usage |
 | `tests/` | Автоматические тесты (без реальных сетевых запросов к Telegram/OpenAI) |
 | `requirements.txt` / `requirements-dev.txt` | Зависимости проекта (версии закреплены точно) |

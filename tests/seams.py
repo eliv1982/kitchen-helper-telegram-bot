@@ -30,6 +30,7 @@ import api_client
 import bot as bot_module
 import config
 import context_manager
+from house_helper.core.identity import ConversationKey
 
 ChatTurn = dict[str, str]
 AiHandler = Callable[[list[ChatTurn], int], Awaitable[str]]
@@ -49,17 +50,47 @@ def reset_state() -> None:
     config._settings = None
 
 
+def conversation_key(user_id: int) -> ConversationKey:
+    """The key under which a Telegram sender's conversation is stored.
+
+    Spelled out here rather than taken from bot.py on purpose: this is the
+    contract the rest of the suite relies on, so a change to how the
+    application namespaces Telegram conversations has to show up as a failing
+    test instead of being silently mirrored.
+    """
+    return ConversationKey("telegram", str(user_id))
+
+
+def history_of(key: ConversationKey) -> list[ChatTurn]:
+    """Snapshot of a conversation's stored history, addressed by key."""
+    return [dict(turn) for turn in context_manager.get_context(key)]
+
+
 def history(user_id: int) -> list[ChatTurn]:
     """Snapshot of a user's stored conversation history."""
-    return [dict(turn) for turn in context_manager.get_context(user_id)]
+    return history_of(conversation_key(user_id))
+
+
+def seed_conversation(
+    key: ConversationKey, messages: list[tuple[str, str]]
+) -> list[ChatTurn]:
+    """Directly store (role, content) turns under any conversation key.
+    Returns a snapshot of the resulting history for later comparison."""
+    for role, content in messages:
+        context_manager.add_message(key, role, content)
+    return history_of(key)
 
 
 def seed_messages(user_id: int, messages: list[tuple[str, str]]) -> list[ChatTurn]:
     """Directly store (role, content) turns as already-completed history.
     Returns a snapshot of the resulting history for later comparison."""
-    for role, content in messages:
-        context_manager.add_message(user_id, role, content)
-    return history(user_id)
+    return seed_conversation(conversation_key(user_id), messages)
+
+
+def stored_conversation_keys() -> set[ConversationKey]:
+    """Every key that currently has conversation state (even if empty --
+    merely reading a history creates its entry)."""
+    return set(context_manager._contexts)
 
 
 def seed_exchanges(user_id: int, pairs: int = 10) -> list[ChatTurn]:
@@ -93,9 +124,19 @@ def set_max_input_length(monkeypatch, value: int) -> None:
 # --- per-user serialization -------------------------------------------------
 
 
+def lock_for(key: ConversationKey) -> asyncio.Lock:
+    """The serialization lock guarding one conversation."""
+    return bot_module._get_user_lock(key)
+
+
+def lock_keys() -> set[ConversationKey]:
+    """Every key for which a serialization lock has been created."""
+    return set(bot_module._user_locks)
+
+
 def is_user_busy(user_id: int) -> bool:
     """True while some operation holds this user's serialization lock."""
-    return bot_module._get_user_lock(user_id).locked()
+    return lock_for(conversation_key(user_id)).locked()
 
 
 async def settle(turns: int = 25) -> None:
