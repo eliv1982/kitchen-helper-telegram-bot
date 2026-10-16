@@ -24,20 +24,11 @@ for _name, _value in _TEST_ENV_DEFAULTS.items():
 
 import pytest
 
-import api_client
-import bot as bot_module
-import config
-import context_manager
+from tests import seams
 
 
 @pytest.fixture(autouse=True)
 def _reset_module_state():
-    context_manager._contexts.clear()
-    bot_module._user_locks.clear()
-    api_client._client = None
-    config._settings = None
+    seams.reset_state()
     yield
-    context_manager._contexts.clear()
-    bot_module._user_locks.clear()
-    api_client._client = None
-    config._settings = None
+    seams.reset_state()

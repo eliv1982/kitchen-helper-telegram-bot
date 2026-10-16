@@ -1,8 +1,16 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import httpx
-from openai import RateLimitError
+from aiogram.methods import SendMessage
+from openai import (
+    APIConnectionError,
+    APIError,
+    APIStatusError,
+    APITimeoutError,
+    RateLimitError,
+)
 
 
 class FakeUser:
@@ -46,7 +54,66 @@ def make_openai_response(content: str | None, usage: tuple[int, int, int] | None
     return SimpleNamespace(choices=[choice], usage=usage_obj)
 
 
+def _openai_request() -> httpx.Request:
+    return httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+
+
 def make_rate_limit_error() -> RateLimitError:
-    request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
-    response = httpx.Response(status_code=429, request=request)
+    response = httpx.Response(status_code=429, request=_openai_request())
     return RateLimitError("Rate limited", response=response, body=None)
+
+
+def make_status_error(error_class: type[APIStatusError], status_code: int) -> APIStatusError:
+    """Build an OpenAI HTTP-status error (e.g. InternalServerError, 500)."""
+    response = httpx.Response(status_code=status_code, request=_openai_request())
+    return error_class("status error", response=response, body=None)
+
+
+def make_timeout_error() -> APITimeoutError:
+    return APITimeoutError(request=_openai_request())
+
+
+def make_connection_error() -> APIConnectionError:
+    return APIConnectionError(request=_openai_request())
+
+
+def make_generic_api_error() -> APIError:
+    return APIError("generic api error", _openai_request(), body=None)
+
+
+def telegram_method() -> SendMessage:
+    """A throwaway Telegram method, as aiogram's API errors require one."""
+    return SendMessage(chat_id=1, text="x")
+
+
+class DelayedDelivery:
+    """Makes `message.answer` block until released, logging into `log`.
+
+    Records ("deliver-start", text) when delivery begins and
+    ("deliver-done", text) when it completes, so tests can assert exactly how
+    deliveries and other events interleave.
+    """
+
+    def __init__(self, message: FakeMessage, log: list[tuple[str, str]]) -> None:
+        self.started = asyncio.Event()
+        self._gate = asyncio.Event()
+        self._log = log
+        message.answer.side_effect = self._answer
+
+    async def _answer(self, text, **kwargs) -> None:
+        self._log.append(("deliver-start", text))
+        self.started.set()
+        await self._gate.wait()
+        self._log.append(("deliver-done", text))
+
+    def release(self) -> None:
+        self._gate.set()
+
+
+def record_delivery(message: FakeMessage, log: list[tuple[str, str]]) -> None:
+    """Log ("deliver", text) whenever `message.answer` is awaited."""
+
+    async def _answer(text, **kwargs) -> None:
+        log.append(("deliver", text))
+
+    message.answer.side_effect = _answer
