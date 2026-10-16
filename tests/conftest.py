@@ -1,3 +1,12 @@
+# The offline guard goes in before anything else -- before the environment is
+# forced and before the application, or the OpenAI / aiogram / httpx stacks
+# beneath it, are imported -- so no import-time code or fixture can open a
+# connection. Only loopback traffic gets through (see tests/network_guard.py).
+from tests import network_guard
+from tests.network_guard import no_unclaimed_network_attempts  # noqa: F401  (autouse fixture)
+
+network_guard.install()
+
 import os
 
 # Must be set before config.py / api_client.py / bot.py are imported anywhere
