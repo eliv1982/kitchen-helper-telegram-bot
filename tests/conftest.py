@@ -49,7 +49,11 @@ dotenv.load_dotenv = _load_dotenv_disabled
 
 import pytest
 
-from tests import seams
+from tests import plugin_check, seams
+
+
+def pytest_collection_modifyitems(config, items):
+    plugin_check.require_asyncio_plugin(config, items)
 
 
 @pytest.fixture(autouse=True)

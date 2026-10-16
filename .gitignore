@@ -5,3 +5,9 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+
+# Local SQLite database and its write-ahead-log files
+*.db
+*.db-shm
+*.db-wal
+*.sqlite3
