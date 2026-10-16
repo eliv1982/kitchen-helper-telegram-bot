@@ -3,8 +3,10 @@
 Bot-level tests go through this module instead of reaching into bot.py,
 context_manager.py or api_client.py directly. It is the single place that
 knows how the application is currently wired: which module owns conversation
-state, where the per-user lock lives, which function performs the AI call, how
-much history is retained and how the Telegram handlers are invoked.
+state, where the per-conversation lock lives, which service answers the
+conversations and with what backend and input limit, which function performs
+the AI call, how much history is retained and how the Telegram handlers are
+invoked.
 
 When the implementation is restructured, this is the only test-support file
 that should need to change; the tests themselves keep describing behavior.
@@ -114,11 +116,11 @@ def history_capacity() -> int:
 
 def max_input_length() -> int:
     """Maximum accepted length (in characters) of one incoming message."""
-    return bot_module.MAX_INPUT_LENGTH
+    return bot_module._chat_service._max_input_length
 
 
 def set_max_input_length(monkeypatch, value: int) -> None:
-    monkeypatch.setattr(bot_module, "MAX_INPUT_LENGTH", value)
+    monkeypatch.setattr(bot_module._chat_service, "_max_input_length", value)
 
 
 # --- per-user serialization -------------------------------------------------
@@ -200,7 +202,7 @@ def install_ai(monkeypatch, handler: AiHandler) -> None:
 def install_backend(monkeypatch, backend) -> None:
     """Answer every conversation with `backend` (any ChatBackend) instead of
     the OpenAI adapter. Unlike install_ai, nothing of api_client is involved."""
-    monkeypatch.setattr(bot_module, "_backend", backend)
+    monkeypatch.setattr(bot_module._chat_service, "_backend", backend)
 
 
 # --- Telegram handlers ------------------------------------------------------

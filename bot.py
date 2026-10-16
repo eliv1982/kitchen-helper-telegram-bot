@@ -10,18 +10,11 @@ from aiogram.utils.chat_action import ChatActionSender
 
 import api_client
 import config
-import context_manager
 from house_helper.core import messages_ru
-from house_helper.core.backend import (
-    BackendConnectionError,
-    BackendEmptyResponseError,
-    BackendError,
-    BackendRateLimitedError,
-    ChatBackend,
-    OpenAIBackend,
-)
+from house_helper.core.backend import OpenAIBackend
+from house_helper.core.chat_service import ChatService
 from house_helper.core.identity import ConversationKey
-from house_helper.core.outcomes import ChatOutcome, OutcomeStatus
+from house_helper.core.outcomes import OutcomeStatus
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,19 +24,15 @@ logger = logging.getLogger(__name__)
 
 RESET_PHRASE = "очистить контекст"
 
-# Application-level cap on a single incoming message, independent of
-# Telegram's own ~4096-character limit. Keeps a single request's OpenAI cost
-# and the context it adds predictable, regardless of how large a message a
-# user sends.
-MAX_INPUT_LENGTH = 2000
-
 dp = Dispatcher()
 
 TELEGRAM_CHANNEL = "telegram"
 
-# The AI backend every conversation is answered by. Stateless (the shared
-# OpenAI client lives in api_client), so tests may simply replace it.
-_backend: ChatBackend = OpenAIBackend()
+# Answers every Telegram conversation. It keeps no conversation state of its
+# own (history and per-conversation locks live in context_manager) and
+# OpenAIBackend is stateless (the shared OpenAI client lives in api_client), so
+# tests may simply replace the backend it answers with.
+_chat_service = ChatService(OpenAIBackend())
 
 
 def _conversation_key(user_id: int) -> ConversationKey:
@@ -56,9 +45,7 @@ def _conversation_key(user_id: int) -> ConversationKey:
     return ConversationKey(TELEGRAM_CHANNEL, str(user_id))
 
 
-async def _clear_user_context(user_id: int, source: str) -> None:
-    """Clear a user's conversation context. Caller must hold the user's lock."""
-    context_manager.clear_context(_conversation_key(user_id))
+def _log_context_cleared(user_id: int, source: str) -> None:
     logger.info("Context cleared via %s for user_id=%s", source, user_id)
 
 
@@ -81,11 +68,12 @@ async def cmd_reset(message: Message) -> None:
     if not message.from_user:
         return
     user_id = message.from_user.id
-    async with context_manager.get_lock(_conversation_key(user_id)):
-        await _clear_user_context(user_id, "/reset")
-    await message.answer(
-        messages_ru.render(ChatOutcome(OutcomeStatus.CONTEXT_CLEARED))
-    )
+    # The state is reset under the conversation's lock; the lock is released
+    # before the confirmation is delivered, so a slow delivery never holds up
+    # the user's next message.
+    outcome = await _chat_service.reset(_conversation_key(user_id), source="/reset")
+    _log_context_cleared(user_id, "/reset")
+    await message.answer(messages_ru.render(outcome))
 
 
 @dp.message(F.text)
@@ -97,79 +85,34 @@ async def handle_text(message: Message, bot: Bot) -> None:
     key = _conversation_key(user_id)
     text = message.text.strip()
 
-    async with context_manager.get_lock(key):
+    # The whole exchange -- the AI call and the delivery of whatever the user
+    # is told about it -- happens inside one turn, so the next message from the
+    # same sender cannot start until this one has been delivered.
+    async with _chat_service.turn(key) as turn:
         if text.lower() == RESET_PHRASE:
-            await _clear_user_context(user_id, "reset phrase")
-            await message.answer(
-                messages_ru.render(ChatOutcome(OutcomeStatus.CONTEXT_CLEARED))
-            )
+            outcome = await turn.reset(source="reset phrase")
+            _log_context_cleared(user_id, "reset phrase")
+            await message.answer(messages_ru.render(outcome))
             return
 
-        if len(text) > MAX_INPUT_LENGTH:
-            await message.answer(
-                messages_ru.render(
-                    ChatOutcome(
-                        OutcomeStatus.INPUT_TOO_LONG,
-                        max_input_length=MAX_INPUT_LENGTH,
-                    )
-                )
-            )
+        # "typing..." is shown only while the AI request is in flight: the
+        # service enters it right before that call and leaves it right after.
+        outcome = await turn.send(
+            text,
+            while_working=lambda: ChatActionSender.typing(
+                chat_id=message.chat.id, bot=bot
+            ),
+        )
+
+        if outcome.status is not OutcomeStatus.REPLIED:
+            # Nothing was exchanged (too long, or the AI failed): tell the user why.
+            await message.answer(messages_ru.render(outcome))
             return
 
-        context_manager.add_message(key, "user", text)
-        ctx_len = context_manager.context_length(key)
-
+        # The exchange is already committed to the history, so a failure to
+        # deliver the answer does not undo it.
         try:
-            # Single rollback point for the whole transaction: any exception
-            # at all -- a recognized OpenAI failure, cancellation, or a
-            # completely unexpected one -- means the turn never completed, so
-            # the pending user message always comes back out here before the
-            # exception is re-raised for the except clauses below (or the
-            # caller) to interpret.
-            try:
-                async with ChatActionSender.typing(chat_id=message.chat.id, bot=bot):
-                    backend_reply = await _backend.complete(
-                        context_manager.get_context(key),
-                        conversation=key,
-                        context_len=ctx_len,
-                    )
-                reply = backend_reply.text
-            except BaseException:
-                context_manager.remove_last_message(key)
-                raise
-        except asyncio.CancelledError:
-            # Never convert cancellation into an API error reply -- just let
-            # it propagate untouched now that the rollback above has run.
-            raise
-        except BackendRateLimitedError:
-            await message.answer(
-                messages_ru.render(ChatOutcome(OutcomeStatus.RATE_LIMITED))
-            )
-            return
-        except BackendConnectionError:
-            await message.answer(
-                messages_ru.render(ChatOutcome(OutcomeStatus.CONNECTION_FAILED))
-            )
-            return
-        except BackendEmptyResponseError:
-            await message.answer(
-                messages_ru.render(ChatOutcome(OutcomeStatus.EMPTY_RESPONSE))
-            )
-            return
-        except BackendError:
-            await message.answer(
-                messages_ru.render(ChatOutcome(OutcomeStatus.API_ERROR))
-            )
-            return
-        # Any other exception (not one of the recognized failure types above)
-        # is unexpected: it must propagate unchanged, never be swallowed or
-        # turned into a friendly reply. The rollback already happened above.
-
-        context_manager.add_message(key, "assistant", reply)
-        context_manager.trim_history(key)
-
-        try:
-            await message.answer(reply)
+            await message.answer(messages_ru.render(outcome))
         except (TelegramNetworkError, TelegramAPIError) as exc:
             logger.error("Telegram error for user_id=%s: %s", user_id, exc)
             await message.answer("Не удалось отправить ответ. Попробуй ещё раз.")
