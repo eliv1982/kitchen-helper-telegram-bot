@@ -1,23 +1,24 @@
 import context_manager
+from house_helper.core.identity import ConversationKey
 
 
-def _add_exchange(user_id: int, index: int) -> None:
+def _add_exchange(key: ConversationKey, index: int) -> None:
     """Simulate one full, successful transaction: both messages are added,
     then trimming runs once -- matching bot.py's deferred-trim contract,
     where add_message() itself never trims."""
-    context_manager.add_message(user_id, "user", f"user-{index}")
-    context_manager.add_message(user_id, "assistant", f"assistant-{index}")
-    context_manager.trim_history(user_id)
+    context_manager.add_message(key, "user", f"user-{index}")
+    context_manager.add_message(key, "assistant", f"assistant-{index}")
+    context_manager.trim_history(key)
 
 
 def test_history_is_not_trimmed_below_the_configured_bound(monkeypatch):
     monkeypatch.setattr(context_manager, "MAX_HISTORY_MESSAGES", 10)
-    user_id = 1
+    key = ConversationKey("telegram", "1")
 
     for i in range(1, 4):  # 3 exchanges = 6 messages, under the bound of 10
-        _add_exchange(user_id, i)
+        _add_exchange(key, i)
 
-    ctx = context_manager.get_context(user_id)
+    ctx = context_manager.get_context(key)
     assert len(ctx) == 6
     assert [m["content"] for m in ctx] == [
         "user-1",
@@ -31,12 +32,12 @@ def test_history_is_not_trimmed_below_the_configured_bound(monkeypatch):
 
 def test_history_trims_to_the_configured_bound(monkeypatch):
     monkeypatch.setattr(context_manager, "MAX_HISTORY_MESSAGES", 4)
-    user_id = 2
+    key = ConversationKey("telegram", "2")
 
     for i in range(1, 6):  # 5 exchanges = 10 messages, over the bound of 4
-        _add_exchange(user_id, i)
+        _add_exchange(key, i)
 
-    ctx = context_manager.get_context(user_id)
+    ctx = context_manager.get_context(key)
     # Only the most recent 2 exchanges (4 messages) survive.
     assert len(ctx) == 4
     assert [m["content"] for m in ctx] == [
@@ -49,11 +50,11 @@ def test_history_trims_to_the_configured_bound(monkeypatch):
 
 def test_trimming_never_splits_a_user_assistant_pair(monkeypatch):
     monkeypatch.setattr(context_manager, "MAX_HISTORY_MESSAGES", 4)
-    user_id = 3
+    key = ConversationKey("telegram", "3")
 
     for i in range(1, 8):
-        _add_exchange(user_id, i)
-        ctx = context_manager.get_context(user_id)
+        _add_exchange(key, i)
+        ctx = context_manager.get_context(key)
         # Every message at an even index (0-based) must be a "user" message,
         # and every odd index an "assistant" message -- the pairing is never
         # corrupted mid-trim.
@@ -64,16 +65,16 @@ def test_trimming_never_splits_a_user_assistant_pair(monkeypatch):
 
 def test_reset_clears_history_even_after_trimming(monkeypatch):
     monkeypatch.setattr(context_manager, "MAX_HISTORY_MESSAGES", 4)
-    user_id = 4
+    key = ConversationKey("telegram", "4")
 
     for i in range(1, 6):
-        _add_exchange(user_id, i)
+        _add_exchange(key, i)
 
-    assert context_manager.get_context(user_id) != []
+    assert context_manager.get_context(key) != []
 
-    context_manager.clear_context(user_id)
+    context_manager.clear_context(key)
 
-    assert context_manager.get_context(user_id) == []
+    assert context_manager.get_context(key) == []
 
 
 def test_add_message_never_trims_on_its_own(monkeypatch):
@@ -82,15 +83,15 @@ def test_add_message_never_trims_on_its_own(monkeypatch):
     # never discard anything by itself. Only trim_history() may do that, and
     # only a caller who knows the transaction succeeded should call it.
     monkeypatch.setattr(context_manager, "MAX_HISTORY_MESSAGES", 4)
-    user_id = 5
+    key = ConversationKey("telegram", "5")
 
     for i in range(1, 3):  # 2 exchanges = 4 messages, exactly at the bound
-        _add_exchange(user_id, i)
-    assert len(context_manager.get_context(user_id)) == 4
+        _add_exchange(key, i)
+    assert len(context_manager.get_context(key)) == 4
 
-    context_manager.add_message(user_id, "user", "pending-user-msg")
+    context_manager.add_message(key, "user", "pending-user-msg")
 
-    ctx = context_manager.get_context(user_id)
+    ctx = context_manager.get_context(key)
     assert len(ctx) == 5
     assert [m["content"] for m in ctx] == [
         "user-1",
@@ -103,9 +104,9 @@ def test_add_message_never_trims_on_its_own(monkeypatch):
 
 def test_trim_history_is_a_no_op_under_the_bound(monkeypatch):
     monkeypatch.setattr(context_manager, "MAX_HISTORY_MESSAGES", 10)
-    user_id = 6
+    key = ConversationKey("telegram", "6")
 
-    context_manager.add_message(user_id, "user", "hi")
-    context_manager.trim_history(user_id)
+    context_manager.add_message(key, "user", "hi")
+    context_manager.trim_history(key)
 
-    assert context_manager.get_context(user_id) == [{"role": "user", "content": "hi"}]
+    assert context_manager.get_context(key) == [{"role": "user", "content": "hi"}]
