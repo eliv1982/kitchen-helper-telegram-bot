@@ -117,14 +117,23 @@ def test_creating_the_application_touches_neither_the_database_nor_the_disk(tmp_
     assert not hasattr(app.state, "database")
 
 
-def test_the_application_exposes_the_health_endpoint_and_nothing_else(tmp_path):
-    # No user-data route may exist before authentication and ownership checks do.
-    # Not even the interactive API pages FastAPI would add by default.
+def test_the_application_exposes_the_health_endpoint_the_sign_in_routes_and_nothing_else(tmp_path):
+    # The sign-in routes (R3A) are the only addition to /healthz: no conversation,
+    # recipe, preference or other user-data route may exist, and not even the
+    # interactive API pages FastAPI would add by default. A route added later has to
+    # change this list on purpose, and has to use auth.require_user.
     app = create_app(settings_for(tmp_path / "routes.db"))
 
     # openapi() is the public listing (app.routes holds FastAPI internals); the
     # schema page itself is off, which test_nothing_else_is_served checks.
-    assert set(app.openapi()["paths"]) == {"/healthz"}
+    paths = app.openapi()["paths"]
+    assert {path: sorted(methods) for path, methods in paths.items()} == {
+        "/healthz": ["get"],
+        "/auth/telegram/login": ["get"],
+        "/auth/telegram/callback": ["get"],
+        "/auth/me": ["get"],
+        "/auth/logout": ["post"],
+    }
 
 
 # --- /healthz -------------------------------------------------------------------------------

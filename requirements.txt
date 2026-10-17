@@ -11,3 +11,10 @@ starlette==1.7.0
 uvicorn==0.54.0
 # Imported directly (the web layer's worker threads); already required by Starlette.
 anyio==4.15.1
+# Telegram sign-in (house_helper/web/telegram_oidc.py). httpx calls the provider; it is
+# already installed for openai, which requires it, and is pinned here because the web
+# layer imports it directly. PyJWT verifies the ID token's signature; the crypto extra
+# brings cryptography, pinned exactly like starlette so that CI's 3.10 and 3.12 agree.
+httpx==0.28.1
+PyJWT[crypto]==2.15.1
+cryptography==49.0.0

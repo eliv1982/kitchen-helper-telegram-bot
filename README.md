@@ -4,7 +4,7 @@
 
 Kitchen Helper — Telegram-бот, который помогает быстро придумать простое домашнее блюдо из продуктов, которые есть у пользователя. Бот использует OpenAI API для генерации ответов и хранит контекст диалога в памяти процесса.
 
-Это pet-проект в активной разработке. Текущая версия реализует только описанную ниже функциональность Kitchen Helper — расширения (сад/дом, напоминания и т.д.) пока не реализованы. Веб-часть пока только инфраструктурная основа (FastAPI, `GET /healthz`, см. «Запуск веб-приложения»): пользовательских веб-функций ещё нет.
+Это pet-проект в активной разработке. Текущая версия реализует только описанную ниже функциональность Kitchen Helper — расширения (сад/дом, напоминания и т.д.) пока не реализованы. Веб-часть пока только инфраструктурная основа (FastAPI, `GET /healthz` и вход через Telegram OIDC, см. «Запуск веб-приложения»): пользовательских веб-функций (диалоги, рецепты, настройки) ещё нет.
 
 ## Возможности
 
@@ -23,6 +23,7 @@ Kitchen Helper — Telegram-бот, который помогает быстро
 - [openai](https://github.com/openai/openai-python) — официальный SDK OpenAI
 - [python-dotenv](https://github.com/theskumar/python-dotenv) — переменные окружения из `.env`
 - [FastAPI](https://fastapi.tiangolo.com/) + [uvicorn](https://www.uvicorn.org/) — веб-приложение (основа, без пользовательских функций)
+- [PyJWT](https://pyjwt.readthedocs.io/) + [cryptography](https://cryptography.io/) + [httpx](https://www.python-httpx.org/) — вход через Telegram OIDC (проверка подписи ID-токена, обмен кода)
 
 ## Структура файлов
 
@@ -36,7 +37,8 @@ Kitchen Helper — Telegram-бот, который помогает быстро
 | `house_helper/core/messages_ru.py` | Каталог русских текстов для результатов обработки (`/start` и сообщение о сбое доставки остаются в `bot.py`) |
 | `house_helper/core/backend.py` | Интерфейс AI-бэкенда `ChatBackend` и адаптер `OpenAIBackend` поверх `api_client.py` (ошибки провайдера → `BackendError`); позволяет подменять бэкенд в тестах |
 | `house_helper/core/chat_service.py` | `ChatService` и `Turn` — обработка одного хода диалога без привязки к Telegram: `service.turn(key)` держит блокировку диалога на всё время хода (включая доставку ответа транспортом), внутри — проверка длины, запрос к бэкенду, откат при сбое или отмене, сохранение обмена |
-| `house_helper/web/` | Веб-приложение FastAPI — отдельный процесс, не зависит от Telegram: фабрика `create_app()`, точка входа ASGI `asgi.py`, `GET /healthz`, настройки веб-процесса, `WebDatabase` (вся работа с БД выполняется в рабочих потоках, а не в цикле событий) |
+| `house_helper/web/` | Веб-приложение FastAPI — отдельный процесс, не зависит от Telegram-бота: фабрика `create_app()`, точка входа ASGI `asgi.py`, `GET /healthz`, настройки веб-процесса, `WebDatabase` (вся работа с БД выполняется в рабочих потоках, а не в цикле событий); вход через Telegram OIDC: `auth.py` (маршруты `/auth/...` и зависимость `require_user`), `telegram_oidc.py` (PKCE, обмен кода, проверка ID-токена), `logsafety.py` (маскировка кода и state в access-логе) |
+| `house_helper/persistence/authn.py` | Хранение входа: состояние OIDC-входа (только хэш `state`, одноразовое), завершение входа через allowlist, серверные сессии (только хэш токена), отзыв |
 | `api_client.py` | Ленивая инициализация клиента OpenAI, запросы, system prompt, логирование usage |
 | `tests/` | Автоматические тесты (без реальных сетевых запросов к Telegram/OpenAI) |
 | `requirements.txt` / `requirements-dev.txt` | Зависимости проекта (версии закреплены точно) |
@@ -102,7 +104,7 @@ python bot.py
 
 ## Запуск веб-приложения (основа)
 
-Веб-приложение (FastAPI, пакет `house_helper/web/`) — отдельный процесс, не связанный с Telegram-ботом. Пока оно умеет только одно: `GET /healthz` отвечает `{"status": "ok"}` (проверка «процесс жив»; базу данных она не трогает). Страниц, API данных пользователей и входа в систему в нём нет.
+Веб-приложение (FastAPI, пакет `house_helper/web/`) — отдельный процесс, не связанный с Telegram-ботом. Оно умеет две вещи: `GET /healthz` отвечает `{"status": "ok"}` (проверка «процесс жив»; базу данных она не трогает), и — если настроено — пускает пользователя через Telegram OIDC (раздел ниже). Страниц и API данных пользователей (диалоги, рецепты, настройки) в нём нет.
 
 ```bash
 python -m uvicorn house_helper.web.asgi:app --host 127.0.0.1 --port 8000
@@ -112,6 +114,84 @@ python -m uvicorn house_helper.web.asgi:app --host 127.0.0.1 --port 8000
 - База данных задаётся переменной `HOUSE_HELPER_DATABASE_URL` (по умолчанию — файл `house_helper.db` в рабочей папке). Для веб-процесса нужен файл SQLite или другая СУБД; SQLite в памяти (`sqlite://`) не поддерживается.
 - Приложение **не создаёт и не меняет схему базы данных**. Миграции применяются отдельной командой: `alembic upgrade head`.
 - Проверка: `curl http://127.0.0.1:8000/healthz`.
+
+### Вход через Telegram (OIDC)
+
+Вход необязателен. Без переменных ниже приложение запускается как раньше (учётные данные не нужны), `/healthz` работает, а маршруты `/auth/...` отвечают `503 {"detail": "login_unavailable"}`.
+
+Маршруты (других нет):
+
+| Маршрут | Назначение |
+|---|---|
+| `GET /auth/telegram/login` | начать вход: перенаправляет в Telegram (Authorization Code + PKCE S256, `state`, `nonce`) |
+| `GET /auth/telegram/callback` | вернуться из Telegram: проверка, допуск по allowlist, открытие сессии, перенаправление (`303`) на `/auth/me` — временное место назначения, пока нет веб-интерфейса; в адресе перенаправления нет ни `code`, ни `state`, ни токена |
+| `GET /auth/me` | `{"user_id", "session_expires_at"}` текущей сессии; `401`, если сессии нет |
+| `POST /auth/logout` | отозвать сессию и удалить cookie (`204`) |
+
+Настройка:
+
+1. В [@BotFather](https://t.me/BotFather) → Login Widget добавьте в **Allowed URLs** адрес возврата `https://<ваш-домен>/auth/telegram/callback` и возьмите Client ID и Client Secret. Алгоритм подписи ID-токена там же (по умолчанию RS256).
+2. Задайте переменные окружения (все три обязательны, если задана хотя бы одна; иначе процесс не запустится, а в сообщении будут только имена переменных):
+
+   | Переменная | Значение |
+   |---|---|
+   | `HOUSE_HELPER_PUBLIC_URL` | адрес приложения для пользователей: `https://host[:port]`, без пути. Из него строятся адрес возврата, допустимый `Origin` для выхода и атрибуты cookie; значения из запроса (`Host`, `X-Forwarded-*`) не используются |
+   | `HOUSE_HELPER_TELEGRAM_CLIENT_ID` | Client ID |
+   | `HOUSE_HELPER_TELEGRAM_CLIENT_SECRET` | Client Secret (не попадает ни в логи, ни в `repr` настроек) |
+   | `HOUSE_HELPER_TELEGRAM_ID_TOKEN_ALG` | необязательно: `RS256` (по умолчанию), `ES256` или `EdDSA` — ровно тот, что выбран в @BotFather |
+
+3. Разработка на своём компьютере: `HOUSE_HELPER_PUBLIC_URL=http://localhost:8000` (простой `http` допускается только для `localhost`/`127.0.0.1`/`::1`; cookie тогда без `Secure` и без префикса `__Host-`, чтобы браузер их сохранил). Для любого другого хоста нужен `https`, отдельного переключателя «небезопасных cookie» нет.
+
+Как это устроено и что важно знать:
+
+- **Допуск только по allowlist**, саморегистрации нет. Пользователь определяется по `sub` из проверенного ID-токена (не по username и не по имени); неизвестный, отозванный или отключённый — отказ `403`. Запись в allowlist (и самого пользователя) создаёт оператор, например:
+
+  ```python
+  from house_helper.persistence.allowlist import allow
+  from house_helper.persistence.database import create_db_engine, create_session_factory
+  from house_helper.persistence.models import User
+
+  engine = create_db_engine()  # HOUSE_HELPER_DATABASE_URL
+  with create_session_factory(engine)() as session, session.begin():
+      user = User(display_name="Елена")
+      session.add(user)
+      allow(session, user, "telegram", "<sub из ID-токена Telegram>")
+  ```
+
+- **Сессия** — случайный токен (256 бит) в cookie `__Host-hh_session` (`HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`, без `Domain`), срок 14 дней, не продлевается. В базе хранится только SHA-256 токена. Сессия перестаёт действовать при выходе, по истечении срока, при отключении пользователя и пока у пользователя нет ни одной неотозванной записи в allowlist (проверяется на каждый запрос). Сама по себе такая сессия не отзывается: её строка в базе остаётся неотозванной.
+- **Временные ограничения R3A** (это не окончательное поведение продукта; они снимаются, когда сессия начнёт запоминать, через какой способ входа открыта, а такая привязка обязательна до включения входа по email в R3B):
+  - Единственный активный способ входа — Telegram. Вход по email не включён.
+  - Сессия пока не привязана к `IdentityLink`, через который открыта, — в схеме такой связи нет. Отзыв отдельной записи allowlist поэтому не завершает «её» сессии, если у того же пользователя остаётся другая неотозванная запись. Отзыв по конкретному способу входа **не реализован**.
+  - Не заводите для одного пользователя больше одной активной записи allowlist (больше одного активного способа входа), пока не реализована привязка сессий.
+  - Чтобы отозвать способ входа, нужно явно отозвать активные сессии его пользователя; отзыва записи allowlist для этого недостаточно. Например:
+
+    ```python
+    import uuid
+
+    import sqlalchemy as sa
+
+    from house_helper.persistence.allowlist import revoke
+    from house_helper.persistence.base import utcnow
+    from house_helper.persistence.database import create_db_engine, create_session_factory
+    from house_helper.persistence.models import Session as LoginSession
+
+    engine = create_db_engine()  # HOUSE_HELPER_DATABASE_URL
+    with create_session_factory(engine)() as session, session.begin():
+        revoke(session, "telegram", "<sub из ID-токена Telegram>")
+        session.execute(
+            sa.update(LoginSession)
+            .where(
+                LoginSession.user_id == uuid.UUID("<id пользователя>"),
+                LoginSession.revoked_at.is_(None),
+            )
+            .values(revoked_at=utcnow())
+        )
+    ```
+
+  - Повторное включение записи allowlist (`allow` снимает отзыв с той же строки) **не** способ отозвать сессии: неотозванные и неистёкшие сессии пользователя снова начинают действовать. Безопасной процедурой отзыва считается только явный отзыв сессий, как выше.
+- Вход привязан к браузеру: при старте ставится короткоживущая cookie `__Host-hh_login` со значением `state`; обратный вызов без неё отклоняется. `state` одноразовый и живёт 10 минут; повтор того же адреса возврата отклоняется.
+- **Логи.** Секреты (`state`, `nonce`, PKCE-верификатор, код, токены, секрет клиента, значения cookie) не пишутся. Адрес возврата содержит `code` и `state`, а строку запроса пишет сам uvicorn: приложение при старте маскирует query для путей `/auth/` в логгере `uvicorn.access` (или запускайте с `--no-access-log`). Не включайте логирование SQL (`echo`, DEBUG для `sqlalchemy.engine`): параметры запросов содержат `nonce` и верификатор.
+- Ограничение частоты запросов к `/auth/telegram/login` приложение не делает: ставьте его на обратном прокси.
 
 ## Как проверить контекст
 

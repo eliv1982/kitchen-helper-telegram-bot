@@ -24,6 +24,12 @@ import pytest
 
 import house_helper.web
 from house_helper.persistence.database import DATABASE_URL_ENV
+from house_helper.web.settings import (
+    PUBLIC_URL_ENV,
+    TELEGRAM_CLIENT_ID_ENV,
+    TELEGRAM_CLIENT_SECRET_ENV,
+    TELEGRAM_ID_TOKEN_ALG_ENV,
+)
 from tests.test_persistence_boundary import (
     CORE_DIR,
     PERSISTENCE_DIR,
@@ -37,6 +43,13 @@ from tests.test_persistence_boundary import (
 WEB_DIR = Path(house_helper.web.__file__).parent
 
 WEB_LIBRARIES = {"fastapi", "starlette", "uvicorn"}
+
+# What Telegram sign-in is built on. It is the web layer's business: the chat core,
+# persistence (which stores only digests and takes the verified `sub` as an
+# argument) and the Telegram process neither verify tokens nor call providers.
+# (openai needs httpx and so loads it inside the Telegram process; what matters is
+# that no module of the bot imports it, or any of these, itself.)
+SIGN_IN_LIBRARIES = {"jwt", "httpx", "cryptography"}
 WEB_PACKAGE = "house_helper.web"
 
 # What the web package must not import: the Telegram transport and its state, the
@@ -125,6 +138,18 @@ def test_the_telegram_modules_do_not_import_the_web_stack_or_package(module):
     assert sorted(
         n for n in names if n.split(".")[0] in WEB_LIBRARIES or _is_under(n, WEB_PACKAGE)
     ) == []
+
+
+def test_the_core_and_persistence_do_not_import_the_sign_in_libraries():
+    assert _offenders(CORE_DIR, SIGN_IN_LIBRARIES) == {}
+    assert _offenders(PERSISTENCE_DIR, SIGN_IN_LIBRARIES) == {}
+
+
+@pytest.mark.parametrize("module", TELEGRAM_MODULES)
+def test_the_telegram_modules_do_not_import_the_sign_in_libraries(module):
+    names = _names_imported_by((REPO_ROOT / module).read_text(encoding="utf-8"), "")
+
+    assert sorted(n for n in names if n.split(".")[0] in SIGN_IN_LIBRARIES) == []
 
 
 def test_the_web_package_does_not_import_the_telegram_transport_or_provider_layer():
@@ -221,7 +246,16 @@ def _run_probe(tmp_path, modules, *, extra_env=None, check=True):
     env = {
         name: value
         for name, value in os.environ.items()
-        if name not in {"BOT_TOKEN", "OPENAI_API_KEY", DATABASE_URL_ENV}
+        if name
+        not in {
+            "BOT_TOKEN",
+            "OPENAI_API_KEY",
+            DATABASE_URL_ENV,
+            PUBLIC_URL_ENV,
+            TELEGRAM_CLIENT_ID_ENV,
+            TELEGRAM_CLIENT_SECRET_ENV,
+            TELEGRAM_ID_TOKEN_ALG_ENV,
+        }
     }
     env.update(extra_env or {})
     work_dir = tmp_path / "cwd"
@@ -326,6 +360,38 @@ def test_the_asgi_module_refuses_to_import_with_unusable_configuration(tmp_path)
     assert "WebConfigError" in completed.stderr
 
 
+def test_the_asgi_module_refuses_to_import_with_a_half_configured_login(tmp_path):
+    completed = _run_probe(
+        tmp_path,
+        ["house_helper.web.asgi"],
+        extra_env={TELEGRAM_CLIENT_ID_ENV: "1234567890"},
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "WebConfigError" in completed.stderr
+    assert "partly configured" in completed.stderr
+    assert PUBLIC_URL_ENV in completed.stderr and TELEGRAM_CLIENT_SECRET_ENV in completed.stderr
+    assert "1234567890" not in completed.stderr  # names of what is missing, never a value
+
+
+def test_the_application_starts_with_login_configured_and_still_needs_no_network_or_file(tmp_path):
+    report = _run_probe(
+        tmp_path,
+        ["house_helper.web.asgi"],
+        extra_env={
+            PUBLIC_URL_ENV: "https://kitchen.example.test",
+            TELEGRAM_CLIENT_ID_ENV: "1234567890",
+            TELEGRAM_CLIENT_SECRET_ENV: "a-secret-that-must-not-be-printed",
+        },
+    )
+
+    assert report["health"] == [200, {"status": "ok"}]
+    assert report["files_after_run"] == []  # no database file either: nothing used it
+    assert report["loaded_after_run"] == []
+    assert report["dotenv_calls_after_run"] == 0
+
+
 def test_the_telegram_process_loads_no_part_of_the_web_stack(tmp_path):
     script = """
 import json, sys, types
@@ -337,7 +403,7 @@ sys.modules["dotenv"] = dotenv
 import bot
 print(json.dumps(sorted(
     name for name in sys.modules
-    if name.split(".")[0] in {"fastapi", "starlette", "uvicorn"} or name.startswith("house_helper.web")
+    if name.split(".")[0] in {"fastapi", "starlette", "uvicorn", "jwt"} or name.startswith("house_helper.web")
 )))
 """
     env = {**os.environ, "BOT_TOKEN": "x", "OPENAI_API_KEY": "x"}

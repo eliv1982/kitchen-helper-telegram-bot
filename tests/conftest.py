@@ -47,6 +47,18 @@ def _load_dotenv_disabled(*args, **kwargs) -> bool:
 
 dotenv.load_dotenv = _load_dotenv_disabled
 
+
+# The web process's Telegram login is configured from the environment too, and a
+# developer's shell may well have it set (or half set). The tests that exercise
+# configuration say what they need; none may depend on what happens to be exported.
+for _name in (
+    "HOUSE_HELPER_PUBLIC_URL",
+    "HOUSE_HELPER_TELEGRAM_CLIENT_ID",
+    "HOUSE_HELPER_TELEGRAM_CLIENT_SECRET",
+    "HOUSE_HELPER_TELEGRAM_ID_TOKEN_ALG",
+):
+    os.environ.pop(_name, None)
+
 import pytest
 
 from tests import plugin_check, seams
