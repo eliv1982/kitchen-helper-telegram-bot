@@ -10,6 +10,8 @@ import io
 import re
 import subprocess
 import sys
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -32,10 +34,23 @@ from house_helper.persistence.database import (
     downgrade_database,
     upgrade_database,
 )
-from tests.persistence_support import new_conversation, new_message, new_user
+from house_helper.persistence.authn import authenticate, complete_login, hash_secret, new_secret
+from house_helper.persistence.models import IdentityLink
+from house_helper.persistence.models import Session as LoginSession
+from tests.persistence_support import (
+    CREATED,
+    new_conversation,
+    new_identity_link,
+    new_message,
+    new_user,
+    raw_insert,
+    stored,
+    utc,
+)
 from tests.test_persistence_schema import TABLES
 
 INITIAL = "0001_persistence_foundation"
+HEAD = "0002_session_provenance"
 REPO_ROOT = Path(house_helper.persistence.__file__).resolve().parents[2]
 
 
@@ -58,11 +73,12 @@ def _version(engine):
 # --- the history ------------------------------------------------------------------
 
 
-def test_the_history_is_one_revision_and_one_head():
+def test_the_history_is_one_line_with_one_head():
     script = ScriptDirectory.from_config(alembic_config())
 
-    assert script.get_heads() == [INITIAL]
-    assert [revision.revision for revision in script.walk_revisions()] == [INITIAL]
+    assert script.get_heads() == [HEAD]
+    assert [revision.revision for revision in script.walk_revisions()] == [HEAD, INITIAL]
+    assert script.get_revision(HEAD).down_revision == INITIAL
     assert script.get_revision(INITIAL).down_revision is None
 
 
@@ -89,7 +105,7 @@ def test_upgrade_creates_every_table_and_records_the_revision(empty_engine):
     upgrade_database(empty_engine)
 
     assert _tables(empty_engine) == TABLES | {"alembic_version"}
-    assert _version(empty_engine) == [INITIAL]
+    assert _version(empty_engine) == [HEAD]
 
 
 def test_upgrading_again_changes_nothing(empty_engine):
@@ -97,7 +113,7 @@ def test_upgrading_again_changes_nothing(empty_engine):
     upgrade_database(empty_engine)
 
     assert _tables(empty_engine) == TABLES | {"alembic_version"}
-    assert _version(empty_engine) == [INITIAL]
+    assert _version(empty_engine) == [HEAD]
 
 
 def test_the_migrated_schema_has_no_drift_from_the_models(empty_engine):
@@ -245,6 +261,168 @@ def test_the_comparison_sees_the_storage_class_and_timestamp_rules(empty_engine)
         assert "'+365 days'" in text
 
 
+# --- 0002 on a database that holds R3A data -----------------------------------------
+#
+# Policy under test: a session that exists when the column is added has no
+# provenance that can be shown, so it is revoked, never matched to a link, and can
+# never be live again; everything else is left as it was.
+
+TOKEN_NAMES = ("live", "revoked_earlier", "expired", "owner_of_a_single_link")
+EARLIER_REVOCATION = utc(2026, 10, 16, 13)
+SOME_TABLES = ("users", "allowlist_entries", "identity_links", "conversations", "messages")
+
+
+def _r3a_database(engine) -> dict[str, str]:
+    """A database as R3A left it (revision 0001 only), holding two users with
+    three identity links and four sessions, none of which says which link it came
+    through, and a conversation. Returns the sessions' tokens by name."""
+    upgrade_database(engine, INITIAL)
+    tokens = {name: new_secret() for name in TOKEN_NAMES}
+    sessions = {
+        # name: (owner, revoked_at)
+        "live": ("elena", None),
+        "revoked_earlier": ("elena", stored(EARLIER_REVOCATION)),
+        "expired": ("elena", None),
+        "owner_of_a_single_link": ("other", None),
+    }
+    with create_session_factory(engine)() as db:
+        elena, other = new_user(db, display_name="Elena"), new_user(db, display_name="Other")
+        owners = {"elena": elena, "other": other}
+        new_identity_link(db, elena, "telegram", "42", last_login_at=CREATED)
+        new_identity_link(db, elena, "email", "elena@example.com")
+        new_identity_link(db, other, "telegram", "77")  # their only link: still not inferred
+        new_message(db, new_conversation(db, elena))
+        for name, (owner, revoked_at) in sessions.items():
+            expires = CREATED + timedelta(days=1 if name == "expired" else 14)
+            raw_insert(
+                db,
+                "sessions",
+                id=uuid.uuid4().hex,
+                user_id=owners[owner].id.hex,
+                token_hash=hash_secret(tokens[name]),
+                created_at=stored(CREATED),
+                last_seen_at=stored(CREATED),
+                expires_at=stored(expires),
+                revoked_at=revoked_at,
+            )
+        db.commit()
+    return tokens
+
+
+def _counts(engine) -> dict[str, int]:
+    with engine.connect() as connection:
+        return {
+            table: connection.exec_driver_sql(f"SELECT count(*) FROM {table}").scalar()
+            for table in SOME_TABLES
+        }
+
+
+def test_the_provenance_migration_revokes_every_existing_session_and_infers_nothing(empty_engine):
+    tokens = _r3a_database(empty_engine)
+    before = datetime.now(timezone.utc) - timedelta(seconds=2)
+
+    upgrade_database(empty_engine)
+
+    after = datetime.now(timezone.utc) + timedelta(seconds=2)
+    with create_session_factory(empty_engine)() as db:
+        by_hash = {row.token_hash: row for row in db.scalars(sa.select(LoginSession))}
+        assert len(by_hash) == 4
+        for name, token in tokens.items():
+            row = by_hash[hash_secret(token)]
+            assert row.identity_link_id is None, name  # not even for the owner of a single link
+            assert row.revoked_at is not None, name
+            if name == "revoked_earlier":
+                assert row.revoked_at == EARLIER_REVOCATION  # the first revocation is kept
+            else:
+                assert before <= row.revoked_at <= after, name  # the time of the migration
+            # R3A's rules would have accepted the first, third and fourth until their
+            # expiry; none can authenticate now
+            assert authenticate(db, token, now=CREATED + timedelta(hours=1)) is None, name
+
+
+def test_the_provenance_migration_leaves_every_other_row_alone(empty_engine):
+    _r3a_database(empty_engine)
+    before = _counts(empty_engine)
+    with empty_engine.connect() as connection:
+        links_before = connection.exec_driver_sql(
+            "SELECT id, user_id, provider, subject, created_at, last_login_at "
+            "FROM identity_links ORDER BY id"
+        ).all()
+
+    upgrade_database(empty_engine)
+
+    assert _counts(empty_engine) == before == {
+        "users": 2,
+        "allowlist_entries": 3,
+        "identity_links": 3,
+        "conversations": 1,
+        "messages": 1,
+    }
+    with empty_engine.connect() as connection:
+        assert connection.exec_driver_sql(
+            "SELECT id, user_id, provider, subject, created_at, last_login_at "
+            "FROM identity_links ORDER BY id"
+        ).all() == links_before
+        assert connection.exec_driver_sql("PRAGMA foreign_key_check").all() == []
+        assert connection.exec_driver_sql("PRAGMA integrity_check").scalars().all() == ["ok"]
+
+
+def test_after_the_migration_a_person_signs_in_again_and_gets_a_session_with_provenance(empty_engine):
+    _r3a_database(empty_engine)
+    upgrade_database(empty_engine)
+    now = CREATED + timedelta(days=2)
+
+    with create_session_factory(empty_engine)() as db, db.begin():
+        issued = complete_login(db, "telegram", "42", now=now)
+    with create_session_factory(empty_engine)() as db:
+        assert authenticate(db, issued.token, now=now) is not None
+        link = db.scalars(sa.select(IdentityLink).where(IdentityLink.subject == "42")).one()
+        assert db.get(LoginSession, issued.session_id).identity_link_id == link.id
+        assert link.last_login_at == now
+
+
+def test_a_session_that_the_migration_revoked_cannot_be_made_live_again(empty_engine):
+    _r3a_database(empty_engine)
+    upgrade_database(empty_engine)
+
+    with pytest.raises(sa.exc.IntegrityError, match="ck_sessions_provenance_or_revoked"):
+        with empty_engine.begin() as connection:
+            connection.exec_driver_sql("UPDATE sessions SET revoked_at = NULL")
+
+
+def test_downgrading_the_provenance_keeps_every_row_and_the_old_schema(tmp_path):
+    migrated = create_db_engine(f"sqlite:///{tmp_path / 'migrated.db'}")
+    pristine = create_db_engine(f"sqlite:///{tmp_path / 'pristine.db'}")
+    try:
+        tokens = _r3a_database(migrated)
+        upgrade_database(pristine, INITIAL)
+        upgrade_database(migrated)
+        with create_session_factory(migrated)() as db, db.begin():
+            issued = complete_login(db, "telegram", "42", now=CREATED + timedelta(days=2))
+        before = _counts(migrated)
+
+        downgrade_database(migrated, INITIAL)
+
+        assert _version(migrated) == [INITIAL]
+        assert _fingerprint(migrated) == _fingerprint(pristine)  # the 0001 schema, exactly
+        assert _counts(migrated) == before
+        with migrated.connect() as connection:
+            revoked = dict(
+                connection.exec_driver_sql("SELECT token_hash, revoked_at IS NOT NULL FROM sessions").all()
+            )
+        # the revocations stand (a downgrade does not bring a session back), and the
+        # session opened since is still there and live
+        assert [revoked[hash_secret(token)] for token in tokens.values()] == [1, 1, 1, 1]
+        assert revoked[hash_secret(issued.token)] == 0
+
+        upgrade_database(migrated)  # and it can go forward again; the provenance is gone, so
+        with create_session_factory(migrated)() as db:
+            assert authenticate(db, issued.token, now=CREATED + timedelta(days=2)) is None
+    finally:
+        migrated.dispose()
+        pristine.dispose()
+
+
 # --- downgrade --------------------------------------------------------------------
 
 
@@ -263,7 +441,7 @@ def test_a_downgraded_database_can_be_upgraded_again(empty_engine):
     upgrade_database(empty_engine)
 
     assert _tables(empty_engine) == TABLES | {"alembic_version"}
-    assert _version(empty_engine) == [INITIAL]
+    assert _version(empty_engine) == [HEAD]
 
 
 def test_downgrading_a_database_that_holds_rows_removes_them_with_their_tables(empty_engine):
@@ -287,6 +465,8 @@ def _offline_sql(direction: str) -> str:
     config.output_buffer = io.StringIO()
     if direction == "up":
         command.upgrade(config, "head", sql=True)
+    elif direction == "down_from_head":
+        command.downgrade(config, f"{HEAD}:{INITIAL}", sql=True)
     else:
         command.downgrade(config, f"{INITIAL}:base", sql=True)
     return config.output_buffer.getvalue()
@@ -310,7 +490,8 @@ def test_the_upgrade_renders_as_postgresql_sql():
     assert "typeof(" not in sql and "CAST(" not in sql and "BLOB" not in sql
     assert "%" not in sql  # a doubled percent sign would make the offline SQL unrunnable
     assert f"INSERT INTO alembic_version (version_num) VALUES ('{INITIAL}')" in sql
-    assert sql.count("CREATE INDEX") == 10
+    assert f"UPDATE alembic_version SET version_num='{HEAD}'" in sql
+    assert sql.count("CREATE INDEX") == 11 and sql.count("CREATE UNIQUE INDEX") == 1
 
 
 def test_the_downgrade_renders_as_postgresql_sql():
@@ -319,6 +500,27 @@ def test_the_downgrade_renders_as_postgresql_sql():
     for table in TABLES:
         assert f"DROP TABLE {table};" in sql
     assert "DELETE FROM alembic_version" in sql
+
+
+def test_the_provenance_revision_renders_as_plain_postgresql_alters():
+    up, down = _offline_sql("up"), _offline_sql("down_from_head")
+    revision = up.split(f"Running upgrade {INITIAL} -> {HEAD}")[1]
+
+    # the data step comes first, so that the CHECK is added to rows that satisfy it
+    steps = [line for line in revision.split("\n") if line.strip()]
+    assert steps[0].startswith("UPDATE sessions SET revoked_at=now() WHERE sessions.revoked_at IS NULL")
+    assert steps[1:6] == [
+        "CREATE UNIQUE INDEX uq_identity_links_user_id_id ON identity_links (user_id, id);",
+        "ALTER TABLE sessions ADD COLUMN identity_link_id UUID;",
+        "ALTER TABLE sessions ADD CONSTRAINT fk_sessions_identity_link FOREIGN KEY(user_id, "
+        "identity_link_id) REFERENCES identity_links (user_id, id) ON DELETE CASCADE;",
+        "CREATE INDEX ix_sessions_identity_link_id ON sessions (identity_link_id);",
+        "ALTER TABLE sessions ADD CONSTRAINT ck_sessions_provenance_or_revoked CHECK "
+        "(identity_link_id IS NOT NULL OR revoked_at IS NOT NULL);",
+    ]
+    assert "strftime" not in revision and "CREATE TABLE" not in revision  # SQLite's rebuild stays out
+    assert "DROP TABLE" not in down and "DROP COLUMN identity_link_id" in down
+    assert "DROP INDEX uq_identity_links_user_id_id" in down
 
 
 def test_rendering_sql_offline_creates_no_database_file(tmp_path, monkeypatch):
@@ -336,19 +538,26 @@ def test_rendering_sql_offline_creates_no_database_file(tmp_path, monkeypatch):
 
 
 def _tables_in(sql: str) -> dict[str, list[str]]:
-    """table name -> its definition lines, normalized and sorted."""
+    """table name -> its definition lines, normalized and sorted. A later
+    ALTER TABLE ... ADD [COLUMN] adds its definition to the table's lines, so the
+    result is the table as the whole history leaves it (and CREATE TABLE alone is
+    the table as the models declare it)."""
     tables = {}
     for match in re.finditer(r"CREATE TABLE (\w+) \(\n(.*?)\n\)", sql, re.DOTALL):
         name, body = match.groups()
-        tables[name] = sorted(
+        tables[name] = [
             re.sub(r"\s+", " ", line.strip().rstrip(",")) for line in body.split("\n") if line.strip()
-        )
-    return tables
+        ]
+    for match in re.finditer(r"ALTER TABLE (\w+) ADD (?:COLUMN )?([^;]*);", sql):
+        name, definition = match.groups()
+        tables[name].append(re.sub(r"\s+", " ", definition.strip()))
+    return {name: sorted(lines) for name, lines in tables.items()}
 
 
 def _indexes_in(sql: str) -> list[str]:
     return sorted(
-        re.sub(r"\s+", " ", m.group(0)).rstrip(";") for m in re.finditer(r"CREATE INDEX [^\n]*", sql)
+        re.sub(r"\s+", " ", m.group(0)).rstrip(";")
+        for m in re.finditer(r"CREATE (?:UNIQUE )?INDEX [^\n]*", sql)
     )
 
 
@@ -372,7 +581,7 @@ def test_the_migration_and_the_models_build_the_same_schema_in_postgresql_sql():
 
 def test_the_migration_and_the_models_create_the_same_indexes_in_postgresql_sql():
     assert _indexes_in(_offline_sql("up")) == _indexes_in(_models_as_postgresql())
-    assert len(_indexes_in(_models_as_postgresql())) == 10
+    assert len(_indexes_in(_models_as_postgresql())) == 12  # 11 plain, 1 unique
 
 
 def test_the_postgresql_comparison_does_see_a_difference(monkeypatch):
@@ -381,6 +590,26 @@ def test_the_postgresql_comparison_does_see_a_difference(monkeypatch):
     sql = _offline_sql("up").replace("interval '8760 hours'", "interval '9999 hours'")
 
     assert _tables_in(sql)["messages"] != _tables_in(_models_as_postgresql())["messages"]
+
+
+def test_the_postgresql_comparison_sees_the_provenance_revision_too():
+    # ... including what 0002 adds with ALTER TABLE (folded into the tables).
+    modeled = _tables_in(_models_as_postgresql())
+    up = _offline_sql("up")
+    for change in (
+        lambda sql: sql.replace(
+            "ON DELETE CASCADE;\n\nCREATE INDEX ix_sessions_identity_link_id",
+            "ON DELETE SET NULL;\n\nCREATE INDEX ix_sessions_identity_link_id",
+        ),
+        lambda sql: sql.replace(
+            "identity_link_id IS NOT NULL OR revoked_at IS NOT NULL", "identity_link_id IS NOT NULL"
+        ),
+    ):
+        assert change(up) != up
+        assert _tables_in(change(up))["sessions"] != modeled["sessions"]
+    narrowed = up.replace("ON identity_links (user_id, id);", "ON identity_links (id);")
+    assert narrowed != up
+    assert _indexes_in(narrowed) != _indexes_in(_models_as_postgresql())
 
 
 # --- no connection details are committed ------------------------------------------

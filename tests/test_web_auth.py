@@ -20,6 +20,7 @@ import pytest
 import sqlalchemy as sa
 from fastapi import Depends
 
+from house_helper.persistence.allowlist import allow, revoke
 from house_helper.persistence.authn import AuthenticatedSession, hash_secret
 from house_helper.persistence.models import AllowlistEntry, IdentityLink, OidcState, User
 from house_helper.persistence.models import Session as LoginSession
@@ -289,6 +290,7 @@ async def test_signing_in_creates_a_session_and_lands_on_auth_me(tmp_path):
         (link,) = rows(h, IdentityLink)
         assert (link.user_id, link.provider, link.subject) == (h.user_id, "telegram", SUBJECT)
         assert link.last_login_at == START
+        assert session_row.identity_link_id == link.id  # opened through the verified identity
         (state_row,) = rows(h, OidcState)
         assert state_row.consumed_at == START
         assert counts(h)["users"] == 1  # signing in created nobody
@@ -573,6 +575,30 @@ async def test_withdrawing_the_allowlist_entry_ends_the_sessions_at_once(tmp_pat
             db.execute(sa.update(AllowlistEntry).values(revoked_at=START))
 
         assert (await h.client.get("/auth/me")).status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_revoking_the_identity_ends_its_session_and_a_new_sign_in_is_needed_after_re_allowing(
+    tmp_path,
+):
+    async with auth_app(tmp_path) as h:
+        old_token = await signed_in(h)
+        assert (await h.client.get("/auth/me")).status_code == 200
+
+        with h.factory() as db, db.begin():
+            assert revoke(db, "telegram", SUBJECT, now=START + timedelta(minutes=1))
+        assert (await h.client.get("/auth/me")).status_code == 401
+
+        with h.factory() as db, db.begin():
+            allow(db, db.get(User, h.user_id), "telegram", SUBJECT)
+        assert (await h.client.get("/auth/me")).status_code == 401  # not restored
+
+        again = h.new_client()
+        new_token = await signed_in(h, again)
+        assert (await again.get("/auth/me")).status_code == 200
+        assert new_token != old_token
+        assert (await h.client.get("/auth/me")).status_code == 401  # the old one stays dead
+        assert sorted(row.revoked_at is not None for row in rows(h, LoginSession)) == [False, True]
 
 
 @pytest.mark.asyncio

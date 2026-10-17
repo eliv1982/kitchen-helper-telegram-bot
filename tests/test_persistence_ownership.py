@@ -11,6 +11,7 @@ import pytest
 import sqlalchemy as sa
 
 from house_helper.persistence.models import (
+    AllowlistEntry,
     Conversation,
     IdentityLink,
     Message,
@@ -20,6 +21,7 @@ from house_helper.persistence.models import (
 )
 from house_helper.persistence.allowlist import allow
 from tests.persistence_support import (  # noqa: F401  (fixtures)
+    CREATED,
     count,
     engine,
     factory,
@@ -34,6 +36,7 @@ from tests.persistence_support import (  # noqa: F401  (fixtures)
     raw_insert,
     rejected,
     session,
+    stored,
     utc,
 )
 
@@ -144,8 +147,137 @@ def test_a_session_needs_an_owner_that_exists(session):
                 token_hash="a" * 64,
                 created_at=now,
                 expires_at=now + timedelta(days=1),
+                revoked_at=now,  # no provenance, so only a revoked row is legal at all
             )
         )
+
+
+# --- login sessions: provenance -----------------------------------------------------
+
+
+def _session_row(user, token_hash="a" * 64, **overrides) -> dict:
+    return {
+        "id": uuid.uuid4().hex,
+        "user_id": user.id.hex,
+        "token_hash": token_hash,
+        "created_at": stored(CREATED),
+        "last_seen_at": stored(CREATED),
+        "expires_at": stored(CREATED + timedelta(days=1)),
+        **overrides,
+    }
+
+
+def test_a_session_records_the_identity_link_it_was_opened_through(session):
+    user = new_user(session)
+    first = new_identity_link(session, user, subject="first")
+    second = new_identity_link(session, user, subject="second")
+
+    login = new_login_session(session, user, token="t", identity_link_id=second.id)
+    session.expire_all()
+
+    assert session.get(Session, login.id).identity_link_id == second.id != first.id
+
+
+@pytest.mark.parametrize("how", ["orm", "sql"])
+def test_a_session_cannot_come_through_the_link_of_another_user(session, how):
+    owner, other = new_user(session), new_user(session)
+    foreign_link = new_identity_link(session, other, subject="theirs")
+
+    with rejected(session, "FOREIGN KEY"):
+        if how == "orm":
+            new_login_session(session, owner, identity_link_id=foreign_link.id)
+        else:
+            raw_insert(
+                session, "sessions", **_session_row(owner, identity_link_id=foreign_link.id.hex)
+            )
+
+
+@pytest.mark.parametrize("how", ["orm", "sql"])
+def test_a_session_cannot_point_at_a_link_that_does_not_exist(session, how):
+    user = new_user(session)
+
+    with rejected(session, "FOREIGN KEY"):
+        if how == "orm":
+            new_login_session(session, user, identity_link_id=uuid.uuid4())
+        else:
+            raw_insert(session, "sessions", **_session_row(user, identity_link_id=uuid.uuid4().hex))
+
+
+@pytest.mark.parametrize("how", ["orm", "sql"])
+def test_a_session_without_provenance_can_only_exist_revoked(session, how):
+    user = new_user(session)
+
+    with rejected(session, "ck_sessions_provenance_or_revoked"):
+        if how == "orm":
+            new_login_session(session, user, identity_link_id=None)
+        else:
+            raw_insert(session, "sessions", **_session_row(user))
+
+    # a revoked one is legal: that is what the sessions that predate the column are
+    revoked = new_login_session(
+        session, user, token="legacy", identity_link_id=None, revoked_at=utc(2026, 10, 17)
+    )
+    assert revoked.identity_link_id is None
+
+
+def test_a_session_without_provenance_cannot_be_made_live_again(session):
+    user = new_user(session)
+    new_login_session(
+        session, user, token="legacy", identity_link_id=None, revoked_at=utc(2026, 10, 17)
+    )
+
+    with rejected(session, "ck_sessions_provenance_or_revoked"):
+        session.execute(sa.update(Session).values(revoked_at=None))
+
+
+def test_the_orm_does_not_rewrite_the_provenance_of_a_stored_session(session):
+    user = new_user(session)
+    first = new_identity_link(session, user, subject="first")
+    second = new_identity_link(session, user, subject="second")
+    login = new_login_session(session, user, identity_link_id=first.id)
+
+    login.identity_link_id = second.id
+
+    with pytest.raises(ValueError, match="identity_link_id cannot change"):
+        session.flush()
+    session.rollback()
+
+
+def test_a_session_without_provenance_cannot_be_given_one_afterwards(session):
+    user = new_user(session)
+    link = new_identity_link(session, user)
+    legacy = new_login_session(
+        session, user, identity_link_id=None, revoked_at=utc(2026, 10, 17)
+    )
+
+    legacy.identity_link_id = link.id
+
+    with pytest.raises(ValueError, match="identity_link_id cannot change"):
+        session.flush()
+    session.rollback()
+
+
+def test_deleting_a_link_deletes_the_sessions_it_opened_and_only_those(session):
+    user = new_user(session)
+    gone = new_identity_link(session, user, subject="gone")
+    kept = new_identity_link(session, user, subject="kept")
+    new_login_session(session, user, token="from-gone", identity_link_id=gone.id)
+    survivor = new_login_session(session, user, token="from-kept", identity_link_id=kept.id)
+
+    session.execute(sa.delete(IdentityLink).where(IdentityLink.id == gone.id))
+
+    assert [row.id for row in session.scalars(sa.select(Session))] == [survivor.id]
+
+
+def test_deleting_the_allowlist_entry_takes_the_link_and_its_sessions_with_it(session):
+    user = new_user(session)
+    link = new_identity_link(session, user, subject="gone")
+    new_login_session(session, user, identity_link_id=link.id)
+
+    session.execute(sa.delete(AllowlistEntry).where(AllowlistEntry.subject == "gone"))
+
+    assert count(session, IdentityLink) == 0 and count(session, Session) == 0
+    assert count(session, User) == 1
 
 
 # --- OIDC login state -------------------------------------------------------------

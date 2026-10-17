@@ -26,8 +26,9 @@ The flow, and where each protection sits:
             3. the code is exchanged and the ID token verified (telegram_oidc);
             4. in one transaction, the `sub` is matched on the allowlist, the
                identity link is created on the first login, and a session is
-               created (persistence.authn.complete_login). Denied or failed, none
-               of it is kept.
+               created and tied to that identity link, so that revoking the
+               identity ends it (persistence.authn.complete_login). Denied or
+               failed, none of it is kept.
             The state stays consumed whatever happens after step 2; the user starts
             again. The answer is a redirect to "/auth/me", so the code and state do
             not stay in the address bar or the history, and a Set-Cookie.

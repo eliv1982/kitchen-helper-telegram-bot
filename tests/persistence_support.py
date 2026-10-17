@@ -143,7 +143,15 @@ def new_turn_request(
 
 
 def new_login_session(session: OrmSession, user: User, token: str = "token-1", **fields) -> Session:
+    """A session of `user`. Unless `identity_link_id` is given (None included) it
+    is opened through a link of that user: their first one, or a new one if they
+    have none. (A session needs provenance to be live; see models.Session.)"""
     now = fields.pop("created_at", datetime.now(timezone.utc))
+    if "identity_link_id" not in fields:
+        link = session.scalar(sa.select(IdentityLink).where(IdentityLink.user_id == user.id))
+        fields["identity_link_id"] = (
+            link or new_identity_link(session, user, subject=f"sub-{user.id}")
+        ).id
     login = Session(
         user_id=user.id,
         token_hash=fields.pop("token_hash", digest(token)),

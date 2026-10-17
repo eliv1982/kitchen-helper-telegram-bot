@@ -31,9 +31,17 @@ exception into access); a database error propagates and must be treated as a
 refusal. Nothing here deletes an entry: revoking sets revoked_at, and lifting a
 revocation clears it on the same row.
 
-Revoking does not end sessions that already exist. The code that validates a
-session must check allowed_user again (or revoke the user's sessions); that
-belongs to the sign-in increment.
+Revoking an identity ends the sessions it opened, in the same transaction (see
+revoke): a session records the identity link it came through, so the revocation
+is exactly as wide as the identity, no wider (the user's other identities, and the
+sessions they opened, are untouched) and no narrower. Lifting a revocation
+(allow) does NOT bring those sessions back: they were revoked, as rows, and
+stay so. A person who signs in again through the re-allowed identity gets a new
+session. This holds for the functions of this module. A direct SQL UPDATE of
+allowlist_entries.revoked_at is not supported and cannot be assumed to do any of
+it: the database has no trigger to end the sessions, so such a revocation is only
+enforced while it lasts (authn.authenticate reads the entry on every request), and
+clearing it again would revive the sessions that were opened through the identity.
 
 None of the functions commits; the caller owns the transaction.
 """
@@ -46,7 +54,8 @@ from sqlalchemy.orm import Session as OrmSession
 
 from house_helper.persistence.base import utcnow
 from house_helper.persistence.identifiers import MAX_SUBJECT_LENGTH, normalize_identity
-from house_helper.persistence.models import AllowlistEntry, User
+from house_helper.persistence.models import AllowlistEntry, IdentityLink, User
+from house_helper.persistence.models import Session as LoginSession
 
 __all__ = ["MAX_SUBJECT_LENGTH", "allow", "allowed_user", "is_allowed", "normalize", "revoke"]
 
@@ -61,17 +70,33 @@ def _entry(session: OrmSession, provider: str, subject: str) -> Optional[Allowli
     )
 
 
-def allowed_user(session: OrmSession, provider: object, subject: object) -> Optional[User]:
+def allowed_user(
+    session: OrmSession, provider: object, subject: object, *, lock: bool = False
+) -> Optional[User]:
     """The user this identity may sign in as, or None.
 
     None unless there is an entry for exactly this (provider, subject), it is not
     revoked, and its user is not disabled.
+
+    lock=True is for the one caller that creates something on the strength of the
+    answer, a login. On PostgreSQL it takes a shared row lock on the entry until
+    the end of the transaction (FOR SHARE), which makes a concurrent revoke() wait
+    for the login to commit, and then end the session it created; or, if the revoke
+    came first, makes the login see the revocation and be refused. Without it a
+    login could read "allowed", the revocation could commit, and the login could
+    then commit a live session that nobody revokes. SQLite has one writer at a time
+    and ignores the clause (SQLAlchemy leaves it out): the write that a login
+    starts with already serializes it against revoke().
     """
     try:
         provider, subject = normalize(provider, subject)
     except ValueError:
         return None
-    return session.scalar(
+    return session.scalar(_allowed_user_query(provider, subject, lock))
+
+
+def _allowed_user_query(provider: str, subject: str, lock: bool) -> sa.Select:
+    query = (
         sa.select(User)
         .join(AllowlistEntry, AllowlistEntry.user_id == User.id)
         .where(
@@ -81,6 +106,11 @@ def allowed_user(session: OrmSession, provider: object, subject: object) -> Opti
             User.disabled_at.is_(None),
         )
     )
+    if lock:
+        # Only the entry: it is what revoke() changes. (OF, so the user's row is
+        # not locked too.)
+        query = query.with_for_update(read=True, of=AllowlistEntry)
+    return query
 
 
 def is_allowed(session: OrmSession, provider: object, subject: object) -> bool:
@@ -124,15 +154,56 @@ def allow(
 def revoke(
     session: OrmSession, provider: object, subject: object, now: Optional[datetime] = None
 ) -> bool:
-    """Withdraw an identity's access (ValueError if it is not a valid one).
+    """Withdraw an identity's access and end the sessions it opened (ValueError if
+    it is not a valid identity).
 
     True if an active entry was revoked; False if there was none or it was
-    already revoked (the first revocation time is kept). The row stays.
+    already revoked (the first revocation time is kept, on the entry and on every
+    session). The rows stay.
+
+    Two UPDATEs in the caller's transaction, so both happen or neither:
+
+      1. the entry: revoked_at is set where it is still NULL, in one statement (no
+         read first, so the answer is the number of rows it changed, and two
+         concurrent revocations cannot both say True). It is also the first
+         statement, which makes this a write-first transaction (authn explains why
+         that matters on SQLite) and takes the row lock that login's
+         allowed_user(lock=True) waits on, on PostgreSQL.
+      2. the sessions: those opened through this identity's link and not yet
+         revoked get the same revoked_at. Sessions of the user's other identities
+         are not touched. This runs even when the entry was already revoked, so
+         the post-condition "no live session came through this identity" holds
+         whatever route led to the revocation (it is a no-op in the normal case).
+
+    Idempotent: a second call changes nothing. Re-allowing the identity later
+    (allow) does not undo step 2.
+
+    The caller's ORM objects for the entry are kept in step; sessions are changed
+    with a Core UPDATE, so Session objects already loaded in the caller's
+    transaction are stale until expired (the same as authn's other UPDATEs).
     """
     provider, subject = normalize(provider, subject)
-    entry = _entry(session, provider, subject)
-    if entry is None or entry.revoked_at is not None:
-        return False
-    entry.revoked_at = now if now is not None else utcnow()
-    session.flush()
-    return True
+    at = now if now is not None else utcnow()
+    revoked = session.execute(
+        sa.update(AllowlistEntry)
+        .where(
+            AllowlistEntry.provider == provider,
+            AllowlistEntry.subject == subject,
+            AllowlistEntry.revoked_at.is_(None),
+        )
+        .values(revoked_at=at)
+    )
+    session.execute(
+        sa.update(LoginSession)
+        .where(
+            LoginSession.revoked_at.is_(None),
+            LoginSession.identity_link_id.in_(
+                sa.select(IdentityLink.id).where(
+                    IdentityLink.provider == provider, IdentityLink.subject == subject
+                )
+            ),
+        )
+        .values(revoked_at=at)
+        .execution_options(synchronize_session=False)
+    )
+    return revoked.rowcount == 1

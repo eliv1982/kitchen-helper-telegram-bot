@@ -25,8 +25,8 @@ identity to a different user, or merge two users.
 
 Transactions: none of the functions commits; the caller owns the transaction
 (web.database.WebDatabase.run is one). The writers (begin_oidc_login,
-consume_oidc_login, complete_login, revoke_session) all make a WRITE their first
-statement. On SQLite the engine begins every transaction with a deferred BEGIN
+consume_oidc_login, complete_login, revoke_session, and allowlist.revoke) all make
+a WRITE their first statement. On SQLite the engine begins every transaction with a deferred BEGIN
 (persistence.database), and a transaction that reads first and writes second
 fails at once with "database is locked" (SQLITE_BUSY_SNAPSHOT) when another
 writer committed in between. A transaction that writes first takes the write lock
@@ -44,12 +44,31 @@ created and is NOT maintained here. A "last seen" that is written on each
 request would turn every authenticated request into a writer. The session
 management increment decides whether and how often to touch it.
 
-Revocation of access: allowlist.revoke does not end sessions that exist. So
-authenticate re-checks, on every call, that the user is not disabled and still
-has at least one allowlist entry that is not revoked. (A session records no
-identity it was created through; the schema has no column for it. A user who
-keeps one active entry therefore keeps their sessions when another entry is
-revoked. To cut a user off at once, disable them or revoke every entry.)
+Provenance: a session records the identity link it was opened through
+(sessions.identity_link_id), set by complete_login from the identity it has just
+verified and admitted, and tied by the database to a link of the session's own
+user. authenticate re-checks on every call that THAT identity is still allowed
+(its own allowlist entry is not revoked) and that the user is not disabled. An
+unrelated active identity of the same user authorizes nothing: the session is as
+good as the way in it came through, no better.
+
+Revocation of access: allowlist.revoke ends an identity's authorization and the
+sessions it opened in one transaction, and a revoked session stays revoked when
+the identity is allowed again (a person signs in again and gets a new session).
+authenticate also reads the entry on every call, so a revocation is enforced the
+moment it commits even if the sessions were not marked. A session without
+provenance (one that predates the column; migration 0002 revokes them all) never
+authenticates, whatever its revoked_at says.
+
+Concurrent login and revocation: a login creates a session only after
+allowed_user(lock=True) has said yes. On SQLite the login's first statement is a
+write, so it and a revoke (also write-first) run one after the other, and the
+later one sees what the earlier committed: a revoke after a login ends the
+session; a login after a revoke is refused. On PostgreSQL the same order comes
+from the shared row lock on the allowlist entry that lock=True takes: a revoke
+waits for a login that has read "allowed" and then ends its session, and a login
+that comes after a revoke is refused. Either way no session of a revoked identity
+is left unrevoked by a revocation that has committed.
 """
 
 import hashlib
@@ -228,7 +247,8 @@ def complete_login(
     module docstring: roll back when it does). On success: the identity link is
     created if this is the identity's first login (from the allowlist entry that
     exists for it, for the user that entry names), its last_login_at is set, and
-    a session is created with a fresh random token.
+    a session is created with a fresh random token and the link it was opened
+    through (the identity just verified, never another one of the user's).
     """
     try:
         provider, subject = normalize_identity(provider, subject)
@@ -244,26 +264,25 @@ def complete_login(
         .values(last_login_at=now)
         .execution_options(synchronize_session=False)
     )
-    user = allowed_user(session, provider, subject)
+    user = allowed_user(session, provider, subject, lock=True)
     if user is None:
         raise LoginDenied
 
-    link_owner = _link_owner(session, provider, subject)
-    if link_owner is None:
+    link = _link(session, provider, subject)
+    if link is None:
         try:
             with session.begin_nested():
-                session.add(
-                    models.IdentityLink(
-                        user_id=user.id, provider=provider, subject=subject, last_login_at=now
-                    )
+                created = models.IdentityLink(
+                    user_id=user.id, provider=provider, subject=subject, last_login_at=now
                 )
+                session.add(created)
                 session.flush()
-            link_owner = user.id
+            link = _Link(id=created.id, user_id=user.id)
         except IntegrityError:
             # Another login created it between our look and our insert (possible
             # on PostgreSQL only). The savepoint is rolled back; it is theirs now.
-            link_owner = _link_owner(session, provider, subject)
-    if link_owner != user.id:
+            link = _link(session, provider, subject)
+    if link is None or link.user_id != user.id:
         # Never true for a link that exists: the composite foreign key ties a link
         # to the user of its allowlist entry. Refused anyway (and for a link that
         # still cannot be found), because the alternative is to sign in as
@@ -273,6 +292,7 @@ def complete_login(
     token = new_secret()
     row = models.Session(
         user_id=user.id,
+        identity_link_id=link.id,
         token_hash=hash_secret(token),
         created_at=now,
         last_seen_at=now,
@@ -283,12 +303,19 @@ def complete_login(
     return IssuedSession(token=token, user_id=user.id, session_id=row.id, expires_at=row.expires_at)
 
 
-def _link_owner(session: OrmSession, provider: str, subject: str) -> Optional[UUID]:
-    return session.scalar(
-        sa.select(models.IdentityLink.user_id).where(
+@dataclass(frozen=True)
+class _Link:
+    id: UUID
+    user_id: UUID
+
+
+def _link(session: OrmSession, provider: str, subject: str) -> Optional[_Link]:
+    row = session.execute(
+        sa.select(models.IdentityLink.id, models.IdentityLink.user_id).where(
             models.IdentityLink.provider == provider, models.IdentityLink.subject == subject
         )
-    )
+    ).first()
+    return None if row is None else _Link(id=row.id, user_id=row.user_id)
 
 
 # --- sessions ---------------------------------------------------------------------
@@ -300,9 +327,14 @@ def authenticate(
     """The session `token` names, if it is live, else None.
 
     Live: it exists, is not revoked, expires after `now` (at expires_at it is
-    over), its user is not disabled, and the user still has an allowlist entry
-    that is not revoked. Anything else, a malformed token included, is the same
-    None. Reads only; see the module docstring.
+    over), its user is not disabled, it records the identity link it was opened
+    through, and that identity's own allowlist entry is not revoked. No other
+    entry of the user counts. Anything else, a malformed token included, is the
+    same None. Reads only (one statement); see the module docstring.
+
+    The identity is reached through joins that must all match, so a session with
+    no link, or whose link is not of the session's user or has no entry, finds no
+    row at all, whatever its other columns say.
     """
     if not is_session_token(token):
         return None
@@ -313,24 +345,30 @@ def authenticate(
             models.Session.expires_at,
             models.Session.revoked_at,
             models.User.disabled_at,
+            models.AllowlistEntry.revoked_at.label("identity_revoked_at"),
         )
         .select_from(models.Session)
         .join(models.User, models.User.id == models.Session.user_id)
+        .join(
+            models.IdentityLink,
+            sa.and_(
+                models.IdentityLink.id == models.Session.identity_link_id,
+                models.IdentityLink.user_id == models.Session.user_id,
+            ),
+        )
+        .join(
+            models.AllowlistEntry,
+            sa.and_(
+                models.AllowlistEntry.user_id == models.IdentityLink.user_id,
+                models.AllowlistEntry.provider == models.IdentityLink.provider,
+                models.AllowlistEntry.subject == models.IdentityLink.subject,
+            ),
+        )
         .where(models.Session.token_hash == hash_secret(token))
     ).first()
     if row is None or row.revoked_at is not None or row.disabled_at is not None:
         return None
-    if row.expires_at <= now:
-        return None
-    has_access = session.scalar(
-        sa.select(
-            sa.exists().where(
-                models.AllowlistEntry.user_id == row.user_id,
-                models.AllowlistEntry.revoked_at.is_(None),
-            )
-        )
-    )
-    if not has_access:
+    if row.identity_revoked_at is not None or row.expires_at <= now:
         return None
     return AuthenticatedSession(user_id=row.user_id, session_id=row.id, expires_at=row.expires_at)
 

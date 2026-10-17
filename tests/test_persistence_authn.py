@@ -40,7 +40,7 @@ from house_helper.persistence.authn import (
     hash_secret,
     revoke_session,
 )
-from house_helper.persistence.models import IdentityLink, OidcState, Session, User
+from house_helper.persistence.models import AllowlistEntry, IdentityLink, OidcState, Session, User
 from tests.persistence_support import (  # noqa: F401  (fixtures)
     count,
     engine,
@@ -226,6 +226,7 @@ def test_the_first_login_creates_the_identity_link_and_a_session(session, user):
     assert link.last_login_at == NOW and link.email is None
     stored = session.scalars(sa.select(Session)).one()
     assert (stored.id, stored.user_id) == (issued.session_id, user.id)
+    assert stored.identity_link_id == link.id  # the identity that was verified
     assert stored.created_at == stored.last_seen_at == NOW
     assert stored.expires_at == NOW + authn.SESSION_LIFETIME and stored.revoked_at is None
 
@@ -359,7 +360,7 @@ def test_an_identity_is_never_matched_by_a_display_name_or_a_lookalike(session, 
 
 def test_a_link_that_somehow_belongs_to_another_user_is_refused(session, user, monkeypatch):
     other = new_user(session, display_name="Somebody else")
-    monkeypatch.setattr(authn, "_link_owner", lambda *args: other.id)
+    monkeypatch.setattr(authn, "_link", lambda *args: authn._Link(id=other.id, user_id=other.id))
 
     with pytest.raises(LoginDenied):
         log_in(session)
@@ -373,27 +374,30 @@ def test_losing_the_race_to_create_the_link_uses_the_winners_link(session, user,
     # concurrent login committed. Reproduced by hiding the existing link once.
     log_in(session)
     session.commit()
-    real = authn._link_owner
+    real = authn._link
     looks = []
 
     def blind_the_first_time(db, provider, subject):
         looks.append(1)
         return None if len(looks) == 1 else real(db, provider, subject)
 
-    monkeypatch.setattr(authn, "_link_owner", blind_the_first_time)
+    monkeypatch.setattr(authn, "_link", blind_the_first_time)
 
     issued = log_in(session, now=NOW + timedelta(hours=1))
     session.commit()
 
     assert issued.user_id == user.id and len(looks) == 2
     assert count(session, IdentityLink) == 1 and count(session, Session) == 2
+    # and the session is tied to the winner's link, the only one there is
+    link_id = session.scalars(sa.select(IdentityLink.id)).one()
+    assert set(session.scalars(sa.select(Session.identity_link_id))) == {link_id}
 
 
 def test_losing_the_race_and_finding_no_link_afterwards_is_a_denial(session, user, monkeypatch):
     def refuse(*args):
         raise sa.exc.IntegrityError("INSERT", {}, Exception("unique"))
 
-    monkeypatch.setattr(authn, "_link_owner", lambda *args: None)
+    monkeypatch.setattr(authn, "_link", lambda *args: None)
     monkeypatch.setattr(session, "add", refuse)
 
     with pytest.raises(LoginDenied):
@@ -468,32 +472,6 @@ def test_withdrawing_access_ends_the_sessions_at_once(session, issued):
     assert authenticate(session, issued.token, now=NOW + timedelta(minutes=2)) is None
 
 
-def test_lifting_a_revocation_restores_the_session_that_never_expired(session, user, issued):
-    revoke(session, "telegram", SUB, now=NOW)
-    session.commit()
-    assert authenticate(session, issued.token, now=NOW) is None
-
-    allow(session, user, "telegram", SUB)
-    session.commit()
-
-    assert authenticate(session, issued.token, now=NOW) is not None
-
-
-def test_a_session_survives_while_the_user_keeps_another_active_identity(session, user, issued):
-    # A session records no identity it came through (the schema has no column for
-    # it), so access is "the user has some entry that is not revoked". Pinned so
-    # that changing it is a decision.
-    allow(session, user, "email", "elena@example.com")
-    session.commit()
-    revoke(session, "telegram", SUB, now=NOW)
-    session.commit()
-    assert authenticate(session, issued.token, now=NOW) is not None
-
-    revoke(session, "email", "elena@example.com", now=NOW)
-    session.commit()
-    assert authenticate(session, issued.token, now=NOW) is None
-
-
 def test_a_session_never_resolves_to_a_different_user(session, user, issued):
     other = new_user(session)
     allow(session, other, "telegram", "777")
@@ -512,6 +490,265 @@ def test_validating_a_session_only_reads(engine, factory, user, issued):
             assert not (reader.new or reader.dirty or reader.deleted)
 
     assert seen and all(statement.lstrip().upper().startswith("SELECT") for statement in seen), seen
+
+
+# --- provenance: a session is as good as the identity it came through ---------------
+
+EMAIL = "elena@example.com"
+
+
+@pytest.fixture
+def two_identities(session, user):
+    """Elena can sign in through Telegram (A) and by email (B), and has one live
+    session opened through each. Returns (user, session through A, session through B)."""
+    allow(session, user, "email", EMAIL)
+    session.commit()
+    through_a = complete_login(session, "telegram", SUB, now=NOW)
+    through_b = complete_login(session, "email", EMAIL, now=NOW)
+    session.commit()
+    return user, through_a, through_b
+
+
+def stored_session(session, issued) -> Session:
+    session.expire_all()  # the revocations are Core UPDATEs
+    return session.get(Session, issued.session_id)
+
+
+def link_id(session, provider) -> UUID:
+    return session.scalar(sa.select(IdentityLink.id).where(IdentityLink.provider == provider))
+
+
+def revoked_ats(session) -> dict:
+    session.expire_all()
+    return {row.id: row.revoked_at for row in session.scalars(sa.select(Session))}
+
+
+def test_each_session_records_the_identity_it_was_opened_through(session, two_identities):
+    _, through_a, through_b = two_identities
+
+    assert stored_session(session, through_a).identity_link_id == link_id(session, "telegram")
+    assert stored_session(session, through_b).identity_link_id == link_id(session, "email")
+    assert link_id(session, "telegram") != link_id(session, "email")
+
+
+def test_revoking_one_identity_ends_only_the_sessions_it_opened(session, two_identities):
+    user, through_a, through_b = two_identities
+    second_through_a = complete_login(session, "telegram", SUB, now=NOW + timedelta(minutes=5))
+    session.commit()
+    later = NOW + timedelta(hours=1)
+
+    assert revoke(session, "telegram", SUB, now=later) is True
+    session.commit()
+
+    assert authenticate(session, through_a.token, now=later) is None
+    assert authenticate(session, second_through_a.token, now=later) is None
+    assert authenticate(session, through_b.token, now=later).user_id == user.id  # B is still allowed
+    assert revoked_ats(session) == {
+        through_a.session_id: later,
+        second_through_a.session_id: later,
+        through_b.session_id: None,
+    }
+
+    assert revoke(session, "email", EMAIL, now=later + timedelta(minutes=1)) is True
+    session.commit()
+    assert authenticate(session, through_b.token, now=later) is None
+
+
+def test_an_unrelated_active_identity_does_not_authorize_a_session(session, two_identities):
+    # Whatever revoked A, B being allowed does not keep A's session alive. Here A's
+    # entry is withdrawn by a plain UPDATE (not through revoke()), so the check that
+    # answers is authenticate's own, not the session's revoked_at.
+    _, through_a, through_b = two_identities
+
+    session.execute(
+        sa.update(AllowlistEntry)
+        .where(AllowlistEntry.provider == "telegram")
+        .values(revoked_at=NOW + timedelta(minutes=1))
+    )
+    session.commit()
+
+    assert authenticate(session, through_a.token, now=NOW + timedelta(minutes=2)) is None
+    assert authenticate(session, through_b.token, now=NOW + timedelta(minutes=2)) is not None
+
+
+def test_a_direct_update_revokes_only_for_as_long_as_it_lasts(session, user, issued):
+    # The boundary of what is supported: clearing a revocation that was written by
+    # a plain UPDATE revives the session, because nothing marked it revoked. Only
+    # revoke() does that (the next two tests).
+    session.execute(sa.update(AllowlistEntry).values(revoked_at=NOW))
+    session.commit()
+    assert authenticate(session, issued.token, now=NOW) is None
+
+    session.execute(sa.update(AllowlistEntry).values(revoked_at=None))
+    session.commit()
+
+    assert authenticate(session, issued.token, now=NOW) is not None
+
+
+def test_re_allowing_an_identity_does_not_restore_the_sessions_revoked_through_it(
+    session, user, issued
+):
+    revoke(session, "telegram", SUB, now=NOW)
+    session.commit()
+
+    allow(session, user, "telegram", SUB)  # lifts the revocation of the entry
+    session.commit()
+
+    assert authenticate(session, issued.token, now=NOW) is None
+    assert stored_session(session, issued).revoked_at == NOW  # still revoked, as a row
+
+
+def test_a_fresh_login_after_re_authorization_opens_a_new_working_session(session, user, issued):
+    revoke(session, "telegram", SUB, now=NOW)
+    session.commit()
+    with pytest.raises(LoginDenied):
+        log_in(session, now=NOW + timedelta(minutes=1))  # not while it is revoked
+    session.rollback()
+
+    allow(session, user, "telegram", SUB)
+    again = log_in(session, now=NOW + timedelta(minutes=2))
+    session.commit()
+
+    assert authenticate(session, again.token, now=NOW + timedelta(minutes=3)).user_id == user.id
+    assert authenticate(session, issued.token, now=NOW + timedelta(minutes=3)) is None
+    assert count(session, IdentityLink) == 1  # the same link, which sessions are tied to
+    assert stored_session(session, again).identity_link_id == link_id(session, "telegram")
+
+
+def test_revoking_an_identity_twice_changes_nothing_the_second_time(session, user, issued):
+    assert revoke(session, "telegram", SUB, now=NOW + timedelta(hours=1)) is True
+    assert revoke(session, "telegram", SUB, now=NOW + timedelta(hours=2)) is False
+    assert revoke(session, "telegram", SUB, now=NOW + timedelta(hours=3)) is False
+    session.commit()
+
+    assert stored_session(session, issued).revoked_at == NOW + timedelta(hours=1)
+    assert session.scalar(sa.select(AllowlistEntry.revoked_at)) == NOW + timedelta(hours=1)
+    assert count(session, Session) == 1
+
+
+def test_revoking_an_identity_ends_its_sessions_even_if_the_entry_was_revoked_another_way(
+    session, user, issued
+):
+    session.execute(sa.update(AllowlistEntry).values(revoked_at=NOW))
+    session.commit()
+
+    assert revoke(session, "telegram", SUB, now=NOW + timedelta(hours=1)) is False  # nothing to revoke
+    session.commit()
+    allow(session, user, "telegram", SUB)
+    session.commit()
+
+    assert stored_session(session, issued).revoked_at == NOW + timedelta(hours=1)
+    assert authenticate(session, issued.token, now=NOW) is None
+
+
+def test_revoking_an_identity_leaves_other_users_alone(session, user, issued):
+    other = new_user(session)
+    allow(session, other, "telegram", "777")
+    theirs = log_in(session, "777")
+    session.commit()
+
+    revoke(session, "telegram", SUB, now=NOW)
+    session.commit()
+
+    assert authenticate(session, theirs.token, now=NOW).user_id == other.id
+    assert stored_session(session, theirs).revoked_at is None
+
+
+def test_revoking_an_identity_that_never_signed_in_touches_only_its_entry(session, user, issued):
+    allow(session, user, "telegram", "555")  # listed, no link, no session
+    session.commit()
+
+    assert revoke(session, "telegram", "555", now=NOW) is True
+    session.commit()
+
+    assert authenticate(session, issued.token, now=NOW) is not None
+    assert stored_session(session, issued).revoked_at is None
+
+
+def test_a_session_without_provenance_never_authenticates(session, user, issued):
+    # The CHECK makes such a row impossible unless revoked; switch it off to prove
+    # that authenticate would refuse the row on its own.
+    token = authn.new_secret()
+    connection = session.connection()
+    connection.exec_driver_sql("PRAGMA ignore_check_constraints=ON")
+    try:
+        session.execute(
+            sa.insert(Session).values(
+                id=UUID(int=7),
+                user_id=user.id,
+                identity_link_id=None,
+                token_hash=hash_secret(token),
+                created_at=NOW,
+                last_seen_at=NOW,
+                expires_at=NOW + timedelta(days=1),
+                revoked_at=None,
+            )
+        )
+    finally:
+        connection.exec_driver_sql("PRAGMA ignore_check_constraints=OFF")
+    session.commit()
+
+    assert authenticate(session, token, now=NOW) is None
+    assert authenticate(session, issued.token, now=NOW) is not None  # the guard is not blanket
+
+
+def test_a_revocation_that_fails_midway_leaves_nothing_behind(factory, user, issued, monkeypatch):
+    with factory() as db:
+        calls = []
+        real = db.execute
+
+        def fail_on_the_sessions_update(statement, *args, **kwargs):
+            calls.append(statement)
+            if len(calls) == 2:  # the entry has been revoked by now
+                raise RuntimeError("boom")
+            return real(statement, *args, **kwargs)
+
+        monkeypatch.setattr(db, "execute", fail_on_the_sessions_update)
+        with pytest.raises(RuntimeError, match="boom"):
+            with db.begin():
+                revoke(db, "telegram", SUB, now=NOW)
+        assert len(calls) == 2
+
+    with factory() as db:
+        assert db.scalar(sa.select(AllowlistEntry.revoked_at)) is None
+        assert db.scalar(sa.select(Session.revoked_at)) is None
+        assert authenticate(db, issued.token, now=NOW) is not None
+
+
+def test_a_login_that_fails_after_its_session_was_written_leaves_nothing_behind(factory, user):
+    with factory() as db:
+        with pytest.raises(RuntimeError, match="boom"):
+            with db.begin():
+                log_in(db)
+                raise RuntimeError("boom")
+
+    with factory() as db:
+        assert count(db, Session) == 0 and count(db, IdentityLink) == 0
+
+
+def test_a_login_locks_the_entry_it_relies_on_where_the_database_has_row_locks(
+    session, user, monkeypatch
+):
+    from sqlalchemy.dialects import postgresql, sqlite
+
+    from house_helper.persistence.allowlist import _allowed_user_query
+
+    locked, plain = _allowed_user_query("telegram", SUB, True), _allowed_user_query("telegram", SUB, False)
+
+    assert "FOR SHARE OF allowlist_entries" in str(locked.compile(dialect=postgresql.dialect()))
+    assert "FOR" not in str(plain.compile(dialect=postgresql.dialect()))
+    assert "FOR" not in str(locked.compile(dialect=sqlite.dialect()))  # SQLite has no row locks
+
+    # and the login is what asks for it
+    asked, real = [], authn.allowed_user
+
+    def spy(*args, **kwargs):
+        asked.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(authn, "allowed_user", spy)
+    log_in(session)
+    assert asked == [{"lock": True}]
 
 
 # --- revoke_session ---------------------------------------------------------------
@@ -556,6 +793,7 @@ def first_statement(engine, factory, action) -> str:
         ("consume a live state", lambda s: consume_oidc_login(s, "telegram", "state-value", now=NOW)),
         ("consume an unknown state", lambda s: consume_oidc_login(s, "telegram", "nope", now=NOW)),
         ("log in", lambda s: log_in(s)),
+        ("revoke an identity", lambda s: revoke(s, "telegram", SUB, now=NOW)),
     ],
 )
 def test_the_writers_start_with_a_write(engine, factory, user, name, action):
@@ -668,3 +906,119 @@ def test_revocations_racing_validations_never_error_and_end_revoked(factory, use
     assert sum(result is True for result in results) == 1  # exactly one revocation took
     with factory() as db:
         assert authenticate(db, issued.token, now=NOW) is None
+
+
+# --- a login and the revocation of its identity, at the same time -------------------
+#
+# Whoever comes second must see what the first committed. The two orders are shown
+# one at a time, with the first transaction held open while the second starts (it
+# waits for the write lock), and then raced.
+
+
+def in_a_thread(work):
+    """Run `work()` in a thread; returns a function that waits for it and returns
+    its result or raises its exception."""
+    outcome = {}
+
+    def target():
+        try:
+            outcome["result"] = work()
+        except BaseException as exc:  # handed to whoever joins
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+
+    def join():
+        thread.join(timeout=30)
+        assert not thread.is_alive(), "a transaction is stuck"
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["result"]
+
+    return join
+
+
+def test_a_revocation_that_arrives_during_a_login_ends_the_session_that_login_creates(
+    factory, user
+):
+    inside, release = threading.Event(), threading.Event()
+
+    def login_and_wait():
+        with factory() as db, db.begin():
+            issued = log_in(db)
+            inside.set()  # the session is written, the transaction is open
+            assert release.wait(timeout=30)
+            return issued
+
+    def revoke_it():
+        with factory() as db, db.begin():
+            return revoke(db, "telegram", SUB, now=NOW + timedelta(minutes=1))
+
+    login = in_a_thread(login_and_wait)
+    assert inside.wait(timeout=30)
+    revocation = in_a_thread(revoke_it)
+    time.sleep(0.3)  # let the revocation reach the write lock the login holds
+    release.set()
+    issued, revoked = login(), revocation()
+
+    assert revoked is True
+    with factory() as db:
+        assert authenticate(db, issued.token, now=NOW) is None
+        assert db.scalar(sa.select(Session.revoked_at)) == NOW + timedelta(minutes=1)
+    with factory() as db, db.begin():
+        allow(db, db.get(User, issued.user_id), "telegram", SUB)
+    with factory() as db:
+        assert authenticate(db, issued.token, now=NOW) is None  # and not by re-allowing
+
+
+def test_a_login_that_arrives_during_a_revocation_is_refused(factory, user):
+    inside, release = threading.Event(), threading.Event()
+
+    def revoke_and_wait():
+        with factory() as db, db.begin():
+            revoked = revoke(db, "telegram", SUB, now=NOW)
+            inside.set()
+            assert release.wait(timeout=30)
+            return revoked
+
+    def login_it():
+        with factory() as db, db.begin():
+            return log_in(db)
+
+    revocation = in_a_thread(revoke_and_wait)
+    assert inside.wait(timeout=30)
+    login = in_a_thread(login_it)
+    time.sleep(0.3)
+    release.set()
+
+    assert revocation() is True
+    with pytest.raises(LoginDenied):
+        login()
+    with factory() as db:
+        assert count(db, Session) == 0
+
+
+def test_logins_racing_a_revocation_never_leave_a_session_alive_or_revivable(
+    factory, user, slow_allowlist_reads
+):
+    logins = 5
+    for round_ in range(4):
+        roles = itertools.count()  # next() on a count is atomic
+
+        def login_or_revoke(db):
+            if next(roles) == 0:
+                return revoke(db, "telegram", SUB, now=NOW + timedelta(minutes=round_))
+            return log_in(db, now=NOW + timedelta(minutes=round_))
+
+        results, errors = run_concurrently(factory, logins + 1, login_or_revoke)
+
+        assert all(isinstance(error, LoginDenied) for error in errors), errors
+        assert True in results  # the revocation took
+        tokens = [r.token for r in results if isinstance(r, IssuedSession)]
+        with factory() as db, db.begin():
+            # nothing that came through the identity is left unrevoked...
+            assert db.scalar(sa.select(sa.func.count()).where(Session.revoked_at.is_(None))) == 0
+            allow(db, db.get(User, user.id), "telegram", SUB)  # ...so re-allowing revives none
+        with factory() as db:
+            assert [authenticate(db, token, now=NOW) for token in tokens] == [None] * len(tokens)
