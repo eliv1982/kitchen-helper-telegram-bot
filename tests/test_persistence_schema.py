@@ -21,6 +21,7 @@ TABLES = {
     "identity_links",
     "sessions",
     "oidc_states",
+    "email_login_challenges",
     "conversations",
     "messages",
     "turn_requests",
@@ -29,7 +30,7 @@ TABLES = {
 POSTGRESQL_IDENTIFIER_LIMIT = 63
 
 
-def test_the_schema_has_exactly_the_eight_foundation_tables():
+def test_the_schema_has_exactly_the_nine_tables():
     assert set(Base.metadata.tables) == TABLES
 
 
@@ -134,29 +135,36 @@ def _functions_in(texts) -> set[str]:
 
 
 # What both databases run with the same meaning. Everything else in a CHECK is a
-# comparison, AND/OR/IN/BETWEEN/IS NULL, or one of the two constructs below.
+# comparison, AND/OR/IN/BETWEEN/IS NULL, or one of the constructs below.
 PORTABLE_FUNCTIONS = {"length", "lower", "replace", "substr"}
 # Used only in the SQLite spelling of the 365-day ceiling and of printable ASCII
 # (house_helper.persistence.sqlchecks). PostgreSQL has operators for both, and
 # its text columns cannot hold a BLOB, so it has no use for typeof().
 SQLITE_ONLY_FUNCTIONS = {"datetime", "coalesce", "cast", "typeof"}
+# The position of the "@" in an email subject: instr() in SQLite, strpos() in
+# PostgreSQL, each database having only its own (sqlchecks.EmailSubjectNormalized).
+POSITION_FUNCTIONS = {"instr": "sqlite", "strpos": "postgresql"}
 
 
-def test_the_check_constraints_use_only_functions_both_databases_have_apart_from_two_constructs():
+def test_the_check_constraints_use_only_functions_both_databases_have_apart_from_three_constructs():
     postgres = _functions_in(_check_texts(postgresql.dialect()).values())
     lite = _functions_in(_check_texts(sqlite.dialect()).values())
 
-    assert postgres <= PORTABLE_FUNCTIONS  # PostgreSQL's spellings need no special function
-    assert lite <= PORTABLE_FUNCTIONS | SQLITE_ONLY_FUNCTIONS
+    assert postgres <= PORTABLE_FUNCTIONS | {"strpos"}  # PostgreSQL's spellings need no special function
+    assert lite <= PORTABLE_FUNCTIONS | SQLITE_ONLY_FUNCTIONS | {"instr"}
     assert lite & SQLITE_ONLY_FUNCTIONS == SQLITE_ONLY_FUNCTIONS  # and the allowance is all used
+    assert "strpos" in postgres and "strpos" not in lite
+    assert "instr" in lite and "instr" not in postgres
 
 
-def test_only_the_two_dialect_specific_rules_are_spelled_differently_per_database():
+def test_only_the_dialect_specific_rules_are_spelled_differently_per_database():
     postgres, lite = _check_texts(postgresql.dialect()), _check_texts(sqlite.dialect())
 
     differing = {name for name in postgres if postgres[name] != lite[name]}
 
     assert differing == {
+        "ck_allowlist_entries_email_subject_normalized",
+        "ck_identity_links_email_subject_normalized",
         "ck_allowlist_entries_subject_printable_ascii",
         "ck_identity_links_subject_printable_ascii",
         "ck_identity_links_email_printable_ascii",
@@ -188,6 +196,13 @@ def test_the_two_spellings_of_the_dialect_specific_rules_say_what_they_should():
     assert postgres[key] == "idempotency_key ~ '^[!-~]+$'"
     assert "NOT GLOB '*[^!-~]*'" in lite[key]
     assert "CAST(idempotency_key AS BLOB)" in lite[key]
+    # The email rule: a lower-case domain, a local part that is free (only the
+    # position of the "@" is spelled per database).
+    rule = "ck_allowlist_entries_email_subject_normalized"
+    for position, text in (("strpos", postgres[rule]), ("instr", lite[rule])):
+        domain = f"substr(subject, {position}(subject, '@'))"
+        assert f"{domain} = lower({domain})" in text
+        assert "subject = lower(subject)" not in text  # that was the whole address
 
 
 def test_every_check_prints_with_the_default_dialect():

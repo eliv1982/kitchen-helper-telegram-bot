@@ -7,8 +7,11 @@ entry that belongs to the user (AllowlistEntry.user_id), keyed by
 
   telegram  the `sub` of Telegram's OIDC ID token, compared exactly. Never a
             username: usernames can be changed and taken over.
-  email     a verified address, trimmed and lower-cased. Nothing more is folded
-            together: "cook+tag@example.com" and "cook@example.com" are
+  email     a verified address, trimmed, with its DOMAIN lower-cased and its local
+            part exactly as the administrator approved it: "Cook@example.com" and
+            "cook@example.com" may be two mailboxes (RFC 5321), so they are two
+            entries, and approving one never approves the other. Nothing more is
+            folded together: "cook+tag@example.com" and "cook@example.com" are
             different entries, because treating aliases as one would let anyone
             who can create an alias walk in.
 
@@ -34,10 +37,11 @@ revocation clears it on the same row.
 Revoking an identity ends the sessions it opened, in the same transaction (see
 revoke): a session records the identity link it came through, so the revocation
 is exactly as wide as the identity, no wider (the user's other identities, and the
-sessions they opened, are untouched) and no narrower. Lifting a revocation
-(allow) does NOT bring those sessions back: they were revoked, as rows, and
-stay so. A person who signs in again through the re-allowed identity gets a new
-session. This holds for the functions of this module. A direct SQL UPDATE of
+sessions they opened, are untouched) and no narrower. It also withdraws the
+emailed sign-in links that were issued for the identity and not yet used. Lifting
+a revocation (allow) does NOT bring those sessions or links back: they were
+revoked, as rows, and stay so. A person who signs in again through the re-allowed
+identity gets a new session (by a new link, for an email identity). This holds for the functions of this module. A direct SQL UPDATE of
 allowlist_entries.revoked_at is not supported and cannot be assumed to do any of
 it: the database has no trigger to end the sessions, so such a revocation is only
 enforced while it lasts (authn.authenticate reads the entry on every request), and
@@ -54,7 +58,7 @@ from sqlalchemy.orm import Session as OrmSession
 
 from house_helper.persistence.base import utcnow
 from house_helper.persistence.identifiers import MAX_SUBJECT_LENGTH, normalize_identity
-from house_helper.persistence.models import AllowlistEntry, IdentityLink, User
+from house_helper.persistence.models import AllowlistEntry, EmailLoginChallenge, IdentityLink, User
 from house_helper.persistence.models import Session as LoginSession
 
 __all__ = ["MAX_SUBJECT_LENGTH", "allow", "allowed_user", "is_allowed", "normalize", "revoke"]
@@ -71,31 +75,44 @@ def _entry(session: OrmSession, provider: str, subject: str) -> Optional[Allowli
 
 
 def allowed_user(
-    session: OrmSession, provider: object, subject: object, *, lock: bool = False
+    session: OrmSession,
+    provider: object,
+    subject: object,
+    *,
+    lock: bool = False,
+    exclusive: bool = False,
 ) -> Optional[User]:
     """The user this identity may sign in as, or None.
 
     None unless there is an entry for exactly this (provider, subject), it is not
     revoked, and its user is not disabled.
 
-    lock=True is for the one caller that creates something on the strength of the
-    answer, a login. On PostgreSQL it takes a shared row lock on the entry until
-    the end of the transaction (FOR SHARE), which makes a concurrent revoke() wait
-    for the login to commit, and then end the session it created; or, if the revoke
-    came first, makes the login see the revocation and be refused. Without it a
-    login could read "allowed", the revocation could commit, and the login could
-    then commit a live session that nobody revokes. SQLite has one writer at a time
-    and ignores the clause (SQLAlchemy leaves it out): the write that a login
-    starts with already serializes it against revoke().
+    lock=True is for the callers that create something on the strength of the
+    answer: a login, and the issuing of an emailed sign-in link. On PostgreSQL it
+    takes a shared row lock on the entry until the end of the transaction (FOR
+    SHARE), which makes a concurrent revoke() wait for the login to commit, and then
+    end the session it created; or, if the revoke came first, makes the login see
+    the revocation and be refused. Without it a login could read "allowed", the
+    revocation could commit, and the login could then commit a live session that
+    nobody revokes. SQLite has one writer at a time and ignores the clause
+    (SQLAlchemy leaves it out): the write that a login starts with already
+    serializes it against revoke().
+
+    exclusive=True (with lock=True) takes the lock FOR UPDATE instead: for the one
+    caller that must also be the only one deciding something about the identity at
+    a time, issuing a link (the cooldown between two of them is a decision that two
+    concurrent requests would otherwise both make).
     """
     try:
         provider, subject = normalize(provider, subject)
     except ValueError:
         return None
-    return session.scalar(_allowed_user_query(provider, subject, lock))
+    return session.scalar(_allowed_user_query(provider, subject, lock, exclusive))
 
 
-def _allowed_user_query(provider: str, subject: str, lock: bool) -> sa.Select:
+def _allowed_user_query(
+    provider: str, subject: str, lock: bool, exclusive: bool = False
+) -> sa.Select:
     query = (
         sa.select(User)
         .join(AllowlistEntry, AllowlistEntry.user_id == User.id)
@@ -109,7 +126,7 @@ def _allowed_user_query(provider: str, subject: str, lock: bool) -> sa.Select:
     if lock:
         # Only the entry: it is what revoke() changes. (OF, so the user's row is
         # not locked too.)
-        query = query.with_for_update(read=True, of=AllowlistEntry)
+        query = query.with_for_update(read=not exclusive, of=AllowlistEntry)
     return query
 
 
@@ -133,6 +150,13 @@ def allow(
     why) replaces the stored note when given. An identity that is on the list for
     a different user is refused (ValueError): an identity is never moved from one
     user to another by asking for it again.
+
+    This is also how an email entry that migration 0004 revoked is re-verified: it
+    was stored lower-cased by the code before, so its spelling may not be the mailbox
+    that was meant, and nothing but an administrator naming the address as it really
+    is can say so. The same spelling lifts the revocation on that row (the sessions
+    and links revoked with it stay revoked); another spelling is a different identity
+    and a new entry, and the old one stays revoked.
     """
     provider, subject = normalize(provider, subject)
     if user.id is None:  # a user that is still pending gets its id on flush
@@ -154,14 +178,14 @@ def allow(
 def revoke(
     session: OrmSession, provider: object, subject: object, now: Optional[datetime] = None
 ) -> bool:
-    """Withdraw an identity's access and end the sessions it opened (ValueError if
-    it is not a valid identity).
+    """Withdraw an identity's access, end the sessions it opened and withdraw the
+    sign-in links emailed for it (ValueError if it is not a valid identity).
 
     True if an active entry was revoked; False if there was none or it was
     already revoked (the first revocation time is kept, on the entry and on every
     session). The rows stay.
 
-    Two UPDATEs in the caller's transaction, so both happen or neither:
+    Three UPDATEs in the caller's transaction, so all happen or none:
 
       1. the entry: revoked_at is set where it is still NULL, in one statement (no
          read first, so the answer is the number of rows it changed, and two
@@ -174,13 +198,21 @@ def revoke(
          are not touched. This runs even when the entry was already revoked, so
          the post-condition "no live session came through this identity" holds
          whatever route led to the revocation (it is a no-op in the normal case).
+      3. the emailed sign-in links not yet used: those issued for this identity
+         (email only) and neither used nor withdrawn get the same revoked_at. A
+         link that was sent but not opened is a sign-in that has not happened yet,
+         and it must not come back to life when the address is allowed again, any
+         more than a revoked session does. It runs after step 1, so that it also
+         sees a link that a concurrent request was issuing while the entry was
+         locked (issuing takes the entry's row lock first: see email_login).
 
     Idempotent: a second call changes nothing. Re-allowing the identity later
-    (allow) does not undo step 2.
+    (allow) does not undo steps 2 and 3.
 
-    The caller's ORM objects for the entry are kept in step; sessions are changed
-    with a Core UPDATE, so Session objects already loaded in the caller's
-    transaction are stale until expired (the same as authn's other UPDATEs).
+    The caller's ORM objects for the entry are kept in step; sessions and
+    challenges are changed with a Core UPDATE, so objects already loaded in the
+    caller's transaction are stale until expired (the same as authn's other
+    UPDATEs).
     """
     provider, subject = normalize(provider, subject)
     at = now if now is not None else utcnow()
@@ -202,6 +234,17 @@ def revoke(
                     IdentityLink.provider == provider, IdentityLink.subject == subject
                 )
             ),
+        )
+        .values(revoked_at=at)
+        .execution_options(synchronize_session=False)
+    )
+    session.execute(
+        sa.update(EmailLoginChallenge)
+        .where(
+            EmailLoginChallenge.provider == provider,
+            EmailLoginChallenge.subject == subject,
+            EmailLoginChallenge.revoked_at.is_(None),
+            EmailLoginChallenge.consumed_at.is_(None),
         )
         .values(revoked_at=at)
         .execution_options(synchronize_session=False)

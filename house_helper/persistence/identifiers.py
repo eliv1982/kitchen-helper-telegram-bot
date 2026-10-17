@@ -18,8 +18,8 @@ is deliberate and strict:
   * it keeps look-alikes out (zero-width characters, a no-break space, Cyrillic
     letters that look Latin, and "K" the Kelvin sign, which str.lower() turns
     into an ASCII "k": an address containing it would otherwise normalize to an
-    allowlisted one), so the text is checked for ASCII *before* it is
-    lower-cased;
+    allowlisted one), so the text is checked for ASCII *before* the domain of an
+    email is lower-cased;
   * the database can say the same thing in both of its dialects, which it
     cannot for Unicode categories.
 
@@ -50,6 +50,36 @@ def is_printable_ascii(text: object) -> bool:
     return isinstance(text, str) and _PRINTABLE_ASCII.fullmatch(text) is not None
 
 
+# What may go into an SMTP envelope and a To/From header without any quoting or
+# escaping, narrower than what normalize_identity accepts (and than RFC 5322): a
+# dot-separated local part of letters (either case: the local part is kept exactly as
+# the administrator approved it), digits and "_", "+", "-", and a domain of at least
+# two lower-case hostname labels (normalize_identity lower-cases the domain, and only
+# the domain). Whatever else the allowlist may hold (a quote, an angle bracket, a
+# comma, "%", "!", ...) is an address no email is ever sent to, so that an entry can
+# never inject a recipient or a header. An address that is refused here is not a
+# failure of the allowlist, only of delivery.
+_MAILABLE_LOCAL = r"[A-Za-z0-9_+-]+(?:\.[A-Za-z0-9_+-]+)*"
+_MAILABLE_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+_MAILABLE = re.compile(rf"({_MAILABLE_LOCAL})@({_MAILABLE_LABEL}(?:\.{_MAILABLE_LABEL})+)")
+MAX_MAILABLE_LOCAL_LENGTH: Final = 64
+MAX_MAILABLE_DOMAIN_LENGTH: Final = 253
+
+
+def is_mailable_address(address: object) -> bool:
+    """True if `address` is a normalized email (domain lower-case, local part as
+    approved) that may be mailed to as it stands. See the comment above for what
+    that excludes."""
+    if not isinstance(address, str):
+        return False
+    found = _MAILABLE.fullmatch(address)
+    return (
+        found is not None
+        and len(found.group(1)) <= MAX_MAILABLE_LOCAL_LENGTH
+        and len(found.group(2)) <= MAX_MAILABLE_DOMAIN_LENGTH
+    )
+
+
 def validate_idempotency_key(key: object) -> str:
     """The key itself, or ValueError. Chosen by the client, so nothing about it
     is trusted: 1 to 128 printable ASCII characters."""
@@ -70,11 +100,18 @@ def normalize_identity(provider: object, subject: object) -> tuple[str, str]:
               Telegram's documentation shows a 19-digit numeric string but does
               not promise the format, so any printable ASCII is accepted, minus
               "@" so that it can never be mistaken for an address or a handle.
-    email     a verified address: surrounding ASCII whitespace removed,
-              lower-cased, exactly one "@" with something on both sides. Nothing
-              more is folded together: "cook+tag@example.com" and
-              "cook@example.com" are different identities, because treating
-              aliases as one would let anyone who can create an alias walk in.
+    email     a verified address: surrounding ASCII whitespace removed, exactly
+              one "@" with something on both sides, and the DOMAIN lower-cased.
+              The local part is kept exactly as given: RFC 5321 makes it the
+              receiving host's to interpret, so "Victim@example.com" and
+              "victim@example.com" may be two mailboxes, and approving one must
+              never approve the other. A domain is case-insensitive (RFC 1035),
+              so "Victim@EXAMPLE.COM" is "Victim@example.com". Nothing more is
+              folded together: no dots or "+tag" removed, no provider-specific
+              alias rules, no Unicode case folding (the text is ASCII by now):
+              "cook+tag@example.com" and "cook@example.com" are different
+              identities, because treating aliases as one would let anyone who
+              can create an alias walk in.
     """
     if isinstance(provider, enum.Enum):  # an AllowlistProvider
         provider = provider.value
@@ -87,10 +124,10 @@ def normalize_identity(provider: object, subject: object) -> tuple[str, str]:
         subject = subject.strip(" \t\n\r\f\v")
         if not is_printable_ascii(subject):  # before lower(): see the module docstring
             raise ValueError("an email address is printable ASCII")
-        subject = subject.lower()
         local, _, domain = subject.partition("@")
         if subject.count("@") != 1 or not local or not domain:
             raise ValueError("not an email address")
+        subject = f"{local}@{domain.lower()}"  # the local part is never case-folded
     else:
         if not is_printable_ascii(subject):
             raise ValueError("a telegram subject is printable ASCII")

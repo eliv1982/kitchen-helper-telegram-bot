@@ -8,6 +8,7 @@ offline mode needs no driver and no connection).
 import ast
 import io
 import re
+import sqlite3
 import subprocess
 import sys
 import uuid
@@ -34,8 +35,16 @@ from house_helper.persistence.database import (
     downgrade_database,
     upgrade_database,
 )
+from house_helper.persistence import authn as authn_module
+from house_helper.persistence.allowlist import allow, allowed_user, is_allowed, revoke
 from house_helper.persistence.authn import authenticate, complete_login, hash_secret, new_secret
-from house_helper.persistence.models import IdentityLink
+from house_helper.persistence.email_login import (
+    IssueOutcome,
+    issue_email_login,
+    preview_email_login,
+    redeem_email_login,
+)
+from house_helper.persistence.models import AllowlistEntry, EmailLoginChallenge, IdentityLink, User
 from house_helper.persistence.models import Session as LoginSession
 from tests.persistence_support import (
     CREATED,
@@ -50,7 +59,9 @@ from tests.persistence_support import (
 from tests.test_persistence_schema import TABLES
 
 INITIAL = "0001_persistence_foundation"
-HEAD = "0002_session_provenance"
+PROVENANCE = "0002_session_provenance"
+CHALLENGES = "0003_email_login_challenges"
+HEAD = "0004_email_identity_case"
 REPO_ROOT = Path(house_helper.persistence.__file__).resolve().parents[2]
 
 
@@ -77,8 +88,15 @@ def test_the_history_is_one_line_with_one_head():
     script = ScriptDirectory.from_config(alembic_config())
 
     assert script.get_heads() == [HEAD]
-    assert [revision.revision for revision in script.walk_revisions()] == [HEAD, INITIAL]
-    assert script.get_revision(HEAD).down_revision == INITIAL
+    assert [revision.revision for revision in script.walk_revisions()] == [
+        HEAD,
+        CHALLENGES,
+        PROVENANCE,
+        INITIAL,
+    ]
+    assert script.get_revision(HEAD).down_revision == CHALLENGES
+    assert script.get_revision(CHALLENGES).down_revision == PROVENANCE
+    assert script.get_revision(PROVENANCE).down_revision == INITIAL
     assert script.get_revision(INITIAL).down_revision is None
 
 
@@ -162,7 +180,7 @@ def _fingerprint(engine) -> dict:
     """Everything about the schema that a behaviour test could depend on."""
     inspector = sa.inspect(engine)
     result = {}
-    for table in sorted(TABLES):
+    for table in sorted(TABLES & set(inspector.get_table_names())):  # an older revision has fewer
         result[table] = {
             "columns": {
                 column["name"]: (str(column["type"]), column["nullable"], column["default"])
@@ -238,6 +256,18 @@ def test_the_comparison_sees_the_constraints_it_is_meant_to_compare(empty_engine
     assert ("uq_messages_conversation_id_id_role", ("conversation_id", "id", "role")) in (
         fingerprint["messages"]["uniques"]
     )
+
+
+def test_the_comparison_sees_the_email_rule_of_both_identity_tables(empty_engine):
+    # Guard the guard: the one CHECK that revision 0004 replaced must be what the
+    # fingerprint equality compares, in the migrated schema as in the models'.
+    upgrade_database(empty_engine)
+    fingerprint = _fingerprint(empty_engine)
+
+    for table in ("allowlist_entries", "identity_links"):
+        rule = dict(fingerprint[table]["checks"])[f"ck_{table}_email_subject_normalized"]
+        assert "substr(subject, instr(subject, '@')) = lower(substr(subject, instr(subject, '@')))" in rule
+        assert "subject = lower(subject)" not in rule  # the whole address is no longer lower-cased
 
 
 def test_the_comparison_sees_the_storage_class_and_timestamp_rules(empty_engine):
@@ -423,6 +453,410 @@ def test_downgrading_the_provenance_keeps_every_row_and_the_old_schema(tmp_path)
         pristine.dispose()
 
 
+# --- 0003 on a database that holds R3B-1 data -----------------------------------------
+#
+# Policy under test: the table is added and nothing else is touched. Sessions with
+# their provenance stay live, identity links stay, and the new table starts empty.
+# (These stop at 0003: 0004, which follows it, revokes the email identities; see below.)
+
+ALL_TABLES_BEFORE_0003 = TABLES - {"email_login_challenges"}
+
+
+def _r3b1_database(engine):
+    """A database as R3B-1 left it (revision 0002): one user with a Telegram and an
+    email entry, a conversation, and a live session opened through the Telegram link.
+    Returns the session that was issued."""
+    upgrade_database(engine, PROVENANCE)
+    with create_session_factory(engine)() as db, db.begin():
+        elena = new_user(db, display_name="Elena")
+        allow(db, elena, "telegram", "42")
+        allow(db, elena, "email", "elena@example.com")
+        issued = complete_login(db, "telegram", "42", now=CREATED)
+        new_message(db, new_conversation(db, elena))
+    return issued
+
+
+def _snapshot(engine) -> dict[str, list]:
+    with engine.connect() as connection:
+        return {
+            table: sorted(connection.exec_driver_sql(f"SELECT * FROM {table}").all(), key=repr)
+            for table in sorted(ALL_TABLES_BEFORE_0003)
+        }
+
+
+def test_the_email_challenge_migration_adds_one_empty_table_and_changes_nothing_else(empty_engine):
+    issued = _r3b1_database(empty_engine)
+    before = _snapshot(empty_engine)
+    assert _version(empty_engine) == [PROVENANCE]
+
+    upgrade_database(empty_engine, CHALLENGES)
+
+    assert _version(empty_engine) == [CHALLENGES]
+    assert _tables(empty_engine) == TABLES | {"alembic_version"}
+    assert _snapshot(empty_engine) == before  # every row of every old table, byte for byte
+    with empty_engine.connect() as connection:
+        assert connection.exec_driver_sql("SELECT count(*) FROM email_login_challenges").scalar() == 0
+        assert connection.exec_driver_sql("PRAGMA foreign_key_check").all() == []
+        assert connection.exec_driver_sql("PRAGMA integrity_check").scalars().all() == ["ok"]
+    with create_session_factory(empty_engine)() as db:
+        # nobody was signed out, and the session still says which identity it came through
+        assert authenticate(db, issued.token, now=CREATED + timedelta(hours=1)) is not None
+        row = db.get(LoginSession, issued.session_id)
+        link = db.scalars(sa.select(IdentityLink).where(IdentityLink.provider == "telegram")).one()
+        assert row.identity_link_id == link.id and row.revoked_at is None
+
+
+def test_after_the_migration_an_allowlisted_address_signs_in_beside_the_old_session(empty_engine):
+    issued = _r3b1_database(empty_engine)
+    upgrade_database(empty_engine, CHALLENGES)
+    now = CREATED + timedelta(hours=2)
+
+    with create_session_factory(empty_engine)() as db, db.begin():
+        link = issue_email_login(db, "elena@example.com", now=now).link
+    with create_session_factory(empty_engine)() as db, db.begin():
+        by_email = redeem_email_login(db, str(link.challenge_id), link.token, now=now)
+
+    with create_session_factory(empty_engine)() as db:
+        assert authenticate(db, by_email.token, now=now) is not None
+        assert authenticate(db, issued.token, now=now) is not None
+        providers = {
+            db.get(LoginSession, token.session_id).identity_link_id: None for token in (issued, by_email)
+        }
+        assert len(providers) == 2  # two sessions, two identity links, one user
+        assert db.scalars(sa.select(sa.func.count(sa.distinct(LoginSession.user_id)))).one() == 1
+
+
+def test_downgrading_the_email_challenges_drops_only_that_table(tmp_path):
+    migrated = create_db_engine(f"sqlite:///{tmp_path / 'migrated.db'}")
+    pristine = create_db_engine(f"sqlite:///{tmp_path / 'pristine.db'}")
+    try:
+        issued = _r3b1_database(migrated)
+        upgrade_database(pristine, PROVENANCE)
+        upgrade_database(migrated, CHALLENGES)
+        with create_session_factory(migrated)() as db, db.begin():
+            issue_email_login(db, "elena@example.com", now=CREATED)  # a link is outstanding
+        before = _snapshot(migrated)
+
+        downgrade_database(migrated, PROVENANCE)
+
+        assert _version(migrated) == [PROVENANCE]
+        assert _tables(migrated) == ALL_TABLES_BEFORE_0003 | {"alembic_version"}
+        assert _fingerprint(migrated) == _fingerprint(pristine)  # the 0002 schema, exactly
+        assert _snapshot(migrated) == before
+        with create_session_factory(migrated)() as db:
+            assert authenticate(db, issued.token, now=CREATED + timedelta(hours=1)) is not None
+
+        upgrade_database(migrated, CHALLENGES)  # and forward again: an empty table, as it began
+        with migrated.connect() as connection:
+            assert connection.exec_driver_sql("SELECT count(*) FROM email_login_challenges").scalar() == 0
+    finally:
+        migrated.dispose()
+        pristine.dispose()
+
+
+# --- 0004 on a database that holds R3B-2 data -----------------------------------------
+#
+# Policy under test (fail closed): every email identity that exists is revoked, with
+# what revoking it means (its sessions, its unused links); Telegram and everything else
+# is left exactly as it was; re-verification by an administrator is the only way back and
+# brings nothing that was revoked back; nothing moves between users.
+
+LATER = CREATED + timedelta(minutes=3)
+
+
+def _r3b2_database(engine) -> dict:
+    """A database as 0003 left it, with email logins in use: Elena (a Telegram identity
+    and a live session through it, an email identity with a live session through it and
+    an unused link) and Other (an email identity with a live session, one revoked by an
+    administrator earlier with its own revoked session), a conversation and a message.
+    Returns the tokens and ids the tests need."""
+    upgrade_database(engine, CHALLENGES)
+    found = {}
+    with create_session_factory(engine)() as db, db.begin():
+        elena, other = new_user(db, display_name="Elena"), new_user(db, display_name="Other")
+        found["elena"], found["other"] = elena.id, other.id
+        for owner, provider, subject in [
+            (elena, "telegram", "42"),
+            (elena, "email", "elena@example.com"),
+            (other, "telegram", "77"),
+            (other, "email", "other@example.com"),
+            (other, "email", "gone@example.com"),
+        ]:
+            allow(db, owner, provider, subject)
+        found["telegram"] = complete_login(db, "telegram", "42", now=CREATED)
+        for name, address in [("elena_email", "elena@example.com"), ("other_email", "other@example.com")]:
+            link = issue_email_login(db, address, now=CREATED).link
+            found[name] = redeem_email_login(db, str(link.challenge_id), link.token, now=CREATED)
+        found["unused_link"] = issue_email_login(db, "elena@example.com", now=CREATED + timedelta(minutes=2)).link
+        new_message(db, new_conversation(db, elena))
+    with create_session_factory(engine)() as db, db.begin():
+        # "gone@" was revoked by an administrator before; a session it had is revoked with it
+        complete_login(db, "email", "gone@example.com", now=CREATED)
+        revoke(db, "email", "gone@example.com", now=EARLIER_REVOCATION)
+    return found
+
+
+def _rows_of(engine, table: str, omit: tuple[str, ...] = ()) -> list:
+    with engine.connect() as connection:
+        result = connection.exec_driver_sql(f"SELECT * FROM {table}")
+        keep = [i for i, name in enumerate(result.keys()) if name not in omit]
+        return sorted(([row[i] for i in keep] for row in result.all()), key=repr)
+
+
+def _entries(db) -> dict[tuple[str, str], AllowlistEntry]:
+    return {(row.provider, row.subject): row for row in db.scalars(sa.select(AllowlistEntry))}
+
+
+def test_the_email_case_migration_revokes_every_email_identity_and_what_came_through_it(empty_engine):
+    found = _r3b2_database(empty_engine)
+    before = datetime.now(timezone.utc) - timedelta(seconds=2)
+
+    upgrade_database(empty_engine)
+
+    after = datetime.now(timezone.utc) + timedelta(seconds=2)
+    assert _version(empty_engine) == [HEAD]
+    with create_session_factory(empty_engine)() as db:
+        entries = _entries(db)
+        for key in [("email", "elena@example.com"), ("email", "other@example.com")]:
+            assert before <= entries[key].revoked_at <= after, key  # the time of the migration
+        assert entries[("email", "gone@example.com")].revoked_at == EARLIER_REVOCATION  # kept
+        # nobody can ask for a link for any of them, or be signed in by what they held
+        for address in ("elena@example.com", "other@example.com", "gone@example.com"):
+            assert issue_email_login(db, address, now=LATER).outcome is IssueOutcome.NOT_ELIGIBLE, address
+        assert authenticate(db, found["elena_email"].token, now=LATER) is None
+        assert authenticate(db, found["other_email"].token, now=LATER) is None
+        row = db.get(LoginSession, found["elena_email"].session_id)
+        assert before <= row.revoked_at <= after  # ended, as revoke() would have ended it
+        # the link that was out is withdrawn: not shown, not redeemable
+        unused = found["unused_link"]
+        assert preview_email_login(db, str(unused.challenge_id), now=LATER) is None
+        challenge = db.get(EmailLoginChallenge, unused.challenge_id)
+        assert before <= challenge.revoked_at <= after and challenge.consumed_at is None
+        used = [c for c in db.scalars(sa.select(EmailLoginChallenge)) if c.consumed_at is not None]
+        assert len(used) == 2 and all(c.revoked_at is None for c in used)  # what was used stays as it was
+    with create_session_factory(empty_engine)() as db, db.begin():
+        assert redeem_email_login(db, str(unused.challenge_id), unused.token, now=LATER) is None
+        with pytest.raises(authn_module.LoginDenied):
+            complete_login(db, "email", "elena@example.com", now=LATER)
+
+
+def test_the_email_case_migration_does_not_touch_telegram_or_anything_else(empty_engine):
+    found = _r3b2_database(empty_engine)
+    unchanged = ("users", "identity_links", "conversations", "messages", "turn_requests")
+    before = {table: _rows_of(empty_engine, table) for table in unchanged}
+    entries_before = _rows_of(empty_engine, "allowlist_entries", omit=("revoked_at",))
+    telegram_before = _rows_of(empty_engine, "allowlist_entries")
+    telegram_before = [row for row in telegram_before if "telegram" in row]
+    sessions_before = _rows_of(empty_engine, "sessions", omit=("revoked_at",))
+
+    upgrade_database(empty_engine)
+
+    for table in unchanged:
+        assert _rows_of(empty_engine, table) == before[table], table  # byte for byte
+    # an entry keeps its id, its owner, its spelling, its note and its creation time;
+    # only revoked_at of the email ones changes, and nothing is created, moved or deleted
+    assert _rows_of(empty_engine, "allowlist_entries", omit=("revoked_at",)) == entries_before
+    assert [row for row in _rows_of(empty_engine, "allowlist_entries") if "telegram" in row] == telegram_before
+    assert _rows_of(empty_engine, "sessions", omit=("revoked_at",)) == sessions_before
+    with create_session_factory(empty_engine)() as db:
+        entries = _entries(db)
+        assert entries[("telegram", "42")].revoked_at is None and entries[("telegram", "77")].revoked_at is None
+        # nobody who signed in with Telegram was signed out
+        assert authenticate(db, found["telegram"].token, now=LATER) is not None
+        telegram_links = db.scalars(sa.select(IdentityLink).where(IdentityLink.provider == "telegram")).all()
+        assert len(telegram_links) == 1
+        assert entries[("email", "elena@example.com")].user_id == found["elena"]  # nothing changed owner
+        assert entries[("email", "other@example.com")].user_id == found["other"]
+    with empty_engine.connect() as connection:
+        assert connection.exec_driver_sql("PRAGMA foreign_key_check").all() == []
+        assert connection.exec_driver_sql("PRAGMA integrity_check").scalars().all() == ["ok"]
+
+
+def test_re_verifying_the_stored_spelling_lifts_the_revocation_and_revives_nothing(empty_engine):
+    found = _r3b2_database(empty_engine)
+    upgrade_database(empty_engine)
+    unused = found["unused_link"]
+
+    with create_session_factory(empty_engine)() as db, db.begin():
+        legacy = _entries(db)[("email", "elena@example.com")]
+        again = allow(db, db.get(User, found["elena"]), "email", "elena@example.com")  # the administrator says so
+        assert again.id == legacy.id and again.revoked_at is None  # the same row, not a new identity
+
+    with create_session_factory(empty_engine)() as db:
+        # the address can be mailed again ...
+        assert is_allowed(db, "email", "elena@example.com")
+        # ... but nothing from before comes back: not the session, not the link
+        assert authenticate(db, found["elena_email"].token, now=LATER) is None
+        assert preview_email_login(db, str(unused.challenge_id), now=LATER) is None
+        assert authenticate(db, found["other_email"].token, now=LATER) is None  # "other@" was not re-verified
+    with create_session_factory(empty_engine)() as db, db.begin():
+        assert redeem_email_login(db, str(unused.challenge_id), unused.token, now=LATER) is None
+    with create_session_factory(empty_engine)() as db, db.begin():
+        fresh = issue_email_login(db, "elena@example.com", now=LATER + timedelta(minutes=5)).link
+        assert fresh is not None
+    with create_session_factory(empty_engine)() as db, db.begin():
+        signed_in = redeem_email_login(db, str(fresh.challenge_id), fresh.token, now=LATER + timedelta(minutes=5))
+        assert signed_in is not None and signed_in.user_id == found["elena"]
+    with create_session_factory(empty_engine)() as db:
+        later = LATER + timedelta(minutes=6)
+        assert authenticate(db, signed_in.token, now=later) is not None  # a NEW session works
+        assert authenticate(db, found["elena_email"].token, now=later) is None  # the old one never does
+        assert db.get(LoginSession, signed_in.session_id).identity_link_id == db.get(
+            LoginSession, found["elena_email"].session_id
+        ).identity_link_id  # the same identity link, a different session
+
+
+def test_re_verifying_another_spelling_is_a_new_identity_and_the_legacy_one_stays_revoked(empty_engine):
+    found = _r3b2_database(empty_engine)
+    upgrade_database(empty_engine)
+
+    with create_session_factory(empty_engine)() as db, db.begin():
+        approved = allow(db, db.get(User, found["elena"]), "email", "Elena@example.com")
+
+    with create_session_factory(empty_engine)() as db:
+        entries = _entries(db)
+        legacy = entries[("email", "elena@example.com")]
+        assert approved.id != legacy.id and approved.subject == "Elena@example.com"
+        assert legacy.revoked_at is not None  # the lower-case spelling was never approved again
+        assert not is_allowed(db, "email", "elena@example.com")
+        assert is_allowed(db, "email", "Elena@example.com")
+        assert issue_email_login(db, "elena@example.com", now=LATER).outcome is IssueOutcome.NOT_ELIGIBLE
+        assert issue_email_login(db, "Elena@example.com", now=LATER).outcome is IssueOutcome.ISSUED
+        assert authenticate(db, found["elena_email"].token, now=LATER) is None  # the old session is not this one
+
+
+def test_the_legacy_spelling_is_not_handed_to_another_user_by_asking_again(empty_engine):
+    found = _r3b2_database(empty_engine)
+    upgrade_database(empty_engine)
+
+    with create_session_factory(empty_engine)() as db, db.begin():
+        with pytest.raises(ValueError, match="another user"):
+            allow(db, db.get(User, found["other"]), "email", "elena@example.com")  # Elena's, revoked or not
+
+    with create_session_factory(empty_engine)() as db:
+        entry = _entries(db)[("email", "elena@example.com")]
+        assert entry.user_id == found["elena"] and entry.revoked_at is not None
+
+
+def test_after_the_migration_two_case_distinct_addresses_belong_to_two_users(empty_engine):
+    upgrade_database(empty_engine)  # an empty database: the schema is what is shown
+
+    with create_session_factory(empty_engine)() as db, db.begin():
+        first, second = new_user(db, display_name="First"), new_user(db, display_name="Second")
+        allow(db, first, "email", "Victim@example.com")
+        allow(db, second, "email", "victim@example.com")
+        new_identity_link(db, first, "email", "Victim@example.com")
+        new_identity_link(db, second, "email", "victim@example.com")
+    with create_session_factory(empty_engine)() as db:
+        assert allowed_user(db, "email", "Victim@example.com").display_name == "First"
+        assert allowed_user(db, "email", "victim@example.com").display_name == "Second"
+        assert allowed_user(db, "email", "VICTIM@example.com") is None
+    for table in ("allowlist_entries", "identity_links"):
+        with pytest.raises(sa.exc.IntegrityError, match="ck_" + table + "_email_subject_normalized"):
+            with empty_engine.begin() as connection:  # a domain that is not lower-case is still refused
+                connection.exec_driver_sql(f"UPDATE {table} SET subject = 'Victim@Example.com' WHERE subject = 'Victim@example.com'")
+
+
+def test_the_migration_is_refused_whole_when_the_stored_definition_is_not_the_expected_one(empty_engine):
+    found = _r3b2_database(empty_engine)
+    with empty_engine.begin() as connection:  # a database that is not what 0003 left
+        connection.exec_driver_sql("PRAGMA writable_schema = ON")
+        connection.exec_driver_sql(
+            "UPDATE sqlite_master SET sql = replace(sql, 'subject = lower(subject)', 'lower(subject) = subject') "
+            "WHERE type = 'table' AND name = 'identity_links'"
+        )
+        version = connection.exec_driver_sql("PRAGMA schema_version").scalar()
+        connection.exec_driver_sql(f"PRAGMA schema_version = {version + 1}")
+        connection.exec_driver_sql("PRAGMA writable_schema = OFF")
+
+    with pytest.raises(RuntimeError, match="identity_links"):
+        upgrade_database(empty_engine)
+
+    # nothing is half applied: the data step is rolled back with the schema step
+    assert _version(empty_engine) == [CHALLENGES]
+    with create_session_factory(empty_engine)() as db:
+        assert all(
+            entry.revoked_at is None
+            for key, entry in _entries(db).items()
+            if key[0] == "email" and key[1] != "gone@example.com"
+        )
+        assert authenticate(db, found["elena_email"].token, now=LATER) is not None
+
+
+@pytest.mark.skipif(
+    not hasattr(sqlite3.Connection, "setconfig"), reason="sqlite3.Connection.setconfig needs Python 3.12"
+)
+def test_a_sqlite_that_refuses_to_edit_its_schema_stops_the_migration_whole(empty_engine):
+    # A "defensive" build (or connection) does not let sqlite_master be written. The
+    # migration then fails, and the data step, which ran first, is rolled back with it.
+    found = _r3b2_database(empty_engine)
+    empty_engine.dispose()  # connections made from here on are the defensive ones
+
+    def defensive(dbapi_connection, _record):
+        dbapi_connection.setconfig(sqlite3.SQLITE_DBCONFIG_DEFENSIVE, True)
+
+    sa.event.listen(empty_engine, "connect", defensive)
+    with pytest.raises((sa.exc.OperationalError, RuntimeError)):
+        upgrade_database(empty_engine)
+
+    assert _version(empty_engine) == [CHALLENGES]
+    with create_session_factory(empty_engine)() as db:
+        assert all(
+            entry.revoked_at is None
+            for key, entry in _entries(db).items()
+            if key[0] == "email" and key[1] != "gone@example.com"
+        )
+        assert authenticate(db, found["elena_email"].token, now=LATER) is not None
+
+
+def test_downgrading_the_email_case_restores_the_0003_schema_and_keeps_the_revocations(tmp_path):
+    migrated = create_db_engine(f"sqlite:///{tmp_path / 'migrated.db'}")
+    pristine = create_db_engine(f"sqlite:///{tmp_path / 'pristine.db'}")
+    modeled = create_db_engine(f"sqlite:///{tmp_path / 'modeled.db'}")
+    try:
+        found = _r3b2_database(migrated)
+        upgrade_database(pristine, CHALLENGES)
+        upgrade_database(migrated)
+
+        downgrade_database(migrated, CHALLENGES)
+
+        assert _version(migrated) == [CHALLENGES]
+        assert _fingerprint(migrated) == _fingerprint(pristine)  # the 0003 schema, exactly
+        with create_session_factory(migrated)() as db:
+            entries = _entries(db)
+            assert entries[("email", "elena@example.com")].revoked_at is not None  # not undone
+            assert entries[("telegram", "42")].revoked_at is None
+            assert authenticate(db, found["telegram"].token, now=LATER) is not None
+            assert authenticate(db, found["elena_email"].token, now=LATER) is None
+        with migrated.connect() as connection:
+            assert connection.exec_driver_sql("PRAGMA integrity_check").scalars().all() == ["ok"]
+            assert connection.exec_driver_sql("PRAGMA foreign_key_check").all() == []
+        upgrade_database(migrated)  # and forward again: the models' schema once more
+        assert _version(migrated) == [HEAD]
+        Base.metadata.create_all(modeled)
+        assert _fingerprint(migrated) == _fingerprint(modeled)
+    finally:
+        migrated.dispose()
+        pristine.dispose()
+        modeled.dispose()
+
+
+def test_downgrading_is_refused_while_an_address_with_a_capital_in_its_local_part_exists(empty_engine):
+    upgrade_database(empty_engine)
+    with create_session_factory(empty_engine)() as db, db.begin():
+        allow(db, new_user(db, display_name="Victim"), "email", "Victim@example.com")
+        allow(db, new_user(db, display_name="Other"), "email", "fine@example.com")
+
+    with pytest.raises(RuntimeError, match=r"cannot downgrade: allowlist_entries holds 1 email"):
+        downgrade_database(empty_engine, CHALLENGES)
+
+    assert _version(empty_engine) == [HEAD]  # nothing was changed
+    with create_session_factory(empty_engine)() as db:
+        assert {key[1] for key in _entries(db)} == {"Victim@example.com", "fine@example.com"}
+    with create_session_factory(empty_engine)() as db, db.begin():  # the new rule is still the one in force
+        allow(db, new_user(db), "email", "AnotherVictim@example.com")
+
+
 # --- downgrade --------------------------------------------------------------------
 
 
@@ -465,10 +899,14 @@ def _offline_sql(direction: str) -> str:
     config.output_buffer = io.StringIO()
     if direction == "up":
         command.upgrade(config, "head", sql=True)
+    elif direction == "down_from_provenance":
+        command.downgrade(config, f"{PROVENANCE}:{INITIAL}", sql=True)
+    elif direction == "down_from_challenges":
+        command.downgrade(config, f"{CHALLENGES}:{PROVENANCE}", sql=True)
     elif direction == "down_from_head":
-        command.downgrade(config, f"{HEAD}:{INITIAL}", sql=True)
+        command.downgrade(config, f"{HEAD}:{CHALLENGES}", sql=True)
     else:
-        command.downgrade(config, f"{INITIAL}:base", sql=True)
+        command.downgrade(config, f"{HEAD}:base", sql=True)
     return config.output_buffer.getvalue()
 
 
@@ -488,10 +926,11 @@ def test_the_upgrade_renders_as_postgresql_sql():
     assert "~ '^[!-~]+$'" in sql and "interval '8760 hours'" in sql
     assert "GLOB" not in sql and "datetime(" not in sql  # the SQLite spellings stay out
     assert "typeof(" not in sql and "CAST(" not in sql and "BLOB" not in sql
+    assert "instr(" not in sql and "writable_schema" not in sql and "sqlite_master" not in sql
     assert "%" not in sql  # a doubled percent sign would make the offline SQL unrunnable
     assert f"INSERT INTO alembic_version (version_num) VALUES ('{INITIAL}')" in sql
     assert f"UPDATE alembic_version SET version_num='{HEAD}'" in sql
-    assert sql.count("CREATE INDEX") == 11 and sql.count("CREATE UNIQUE INDEX") == 1
+    assert sql.count("CREATE INDEX") == 13 and sql.count("CREATE UNIQUE INDEX") == 1
 
 
 def test_the_downgrade_renders_as_postgresql_sql():
@@ -503,8 +942,8 @@ def test_the_downgrade_renders_as_postgresql_sql():
 
 
 def test_the_provenance_revision_renders_as_plain_postgresql_alters():
-    up, down = _offline_sql("up"), _offline_sql("down_from_head")
-    revision = up.split(f"Running upgrade {INITIAL} -> {HEAD}")[1]
+    up, down = _offline_sql("up"), _offline_sql("down_from_provenance")
+    revision = up.split(f"Running upgrade {INITIAL} -> {PROVENANCE}")[1].split("Running upgrade")[0]
 
     # the data step comes first, so that the CHECK is added to rows that satisfy it
     steps = [line for line in revision.split("\n") if line.strip()]
@@ -521,6 +960,51 @@ def test_the_provenance_revision_renders_as_plain_postgresql_alters():
     assert "strftime" not in revision and "CREATE TABLE" not in revision  # SQLite's rebuild stays out
     assert "DROP TABLE" not in down and "DROP COLUMN identity_link_id" in down
     assert "DROP INDEX uq_identity_links_user_id_id" in down
+
+
+def test_the_email_challenge_revision_renders_as_one_table_and_its_indexes():
+    up, down = _offline_sql("up"), _offline_sql("down_from_challenges")
+    revision = up.split(f"Running upgrade {PROVENANCE} -> {CHALLENGES}")[1].split("-- Running upgrade")[0]
+
+    statements = [part.strip() for part in revision.split(";") if part.strip() not in ("", "COMMIT")]
+    assert statements[0].startswith("CREATE TABLE email_login_challenges (")
+    assert "FOREIGN KEY(user_id, provider, subject) REFERENCES allowlist_entries (user_id, provider, subject) ON DELETE CASCADE" in statements[0]
+    assert "CHECK (provider = 'email')" in statements[0]
+    assert statements[1].startswith("CREATE INDEX ix_email_login_challenges_identity ON email_login_challenges (user_id, provider, subject, created_at)")
+    assert statements[2].startswith("CREATE INDEX ix_email_login_challenges_expires_at ON email_login_challenges (expires_at)")
+    assert statements[3].startswith("UPDATE alembic_version SET version_num='" + CHALLENGES + "'")
+    assert len(statements) == 4  # nothing else is created, altered, updated or dropped
+    assert "ALTER TABLE" not in revision and "DROP" not in revision
+    assert re.findall(r"^DROP [^;]*", down, re.MULTILINE) == ["DROP TABLE email_login_challenges"]
+
+
+def test_the_email_case_revision_renders_as_three_updates_and_a_swap_of_one_check_per_table():
+    up, down = _offline_sql("up"), _offline_sql("down_from_head")
+    revision = up.split(f"Running upgrade {CHALLENGES} -> {HEAD}")[1]
+
+    statements = [re.sub(r"\s+", " ", part.strip()) for part in revision.split(";")]
+    statements = [part for part in statements if part not in ("", "COMMIT")]
+    assert statements[0].startswith(
+        "UPDATE allowlist_entries SET revoked_at=now() WHERE allowlist_entries.provider = 'email' "
+        "AND allowlist_entries.revoked_at IS NULL"
+    )
+    assert statements[1].startswith("UPDATE sessions SET revoked_at=now() WHERE sessions.revoked_at IS NULL AND ")
+    assert "sessions.identity_link_id IN (SELECT identity_links.id FROM identity_links WHERE identity_links.provider = 'email')" in statements[1]
+    assert statements[2].startswith("UPDATE email_login_challenges SET revoked_at=now() WHERE ")
+    assert "consumed_at IS NULL AND email_login_challenges.revoked_at IS NULL" in statements[2]
+    for table, drop, add in (("allowlist_entries", 3, 4), ("identity_links", 5, 6)):
+        name = f"ck_{table}_email_subject_normalized"
+        assert statements[drop] == f"ALTER TABLE {table} DROP CONSTRAINT {name}"
+        assert statements[add].startswith(f"ALTER TABLE {table} ADD CONSTRAINT {name} CHECK (provider <> 'email' OR (")
+        assert "substr(subject, strpos(subject, '@')) = lower(substr(subject, strpos(subject, '@')))" in statements[add]
+        assert "subject = lower(subject)" not in statements[add]
+    assert statements[7].startswith("UPDATE alembic_version SET version_num='" + HEAD + "'")
+    assert len(statements) == 8  # nothing else is created, altered, updated or dropped
+    assert "telegram" not in revision  # the data step names no Telegram row
+    # the way back swaps the old rule in, and undoes no revocation
+    assert down.count("DROP CONSTRAINT") == 2 and down.count("ADD CONSTRAINT") == 2
+    assert down.count("CHECK (provider <> 'email' OR (subject = lower(subject) AND ") == 2
+    assert "UPDATE allowlist_entries" not in down and "UPDATE sessions" not in down
 
 
 def test_rendering_sql_offline_creates_no_database_file(tmp_path, monkeypatch):
@@ -548,9 +1032,17 @@ def _tables_in(sql: str) -> dict[str, list[str]]:
         tables[name] = [
             re.sub(r"\s+", " ", line.strip().rstrip(",")) for line in body.split("\n") if line.strip()
         ]
-    for match in re.finditer(r"ALTER TABLE (\w+) ADD (?:COLUMN )?([^;]*);", sql):
-        name, definition = match.groups()
-        tables[name].append(re.sub(r"\s+", " ", definition.strip()))
+    for match in re.finditer(
+        r"ALTER TABLE (\w+) (?:ADD (?:COLUMN )?(?P<added>[^;]*)|DROP CONSTRAINT (?P<dropped>\w+));", sql
+    ):
+        name = match.group(1)
+        if match.group("added") is not None:
+            tables[name].append(re.sub(r"\s+", " ", match.group("added").strip()))
+        else:  # DROP CONSTRAINT: the definition goes (a later ADD may put another in its place)
+            prefix = f"CONSTRAINT {match.group('dropped')} "
+            kept = [line for line in tables[name] if not line.startswith(prefix)]
+            assert len(kept) == len(tables[name]) - 1, (name, prefix)
+            tables[name] = kept
     return {name: sorted(lines) for name, lines in tables.items()}
 
 
@@ -581,7 +1073,7 @@ def test_the_migration_and_the_models_build_the_same_schema_in_postgresql_sql():
 
 def test_the_migration_and_the_models_create_the_same_indexes_in_postgresql_sql():
     assert _indexes_in(_offline_sql("up")) == _indexes_in(_models_as_postgresql())
-    assert len(_indexes_in(_models_as_postgresql())) == 12  # 11 plain, 1 unique
+    assert len(_indexes_in(_models_as_postgresql())) == 14  # 13 plain, 1 unique
 
 
 def test_the_postgresql_comparison_does_see_a_difference(monkeypatch):
@@ -610,6 +1102,24 @@ def test_the_postgresql_comparison_sees_the_provenance_revision_too():
     narrowed = up.replace("ON identity_links (user_id, id);", "ON identity_links (id);")
     assert narrowed != up
     assert _indexes_in(narrowed) != _indexes_in(_models_as_postgresql())
+
+
+def test_the_postgresql_comparison_sees_the_email_case_revision_too():
+    # ... including the CHECK that 0004 drops and adds back (folded into the tables).
+    modeled = _tables_in(_models_as_postgresql())
+    up = _offline_sql("up")
+    for table in ("allowlist_entries", "identity_links"):
+        assert _tables_in(up)[table] == modeled[table]  # the folded history is the model
+        for change in (
+            lambda sql: sql.replace("lower(substr(subject, strpos(subject, '@')))", "lower(subject)"),
+            lambda sql: sql.replace("AND substr(subject, 1, 1) <> '@' ", ""),
+        ):
+            assert change(up) != up
+            assert _tables_in(change(up))[table] != modeled[table]
+    # the old rule left in place (the DROP not honoured) is a difference too
+    undropped = re.sub(r"ALTER TABLE \w+ DROP CONSTRAINT ck_\w+_email_subject_normalized;", "", up)
+    assert undropped != up
+    assert _tables_in(undropped)["allowlist_entries"] != modeled["allowlist_entries"]
 
 
 # --- no connection details are committed ------------------------------------------

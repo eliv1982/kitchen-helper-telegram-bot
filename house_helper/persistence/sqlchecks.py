@@ -1,8 +1,11 @@
 """CHECK constraint expressions that cannot be written once for both databases.
 
 Nearly every CHECK in models.py is plain SQL that SQLite and PostgreSQL both
-run (length, lower, replace, substr, comparisons). Two rules are not:
+run (length, lower, replace, substr, comparisons). Three rules are not:
 
+  * "the domain of an email is lower-case, its local part is as given": needs the
+    position of the "@", which SQLite calls instr() and PostgreSQL strpos(); each
+    dialect has only its own.
   * "only printable ASCII": SQLite has no regular expressions but has GLOB, and
     its length() stops at an embedded NUL, so a NUL must be caught separately;
     and it keeps a value in whatever storage class it arrives in, so a BLOB has
@@ -104,6 +107,44 @@ def _printable_ascii_sqlite(element: PrintableAscii, compiler, **kw) -> str:
         f"AND length({column}) = length(CAST({column} AS BLOB)) "
         f"AND length({column}) >= 1)"
     )
+
+
+class EmailSubjectNormalized(ColumnElement):
+    """The database's copy of identifiers.normalize_identity for an email subject:
+    one "@" with something on both sides, and everything from the "@" on (the
+    domain) lower-case. The local part is deliberately not constrained: it is kept
+    exactly as the administrator approved it, because "Victim@example.com" and
+    "victim@example.com" may be two mailboxes. True for any provider but email.
+    (Lower-casing is ASCII-only on both databases, which is all that
+    subject_printable_ascii lets through.)"""
+
+    inherit_cache = False  # only ever used in DDL, never in a cached query
+    type = sa.Boolean()
+
+    def __init__(self, provider: str, subject: str) -> None:
+        self.provider = provider
+        self.subject = subject
+
+
+def _email_subject_normalized(element: EmailSubjectNormalized, position: str) -> str:
+    subject = element.subject
+    domain = f"substr({subject}, {position}({subject}, '@'))"  # "@" and what follows it
+    return (
+        f"{element.provider} <> 'email' OR ({domain} = lower({domain}) "
+        f"AND length({subject}) - length(replace({subject}, '@', '')) = 1 "
+        f"AND substr({subject}, 1, 1) <> '@' "
+        f"AND substr({subject}, length({subject}), 1) <> '@')"
+    )
+
+
+@compiles(EmailSubjectNormalized)  # PostgreSQL, and the text shown by str()
+def _email_subject_normalized_default(element: EmailSubjectNormalized, compiler, **kw) -> str:
+    return _email_subject_normalized(element, "strpos")
+
+
+@compiles(EmailSubjectNormalized, "sqlite")
+def _email_subject_normalized_sqlite(element: EmailSubjectNormalized, compiler, **kw) -> str:
+    return _email_subject_normalized(element, "instr")
 
 
 class WithinRetention(ColumnElement):

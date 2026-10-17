@@ -118,7 +118,8 @@ def test_creating_the_application_touches_neither_the_database_nor_the_disk(tmp_
 
 
 def test_the_application_exposes_the_health_endpoint_the_sign_in_routes_and_nothing_else(tmp_path):
-    # The sign-in routes (R3A) are the only addition to /healthz: no conversation,
+    # The sign-in routes (R3A Telegram, R3B-2 email) are the only addition to
+    # /healthz: no conversation,
     # recipe, preference or other user-data route may exist, and not even the
     # interactive API pages FastAPI would add by default. A route added later has to
     # change this list on purpose, and has to use auth.require_user.
@@ -133,6 +134,8 @@ def test_the_application_exposes_the_health_endpoint_the_sign_in_routes_and_noth
         "/auth/telegram/callback": ["get"],
         "/auth/me": ["get"],
         "/auth/logout": ["post"],
+        "/auth/email/request": ["post"],
+        "/auth/email/confirm": ["get", "post"],
     }
 
 
@@ -388,7 +391,7 @@ async def test_starting_and_stopping_leaves_a_migrated_database_as_it_was(tmp_pa
     upgrade_database(engine)
     engine.dispose()
     before = _snapshot(target)
-    assert before[1] == [("0002_session_provenance",)]
+    assert before[1] == [("0004_email_identity_case",)]
 
     async with serving(create_app(settings_for(target))) as client:
         await client.get("/healthz")

@@ -124,6 +124,56 @@ def test_an_identity_belongs_to_one_user_in_both_tables(session, provisioned):
         raw_insert(session, "identity_links", **link_row(other, subject=TELEGRAM_SUB))
 
 
+# --- two addresses that differ only in case are two identities ---------------------
+
+
+def test_two_case_distinct_emails_belong_to_two_users_without_collision(session):
+    first, second = new_user(session, display_name="First"), new_user(session, display_name="Second")
+
+    upper = allow(session, first, "email", "Victim@example.com")
+    lower = allow(session, second, "email", "victim@example.com")  # not "already on the list for another user"
+    link_upper = new_identity_link(session, first, "email", "Victim@example.com")
+    link_lower = new_identity_link(session, second, "email", "victim@example.com")
+
+    assert (upper.subject, lower.subject) == ("Victim@example.com", "victim@example.com")
+    assert count(session, AllowlistEntry) == 2 and count(session, IdentityLink) == 2
+    assert allowed_user(session, "email", "Victim@example.com").id == first.id
+    assert allowed_user(session, "email", "victim@example.com").id == second.id
+    assert allowed_user(session, "email", "VICTIM@example.com") is None
+    assert (link_upper.user_id, link_lower.user_id) == (first.id, second.id)
+
+
+def test_a_link_for_one_case_cannot_borrow_the_entry_of_the_other(session):
+    first, second = new_user(session), new_user(session)
+    allow(session, first, "email", "Victim@example.com")
+    allow(session, second, "email", "victim@example.com")
+
+    with rejected(session, "FOREIGN KEY"):  # the entry for this very pair and user must exist
+        raw_insert(session, "identity_links", **link_row(second, provider="email", subject="Victim@example.com"))
+
+
+def test_asking_again_for_the_other_case_does_not_move_an_identity_between_users(session):
+    first, second = new_user(session), new_user(session)
+    allow(session, first, "email", "Victim@example.com")
+
+    with pytest.raises(ValueError, match="another user"):
+        allow(session, second, "email", " Victim@EXAMPLE.com ")  # the same identity, once normalized
+    allow(session, second, "email", "victim@example.com")  # a different one: nothing is moved or merged
+
+    assert allowed_user(session, "email", "Victim@example.com").id == first.id
+
+
+def test_revoking_one_case_ends_only_its_own_identity(session):
+    first, second = new_user(session), new_user(session)
+    allow(session, first, "email", "Victim@example.com")
+    allow(session, second, "email", "victim@example.com")
+
+    assert revoke(session, "email", "victim@example.com", now=NOW)
+
+    assert allowed_user(session, "email", "victim@example.com") is None
+    assert allowed_user(session, "email", "Victim@example.com").id == first.id
+
+
 # --- revocation and deletion -------------------------------------------------------
 
 
@@ -230,7 +280,9 @@ REFUSED = [
     ("telegram", "٤٢", "subject_printable_ascii"),  # Arabic-Indic digits
     ("telegram", "@name", "telegram_subject_not_email"),
     ("telegram", "a@b.c", "telegram_subject_not_email"),
-    ("email", "Cook@example.com", "email_subject_normalized"),
+    ("email", "Cook@Example.com", "email_subject_normalized"),  # the domain is lower-cased
+    ("email", "cook@example.COM", "email_subject_normalized"),
+    ("email", "COOK@EXAMPLE.COM", "email_subject_normalized"),
     ("email", "cook", "email_subject_normalized"),
     ("email", "@example.com", "email_subject_normalized"),
     ("email", "cook@", "email_subject_normalized"),
@@ -253,7 +305,14 @@ def test_both_tables_refuse_the_same_malformed_identities(
 @pytest.mark.parametrize("table", ["allowlist_entries", "identity_links"])
 @pytest.mark.parametrize(
     "provider, subject",
-    [("telegram", TELEGRAM_SUB), ("telegram", "~!"), ("email", "elena@example.com"), ("email", "a+b@c.d")],
+    [
+        ("telegram", TELEGRAM_SUB),
+        ("telegram", "~!"),
+        ("email", "elena@example.com"),
+        ("email", "a+b@c.d"),
+        ("email", "Elena@example.com"),  # the local part is kept as approved
+        ("email", "A+B@c.d"),
+    ],
 )
 def test_both_tables_accept_the_same_well_formed_identities(session, user, table, provider, subject):
     # An entry must exist for the link to point at.
@@ -310,12 +369,13 @@ def test_the_provisioning_is_durable(factory):
         owner = new_user(s)
         allow(s, owner, "telegram", TELEGRAM_SUB)
         allow(s, owner, "email", "Elena@Example.com")
-        new_identity_link(s, owner, "email", "elena@example.com", email="elena@example.com")
+        new_identity_link(s, owner, "email", "Elena@example.com", email="Elena@example.com")
         owner_id = owner.id
         s.commit()
 
     with factory() as s:
         assert allowed_user(s, "telegram", TELEGRAM_SUB).id == owner_id
-        assert allowed_user(s, "email", "ELENA@example.com").id == owner_id
+        assert allowed_user(s, "email", " Elena@EXAMPLE.COM ").id == owner_id
+        assert allowed_user(s, "email", "elena@example.com") is None
         assert s.scalar(sa.select(IdentityLink.user_id)) == owner_id
         assert uuid.UUID(int=0) != owner_id

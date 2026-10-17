@@ -237,9 +237,10 @@ def test_every_character_up_to_latin_1_gets_the_same_verdict_inside_a_subject(
 
     assert disagreements == []
     # What is left is printable ASCII, minus what each provider rules out ("@" in a
-    # Telegram subject; in an email, "@" as the extra one and every capital letter).
+    # Telegram subject; in an email, "@" as the extra one and, in the DOMAIN only, every
+    # capital letter: a local part is kept exactly as approved).
     expected = [c for c in range(0x21, 0x7F) if chr(c) != "@"]
-    if provider == "email":
+    if provider == "email" and template.startswith("a@"):
         expected = [c for c in expected if not chr(c).isupper()]
     assert accepted == expected
 
@@ -259,7 +260,9 @@ SUBJECTS = {
     "email: plain": ("email", "cook@example.com"),
     "email: with an alias": ("email", "cook+tag@example.com"),
     "email: dots and digits": ("email", "c.o.o.k1@sub.example.co.uk"),
-    "email: upper case": ("email", "Cook@example.com"),
+    "email: upper case local part": ("email", "Cook@example.com"),
+    "email: all upper case local part": ("email", "COOK@example.com"),
+    "email: upper case domain": ("email", "cook@Example.com"),
     "email: all upper case": ("email", "COOK@EXAMPLE.COM"),
     "email: the longest": ("email", "a" * (MAX_SUBJECT_LENGTH - len("@b.c")) + "@b.c"),
     "email: one too long": ("email", "a" * (MAX_SUBJECT_LENGTH - len("@b.c") + 1) + "@b.c"),
@@ -522,12 +525,17 @@ def test_a_text_subject_of_the_wrong_length_is_refused_on_an_identity_link(sessi
 @pytest.mark.parametrize(
     "raw, expected",
     [
-        ("Cook@Example.COM", "cook@example.com"),
+        ("Cook@Example.COM", "Cook@example.com"),
         ("  cook@example.com\n", "cook@example.com"),
-        ("\tCOOK+Tag@Example.com \r\n", "cook+tag@example.com"),
+        ("\tCOOK+Tag@Example.com \r\n", "COOK+Tag@example.com"),
+        ("Victim@EXAMPLE.COM", "Victim@example.com"),
+        ("victim@example.com", "victim@example.com"),
+        ("V.i.C+T@sub.EXAMPLE.co.UK", "V.i.C+T@sub.example.co.uk"),
     ],
 )
-def test_an_email_is_trimmed_and_lower_cased_into_its_stored_form(session, user, raw, expected):
+def test_an_email_is_trimmed_and_only_its_domain_is_lower_cased_into_its_stored_form(
+    session, user, raw, expected
+):
     provider, subject = normalize_identity("email", raw)
 
     assert (provider, subject) == ("email", expected)
@@ -536,12 +544,53 @@ def test_an_email_is_trimmed_and_lower_cased_into_its_stored_form(session, user,
 
 
 def test_the_kelvin_sign_is_refused_before_lower_casing_not_after():
-    # "K".lower() == "k": checking for ASCII after lower-casing would turn
-    # an attacker's mailbox into the allowlisted one.
-    assert "cooK@example.com".lower() == "cook@example.com"
+    # The Kelvin sign (U+212A).lower() == "k": checking for ASCII after lower-casing would turn
+    # an attacker's mailbox into the allowlisted one. Only a domain is lower-cased
+    # now, but the order matters there all the same.
+    assert "coo\N{KELVIN SIGN}@example.com".lower() == "cook@example.com"
+    assert "cook@example\N{KELVIN SIGN}.com".lower() == "cook@examplek.com"
 
-    with pytest.raises(ValueError, match="printable ASCII"):
-        normalize_identity("email", "cooK@example.com")
+    for address in ("coo\N{KELVIN SIGN}@example.com", "cook@example\N{KELVIN SIGN}.com"):
+        with pytest.raises(ValueError, match="printable ASCII"):
+            normalize_identity("email", address)
+
+
+@pytest.mark.parametrize("local", ["Victim", "victim", "VICTIM", "vIcTiM", "V.ictim", "v.ictim", "Victim+Tag", "victim+tag"])
+def test_the_local_part_of_an_email_is_never_case_folded_or_otherwise_folded(local):
+    # Two spellings that differ only in case, in dots or in a "+tag" are two identities.
+    address = f"{local}@example.com"
+
+    assert normalize_identity("email", address) == ("email", address)
+    assert normalize_identity("email", f"{local}@EXAMPLE.Com") == ("email", address)
+    others = [
+        normalize_identity("email", f"{other}@example.com")
+        for other in ["Victim", "victim", "VICTIM", "vIcTiM", "V.ictim", "v.ictim", "Victim+Tag", "victim+tag"]
+        if other != local
+    ]
+    assert ("email", address) not in others
+    assert len(set(others)) == len(others)  # and no two of the others collapse either
+
+
+def test_the_domain_alone_is_case_insensitive():
+    assert (
+        normalize_identity("email", "Victim@example.com")
+        == normalize_identity("email", "Victim@EXAMPLE.COM")
+        == normalize_identity("email", " Victim@Example.Com\n")
+        == ("email", "Victim@example.com")
+    )
+    assert normalize_identity("email", "Victim@example.com") != normalize_identity(
+        "email", "victim@example.com"
+    )
+
+
+def test_telegram_normalization_is_unchanged_by_the_email_rule():
+    # Compared exactly: no trimming, no folding, "@" refused (what it always was).
+    for subject in ("1234123412341234123", "AbC", "ABC", "abc", "a.B_c-1~!"):
+        assert normalize_identity("telegram", subject) == ("telegram", subject)
+    assert normalize_identity("telegram", "ABC") != normalize_identity("telegram", "abc")
+    for subject in ("AbC ", " AbC", "a@b.c", "@name", "", "４２"):
+        with pytest.raises(ValueError):
+            normalize_identity("telegram", subject)
 
 
 def test_only_ascii_whitespace_is_trimmed_from_an_email():

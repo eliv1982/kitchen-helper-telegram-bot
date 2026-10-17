@@ -1,6 +1,7 @@
 """Telegram sign-in and the server-side session: the HTTP surface.
 
-Four routes, no more:
+Four routes (the email sign-in's are in email_auth.py, and share the service and the
+session cookie below):
 
   GET  /auth/telegram/login     start: remember the login, send the browser to Telegram
   GET  /auth/telegram/callback  finish: verify, admit through the allowlist, open a session
@@ -8,6 +9,8 @@ Four routes, no more:
   POST /auth/logout             end the session
 
 and `require_user`, the dependency every route that serves a user's data must use.
+The Telegram routes answer 503 unless Telegram login is configured; /auth/me,
+/auth/logout and `require_user` work with either way of signing in, or both.
 The user is whoever the session cookie resolves to on the server. A user id sent by
 the client, in a query, a body or a header, is never read.
 
@@ -60,7 +63,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from house_helper.persistence import authn
 from house_helper.persistence.authn import AuthenticatedSession, IssuedSession
 from house_helper.web.database import DatabaseClosed, WebDatabase
-from house_helper.web.settings import AuthSettings
+from house_helper.web.settings import AuthSettings, SessionSettings
 from house_helper.web.telegram_oidc import (
     PROVIDER,
     InvalidIdToken,
@@ -101,17 +104,29 @@ class AuthService:
 
     def __init__(
         self,
-        settings: AuthSettings,
+        settings: SessionSettings,
         database: WebDatabase,
-        oidc: TelegramOidc,
+        oidc: Optional[TelegramOidc],
         clock: Callable[[], datetime],
     ) -> None:
+        """`settings` is the Telegram login's own (an AuthSettings) when `oidc` is
+        given, and only the shared part otherwise (email login without Telegram)."""
+        if oidc is not None and not isinstance(settings, AuthSettings):
+            raise TypeError("Telegram login needs the Telegram settings")
         self.settings = settings
         self._database = database
         self._oidc = oidc
         self._clock = clock
 
-    async def _run(self, work):
+    @property
+    def telegram_enabled(self) -> bool:
+        return self._oidc is not None
+
+    def now(self) -> datetime:
+        """The application's clock: the "now" of every expiry (tests move it)."""
+        return self._clock()
+
+    async def run(self, work):
         """database.run, with a database failure turned into a 503 whose log line
         names the class of the error and nothing else."""
         try:
@@ -125,7 +140,7 @@ class AuthService:
     async def start_login(self):
         authorization = new_authorization(self.settings)
         now = self._clock()
-        await self._run(
+        await self.run(
             lambda session: authn.begin_oidc_login(
                 session,
                 PROVIDER,
@@ -143,7 +158,7 @@ class AuthService:
     ) -> IssuedSession:
         """Raises LoginFailure (and HTTPException 503 for a database failure)."""
         now = self._clock()
-        login = await self._run(
+        login = await self.run(
             lambda session: authn.consume_oidc_login(session, PROVIDER, state, now=now)
         )
         if login is None:
@@ -168,7 +183,7 @@ class AuthService:
 
         now = self._clock()
         try:
-            issued = await self._run(
+            issued = await self.run(
                 lambda session: authn.complete_login(
                     session,
                     PROVIDER,
@@ -187,13 +202,13 @@ class AuthService:
         if token is None:
             return None
         now = self._clock()
-        return await self._run(lambda session: authn.authenticate(session, token, now=now))
+        return await self.run(lambda session: authn.authenticate(session, token, now=now))
 
     async def logout(self, token: Optional[str]) -> None:
         if not authn.is_session_token(token):
             return
         now = self._clock()
-        await self._run(lambda session: authn.revoke_session(session, token, now=now))
+        await self.run(lambda session: authn.revoke_session(session, token, now=now))
 
     # --- cookies ----------------------------------------------------------------------
 
@@ -219,12 +234,20 @@ class AuthService:
 
 
 async def get_auth_service(request: Request) -> AuthService:
-    """The running application's sign-in service; 503 when Telegram login is not
+    """The running application's sign-in service; 503 when no way of signing in is
     configured (or the application is not running)."""
     service = getattr(request.app.state, "auth", None)
     if service is None:
         raise _error(503, "login_unavailable")
     return service
+
+
+async def get_telegram_service(auth: AuthService = Depends(get_auth_service)) -> AuthService:
+    """The same service, for the Telegram routes: 503 unless Telegram login is
+    configured (email login may be, without it)."""
+    if not auth.telegram_enabled:
+        raise _error(503, "login_unavailable")
+    return auth
 
 
 async def require_user(
@@ -251,7 +274,7 @@ def _failure(auth: AuthService, status_code: int, code: str) -> JSONResponse:
 
 
 @router.get("/telegram/login")
-async def telegram_login(auth: AuthService = Depends(get_auth_service)) -> Response:
+async def telegram_login(auth: AuthService = Depends(get_telegram_service)) -> Response:
     authorization = await auth.start_login()
     response = RedirectResponse(authorization.url, status_code=303, headers=_PRIVATE_HEADERS)
     auth.set_cookie(
@@ -265,7 +288,7 @@ async def telegram_login(auth: AuthService = Depends(get_auth_service)) -> Respo
 
 @router.get("/telegram/callback")
 async def telegram_callback(
-    request: Request, auth: AuthService = Depends(get_auth_service)
+    request: Request, auth: AuthService = Depends(get_telegram_service)
 ) -> Response:
     # Read by hand, not declared as parameters: a declared parameter that is missing
     # or too long would be answered by FastAPI's validation error, which quotes the

@@ -12,10 +12,13 @@ the places that deliberately do so), which an operator or a deployment step runs
 Starting against a database that is missing or not migrated therefore succeeds,
 and a database error shows when something first uses the database, not before.
 
-Telegram login (auth.py) exists only when it is configured (see settings.py). The
-routes are always there; without the configuration they answer 503, and the process
-neither needs credentials nor opens an HTTP client. With it, the lifespan also
-creates the client used to call Telegram and closes it on the way out.
+The two ways to sign in exist only when configured, each on its own (see
+settings.py): Telegram login (auth.py) and email login (email_auth.py). The routes
+are always there; without the configuration they answer 503, and the process neither
+needs credentials nor opens an HTTP client nor a connection to a mail server. With
+Telegram configured, the lifespan also creates the client used to call Telegram and
+closes it on the way out. With email configured it creates the sender (which opens a
+connection to the mail server only when it has a message to send).
 """
 
 import logging
@@ -28,10 +31,12 @@ from fastapi import FastAPI
 
 from house_helper.persistence.base import utcnow
 from house_helper.persistence.database import create_db_engine
-from house_helper.web import auth, health
+from house_helper.web import auth, email_auth, health
 from house_helper.web.auth import AuthService
 from house_helper.web.database import WebDatabase
+from house_helper.web.email_auth import EmailLoginService
 from house_helper.web.logsafety import install_access_log_redaction
+from house_helper.web.mailer import EmailSender, SmtpEmailSender
 from house_helper.web.settings import WebSettings, load_web_settings
 from house_helper.web.telegram_oidc import TelegramOidc
 
@@ -50,6 +55,7 @@ async def _lifespan(app: FastAPI):
     app.state.database = database
     http: Optional[httpx.AsyncClient] = None
     try:
+        oidc: Optional[TelegramOidc] = None
         if settings.auth is not None:
             # Redirects are not followed: the endpoints are fixed, and an answer
             # that points elsewhere is a failure, not a place to go.
@@ -58,21 +64,30 @@ async def _lifespan(app: FastAPI):
                 timeout=PROVIDER_TIMEOUT,
                 follow_redirects=False,
             )
-            app.state.auth = AuthService(
-                settings.auth,
-                database,
-                TelegramOidc(settings.auth, http, app.state.clock),
-                app.state.clock,
+            oidc = TelegramOidc(settings.auth, http, app.state.clock)
+        if settings.session is not None:
+            # The session and its cookie belong to the application, not to a way of
+            # signing in: the service exists when either is configured.
+            service = AuthService(
+                settings.auth or settings.session, database, oidc, app.state.clock
             )
+            app.state.auth = service
+            if settings.email is not None:
+                sender = app.state.email_sender
+                if sender is None:
+                    sender = SmtpEmailSender(settings.email)
+                app.state.email = EmailLoginService(settings.email, service, sender)
         # The backend name only: never the URL, which may hold a password.
         logger.info(
-            "Web application started (database backend: %s, Telegram login: %s)",
+            "Web application started (database backend: %s, Telegram login: %s, email login: %s)",
             settings.database_backend,
             "on" if settings.auth is not None else "off",
+            "on" if settings.email is not None else "off",
         )
         yield
     finally:
         app.state.auth = None
+        app.state.email = None
         try:
             if http is not None:
                 await http.aclose()
@@ -86,6 +101,7 @@ def create_app(
     *,
     provider_transport: Optional[httpx.AsyncBaseTransport] = None,
     clock: Callable[[], datetime] = utcnow,
+    email_sender: Optional[EmailSender] = None,
 ) -> FastAPI:
     """A new application. `settings` defaults to the process environment.
 
@@ -93,9 +109,10 @@ def create_app(
     pages (/docs, /redoc, /openapi.json) are off: they are routes nobody asked
     for.
 
-    `provider_transport` and `clock` are seams for tests: the transport stands in
-    for the network to Telegram (None: the real one), the clock is the "now" of
-    every expiry (sessions, logins, ID token claims).
+    `provider_transport`, `clock` and `email_sender` are seams for tests: the
+    transport stands in for the network to Telegram (None: the real one), the clock
+    is the "now" of every expiry (sessions, logins, links, ID token claims), and the
+    sender stands in for the mail server (None: SMTP, as configured).
     """
     app = FastAPI(
         title="Kitchen Helper",
@@ -107,7 +124,10 @@ def create_app(
     app.state.settings = settings if settings is not None else load_web_settings()
     app.state.provider_transport = provider_transport
     app.state.clock = clock
+    app.state.email_sender = email_sender
     app.state.auth = None
+    app.state.email = None
     app.include_router(health.router)
     app.include_router(auth.router)
+    app.include_router(email_auth.router)
     return app

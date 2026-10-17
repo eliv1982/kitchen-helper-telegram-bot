@@ -115,12 +115,24 @@ def test_a_subject_cannot_contain_whitespace(session, user, subject):
         raw_insert(session, "allowlist_entries", **entry_row(user, subject=subject))
 
 
-@pytest.mark.parametrize("subject", ["Cook@Example.com", "cook.example.com", "COOK@EXAMPLE.COM"])
-def test_a_stored_email_must_be_lower_case_and_contain_an_at_sign(session, user, subject):
+@pytest.mark.parametrize(
+    "subject",
+    ["Cook@Example.com", "cook.example.com", "COOK@EXAMPLE.COM", "Cook@example.COM", "cook@Example.com"],
+)
+def test_a_stored_email_must_have_a_lower_case_domain_and_contain_an_at_sign(session, user, subject):
     with rejected(session, "ck_allowlist_entries_email_subject_normalized"):
         raw_insert(
             session, "allowlist_entries", **entry_row(user, provider="email", subject=subject)
         )
+
+
+@pytest.mark.parametrize(
+    "subject", ["Cook@example.com", "COOK@example.com", "cOOk+Tag@example.com", "cook@example.com"]
+)
+def test_a_stored_email_keeps_the_case_of_its_local_part(session, user, subject):
+    raw_insert(session, "allowlist_entries", **entry_row(user, provider="email", subject=subject))
+
+    assert session.scalar(sa.select(AllowlistEntry.subject)) == subject
 
 
 @pytest.mark.parametrize("subject", ["@example.com", "cook@", "a@b@example.com", "@@"])
@@ -162,8 +174,11 @@ def test_revoking_an_entry_keeps_the_row(session, user):
     "provider, subject, expected",
     [
         ("email", "cook@example.com", ("email", "cook@example.com")),
-        ("email", "  Cook@Example.COM \n", ("email", "cook@example.com")),
-        (AllowlistProvider.EMAIL, "Cook@Example.com", ("email", "cook@example.com")),
+        ("email", "  Cook@Example.COM \n", ("email", "Cook@example.com")),  # the domain only
+        (AllowlistProvider.EMAIL, "Cook@Example.com", ("email", "Cook@example.com")),
+        ("email", "Victim@EXAMPLE.COM", ("email", "Victim@example.com")),
+        ("email", "VICTIM@example.com", ("email", "VICTIM@example.com")),  # never folded to lower case
+        ("email", "Cook.Tag+Mixed@Example.COM", ("email", "Cook.Tag+Mixed@example.com")),
         ("email", "cook+tag@example.com", ("email", "cook+tag@example.com")),  # an alias stays itself
         ("telegram", "123456789", ("telegram", "123456789")),
         ("telegram", "1234123412341234123", ("telegram", "1234123412341234123")),  # Telegram's example `sub`
@@ -220,6 +235,7 @@ def test_a_normalized_value_is_accepted_by_the_database(session, user):
         ("email", "Ünal@Bücher.example"),  # internationalized: refused, not folded (identifiers.py)
         ("email", "cook@example.com "),  # only ASCII whitespace is trimmed, so this is refused
         ("email", "cooK@example.com"),  # the Kelvin sign: str.lower() would make it "k"
+        ("email", "cook@exampleK.com"),  # the same in the domain, which IS lower-cased
         ("email", "cook＠example.com"),  # full-width "@"
     ],
 )
@@ -252,11 +268,19 @@ def test_a_telegram_subject_is_allowed_only_exactly(session, user):
     assert not is_allowed(session, "telegram", " 42")
 
 
-def test_an_email_is_allowed_whatever_its_case_or_padding(session, user):
+def test_an_email_is_allowed_with_its_local_part_as_approved_whatever_its_domain_case_or_padding(session, user):
     allow(session, user, "email", "Cook@Example.com")
 
-    assert is_allowed(session, "email", "cook@example.com")
-    assert is_allowed(session, "email", " COOK@EXAMPLE.COM ")
+    assert is_allowed(session, "email", "Cook@example.com")
+    assert is_allowed(session, "email", " Cook@EXAMPLE.COM ")
+
+
+@pytest.mark.parametrize("asked", ["cook@example.com", "COOK@example.com", "cOOK@example.com", "cooK@example.com"])
+def test_another_case_of_the_local_part_is_not_the_approved_email(session, user, asked):
+    allow(session, user, "email", "Cook@Example.com")
+
+    assert not is_allowed(session, "email", asked)
+    assert allowed_user(session, "email", asked) is None
 
 
 def test_an_alias_of_an_allowed_email_is_not_allowed(session, user):
@@ -288,10 +312,21 @@ def test_a_revoked_entry_is_not_allowed(session, user):
     allow(session, user, "email", "cook@example.com")
 
     assert revoke(session, "telegram", "42", now=NOW)
-    assert revoke(session, "email", "Cook@Example.com", now=NOW)
+    assert revoke(session, "email", " cook@EXAMPLE.com ", now=NOW)
 
     assert not is_allowed(session, "telegram", "42")
     assert not is_allowed(session, "email", "cook@example.com")
+
+
+def test_revoking_one_case_of_an_email_leaves_the_other_alone(session, user):
+    allow(session, user, "email", "Cook@example.com")
+    allow(session, user, "email", "cook@example.com")
+
+    assert revoke(session, "email", "cook@example.com", now=NOW)
+    assert not revoke(session, "email", "COOK@example.com", now=NOW)  # no such entry
+
+    assert not is_allowed(session, "email", "cook@example.com")
+    assert is_allowed(session, "email", "Cook@example.com")
 
 
 def test_a_revocation_dated_in_the_future_still_refuses(session, user):
@@ -331,10 +366,11 @@ def test_both_ways_in_resolve_to_the_same_user(session, user):
     allow(session, user, "email", "Elena@Example.com", note="backup")
 
     by_telegram = allowed_user(session, "telegram", "1234123412341234123")
-    by_email = allowed_user(session, "email", "elena@example.com")
+    by_email = allowed_user(session, "email", "Elena@example.com")
 
     assert by_telegram is not None and by_telegram.id == user.id
     assert by_email is not None and by_email.id == user.id
+    assert allowed_user(session, "email", "elena@example.com") is None  # another case: not approved
 
 
 def test_each_way_in_is_revoked_on_its_own(session, user):
@@ -385,7 +421,7 @@ def test_allow_stores_the_normalized_pair_note_and_owner(session, user):
     entry = allow(session, user, AllowlistProvider.EMAIL, " Cook@Example.com ", note="Elena, backup login")
 
     assert (entry.provider, entry.subject, entry.note) == (
-        "email", "cook@example.com", "Elena, backup login",
+        "email", "Cook@example.com", "Elena, backup login",
     )
     assert entry.user_id == user.id
     assert entry.revoked_at is None and entry.created_at is not None
@@ -404,11 +440,20 @@ def test_allow_accepts_a_user_that_has_not_been_flushed_yet(session):
 
 def test_allowing_twice_keeps_one_row(session, user):
     first = allow(session, user, "email", "cook@example.com", note="first")
-    second = allow(session, user, "email", "COOK@example.com")
+    second = allow(session, user, "email", " cook@EXAMPLE.com ")
 
     assert second.id == first.id
     assert second.note == "first"  # no note given: the old one stays
     assert count(session, AllowlistEntry) == 1
+
+
+def test_allowing_another_case_of_an_email_is_another_entry(session, user):
+    first = allow(session, user, "email", "cook@example.com")
+    second = allow(session, user, "email", "COOK@example.com")
+
+    assert second.id != first.id
+    assert (first.subject, second.subject) == ("cook@example.com", "COOK@example.com")
+    assert count(session, AllowlistEntry) == 2
 
 
 def test_allowing_with_a_note_replaces_the_note(session, user):
@@ -542,4 +587,5 @@ def test_entries_and_revocations_are_durable(factory):
 
     with factory() as s:
         assert not is_allowed(s, "telegram", "42")
-        assert is_allowed(s, "email", "cook@example.com")
+        assert is_allowed(s, "email", "Cook@example.com")
+        assert not is_allowed(s, "email", "cook@example.com")

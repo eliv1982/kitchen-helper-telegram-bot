@@ -25,7 +25,13 @@ import pytest
 import house_helper.web
 from house_helper.persistence.database import DATABASE_URL_ENV
 from house_helper.web.settings import (
+    EMAIL_FROM_ENV,
     PUBLIC_URL_ENV,
+    SMTP_HOST_ENV,
+    SMTP_PASSWORD_ENV,
+    SMTP_PORT_ENV,
+    SMTP_SECURITY_ENV,
+    SMTP_USERNAME_ENV,
     TELEGRAM_CLIENT_ID_ENV,
     TELEGRAM_CLIENT_SECRET_ENV,
     TELEGRAM_ID_TOKEN_ALG_ENV,
@@ -255,6 +261,12 @@ def _run_probe(tmp_path, modules, *, extra_env=None, check=True):
             TELEGRAM_CLIENT_ID_ENV,
             TELEGRAM_CLIENT_SECRET_ENV,
             TELEGRAM_ID_TOKEN_ALG_ENV,
+            SMTP_HOST_ENV,
+            SMTP_PORT_ENV,
+            SMTP_SECURITY_ENV,
+            SMTP_USERNAME_ENV,
+            SMTP_PASSWORD_ENV,
+            EMAIL_FROM_ENV,
         }
     }
     env.update(extra_env or {})

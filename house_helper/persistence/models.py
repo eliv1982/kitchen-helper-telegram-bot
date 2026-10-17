@@ -40,8 +40,9 @@ guard access (users, sessions, conversations, turn requests, ...); a database
 sequence for messages, whose order within a conversation is the order of their
 ids. Timestamps are timezone-aware UTC (see base.UtcDateTime).
 
-Secrets: a session token or an OIDC state value is stored only as its SHA-256
-hex digest, so a copy of the database cannot be replayed. The PKCE code
+Secrets: a session token, an emailed sign-in token or an OIDC state value is
+stored only as its SHA-256 hex digest, so a copy of the database cannot be
+replayed. The PKCE code
 verifier and nonce of an OIDC login must be sent back to the provider, so they
 are stored as given, and live only until the login's expires_at.
 
@@ -86,7 +87,7 @@ from house_helper.persistence.identifiers import (
     normalize_identity,
     validate_idempotency_key,
 )
-from house_helper.persistence.sqlchecks import PrintableAscii, WithinRetention
+from house_helper.persistence.sqlchecks import EmailSubjectNormalized, PrintableAscii, WithinRetention
 
 MESSAGE_RETENTION_DAYS = RETENTION_DAYS
 MESSAGE_RETENTION = RETENTION
@@ -164,15 +165,12 @@ def _identity_checks() -> list[sa.CheckConstraint]:
             f"length(subject) BETWEEN 1 AND {MAX_SUBJECT_LENGTH}", name="subject_length"
         ),
         sa.CheckConstraint(PrintableAscii("subject"), name="subject_printable_ascii"),
-        # An email is stored lower-case with exactly one "@" and something on
-        # both sides of it. (Lower-casing is ASCII-only on both databases, which
-        # is all that subject_printable_ascii lets through.)
+        # An email has exactly one "@" with something on both sides, and a
+        # lower-case domain; its local part is stored as approved, case included
+        # (sqlchecks.EmailSubjectNormalized; migration 0004 relaxed this rule from
+        # "all lower-case" and said what became of the rows stored under it).
         sa.CheckConstraint(
-            "provider <> 'email' OR (subject = lower(subject) "
-            "AND length(subject) - length(replace(subject, '@', '')) = 1 "
-            "AND substr(subject, 1, 1) <> '@' "
-            "AND substr(subject, length(subject), 1) <> '@')",
-            name="email_subject_normalized",
+            EmailSubjectNormalized("provider", "subject"), name="email_subject_normalized"
         ),
         # A Telegram subject can never be taken for an address or a @handle.
         sa.CheckConstraint(
@@ -238,7 +236,9 @@ class AllowlistEntry(Base):
     (provider, subject) names the identity the way its IdentityLink will once
     the person has signed in: for TELEGRAM the stable `sub` of Telegram's OIDC
     ID token (never a username, which can change hands), for EMAIL the verified
-    address, lower-case (see identifiers.normalize_identity). The pair is unique
+    address, domain lower-case and local part exactly as approved (see
+    identifiers.normalize_identity: "Cook@example.com" and "cook@example.com" are
+    two identities). The pair is unique
     across all users, revoked rows included: an identity belongs to exactly one
     user, and a revoked entry stays as a row with revoked_at set and is lifted
     by clearing it, so there is never a second row to disagree with the first.
@@ -413,6 +413,63 @@ class OidcState(Base):
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     expires_at: Mapped[datetime]
     consumed_at: Mapped[Optional[datetime]]
+
+
+class EmailLoginChallenge(Base):
+    """One emailed sign-in link: what must be remembered between sending a link to
+    an address and the person opening it. Single use (consumed_at), short-lived
+    (expires_at) and withdrawable (revoked_at). token_hash is the SHA-256 hex
+    digest of the secret in the link; the secret itself is never stored.
+
+    The challenge belongs to an identity that was provisioned in advance: the
+    composite foreign key (user_id, provider, subject) -> allowlist_entries is the
+    same rule as identity_links', so a challenge can exist only for an allowlisted
+    address and only for the very user that entry names. The provider is always
+    'email' (a CHECK). Deleting the entry deletes its challenges; revoking it
+    withdraws them (allowlist.revoke), and a withdrawn challenge stays withdrawn
+    when the address is allowed again, as a revoked session does.
+
+    The row is a record of what was issued to whom, not a login: redeeming it
+    (email_login.redeem_email_login) re-checks the allowlist and creates a session
+    through the identity link of the address, like any other sign-in.
+
+    Once stored, the binding (user, address, token, lifetime) does not change: the
+    ORM refuses to rewrite it. Only consumed_at and revoked_at are ever set.
+    """
+
+    __tablename__ = "email_login_challenges"
+    __table_args__ = (
+        sa.UniqueConstraint("token_hash"),
+        # Serves the cooldown lookup (the latest challenge of an identity) and the
+        # composite foreign key's cascade. An explicit name: the convention's would
+        # be 61 characters, too close to PostgreSQL's 63 to leave to chance.
+        sa.Index(
+            "ix_email_login_challenges_identity", "user_id", "provider", "subject", "created_at"
+        ),
+        sa.Index(None, "expires_at"),
+        sa.ForeignKeyConstraint(
+            ["user_id", "provider", "subject"],
+            ["allowlist_entries.user_id", "allowlist_entries.provider", "allowlist_entries.subject"],
+            name="fk_email_login_challenges_allowlist_entry",
+            ondelete="CASCADE",
+        ),
+        sa.CheckConstraint("provider = 'email'", name="provider_is_email"),
+        # The entry this refers to already holds the address to the full identity
+        # rules (identity checks); this is the width, which SQLite does not enforce.
+        sa.CheckConstraint(f"length(subject) BETWEEN 1 AND {MAX_SUBJECT_LENGTH}", name="subject_length"),
+        sa.CheckConstraint("length(token_hash) = 64", name="token_hash_length"),
+        sa.CheckConstraint("expires_at > created_at", name="expires_after_created"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("users.id", ondelete="CASCADE"))
+    provider: Mapped[str] = mapped_column(sa.String(64))
+    subject: Mapped[str] = mapped_column(sa.String(MAX_SUBJECT_LENGTH))
+    token_hash: Mapped[str] = mapped_column(sa.String(64))
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    expires_at: Mapped[datetime]
+    consumed_at: Mapped[Optional[datetime]]
+    revoked_at: Mapped[Optional[datetime]]
 
 
 class Conversation(Base):
@@ -800,11 +857,18 @@ def _guard_session_on_update(mapper: Any, connection: Any, target: Any) -> None:
     _forbid_changes(target, "identity_link_id")
 
 
+def _guard_challenge_on_update(mapper: Any, connection: Any, target: Any) -> None:
+    _forbid_changes(
+        target, "user_id", "provider", "subject", "token_hash", "created_at", "expires_at"
+    )
+
+
 sa.event.listen(Session, "before_update", _guard_session_on_update)
+sa.event.listen(EmailLoginChallenge, "before_update", _guard_challenge_on_update)
 sa.event.listen(Message, "before_insert", _guard_retention_on_insert)
 sa.event.listen(Message, "before_update", _guard_message)
 sa.event.listen(TurnRequest, "before_insert", _guard_turn_request_on_insert)
 sa.event.listen(TurnRequest, "before_update", _guard_turn_request_on_update)
-for _identity_model in (AllowlistEntry, IdentityLink):
+for _identity_model in (AllowlistEntry, IdentityLink, EmailLoginChallenge):
     sa.event.listen(_identity_model, "before_insert", _guard_identity)
     sa.event.listen(_identity_model, "before_update", _guard_identity)
