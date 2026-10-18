@@ -46,15 +46,14 @@ from house_helper.core.backend import (
     ChatBackend,
 )
 from house_helper.core.identity import ConversationKey
+from house_helper.core.limits import MAX_INPUT_LENGTH
 from house_helper.core.outcomes import ChatOutcome, OutcomeStatus
 
 logger = logging.getLogger(__name__)
 
-# Application-level cap on a single incoming message, independent of any
-# transport's own limit (Telegram's is ~4096 characters). Keeps a single
-# request's cost and the history it adds predictable, regardless of how large
-# a message a user sends.
-DEFAULT_MAX_INPUT_LENGTH = 2000
+# Application-level cap on a single incoming message (2000 characters, see
+# house_helper.core.limits, where the web chat reads the same number).
+DEFAULT_MAX_INPUT_LENGTH = MAX_INPUT_LENGTH
 
 # Something to keep open for exactly as long as the backend call is in flight
 # (a transport's "typing..." indicator). A factory rather than an instance, so

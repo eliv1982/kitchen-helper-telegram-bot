@@ -3,6 +3,8 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
+from house_helper.core.provider_settings import read_provider_settings
+
 load_dotenv()
 
 
@@ -21,19 +23,6 @@ class Settings:
     openai_max_retries: int
 
 
-def _parse_number(env, name, default, cast, low, high, errors):
-    raw = env.get(name, default)
-    try:
-        value = cast(raw)
-    except (TypeError, ValueError):
-        errors.append(f"{name} must be a number, got {raw!r}")
-        return None
-    if not (low <= value <= high):
-        errors.append(f"{name} must be between {low} and {high}, got {value}")
-        return None
-    return value
-
-
 def load_settings(env: dict[str, str] | None = None) -> Settings:
     """
     Build and validate Settings from environment variables (os.environ by
@@ -49,32 +38,23 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
     if not bot_token:
         errors.append("BOT_TOKEN is not set")
 
-    openai_api_key = source.get("OPENAI_API_KEY")
-    if not openai_api_key:
-        errors.append("OPENAI_API_KEY is not set")
-
-    openai_model = source.get("OPENAI_MODEL", "gpt-4.1-mini")
-
-    temperature = _parse_number(source, "TEMPERATURE", "0.7", float, 0.0, 2.0, errors)
-    max_tokens = _parse_number(source, "MAX_TOKENS", "600", int, 1, 4096, errors)
-    openai_timeout_seconds = _parse_number(
-        source, "OPENAI_TIMEOUT_SECONDS", "15", float, 1.0, 120.0, errors
-    )
-    openai_max_retries = _parse_number(
-        source, "OPENAI_MAX_RETRIES", "1", int, 0, 5, errors
-    )
+    # The provider's own variables (key, model, temperature, limits), their defaults
+    # and ranges are read in one place shared with the web process, which has no bot
+    # token: house_helper.core.provider_settings. It appends to `errors`, so the
+    # messages and their order are what they have always been.
+    provider = read_provider_settings(source, errors)
 
     if errors:
         raise ConfigError("; ".join(errors))
 
     return Settings(
         bot_token=bot_token,
-        openai_api_key=openai_api_key,
-        openai_model=openai_model,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        openai_timeout_seconds=openai_timeout_seconds,
-        openai_max_retries=openai_max_retries,
+        openai_api_key=provider.api_key,
+        openai_model=provider.model,
+        temperature=provider.temperature,
+        max_tokens=provider.max_tokens,
+        openai_timeout_seconds=provider.timeout_seconds,
+        openai_max_retries=provider.max_retries,
     )
 
 

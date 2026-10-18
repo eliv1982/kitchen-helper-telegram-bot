@@ -39,6 +39,15 @@ Email login (a link mailed over SMTP; needs no Telegram variable):
   HOUSE_HELPER_SMTP_USERNAME          optional, together with the password: the login
   HOUSE_HELPER_SMTP_PASSWORD            to the mail server
 
+The assistant (the chat's AI provider) is configured by the same variables as the
+Telegram bot's, read through house_helper.core.provider_settings: OPENAI_API_KEY (the
+only required one), OPENAI_MODEL, TEMPERATURE, MAX_TOKENS, OPENAI_TIMEOUT_SECONDS and
+OPENAI_MAX_RETRIES. Not BOT_TOKEN: the web process has none and asks for none. Without
+OPENAI_API_KEY the process starts, signs people in, creates and shows conversations,
+and answers a message with 503 "chat_unavailable"; with it, every other provider
+variable is validated at start (a malformed one refuses to start, naming the variable
+and never its value). A key with nothing else set uses the defaults.
+
 The public URL is configuration, never read from a request: the redirect URI the
 provider is given, the address in a mailed link, the Origin accepted on logout and
 the cookie attributes all derive from it, so a forged Host header changes none of
@@ -64,6 +73,11 @@ from urllib.parse import urlsplit
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 
+from house_helper.core.provider_settings import (
+    API_KEY_ENV,
+    ProviderSettings,
+    read_provider_settings,
+)
 from house_helper.persistence.authn import OIDC_LOGIN_LIFETIME, SESSION_LIFETIME
 from house_helper.persistence.database import DATABASE_URL_ENV, DEFAULT_DATABASE_URL
 from house_helper.persistence.email_login import EMAIL_LOGIN_LIFETIME, EMAIL_REQUEST_COOLDOWN
@@ -99,6 +113,7 @@ ID_TOKEN_ALGORITHMS = ("RS256", "ES256", "EdDSA")
 DEFAULT_ID_TOKEN_ALGORITHM = "RS256"
 
 _MAX_CREDENTIAL_LENGTH = 256
+_MAX_API_KEY_LENGTH = 512
 
 
 class WebConfigError(Exception):
@@ -302,6 +317,9 @@ class WebSettings:
     database_url: str = field(repr=False)
     auth: Optional[AuthSettings] = None
     email: Optional[EmailSettings] = None
+    # The assistant. None: not configured, and the chat answers 503. (Its repr hides
+    # the key.)
+    provider: Optional[ProviderSettings] = None
 
     @property
     def session(self) -> Optional[SessionSettings]:
@@ -415,6 +433,26 @@ def load_email_settings(env: Optional[Mapping[str, str]] = None) -> Optional[Ema
     )
 
 
+def load_provider_settings(env: Optional[Mapping[str, str]] = None) -> Optional[ProviderSettings]:
+    """The assistant's settings from `env` (os.environ by default): None when there
+    is no OPENAI_API_KEY (the chat is then unavailable, nothing else is), the settings
+    when there is, WebConfigError for a key with a malformed companion variable. The
+    message names the variable and the rule, never the value found."""
+    source = os.environ if env is None else env
+    key = source.get(API_KEY_ENV)
+    if not key:
+        return None
+    # A stray space or newline from a pasted .env line would otherwise surface as a
+    # failure of the first chat request, not of the start.
+    if not is_printable_ascii(key) or len(key) > _MAX_API_KEY_LENGTH:
+        raise WebConfigError(f"{API_KEY_ENV} is not valid (printable ASCII without spaces)")
+    problems: list[str] = []
+    settings = read_provider_settings(source, problems, quote_values=False)
+    if settings is None:
+        raise WebConfigError("The assistant is not configured correctly: " + "; ".join(problems))
+    return settings
+
+
 def load_web_settings(env: Optional[Mapping[str, str]] = None) -> WebSettings:
     """Settings from `env` (os.environ by default). Raises WebConfigError."""
     source = os.environ if env is None else env
@@ -422,4 +460,5 @@ def load_web_settings(env: Optional[Mapping[str, str]] = None) -> WebSettings:
         database_url=source.get(DATABASE_URL_ENV) or DEFAULT_DATABASE_URL,
         auth=load_auth_settings(source),
         email=load_email_settings(source),
+        provider=load_provider_settings(source),
     )

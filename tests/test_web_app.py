@@ -117,12 +117,13 @@ def test_creating_the_application_touches_neither_the_database_nor_the_disk(tmp_
     assert not hasattr(app.state, "database")
 
 
-def test_the_application_exposes_the_health_endpoint_the_sign_in_routes_and_nothing_else(tmp_path):
-    # The sign-in routes (R3A Telegram, R3B-2 email) are the only addition to
-    # /healthz: no conversation,
-    # recipe, preference or other user-data route may exist, and not even the
-    # interactive API pages FastAPI would add by default. A route added later has to
-    # change this list on purpose, and has to use auth.require_user.
+def test_the_application_exposes_health_sign_in_chat_and_nothing_else(tmp_path):
+    # The sign-in routes (R3A Telegram, R3B-2 email) and the chat API (R4A: the
+    # conversations and their messages) are the only additions to /healthz: no recipe,
+    # preference or other user-data route may exist, and not even the interactive API
+    # pages FastAPI would add by default. A route added later has to change this list
+    # on purpose, and has to use auth.require_user (the chat routes do: see
+    # test_web_chat_api.py, which asks each of them without a session).
     app = create_app(settings_for(tmp_path / "routes.db"))
 
     # openapi() is the public listing (app.routes holds FastAPI internals); the
@@ -136,6 +137,8 @@ def test_the_application_exposes_the_health_endpoint_the_sign_in_routes_and_noth
         "/auth/logout": ["post"],
         "/auth/email/request": ["post"],
         "/auth/email/confirm": ["get", "post"],
+        "/api/conversations": ["get", "post"],
+        "/api/conversations/{conversation_id}/messages": ["get", "post"],
     }
 
 

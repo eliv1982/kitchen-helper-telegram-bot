@@ -4,17 +4,12 @@ from typing import Any
 from openai import APIConnectionError, APIError, APITimeoutError, AsyncOpenAI, RateLimitError
 
 import config
+from house_helper.core.kitchen_prompt import KITCHEN_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_MESSAGE = (
-    "Ты Kitchen Helper — дружелюбный помощник по простым домашним блюдам. "
-    "Помогай пользователю придумать, что приготовить из доступных продуктов. "
-    "Отвечай кратко, практично и по-русски. "
-    "Не давай медицинских, диетологических или опасных советов. "
-    "Если данных мало, предложи 2-3 варианта и задай один уточняющий вопрос. "
-    "Не выдумывай наличие продуктов, которых пользователь не называл."
-)
+# One text for the bot and the web chat (house_helper.core.kitchen_prompt).
+SYSTEM_MESSAGE = KITCHEN_SYSTEM_PROMPT
 
 
 class InvalidResponseError(Exception):
@@ -93,7 +88,15 @@ async def get_chat_response(
         logger.error("OpenAI connection error for user_id=%s", user_id)
         raise
     except APIError as exc:
-        logger.error("OpenAI API error for user_id=%s: %s", user_id, exc)
+        # The class and the HTTP status only, never str(exc): the provider's message
+        # can quote the request or the credential ("Incorrect API key provided:
+        # sk-...") and must not reach a log.
+        logger.error(
+            "OpenAI API error for user_id=%s (%s, status=%s)",
+            user_id,
+            type(exc).__name__,
+            getattr(exc, "status_code", None),
+        )
         raise
 
     content = _extract_content(response, user_id=user_id)

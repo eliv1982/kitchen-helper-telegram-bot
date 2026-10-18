@@ -2,6 +2,7 @@ import asyncio
 from typing import TypedDict
 
 from house_helper.core.identity import ConversationKey
+from house_helper.core.limits import MAX_HISTORY_MESSAGES
 
 MessageDict = TypedDict("MessageDict", {"role": str, "content": str})
 
@@ -16,7 +17,10 @@ MessageDict = TypedDict("MessageDict", {"role": str, "content": str})
 # be free to sit there un-trimmed while its request is in flight, so a
 # failed or cancelled request can roll it back without having already
 # discarded a previously completed pair to make room for it.
-MAX_HISTORY_MESSAGES = 20
+#
+# MAX_HISTORY_MESSAGES (20) is defined in house_helper.core.limits, shared with the web
+# chat, and imported above. It stays a name of this module: trim_history() reads it at
+# call time, which is what lets a test replace it.
 
 # conversation key -> list of chat messages (user/assistant only)
 _contexts: dict[ConversationKey, list[MessageDict]] = {}

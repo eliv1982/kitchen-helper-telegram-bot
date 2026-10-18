@@ -80,7 +80,9 @@ def test_valid_env_produces_settings_with_expected_defaults():
     assert settings.openai_api_key == "key"
     assert settings.openai_model == "gpt-4.1-mini"
     assert settings.temperature == 0.7
-    assert settings.max_tokens == 600
+    # Raised from 600, which cut a complete recipe in Russian off in the middle (the
+    # cap itself is still MAX_TOKENS in the environment, 1 to 4096).
+    assert settings.max_tokens == 1000
     assert settings.openai_timeout_seconds == 15.0
     assert settings.openai_max_retries == 1
 

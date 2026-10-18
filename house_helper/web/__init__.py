@@ -16,4 +16,12 @@ settings.py says how it is configured and what happens when it is not. It is the
 only way into the application: every route that serves a user's data must depend on
 auth.require_user, which resolves the user from the server-side session and never
 from anything the client sends.
+
+The chat API (chat_api.py: the conversations and their messages under /api) is the
+first such route set. turn_runner.py answers a message durably (the database, not the
+process, holds the conversation; the AI is called with no transaction open and a
+disconnecting client does not interrupt the turn), and diagnostics.py is the catalogue
+of its errors (stable codes, Russian messages, server-made correlation ids). The AI
+comes from the same settings as the Telegram bot's, minus its token (settings.py), and
+is built when the application starts but connects only on the first message.
 """

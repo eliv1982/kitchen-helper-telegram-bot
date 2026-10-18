@@ -430,10 +430,15 @@ async def auth_app(
     origin: str = ORIGIN,
     seed: bool = True,
     configure: Optional[Callable[[Any], None]] = None,
+    chat_backend: Optional[Any] = None,
+    provider: Optional[Any] = None,
     **options: Any,
 ):
     """The application with Telegram login on, started, and a client for it.
-    `configure(app)` runs before the application starts (to add a test-only route)."""
+    `configure(app)` runs before the application starts (to add a test-only route).
+    `chat_backend` answers chat messages (None: the chat is not configured, unless
+    `provider` -- a ProviderSettings -- is given, which makes the application build the
+    real OpenAI backend from it)."""
     url = sqlite_url(tmp_path / "auth.db")
     engine = create_db_engine(url)
     upgrade_database(engine)
@@ -443,9 +448,10 @@ async def auth_app(
     settings = auth_settings(origin, **options)
     telegram = FakeTelegram(clock, settings)
     app = create_app(
-        WebSettings(database_url=url, auth=settings),
+        WebSettings(database_url=url, auth=settings, provider=provider),
         provider_transport=telegram.transport(),
         clock=clock,
+        chat_backend=chat_backend,
     )
     if configure is not None:
         configure(app)

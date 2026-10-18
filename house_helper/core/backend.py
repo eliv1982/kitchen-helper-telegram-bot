@@ -12,13 +12,14 @@ replacing api_client.get_chat_response at runtime keeps working.
 api_client is imported when the adapter first runs, not when this module is
 imported: it pulls in config, which reads the .env file at import time, and
 merely importing the chat core (ChatService, the backend contract, the errors
-below) must not load provider configuration.
+below) must not load provider configuration. The same goes for the openai SDK
+itself: its exception classes are imported on first use too, so that the web
+process, which imports the contract and the errors from here, loads neither the
+SDK nor the Telegram-side provider layer just by starting.
 """
 
 from dataclasses import dataclass
 from typing import Protocol
-
-from openai import APIConnectionError, APIError, APITimeoutError, RateLimitError
 
 from house_helper.core.identity import ConversationKey
 
@@ -45,10 +46,16 @@ class BackendEmptyResponseError(BackendError):
 
 @dataclass(frozen=True)
 class BackendReply:
-    """What a backend returns for one request."""
+    """What a backend returns for one request.
+
+    `truncated` is True when the provider stopped because the answer reached the
+    length cap, so `text` ends mid-thought. Only a backend that can tell sets it;
+    the default (False) is what every other one means.
+    """
 
     text: str
     usage: dict[str, int] | None = None
+    truncated: bool = False
 
 
 class ChatBackend(Protocol):
@@ -97,7 +104,9 @@ class OpenAIBackend:
         conversation: ConversationKey,
         context_len: int,
     ) -> BackendReply:
-        import api_client  # deferred on purpose, see the module docstring
+        # Deferred on purpose, see the module docstring.
+        import api_client
+        from openai import APIConnectionError, APIError, APITimeoutError, RateLimitError
 
         try:
             text, usage = await api_client.get_chat_response(

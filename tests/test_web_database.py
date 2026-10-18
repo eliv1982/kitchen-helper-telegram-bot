@@ -1059,3 +1059,78 @@ def test_a_database_can_be_built_before_any_event_loop_exists(tmp_path):
         assert not (tmp_path / "never.db").exists()
     finally:
         engine.dispose()
+
+
+# --- the unit is accepted: the caller is told when it can no longer be stopped ------------------
+
+
+@pytest.mark.asyncio
+async def test_on_accepted_is_called_once_when_the_pool_has_the_unit_and_before_it_ends(tmp_path):
+    async with opened_database(tmp_path) as (database, engine):
+        units = Units(engine)
+        accepted = []
+
+        call = asyncio.ensure_future(database.run(units.hold, on_accepted=lambda: accepted.append("yes")))
+        await until(lambda: units.started == 1)
+
+        assert accepted == ["yes"]  # told while the function is still running ...
+        units.release.set()
+        assert await asyncio.wait_for(call, TIMEOUT) == "held"
+        assert accepted == ["yes"]  # ... and only once
+
+
+@pytest.mark.asyncio
+async def test_on_accepted_waits_for_the_slot_and_a_call_withdrawn_before_it_is_never_told(tmp_path):
+    ran, told = [], []
+    async with opened_database(tmp_path, max_concurrent=1) as (database, engine):
+        units = Units(engine)
+        holder = submit(database, units.hold)
+        await until(lambda: units.started == 1)
+        waiting = asyncio.ensure_future(
+            database.run(lambda session: ran.append("waiting") or "ran", on_accepted=lambda: told.append("waiting"))
+        )
+        withdrawn = asyncio.ensure_future(
+            database.run(lambda session: ran.append("withdrawn"), on_accepted=lambda: told.append("withdrawn"))
+        )
+        await settle()  # both wait for the only slot
+
+        assert told == []  # not accepted: nothing can run yet, and the call can still be withdrawn
+        await cancelled_at_once([withdrawn])
+        units.release.set()
+        assert await asyncio.wait_for(waiting, TIMEOUT) == "ran"
+        assert await asyncio.wait_for(holder, TIMEOUT) == "held"
+
+        assert told == ["waiting"] and ran == ["waiting"]
+
+
+@pytest.mark.asyncio
+async def test_on_accepted_is_not_called_for_work_the_database_refuses(tmp_path, monkeypatch):
+    told = []
+    async with opened_database(tmp_path) as (database, engine):
+        with monkeypatch.context() as patch:
+
+            def no_thread(*args, **kwargs):
+                raise RuntimeError("can't start new thread")
+
+            patch.setattr(database._pool, "submit", no_thread)
+            with pytest.raises(RuntimeError, match="start new thread"):
+                await database.run(add_user, on_accepted=lambda: told.append("accepted"))
+        await database.aclose()
+        with pytest.raises(DatabaseClosed):
+            await database.run(add_user, on_accepted=lambda: told.append("accepted"))
+
+    assert told == []
+
+
+@pytest.mark.asyncio
+async def test_a_failing_on_accepted_does_not_stop_the_unit_or_hide_its_result(tmp_path, caplog):
+    caplog.set_level(logging.ERROR)
+    async with opened_database(tmp_path) as (database, engine):
+
+        def broken():
+            raise ZeroDivisionError("SECRET")
+
+        result = await asyncio.wait_for(database.run(add_user, on_accepted=broken), TIMEOUT)
+
+        assert users(engine) == 1 and result is not None  # it ran and committed
+        assert "ZeroDivisionError" in caplog.text and "SECRET" not in caplog.text

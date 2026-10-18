@@ -26,7 +26,13 @@ cancellation comes from anyio (a task group, a cancel scope: what Starlette
 uses) it is held back until the function has finished; a bare Task.cancel() is
 delivered at once and leaves the function running on its own. A request that
 must not repeat its effect when retried needs an idempotency key (see
-house_helper.persistence.turns).
+house_helper.persistence.turns). A caller that must know how a unit ended, whoever
+is still waiting, therefore does not call run() from the task that may be cancelled:
+the web turn runner runs every unit as a task of its own that nothing cancels, and
+settles a cancelled turn from the unit's outcome (web.turn_runner). From outside,
+"waiting for a slot", "queued" and "running" are not told apart; a cancelled call is
+withdrawn only in the first two, so "the awaiting task was cancelled" never means
+"the function did not run".
 
 The bound: a slot belongs to the unit of work, not to the task awaiting it. It is
 taken before the function is handed to the pool and given back when the function
@@ -66,7 +72,7 @@ import contextvars
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, Optional, TypeVar
 
 import anyio
 import anyio.to_thread
@@ -157,10 +163,26 @@ class WebDatabase:
     def closed(self) -> bool:
         return self._closed
 
-    async def run(self, work: Callable[[OrmSession], T]) -> T:
+    async def run(
+        self,
+        work: Callable[[OrmSession], T],
+        *,
+        on_accepted: Optional[Callable[[], None]] = None,
+    ) -> T:
         """Call `work(session)` on a worker thread, in one transaction, and
         return what it returns. Whatever it raises is raised here, after the
-        transaction has been rolled back. Raises DatabaseClosed once closed."""
+        transaction has been rolled back. Raises DatabaseClosed once closed.
+
+        `on_accepted`, if given, is called once on the event loop, in the very step in
+        which the pool takes the unit (no await between). From then on the function
+        may run whatever happens to this call: cancelling it no longer promises that
+        the function does not run (it is withdrawn only while it has not started).
+        Before it, the call is only waiting for a slot, and cancelling it means the
+        function never runs. So a caller that must know which of the two it is in has
+        its answer here. It is not called for a call that is refused (DatabaseClosed,
+        a pool that would not take the unit) or cancelled while it waits for a slot.
+        It must be quick and must not raise: an exception is logged by class name and
+        ignored, because by then the unit is already on its way."""
         loop = asyncio.get_running_loop()
         self._refuse_if_closed()  # at once, even if every slot is taken
         await self._slots.acquire()  # cancelled while waiting: holds nothing
@@ -193,6 +215,11 @@ class WebDatabase:
                 # give nothing back, and nothing ever cancels it, so the callback
                 # above cannot give it back either. The slot is given back here, once.
                 self._slots.release()
+        if on_accepted is not None:
+            try:
+                on_accepted()
+            except Exception as exc:  # the unit is accepted: nothing may now fail the call
+                logger.error("An on_accepted callback failed: category=%s", type(exc).__name__)
         # What anyio's thread limiter did: a cancel scope waits for the function to
         # finish. (A bare Task.cancel() still gets through, and the slot stays taken.)
         with anyio.CancelScope(shield=True):
