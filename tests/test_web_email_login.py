@@ -31,7 +31,7 @@ from house_helper.persistence.models import (
 )
 from house_helper.persistence.models import Session as LoginSession
 from house_helper.web import email_pages
-from tests.auth_support import ORIGIN, START, cookie_attributes, rows, sign_in
+from tests.auth_support import ORIGIN, START, cookie_attributes, logout_as, rows, sign_in
 from tests.email_support import ADDRESS, email_app, parse_link
 
 SESSION_COOKIE = "__Host-hh_session"
@@ -428,14 +428,14 @@ async def test_a_page_for_an_address_with_markup_in_it_is_escaped(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_confirming_signs_the_owner_in_and_redirects_to_me(tmp_path):
+async def test_confirming_signs_the_owner_in_and_redirects_to_the_application_page(tmp_path):
     async with email_app(tmp_path) as h:
         link = await h.ask_and_get_link()
         before = state_of(h)
 
         response = await h.confirm(link)
 
-        assert response.status_code == 303 and response.headers["location"] == "/auth/me"
+        assert response.status_code == 303 and response.headers["location"] == "/"
         assert response.headers["cache-control"] == "no-store"
         assert response.headers["referrer-policy"] == "no-referrer"
         me = await h.client.get("/auth/me")
@@ -609,8 +609,8 @@ async def test_a_browser_signed_in_as_somebody_else_is_not_switched_and_the_link
         assert rows(h, EmailLoginChallenge)[-1].consumed_at is None  # not used up
         assert state_of(h)["sessions"] == 1
 
-        # the explicit transition: sign out, then open the same link
-        assert (await h.client.post("/auth/logout", headers={"Origin": ORIGIN})).status_code == 204
+        # the explicit transition: sign out (as who the browser is signed in as), then open the same link
+        assert (await h.client.post("/auth/logout", headers=logout_as(second, Origin=ORIGIN))).status_code == 204
         accepted = await h.confirm(elenas)
         assert accepted.status_code == 303
         assert me_user(await h.client.get("/auth/me")) == h.user_id
@@ -766,7 +766,7 @@ async def test_logging_out_ends_the_session_and_leaves_the_identity_alone(tmp_pa
     async with email_app(tmp_path) as h:
         await h.sign_in()
 
-        assert (await h.client.post("/auth/logout", headers={"Origin": ORIGIN})).status_code == 204
+        assert (await h.client.post("/auth/logout", headers=logout_as(h.user_id, Origin=ORIGIN))).status_code == 204
         assert (await h.client.get("/auth/me")).status_code == 401
         h.clock.advance(minutes=2)
         assert (await h.sign_in()).status_code == 303  # the identity is as allowed as before

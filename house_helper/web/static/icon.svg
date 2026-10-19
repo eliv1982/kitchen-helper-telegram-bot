@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Кухонный помощник">
+  <rect width="64" height="64" rx="14" fill="#1c3f94"/>
+  <path d="M14 30h36v6a14 14 0 0 1-14 14H28a14 14 0 0 1-14-14z" fill="#ffffff"/>
+  <path d="M10 30h44" stroke="#ffffff" stroke-width="4" stroke-linecap="round"/>
+  <path d="M26 24c0-4 4-4 4-8m8 8c0-4 4-4 4-8" fill="none" stroke="#7fd3a3" stroke-width="3" stroke-linecap="round"/>
+</svg>

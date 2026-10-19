@@ -20,6 +20,7 @@ state, and uvicorn writes the request line.
 
 import base64
 import logging
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -35,6 +36,7 @@ from tests.auth_support import (
     app_log_text,
     auth_app,
     begin_sign_in,
+    logout_as,
     make_rsa,
     rows,
     sign_in,
@@ -76,7 +78,9 @@ async def test_nothing_secret_is_logged_whatever_happens(tmp_path, caplog):
         h.client.cookies.set(LOGIN_COOKIE, state, domain="kitchen.example.test", path="/")
         assert (await h.client.get(callback)).status_code == 400
         assert (await h.client.get("/auth/me")).status_code == 200
-        assert (await h.client.post("/auth/logout")).status_code == 204
+        assert (await h.client.post("/auth/logout")).status_code == 400  # no X-Expected-User
+        assert (await h.client.post("/auth/logout", headers=logout_as(uuid4()))).status_code == 409  # not this session's user
+        assert (await h.client.post("/auth/logout", headers=logout_as(h.user_id))).status_code == 204
 
         # a stranger, a bad nonce, a foreign key, an unsigned token
         assert (await one(h.new_client(), "9999999999"))[1].status_code == 403

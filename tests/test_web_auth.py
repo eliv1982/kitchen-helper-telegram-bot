@@ -14,6 +14,7 @@ over its public https origin (a Secure cookie is only sent back there).
 from datetime import timedelta
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -45,7 +46,9 @@ from tests.auth_support import (
     database_text,
     finish_sign_in,
     key_for,
+    logout_as,
     rows,
+    seed_user,
     sign_in,
 )
 from tests.web_support import LifespanFailed, running, serving, settings_for, sqlite_url
@@ -269,12 +272,12 @@ async def test_starting_a_login_removes_logins_that_have_expired(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_signing_in_creates_a_session_and_lands_on_auth_me(tmp_path):
+async def test_signing_in_creates_a_session_and_lands_on_the_application_page(tmp_path):
     async with auth_app(tmp_path) as h:
         response = await sign_in(h.client, h.telegram)
 
         assert response.status_code == 303
-        assert response.headers["location"] == "/auth/me"
+        assert response.headers["location"] == "/"
         assert response.content == b""
         assert_private(response)
         assert h.telegram.protocol_errors == []
@@ -314,23 +317,28 @@ async def test_where_a_sign_in_lands_is_never_chosen_by_the_request(tmp_path, ex
         response = await h.client.get(callback + extra)
 
         assert response.status_code == 303
-        assert response.headers["location"] == "/auth/me"
+        assert response.headers["location"] == "/"
 
 
 @pytest.mark.asyncio
-async def test_following_the_sign_in_redirect_with_its_cookie_shows_the_signed_in_user(tmp_path):
+async def test_following_the_sign_in_redirect_with_its_cookie_shows_the_page_and_the_signed_in_user(
+    tmp_path,
+):
     async with auth_app(tmp_path) as h:
         response = await sign_in(h.client, h.telegram)
         assert response.status_code == 303
 
         landed = await h.client.get(response.headers["location"])  # the cookie jar carries the session
+        me = await h.client.get("/auth/me")  # what the page asks next
 
         assert landed.status_code == 200
-        assert landed.json() == {
+        assert landed.headers["content-type"].startswith("text/html")
+        assert me.status_code == 200
+        assert me.json() == {
             "user_id": str(h.user_id),
             "session_expires_at": (START + timedelta(days=14)).isoformat(),
         }
-        assert_private(landed)
+        assert_private(me)
 
 
 @pytest.mark.asyncio
@@ -346,7 +354,7 @@ async def test_the_sign_in_redirect_carries_no_secret_in_its_address_or_headers(
         location = response.headers["location"]
         parts = urlsplit(location)
         assert (parts.scheme, parts.netloc, parts.path, parts.query, parts.fragment) == (
-            "", "", "/auth/me", "", ""
+            "", "", "/", "", ""
         )
         session_token = h.client.cookies.get("__Host-hh_session")
         handed_over = [returned["code"], returned["state"], CLIENT_SECRET]
@@ -662,7 +670,7 @@ async def test_logout_revokes_the_session_and_clears_the_cookie(tmp_path):
     async with auth_app(tmp_path) as h:
         await signed_in(h)
 
-        response = await h.client.post("/auth/logout")
+        response = await h.client.post("/auth/logout", headers=logout_as(h.user_id))
 
         assert response.status_code == 204 and response.content == b""
         assert_private(response)
@@ -678,7 +686,7 @@ async def test_logout_revokes_the_session_and_clears_the_cookie(tmp_path):
 async def test_a_revoked_token_stays_revoked_even_if_a_browser_keeps_sending_it(tmp_path):
     async with auth_app(tmp_path) as h:
         token = await signed_in(h)
-        await h.client.post("/auth/logout")
+        await h.client.post("/auth/logout", headers=logout_as(h.user_id))
         replay = h.new_client()
 
         response = await replay.get("/auth/me", headers={"cookie": f"__Host-hh_session={token}"})
@@ -690,12 +698,15 @@ async def test_a_revoked_token_stays_revoked_even_if_a_browser_keeps_sending_it(
 async def test_logout_is_repeatable_and_keeps_the_first_revocation_time(tmp_path):
     async with auth_app(tmp_path) as h:
         token = await signed_in(h)
-        await h.client.post("/auth/logout")
+        await h.client.post("/auth/logout", headers=logout_as(h.user_id))
         h.clock.advance(hours=1)
 
-        again = await h.new_client().post("/auth/logout", headers={"cookie": f"__Host-hh_session={token}"})
+        again = await h.new_client().post(
+            "/auth/logout", headers=logout_as(h.user_id, cookie=f"__Host-hh_session={token}")
+        )
 
         assert again.status_code == 204
+        assert cookie_attributes(again, "__Host-hh_session")["max-age"] == "0"
         assert rows(h, LoginSession)[0].revoked_at == START
 
 
@@ -704,13 +715,16 @@ async def test_logout_is_repeatable_and_keeps_the_first_revocation_time(tmp_path
 async def test_logging_out_without_a_real_session_is_harmless(tmp_path, cookie):
     async with auth_app(tmp_path) as h:
         await signed_in(h)
-        headers = {} if cookie is None else {"cookie": f"__Host-hh_session={cookie}"}
+        # The page says it is Elena's, and the cookie names nobody's session: the claim ends
+        # nothing, hers included (it is compared with a session, never taken for one).
+        headers = logout_as(h.user_id, **({} if cookie is None else {"cookie": f"__Host-hh_session={cookie}"}))
 
         response = await h.new_client().post("/auth/logout", headers=headers)
 
         assert response.status_code == 204
         assert cookie_attributes(response, "__Host-hh_session")["max-age"] == "0"
         assert (await h.client.get("/auth/me")).status_code == 200  # somebody else's session is untouched
+        assert [row.revoked_at for row in rows(h, LoginSession)] == [None]
 
 
 @pytest.mark.asyncio
@@ -720,7 +734,7 @@ async def test_logout_ends_only_the_session_it_was_called_with(tmp_path):
         other = h.new_client()
         await signed_in(h, other)
 
-        await h.client.post("/auth/logout")
+        await h.client.post("/auth/logout", headers=logout_as(h.user_id))
 
         assert (await h.client.get("/auth/me")).status_code == 401
         assert (await other.get("/auth/me")).status_code == 200
@@ -732,13 +746,15 @@ async def test_logout_from_another_origin_is_refused_and_does_nothing(tmp_path, 
     async with auth_app(tmp_path) as h:
         await signed_in(h)
 
-        response = await h.client.post("/auth/logout", headers={"origin": origin})
+        for headers in (logout_as(h.user_id, origin=origin), {"origin": origin}):  # (the origin is judged first)
+            response = await h.client.post("/auth/logout", headers=headers)
 
-        assert response.status_code == 403
-        assert response.json() == {"detail": "forbidden_origin"}
-        assert_private(response)
-        assert rows(h, LoginSession)[0].revoked_at is None
-        assert (await h.client.get("/auth/me")).status_code == 200
+            assert response.status_code == 403
+            assert response.json() == {"detail": "forbidden_origin"}
+            assert_private(response)
+            assert "set-cookie" not in response.headers
+            assert rows(h, LoginSession)[0].revoked_at is None
+            assert (await h.client.get("/auth/me")).status_code == 200
 
 
 @pytest.mark.asyncio
@@ -748,8 +764,9 @@ async def test_logout_from_our_own_origin_or_without_one_is_accepted(tmp_path):
         other = h.new_client()
         await signed_in(h, other)
 
-        assert (await h.client.post("/auth/logout", headers={"origin": ORIGIN})).status_code == 204
-        assert (await other.post("/auth/logout")).status_code == 204  # no Origin: not a browser's cross-site POST
+        assert (await h.client.post("/auth/logout", headers=logout_as(h.user_id, origin=ORIGIN))).status_code == 204
+        # no Origin: not a browser's cross-site POST
+        assert (await other.post("/auth/logout", headers=logout_as(h.user_id))).status_code == 204
 
 
 @pytest.mark.asyncio
@@ -758,10 +775,227 @@ async def test_the_origin_logout_accepts_is_the_configured_one_not_the_hosts(tmp
         await signed_in(h)
 
         forged = await h.client.post(
-            "/auth/logout", headers={"origin": "https://evil.test", "host": "evil.test"}
+            "/auth/logout", headers=logout_as(h.user_id, origin="https://evil.test", host="evil.test")
         )
 
         assert forged.status_code == 403
+
+
+# --- logout says whose session it means to end ------------------------------------------------------
+#
+# The page that asks to sign out and never hears back asks again; by then the browser's one
+# cookie may be somebody else's. The request carries the user_id /auth/me gave the page
+# (X-Expected-User); the session is the one in the cookie of that very request, and it is
+# ended only if it is that user's.
+
+BORIS_SUBJECT = "5555666677778888999"
+SESSION = "__Host-hh_session"
+
+
+def second_person(h):
+    """Boris, who may sign in with Telegram too. His user id."""
+    return seed_user(h.factory, subject=BORIS_SUBJECT, display_name="Борис")
+
+
+def revocations(h):
+    """{session id: when it was revoked, or None}, read by an independent session."""
+    return {row.id: row.revoked_at for row in rows(h, LoginSession)}
+
+
+def assert_nothing_said_about_anybody(response, *users):
+    assert set(response.json()) == {"detail"}
+    for user in users:
+        assert str(user) not in response.text and str(user) not in str(response.headers)
+
+
+@pytest.mark.asyncio
+async def test_a_repeated_logout_does_not_end_the_session_of_somebody_who_signed_in_since(tmp_path):
+    async with auth_app(tmp_path) as h:
+        boris = second_person(h)
+        elena_token = await signed_in(h)  # Elena's page; the browser's one cookie is hers
+        # Her sign-out reaches the server, which ends her session; the answer is lost on the way
+        # back, so the browser keeps her (now dead) cookie. (Another client stands for the lost answer.)
+        lost = await h.new_client().post(
+            "/auth/logout", headers=logout_as(h.user_id, cookie=f"{SESSION}={elena_token}", origin=ORIGIN)
+        )
+        assert lost.status_code == 204
+        # Boris signs in, in another tab of the same browser: the cookie is his now.
+        assert (await sign_in(h.client, h.telegram, BORIS_SUBJECT)).status_code == 303
+        boris_token = h.client.cookies.get(SESSION)
+        assert boris_token and boris_token != elena_token
+        before = revocations(h)
+        assert sorted(value is None for value in before.values()) == [False, True]  # hers ended, his live
+
+        # Elena's old page asks again, as who it was signed in as, with whatever cookie the browser holds.
+        retry = await h.client.post("/auth/logout", headers=logout_as(h.user_id, origin=ORIGIN))
+
+        assert retry.status_code == 409
+        assert retry.json() == {"detail": "session_mismatch"}
+        assert_private(retry)
+        assert_nothing_said_about_anybody(retry, h.user_id, boris)
+        assert "set-cookie" not in retry.headers  # his cookie is not cleared
+        assert revocations(h) == before  # his session is not revoked; hers keeps its first revocation time
+        assert h.client.cookies.get(SESSION) == boris_token
+        me = await h.client.get("/auth/me")
+        assert (me.status_code, me.json()["user_id"]) == (200, str(boris))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["live", "revoked", "expired"])
+async def test_logout_for_one_user_never_touches_a_session_of_another_whatever_its_state(tmp_path, state):
+    async with auth_app(tmp_path) as h:
+        boris = second_person(h)
+        client = h.new_client()
+        assert (await sign_in(client, h.telegram, BORIS_SUBJECT)).status_code == 303
+        borises_token = client.cookies.get(SESSION)
+        if state == "revoked":
+            assert (await client.post("/auth/logout", headers=logout_as(boris))).status_code == 204
+        elif state == "expired":
+            h.clock.advance(days=15)
+        before = revocations(h)
+
+        # Elena's page, with Boris's cookie in the request.
+        response = await h.new_client().post(
+            "/auth/logout", headers=logout_as(h.user_id, cookie=f"{SESSION}={borises_token}")
+        )
+
+        assert response.status_code == 409 and response.json() == {"detail": "session_mismatch"}
+        assert "set-cookie" not in response.headers
+        assert revocations(h) == before
+        assert_nothing_said_about_anybody(response, h.user_id, boris)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reached_the_server", [True, False], ids=["answer lost", "request lost"])
+async def test_the_same_person_asking_again_ends_their_session_once(tmp_path, reached_the_server):
+    async with auth_app(tmp_path) as h:
+        token = await signed_in(h)
+        if reached_the_server:
+            lost = await h.new_client().post(
+                "/auth/logout", headers=logout_as(h.user_id, cookie=f"{SESSION}={token}")
+            )
+            assert lost.status_code == 204
+        h.clock.advance(hours=1)
+        started = h.clock()
+
+        again = await h.client.post("/auth/logout", headers=logout_as(h.user_id, origin=ORIGIN))
+
+        assert again.status_code == 204 and again.content == b""
+        assert_private(again)
+        assert cookie_attributes(again, SESSION)["max-age"] == "0"
+        assert [row.revoked_at for row in rows(h, LoginSession)] == [START if reached_the_server else started]
+        assert (await h.client.get("/auth/me")).status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_the_user_id_is_compared_as_a_uuid_not_as_text(tmp_path):
+    async with auth_app(tmp_path) as h:
+        await signed_in(h)
+
+        response = await h.client.post("/auth/logout", headers=logout_as(str(h.user_id).upper()))
+
+        assert response.status_code == 204
+        assert rows(h, LoginSession)[0].revoked_at == START
+
+
+@pytest.mark.asyncio
+async def test_a_user_id_with_no_session_behind_it_ends_nothing_and_says_nothing(tmp_path):
+    async with auth_app(tmp_path) as h:
+        boris = second_person(h)
+        await signed_in(h)  # Elena, live; Boris has no session at all
+
+        for cookie in (None, "garbage", "a" * 43):
+            headers = logout_as(boris, **({} if cookie is None else {"cookie": f"{SESSION}={cookie}"}))
+            response = await h.new_client().post("/auth/logout", headers=headers)
+
+            assert response.status_code == 204, cookie  # nothing to end: as before
+            assert revocations(h) == {row.id: None for row in rows(h, LoginSession)}
+        # a user id nobody has either
+        unknown = await h.new_client().post("/auth/logout", headers=logout_as(uuid4()))
+        assert unknown.status_code == 204
+        assert (await h.client.get("/auth/me")).status_code == 200
+
+
+SOME_USER = "9f1c2d3e-4b5a-4c6d-8e7f-a0b1c2d3e4f5"
+
+
+INVALID_EXPECTED_USERS = [
+    pytest.param(None, id="absent"),
+    pytest.param("", id="empty"),
+    pytest.param("not-a-user", id="garbage"),
+    pytest.param("gggggggg-gggg-gggg-gggg-gggggggggggg", id="not hexadecimal"),
+    pytest.param(SOME_USER.replace("-", ""), id="no hyphens"),
+    pytest.param("{" + SOME_USER + "}", id="braces"),
+    pytest.param("urn:uuid:" + SOME_USER, id="urn"),
+    pytest.param(SOME_USER + "0", id="too long"),
+    pytest.param(SOME_USER[:-1], id="too short"),
+    pytest.param(SOME_USER + ", " + SOME_USER, id="a list in one header"),
+    pytest.param(SOME_USER + ";x", id="trailing text"),
+    pytest.param("a" * 5000, id="huge"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("given", INVALID_EXPECTED_USERS)
+async def test_a_logout_that_does_not_say_whose_session_fails_closed(tmp_path, given):
+    async with auth_app(tmp_path) as h:
+        await signed_in(h)
+        headers = {} if given is None else {"x-expected-user": given}
+
+        response = await h.client.post("/auth/logout", headers=headers)
+
+        assert response.status_code == 400
+        assert response.json() == {"detail": "invalid_request"}
+        assert_private(response)
+        assert "set-cookie" not in response.headers  # not cleared either
+        assert [row.revoked_at for row in rows(h, LoginSession)] == [None]
+        assert (await h.client.get("/auth/me")).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_a_logout_that_names_two_users_fails_closed(tmp_path):
+    async with auth_app(tmp_path) as h:
+        boris = second_person(h)
+        await signed_in(h)
+
+        response = await h.client.post(
+            "/auth/logout",
+            headers=[("x-expected-user", str(h.user_id)), ("x-expected-user", str(boris))],
+        )
+
+        assert response.status_code == 400 and response.json() == {"detail": "invalid_request"}
+        assert "set-cookie" not in response.headers
+        assert [row.revoked_at for row in rows(h, LoginSession)] == [None]
+
+
+@pytest.mark.asyncio
+async def test_the_user_id_in_a_body_a_query_or_another_header_is_not_a_guard(tmp_path):
+    async with auth_app(tmp_path) as h:
+        await signed_in(h)
+        me = str(h.user_id)
+
+        for kwargs in (
+            {"json": {"user_id": me, "expected_user_id": me}},
+            {"params": {"user_id": me, "expected_user": me}},
+            {"headers": {"x-user-id": me, "x-forwarded-user": me, "authorization": f"Bearer {me}"}},
+        ):
+            response = await h.client.post("/auth/logout", **kwargs)
+
+            assert response.status_code == 400, kwargs
+            assert "set-cookie" not in response.headers
+        assert [row.revoked_at for row in rows(h, LoginSession)] == [None]
+
+
+@pytest.mark.asyncio
+async def test_the_guard_is_not_a_credential_it_cannot_end_a_session_the_request_has_no_cookie_for(tmp_path):
+    async with auth_app(tmp_path) as h:
+        await signed_in(h)
+
+        stranger = await h.new_client().post("/auth/logout", headers=logout_as(h.user_id, origin=ORIGIN))
+
+        assert stranger.status_code == 204  # (there was nothing to end in that request)
+        assert [row.revoked_at for row in rows(h, LoginSession)] == [None]
+        assert (await h.client.get("/auth/me")).status_code == 200
 
 
 # --- the shape of the surface -------------------------------------------------------------------------

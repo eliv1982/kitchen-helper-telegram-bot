@@ -403,6 +403,12 @@ async def sign_in(
     return await finish_sign_in(client, telegram, await begin_sign_in(client), subject)
 
 
+def logout_as(user_id: Any, **headers: str) -> dict[str, str]:
+    """The headers of a logout that means to end `user_id`'s session (X-Expected-User),
+    plus any others (an Origin, a cookie), given as keyword arguments."""
+    return {"x-expected-user": str(user_id), **{name.replace("_", "-"): value for name, value in headers.items()}}
+
+
 def auth_settings(origin: str = ORIGIN, algorithm: str = "RS256", **options: Any) -> AuthSettings:
     return AuthSettings(
         origin=origin,

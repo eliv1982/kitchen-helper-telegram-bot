@@ -6,13 +6,31 @@ session cookie below):
   GET  /auth/telegram/login     start: remember the login, send the browser to Telegram
   GET  /auth/telegram/callback  finish: verify, admit through the allowlist, open a session
   GET  /auth/me                 who the session cookie belongs to (the minimal identity)
-  POST /auth/logout             end the session
+  POST /auth/logout             end the session, if it is the expected user's
 
 and `require_user`, the dependency every route that serves a user's data must use.
 The Telegram routes answer 503 unless Telegram login is configured; /auth/me,
 /auth/logout and `require_user` work with either way of signing in, or both.
 The user is whoever the session cookie resolves to on the server. A user id sent by
-the client, in a query, a body or a header, is never read.
+the client, in a query, a body or a header, is never read, with one exception: logout
+reads the X-Expected-User header (below), to compare it with the session's owner and
+for nothing else.
+
+Logout and a lost answer. A page that asked to sign out and never heard back asks
+again, and by then the browser's one session cookie may be somebody else's (another
+tab signed in as another person). So the request says whose session it means to end:
+X-Expected-User, the user_id /auth/me gave the page, sent with the first request and
+with every repeat. The session is the one in the cookie of that very request, and it is
+ended only if it is that user's: the user is part of the UPDATE's own condition
+(persistence.authn.revoke_session_of), so a session of anybody else is not touched by
+it. If the cookie names a session of someone else the answer is 409 session_mismatch,
+nothing is revoked and no cookie is set or cleared. The header is a comparison and not
+a credential: it never selects, authenticates or authorizes anything, and it is not
+trusted for who the user is. A header that is missing, repeated or not a UUID is 400
+invalid_request, again with nothing revoked or cleared; a database that cannot say
+is 503, the same. A cookie that names no session, or one that was already ended (the
+repeat after a lost answer), is 204 as before, since there is nothing left to end, and
+the answer clears the cookie. Neither answer says who anybody is.
 
 The flow, and where each protection sits:
 
@@ -33,8 +51,9 @@ The flow, and where each protection sits:
                identity ends it (persistence.authn.complete_login). Denied or
                failed, none of it is kept.
             The state stays consumed whatever happens after step 2; the user starts
-            again. The answer is a redirect to "/auth/me", so the code and state do
-            not stay in the address bar or the history, and a Set-Cookie.
+            again. The answer is a redirect to the application's page ("/"), so the
+            code and state do not stay in the address bar or the history, and a
+            Set-Cookie.
   session   a random 256-bit token in a cookie; the database holds its digest. The
             cookie is HttpOnly, SameSite=Lax, path "/", with no Domain, and Secure
             (with the __Host- prefix) whenever the public URL is https. Lax, not
@@ -55,6 +74,7 @@ import logging
 import re
 from datetime import datetime
 from typing import Callable, Optional
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -75,13 +95,17 @@ from house_helper.web.telegram_oidc import (
 
 logger = logging.getLogger(__name__)
 
-# The answer to a successful sign-in. There is no frontend yet, so "/" would be a 404;
-# /auth/me is a temporary destination that shows who is signed in. It moves to the
-# application's pages when they exist. A path, never a value from the request.
-LANDING_PATH = "/auth/me"
+# The answer to a successful sign-in: the application's page (ui.py), which asks
+# /auth/me who is signed in and shows the conversations. (Before the page existed this
+# was /auth/me itself.) A path, never a value from the request.
+LANDING_PATH = "/"
 
 MAX_CODE_LENGTH = 2048
 _CODE = re.compile(r"[\x21-\x7e]{1,%d}" % MAX_CODE_LENGTH)
+
+# Whose session a logout means to end (see the module docstring): a UUID as /auth/me writes it.
+EXPECTED_USER_HEADER = "X-Expected-User"
+_USER_ID = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")
 
 _PRIVATE_HEADERS = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
 
@@ -204,11 +228,17 @@ class AuthService:
         now = self._clock()
         return await self.run(lambda session: authn.authenticate(session, token, now=now))
 
-    async def logout(self, token: Optional[str]) -> None:
+    async def logout(self, token: Optional[str], expected_user: UUID) -> None:
+        """End the session behind `token` if it is `expected_user`'s. Raises
+        authn.SessionOfAnotherUser (nothing changed) if it is somebody else's, and
+        HTTPException 503 for a database failure; never ends a session it could not
+        check the owner of."""
         if not authn.is_session_token(token):
             return
         now = self._clock()
-        await self.run(lambda session: authn.revoke_session(session, token, now=now))
+        await self.run(
+            lambda session: authn.revoke_session_of(session, token, expected_user, now=now)
+        )
 
     # --- cookies ----------------------------------------------------------------------
 
@@ -339,6 +369,17 @@ async def me(
     }
 
 
+def _expected_user(request: Request) -> Optional[UUID]:
+    """The user the page means to sign out: exactly one X-Expected-User header holding a
+    UUID in its usual written form; None for anything else. (Read by hand, not declared:
+    a declared header that is missing would be answered by FastAPI's validation error,
+    which quotes the input back.)"""
+    values = request.headers.getlist(EXPECTED_USER_HEADER)
+    if len(values) != 1 or _USER_ID.fullmatch(values[0]) is None:
+        return None
+    return UUID(values[0])
+
+
 @router.post("/logout")
 async def logout(request: Request, auth: AuthService = Depends(get_auth_service)) -> Response:
     origin = request.headers.get("origin")
@@ -346,7 +387,18 @@ async def logout(request: Request, auth: AuthService = Depends(get_auth_service)
         return JSONResponse(
             {"detail": "forbidden_origin"}, status_code=403, headers=_PRIVATE_HEADERS
         )
-    await auth.logout(request.cookies.get(auth.settings.session_cookie_name))
+    expected = _expected_user(request)
+    if expected is None:
+        return JSONResponse(
+            {"detail": "invalid_request"}, status_code=400, headers=_PRIVATE_HEADERS
+        )
+    try:
+        await auth.logout(request.cookies.get(auth.settings.session_cookie_name), expected)
+    except authn.SessionOfAnotherUser:
+        logger.info("A sign-out was refused: the session in the cookie is not the expected user's")
+        return JSONResponse(
+            {"detail": "session_mismatch"}, status_code=409, headers=_PRIVATE_HEADERS
+        )
     response = Response(status_code=204, headers=_PRIVATE_HEADERS)
     auth.clear_cookie(response, auth.settings.session_cookie_name)
     return response

@@ -21,7 +21,7 @@ from house_helper.persistence.models import Session as LoginSession
 from house_helper.web import email_pages
 from house_helper.web.logsafety import ACCESS_LOGGER, RedactAuthQuery
 from house_helper.web.mailer import EmailDeliveryError
-from tests.auth_support import ORIGIN, START, app_log_text, rows, watch_logs
+from tests.auth_support import ORIGIN, START, app_log_text, logout_as, rows, watch_logs
 from tests.email_support import ADDRESS, email_app, parse_link
 
 SESSION_COOKIE = "__Host-hh_session"
@@ -357,7 +357,7 @@ async def test_nothing_secret_is_logged_whatever_happens(tmp_path, caplog):
         assert (await h.confirm(first)).status_code == 303
         secrets.add(h.client.cookies.get(SESSION_COOKIE))
         assert (await h.confirm(first)).status_code == 400
-        assert (await h.client.post("/auth/logout", headers={"Origin": ORIGIN})).status_code == 204
+        assert (await h.client.post("/auth/logout", headers=logout_as(h.user_id, Origin=ORIGIN))).status_code == 204
 
         # wrong and malformed secrets
         h.clock.advance(minutes=2)

@@ -29,6 +29,7 @@ from house_helper.persistence import turns
 from house_helper.persistence.models import Message
 from house_helper.web.diagnostics import ApiError
 from house_helper.web.turn_runner import TRUNCATED_NOTE
+from tests.auth_support import logout_as
 from tests.chat_support import ScriptedBackend, chat_app, error_of, gate_on, reached, runner_env
 from tests.web_support import TIMEOUT
 
@@ -221,7 +222,9 @@ async def test_a_replay_survives_a_new_session(tmp_path):
     async with chat_app(tmp_path, backend) as chat:
         conversation = await chat.create()
         first = await chat.send(conversation, "Что из яиц?", "k-1")
-        await chat.base.client.post("/auth/logout", headers={"Origin": "https://kitchen.example.test"})
+        await chat.base.client.post(
+            "/auth/logout", headers=logout_as(chat.user_id, Origin="https://kitchen.example.test")
+        )
         await chat.sign_in_again()
 
         replay = await chat.send(conversation, "Что из яиц?", "k-1")

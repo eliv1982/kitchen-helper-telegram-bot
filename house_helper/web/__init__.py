@@ -24,4 +24,8 @@ disconnecting client does not interrupt the turn), and diagnostics.py is the cat
 of its errors (stable codes, Russian messages, server-made correlation ids). The AI
 comes from the same settings as the Telegram bot's, minus its token (settings.py), and
 is built when the application starts but connects only on the first message.
+
+The page (ui.py and static/) is the people's side of both: the shell at "/" and the
+script, style and logic under /static. It is public and holds no data of anyone's; it
+asks /auth/me who is signed in and calls the routes above with the visitor's own cookie.
 """

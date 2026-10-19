@@ -38,7 +38,9 @@ from house_helper.persistence.authn import (
     complete_login,
     consume_oidc_login,
     hash_secret,
+    SessionOfAnotherUser,
     revoke_session,
+    revoke_session_of,
 )
 from house_helper.persistence.models import AllowlistEntry, IdentityLink, OidcState, Session, User
 from tests.persistence_support import (  # noqa: F401  (fixtures)
@@ -776,6 +778,101 @@ def test_revoking_what_is_not_a_session_changes_nothing(session, issued, token):
     assert session.scalars(sa.select(Session)).one().revoked_at is None
 
 
+# --- revoke_session_of: the same, for a caller that knows whose session it means -------
+
+
+@pytest.fixture
+def someone_else(session, user):
+    """A second person, with a live session of their own. Returns (user, session)."""
+    other = new_user(session, display_name="Boris")
+    allow(session, other, "telegram", "9876987698769876987")
+    session.commit()
+    theirs = log_in(session, "9876987698769876987")
+    session.commit()
+    return other, theirs
+
+
+def revoked_at_by_session(session):
+    session.expire_all()
+    return {row.id: row.revoked_at for row in session.scalars(sa.select(Session))}
+
+
+def test_a_session_is_revoked_for_its_own_user_and_the_first_revocation_is_kept(session, user, issued, someone_else):
+    _, theirs = someone_else
+
+    assert revoke_session_of(session, issued.token, user.id, now=NOW + timedelta(hours=1)) is True
+    assert revoke_session_of(session, issued.token, user.id, now=NOW + timedelta(hours=2)) is False
+    session.commit()
+
+    assert revoked_at_by_session(session) == {
+        issued.session_id: NOW + timedelta(hours=1),
+        theirs.session_id: None,
+    }
+
+
+def test_a_session_of_another_user_is_not_revoked_and_the_exception_says_nothing_of_either(session, user, issued, someone_else):
+    other, theirs = someone_else
+
+    with pytest.raises(SessionOfAnotherUser) as raised:
+        revoke_session_of(session, theirs.token, user.id, now=NOW)  # the cookie is Boris's, the page is Elena's
+    session.commit()
+
+    assert revoked_at_by_session(session) == {issued.session_id: None, theirs.session_id: None}
+    shown = repr(raised.value) + str(raised.value)
+    assert str(user.id) not in shown and str(other.id) not in shown and theirs.token not in shown
+
+
+@pytest.mark.parametrize("state", ["revoked", "expired"])
+def test_a_session_of_another_user_is_a_mismatch_whatever_state_it_is_in(session, user, issued, someone_else, state):
+    if state == "revoked":
+        _, theirs = someone_else
+        assert revoke_session(session, theirs.token, now=NOW) is True
+    else:
+        theirs = log_in(session, "9876987698769876987", now=NOW - timedelta(days=30))  # over since 16 days
+    session.commit()
+    before = revoked_at_by_session(session)
+
+    with pytest.raises(SessionOfAnotherUser):
+        revoke_session_of(session, theirs.token, user.id, now=NOW + timedelta(hours=1))
+    session.commit()
+
+    assert revoked_at_by_session(session) == before
+
+
+def test_a_session_of_the_expected_user_that_is_over_by_the_clock_is_still_ended_once(session, user):
+    old = log_in(session, now=NOW - timedelta(days=30))
+    session.commit()
+
+    assert revoke_session_of(session, old.token, user.id, now=NOW) is True
+    assert revoke_session_of(session, old.token, user.id, now=NOW + timedelta(hours=1)) is False
+    session.commit()
+
+    assert revoked_at_by_session(session) == {old.session_id: NOW}
+
+
+@pytest.mark.parametrize("token", [None, "", "x" * 43, "!" * 43, 7])
+def test_revoking_what_is_not_a_session_of_anybody_changes_nothing_for_anybody(session, user, issued, someone_else, token):
+    other, theirs = someone_else
+
+    assert revoke_session_of(session, token, user.id, now=NOW) is False
+    session.commit()
+
+    assert revoked_at_by_session(session) == {issued.session_id: None, theirs.session_id: None}
+
+
+def test_the_user_is_part_of_the_statement_that_revokes(engine, factory, session, user, issued, someone_else):
+    """Not a check followed by an update: the one UPDATE that revokes carries the user, so a
+    session of anybody else cannot be ended by it, whatever happens between two statements."""
+    other, theirs = someone_else
+    with factory() as writer, statements(engine) as seen, writer.begin():
+        with pytest.raises(SessionOfAnotherUser):
+            revoke_session_of(writer, theirs.token, user.id, now=NOW)
+
+    update = seen[0].upper()
+    assert update.startswith("UPDATE SESSIONS") and "USER_ID" in update.split("WHERE", 1)[1]
+    assert revoked_at_by_session(session) == {issued.session_id: None, theirs.session_id: None}
+
+
 # --- the order of statements: writers write first -------------------------------------
 
 
@@ -815,6 +912,18 @@ def test_revoking_a_session_starts_with_a_write(engine, factory, issued):
     first = first_statement(engine, factory, lambda s: revoke_session(s, issued.token, now=NOW))
 
     assert first == "UPDATE"
+
+
+def test_revoking_a_session_of_a_user_starts_with_a_write_also_when_it_finds_another_user(engine, factory, user, issued, someone_else):
+    _, theirs = someone_else
+
+    own = first_statement(engine, factory, lambda s: revoke_session_of(s, issued.token, user.id, now=NOW))
+
+    def mismatch(s):
+        with pytest.raises(SessionOfAnotherUser):
+            revoke_session_of(s, theirs.token, user.id, now=NOW)
+
+    assert (own, first_statement(engine, factory, mismatch)) == ("UPDATE", "UPDATE")
 
 
 # --- concurrency (real threads, a real file) ----------------------------------------------

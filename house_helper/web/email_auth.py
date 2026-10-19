@@ -39,8 +39,9 @@ Nothing is used up by looking: mail scanners fetch links.
 
 Confirming (POST). The form carries the id and the secret. In one transaction the link
 is used up and a session is opened (persistence.email_login.redeem_email_login); the
-answer is a redirect to /auth/me with the session cookie. Origin is checked as logout
-checks it. The link may be opened on another device than the one that asked: nothing
+answer is a redirect to the application's page (auth.LANDING_PATH) with the session
+cookie. Origin is checked as logout checks it. The link may be opened on another device
+than the one that asked: nothing
 ties it to the requesting browser, because its secret travels only in the mailbox.
 What it must not do is change who a browser is: if the browser presented a session of
 a DIFFERENT user, the answer is 409 and the link is not used up (sign out, then open it

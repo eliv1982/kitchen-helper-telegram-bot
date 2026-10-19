@@ -32,6 +32,7 @@ from tests.auth_support import (
     begin_sign_in,
     counts,
     finish_sign_in,
+    logout_as,
     rows,
     sign_in,
     watch_logs,
@@ -180,7 +181,10 @@ async def test_logging_out_while_the_same_session_is_in_use_never_fails(tmp_path
         await sign_in(h.client, h.telegram)
 
         responses = await together(
-            *(h.client.post("/auth/logout") if i % 3 == 0 else h.client.get("/auth/me") for i in range(12))
+            *(
+                h.client.post("/auth/logout", headers=logout_as(h.user_id)) if i % 3 == 0 else h.client.get("/auth/me")
+                for i in range(12)
+            )
         )
 
         assert {r.status_code for r in responses} <= {200, 204, 401}

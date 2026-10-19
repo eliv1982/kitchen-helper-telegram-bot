@@ -17,7 +17,7 @@ import pytest
 import sqlalchemy as sa
 
 from house_helper.persistence.models import Conversation, Message, TurnRequest, User
-from tests.auth_support import ORIGIN
+from tests.auth_support import ORIGIN, logout_as
 from tests.chat_support import ScriptedBackend, chat_app, error_of, post_headers
 
 pytestmark = pytest.mark.asyncio
@@ -89,7 +89,8 @@ async def test_a_forged_or_malformed_session_cookie_is_no_session(tmp_path, meth
 async def test_a_signed_out_session_stops_working(tmp_path, method, path, body):
     async with chat_app(tmp_path, ScriptedBackend()) as chat:
         conversation = await chat.create()
-        assert (await chat.client.post("/auth/logout", headers=post_headers())).status_code == 204
+        out = await chat.client.post("/auth/logout", headers=post_headers(**logout_as(chat.user_id)))
+        assert out.status_code == 204
 
         response = await call(chat, method, path, body, conversation_id=conversation)
 

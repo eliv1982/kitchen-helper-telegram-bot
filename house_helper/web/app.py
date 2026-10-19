@@ -27,6 +27,12 @@ before) and the turn runner over it. Without a key the conversations can still b
 created and read, and a message is answered 503. `chat_backend` replaces the backend
 in tests. On the way out the runner is stopped first (it lets running turns finish,
 then cancels what is left), then the backend's client is closed, then the database.
+
+The page (ui.py) is always served too: `GET /` and the few files under /static. It is
+public and static -- it holds nothing of anyone's, and every byte of user data it shows
+comes from the /auth and /api routes it calls with the visitor's own cookie -- and it
+draws only the ways of signing in that are configured (it reads which are running from
+the services above, never from a request).
 """
 
 import logging
@@ -41,7 +47,7 @@ from house_helper.core.backend import ChatBackend
 from house_helper.core.openai_chat import StandaloneOpenAIBackend
 from house_helper.persistence.base import utcnow
 from house_helper.persistence.database import create_db_engine
-from house_helper.web import auth, chat_api, email_auth, health
+from house_helper.web import auth, chat_api, email_auth, health, ui
 from house_helper.web.auth import AuthService
 from house_helper.web.database import WebDatabase
 from house_helper.web.email_auth import EmailLoginService
@@ -162,4 +168,5 @@ def create_app(
     app.include_router(auth.router)
     app.include_router(email_auth.router)
     app.include_router(chat_api.router)
+    app.include_router(ui.router)
     return app

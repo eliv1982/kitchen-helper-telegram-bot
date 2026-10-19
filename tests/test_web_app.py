@@ -117,13 +117,15 @@ def test_creating_the_application_touches_neither_the_database_nor_the_disk(tmp_
     assert not hasattr(app.state, "database")
 
 
-def test_the_application_exposes_health_sign_in_chat_and_nothing_else(tmp_path):
-    # The sign-in routes (R3A Telegram, R3B-2 email) and the chat API (R4A: the
-    # conversations and their messages) are the only additions to /healthz: no recipe,
-    # preference or other user-data route may exist, and not even the interactive API
-    # pages FastAPI would add by default. A route added later has to change this list
-    # on purpose, and has to use auth.require_user (the chat routes do: see
-    # test_web_chat_api.py, which asks each of them without a session).
+def test_the_application_exposes_health_sign_in_chat_the_page_and_nothing_else(tmp_path):
+    # The sign-in routes (R3A Telegram, R3B-2 email), the chat API (R4A: the
+    # conversations and their messages) and the page (R4B: the shell at "/" and its few
+    # static files) are the only additions to /healthz: no recipe, preference or other
+    # user-data route may exist, and not even the interactive API pages FastAPI would
+    # add by default. A route added later has to change this list on purpose, and a
+    # route that serves a person's data has to use auth.require_user (the chat routes
+    # do: see test_web_chat_api.py, which asks each of them without a session; the page
+    # holds no data of anyone's: see test_web_ui.py).
     app = create_app(settings_for(tmp_path / "routes.db"))
 
     # openapi() is the public listing (app.routes holds FastAPI internals); the
@@ -139,6 +141,8 @@ def test_the_application_exposes_health_sign_in_chat_and_nothing_else(tmp_path):
         "/auth/email/confirm": ["get", "post"],
         "/api/conversations": ["get", "post"],
         "/api/conversations/{conversation_id}/messages": ["get", "post"],
+        "/": ["get"],
+        "/static/{name}": ["get"],
     }
 
 
@@ -197,7 +201,7 @@ async def test_healthz_only_answers_get(tmp_path, method):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("path", ["/", "/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json", "/api", "/healthz/x"])
+@pytest.mark.parametrize("path", ["/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json", "/api", "/healthz/x", "/index.html", "/static", "/static/"])
 async def test_nothing_else_is_served(tmp_path, path):
     app = create_app(settings_for(tmp_path / "health.db"))
 

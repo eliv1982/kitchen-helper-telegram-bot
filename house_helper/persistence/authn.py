@@ -4,6 +4,7 @@ server-side session that follows.
 Three things happen here and nowhere else: begin_oidc_login / consume_oidc_login
 keep the state of one OIDC authorization round trip, complete_login turns a
 provider-vouched identity into a session, and authenticate / revoke_session
+(revoke_session_of, for a caller that knows whose session it means to end)
 resolve and end that session. Nothing here talks to a provider or to HTTP: the
 caller passes the `sub` of an ID token it has already verified, the secrets it
 generated, and the time ("now": the application's UTC clock, never the
@@ -25,8 +26,9 @@ identity to a different user, or merge two users.
 
 Transactions: none of the functions commits; the caller owns the transaction
 (web.database.WebDatabase.run is one). The writers (begin_oidc_login,
-consume_oidc_login, complete_login, revoke_session, and allowlist.revoke) all make
-a WRITE their first statement. On SQLite the engine begins every transaction with a deferred BEGIN
+consume_oidc_login, complete_login, revoke_session, revoke_session_of, and
+allowlist.revoke) all make a WRITE their first statement. On SQLite the engine begins every
+transaction with a deferred BEGIN
 (persistence.database), and a transaction that reads first and writes second
 fails at once with "database is locked" (SQLITE_BUSY_SNAPSHOT) when another
 writer committed in between. A transaction that writes first takes the write lock
@@ -386,3 +388,44 @@ def revoke_session(session: OrmSession, token: object, *, now: datetime) -> bool
         .execution_options(synchronize_session=False)
     )
     return revoked.rowcount == 1
+
+
+class SessionOfAnotherUser(Exception):
+    """The token names a session, but not one of the user the caller expected. Nothing
+    was changed; the exception carries nothing about either user."""
+
+
+def revoke_session_of(
+    session: OrmSession, token: object, user_id: UUID, *, now: datetime
+) -> bool:
+    """revoke_session, for a caller that knows whose session it means to end (logout).
+
+    The user is part of the UPDATE's own condition, so a session of anybody else is not
+    touched by this statement, whatever happens around it. True if the session was
+    revoked by this call; False for an unknown, malformed or already revoked one that is
+    `user_id`'s, or that nobody's. Raises SessionOfAnotherUser if the token names a
+    session (live, revoked or expired) of a different user. The write comes first, as
+    in revoke_session; the read that tells the two apart comes only after it found
+    nothing to revoke.
+    """
+    if not is_session_token(token):
+        return False
+    digest = hash_secret(token)
+    revoked = session.execute(
+        sa.update(models.Session)
+        .where(
+            models.Session.token_hash == digest,
+            models.Session.user_id == user_id,
+            models.Session.revoked_at.is_(None),
+        )
+        .values(revoked_at=now)
+        .execution_options(synchronize_session=False)
+    )
+    if revoked.rowcount == 1:
+        return True
+    owner = session.execute(
+        sa.select(models.Session.user_id).where(models.Session.token_hash == digest)
+    ).scalar_one_or_none()
+    if owner is not None and owner != user_id:
+        raise SessionOfAnotherUser()
+    return False

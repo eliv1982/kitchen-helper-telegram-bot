@@ -17,7 +17,7 @@ from house_helper.persistence import email_login
 from house_helper.persistence.allowlist import allow, revoke
 from house_helper.persistence.models import EmailLoginChallenge, IdentityLink, User
 from house_helper.persistence.models import Session as LoginSession
-from tests.auth_support import ORIGIN, SUBJECT, finish_sign_in, begin_sign_in, rows, sign_in
+from tests.auth_support import ORIGIN, SUBJECT, finish_sign_in, begin_sign_in, logout_as, rows, sign_in
 from tests.email_support import ADDRESS, email_app
 
 SESSION_COOKIE = "__Host-hh_session"
@@ -198,7 +198,7 @@ async def test_logging_out_of_one_session_does_not_end_the_other(tmp_path):
         give_the_user_a_telegram_identity(h)
         by_telegram, by_email = await both_sessions(h)
 
-        assert (await by_email.post("/auth/logout", headers={"Origin": ORIGIN})).status_code == 204
+        assert (await by_email.post("/auth/logout", headers=logout_as(h.user_id, Origin=ORIGIN))).status_code == 204
 
         assert (await by_email.get("/auth/me")).status_code == 401
         assert (await by_telegram.get("/auth/me")).status_code == 200
@@ -258,12 +258,12 @@ async def test_each_way_in_is_independently_on_or_off(tmp_path):
         assert (await h.client.get("/auth/telegram/login")).status_code == 503
         assert (await h.sign_in()).status_code == 303
         assert (await h.client.get("/auth/me")).status_code == 200
-        assert (await h.client.post("/auth/logout", headers={"Origin": ORIGIN})).status_code == 204
+        assert (await h.client.post("/auth/logout", headers=logout_as(h.user_id, Origin=ORIGIN))).status_code == 204
     async with auth_app(tmp_path / "telegram_only") as h:
         assert (await h.client.post("/auth/email/request", json={"email": ADDRESS})).status_code == 503
         assert (await sign_in(h.client, h.telegram)).status_code == 303
         assert (await h.client.get("/auth/me")).status_code == 200
-        assert (await h.client.post("/auth/logout", headers={"Origin": ORIGIN})).status_code == 204
+        assert (await h.client.post("/auth/logout", headers=logout_as(h.user_id, Origin=ORIGIN))).status_code == 204
 
 
 @pytest.mark.asyncio

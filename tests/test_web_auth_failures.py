@@ -32,6 +32,7 @@ from tests.auth_support import (
     hmac_variant,
     jwks_of,
     key_for,
+    logout_as,
     make_rsa,
     rows,
     sign_in,
@@ -657,11 +658,29 @@ async def test_with_the_database_closed_every_route_that_needs_it_says_unavailab
 
         login = await h.client.get("/auth/telegram/login")
         me = await h.client.get("/auth/me")
-        logout = await h.client.post("/auth/logout")
+        logout = await h.client.post("/auth/logout", headers=logout_as(h.user_id))
 
         assert (login.status_code, me.status_code, logout.status_code) == (503, 503, 503)
         assert login.json() == me.json() == logout.json() == {"detail": "temporarily_unavailable"}
+        assert "set-cookie" not in logout.headers  # the session could not be checked: the cookie is not cleared either
         assert started.status_code == 303
+
+
+@pytest.mark.asyncio
+async def test_a_logout_that_cannot_check_the_owner_of_the_session_ends_nothing_and_clears_nothing(tmp_path):
+    async with auth_app(tmp_path) as h:
+        await sign_in(h.client, h.telegram)
+        with h.factory() as db, db.begin():
+            db.execute(sa.text("ALTER TABLE sessions RENAME TO sessions_gone"))
+
+        response = await h.client.post("/auth/logout", headers=logout_as(h.user_id))
+
+        assert response.status_code == 503
+        assert response.json() == {"detail": "temporarily_unavailable"}
+        assert "set-cookie" not in response.headers
+        with h.factory() as db, db.begin():
+            db.execute(sa.text("ALTER TABLE sessions_gone RENAME TO sessions"))
+        assert [row.revoked_at for row in rows(h, LoginSession)] == [None]  # not ended "to be safe"
 
 
 @pytest.mark.asyncio
