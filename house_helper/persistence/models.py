@@ -23,10 +23,12 @@ foreign keys that include the request's own conversation_id and the expected
 role, so the message must be in the same conversation (hence of the same user)
 and must have the right role. See TurnRequest.
 
-Identity: ONE user is provisioned first. Each way that user may sign in (a
-Telegram OIDC subject, a verified email) is an allowlist entry owned by that
-user; an identity link can exist only for an allowlist entry of the same user.
-Nothing is ever linked by a name or a claim that is not already on the list.
+Identity: a user is provisioned by an operator before they can sign in (onboarding
+is closed). Each way that user may sign in (a Telegram OIDC subject, a verified
+email) is an allowlist entry owned by that user; an identity link can exist only
+for an allowlist entry of the same user. Nothing is ever linked by a name or a
+claim that is not already on the list. A Telegram identity reaches the list in one
+way: a verified sign-in that presents an IdentityInvitation issued for the user.
 
 Session provenance: a session records the identity link it was opened through
 (sessions.identity_link_id), and the database ties it to a link of the session's
@@ -40,9 +42,9 @@ guard access (users, sessions, conversations, turn requests, ...); a database
 sequence for messages, whose order within a conversation is the order of their
 ids. Timestamps are timezone-aware UTC (see base.UtcDateTime).
 
-Secrets: a session token, an emailed sign-in token or an OIDC state value is
-stored only as its SHA-256 hex digest, so a copy of the database cannot be
-replayed. The PKCE code
+Secrets: a session token, an emailed sign-in token, a Telegram invitation secret
+or an OIDC state value is stored only as its SHA-256 hex digest, so a copy of the
+database cannot be replayed. The PKCE code
 verifier and nonce of an OIDC login must be sent back to the provider, so they
 are stored as given, and live only until the login's expires_at.
 
@@ -472,6 +474,73 @@ class EmailLoginChallenge(Base):
     revoked_at: Mapped[Optional[datetime]]
 
 
+class IdentityInvitation(Base):
+    """A one-time invitation for a provisioned user to link their Telegram identity.
+
+    An operator creates the user and issues the invitation (admin.enrollment); the
+    person it is handed to presents it, signs in with Telegram, and the verified
+    `sub` of that sign-in is put on the allowlist for the invitation's user and for
+    nobody else (invitations.claim_invitation). The invitation is the ONLY thing that
+    says which user a new Telegram identity belongs to: nothing is ever matched by a
+    name, an email address, a username or a Telegram numeric id.
+
+    token_hash is the SHA-256 hex digest of the secret; the secret itself is never
+    stored (it is shown once, to the operator, when the invitation is issued). The
+    row's id is a separate random UUID and is not a secret.
+
+    One use and one lifetime: consumed_at is set once, by a single conditional UPDATE,
+    and only while the row is neither consumed, revoked nor expired; revoked_at
+    withdraws it. The two are mutually exclusive (a CHECK), so a withdrawn invitation
+    can never be used up and a used one never withdrawn, whatever writes the row.
+    expires_at is the issuing function's policy (two hours); the database holds only
+    that it is after created_at, as for the other single-use secrets here.
+
+    At most one invitation per user is outstanding (neither consumed nor revoked): a
+    partial unique index. Issuing a new one revokes the earlier ones first, so
+    "reissuing invalidates the earlier invitation" is structure, not only code, and
+    two concurrent reissues cannot both succeed.
+
+    The owner is a foreign key to users (ON DELETE CASCADE). `provider` is always
+    'telegram' (a CHECK, as email_login_challenges.provider is 'email'); it is a
+    column so that the claim names the provider it is for.
+
+    Once stored, the binding (user, provider, token, lifetime) does not change: the
+    ORM refuses to rewrite it. Only consumed_at and revoked_at are ever set.
+    """
+
+    __tablename__ = "identity_invitations"
+    __table_args__ = (
+        sa.UniqueConstraint("token_hash"),
+        # The invitations of a user (status), and the foreign key's cascade.
+        sa.Index(None, "user_id", "created_at"),
+        sa.Index(None, "expires_at"),
+        # An explicit name: it says what the rule is. A partial unique index, which
+        # SQLite and PostgreSQL both support, written with the same predicate for each.
+        sa.Index(
+            "uq_identity_invitations_one_outstanding",
+            "user_id",
+            unique=True,
+            sqlite_where=sa.text("consumed_at IS NULL AND revoked_at IS NULL"),
+            postgresql_where=sa.text("consumed_at IS NULL AND revoked_at IS NULL"),
+        ),
+        sa.CheckConstraint("provider = 'telegram'", name="provider_is_telegram"),
+        sa.CheckConstraint("length(token_hash) = 64", name="token_hash_length"),
+        sa.CheckConstraint("expires_at > created_at", name="expires_after_created"),
+        sa.CheckConstraint(
+            "consumed_at IS NULL OR revoked_at IS NULL", name="not_consumed_and_revoked"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("users.id", ondelete="CASCADE"))
+    provider: Mapped[str] = mapped_column(sa.String(64), default="telegram")
+    token_hash: Mapped[str] = mapped_column(sa.String(64))
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    expires_at: Mapped[datetime]
+    consumed_at: Mapped[Optional[datetime]]
+    revoked_at: Mapped[Optional[datetime]]
+
+
 class Conversation(Base):
     """One conversation of one user. A user has any number of them; updated_at
     is the time of the last activity (whoever adds a message touches it) and
@@ -863,8 +932,13 @@ def _guard_challenge_on_update(mapper: Any, connection: Any, target: Any) -> Non
     )
 
 
+def _guard_invitation_on_update(mapper: Any, connection: Any, target: Any) -> None:
+    _forbid_changes(target, "user_id", "provider", "token_hash", "created_at", "expires_at")
+
+
 sa.event.listen(Session, "before_update", _guard_session_on_update)
 sa.event.listen(EmailLoginChallenge, "before_update", _guard_challenge_on_update)
+sa.event.listen(IdentityInvitation, "before_update", _guard_invitation_on_update)
 sa.event.listen(Message, "before_insert", _guard_retention_on_insert)
 sa.event.listen(Message, "before_update", _guard_message)
 sa.event.listen(TurnRequest, "before_insert", _guard_turn_request_on_insert)

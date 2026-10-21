@@ -111,6 +111,7 @@ def test_the_first_run_creates_one_user_and_one_approved_email_entry(capsys, db_
         "identity_links": 0,
         "sessions": 0,
         "email_login_challenges": 0,
+        "identity_invitations": 0,  # provision-email never issues an invitation
         "conversations": 0,
         "messages": 0,
     }

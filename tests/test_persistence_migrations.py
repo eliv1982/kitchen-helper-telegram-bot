@@ -61,7 +61,8 @@ from tests.test_persistence_schema import TABLES
 INITIAL = "0001_persistence_foundation"
 PROVENANCE = "0002_session_provenance"
 CHALLENGES = "0003_email_login_challenges"
-HEAD = "0004_email_identity_case"
+EMAIL_CASE = "0004_email_identity_case"
+HEAD = "0005_identity_invitations"
 REPO_ROOT = Path(house_helper.persistence.__file__).resolve().parents[2]
 
 
@@ -90,11 +91,13 @@ def test_the_history_is_one_line_with_one_head():
     assert script.get_heads() == [HEAD]
     assert [revision.revision for revision in script.walk_revisions()] == [
         HEAD,
+        EMAIL_CASE,
         CHALLENGES,
         PROVENANCE,
         INITIAL,
     ]
-    assert script.get_revision(HEAD).down_revision == CHALLENGES
+    assert script.get_revision(HEAD).down_revision == EMAIL_CASE
+    assert script.get_revision(EMAIL_CASE).down_revision == CHALLENGES
     assert script.get_revision(CHALLENGES).down_revision == PROVENANCE
     assert script.get_revision(PROVENANCE).down_revision == INITIAL
     assert script.get_revision(INITIAL).down_revision is None
@@ -459,7 +462,7 @@ def test_downgrading_the_provenance_keeps_every_row_and_the_old_schema(tmp_path)
 # their provenance stay live, identity links stay, and the new table starts empty.
 # (These stop at 0003: 0004, which follows it, revokes the email identities; see below.)
 
-ALL_TABLES_BEFORE_0003 = TABLES - {"email_login_challenges"}
+ALL_TABLES_BEFORE_0003 = TABLES - {"email_login_challenges", "identity_invitations"}
 
 
 def _r3b1_database(engine):
@@ -492,7 +495,7 @@ def test_the_email_challenge_migration_adds_one_empty_table_and_changes_nothing_
     upgrade_database(empty_engine, CHALLENGES)
 
     assert _version(empty_engine) == [CHALLENGES]
-    assert _tables(empty_engine) == TABLES | {"alembic_version"}
+    assert _tables(empty_engine) == ALL_TABLES_BEFORE_0003 | {"email_login_challenges", "alembic_version"}
     assert _snapshot(empty_engine) == before  # every row of every old table, byte for byte
     with empty_engine.connect() as connection:
         assert connection.exec_driver_sql("SELECT count(*) FROM email_login_challenges").scalar() == 0
@@ -857,6 +860,128 @@ def test_downgrading_is_refused_while_an_address_with_a_capital_in_its_local_par
         allow(db, new_user(db), "email", "AnotherVictim@example.com")
 
 
+# --- 0005 on a database that holds R3B data --------------------------------------------
+#
+# Policy under test: one table is added, empty, and nothing else is touched: every row of
+# every old table stays byte for byte, nobody is signed out, no migration-time data step
+# exists. No limit on the number of users enters the schema.
+
+TABLES_BEFORE_0005 = TABLES - {"identity_invitations"}
+
+
+def _r3b3_database(engine) -> dict:
+    """A database as 0004 left it, with data in it: _r3b2_database's two users (their
+    email identities now revoked by 0004), a live Telegram session, a conversation."""
+    found = _r3b2_database(engine)
+    upgrade_database(engine, EMAIL_CASE)
+    return found
+
+
+def _snapshot_before_0005(engine) -> dict[str, list]:
+    with engine.connect() as connection:
+        return {
+            table: sorted(connection.exec_driver_sql(f"SELECT * FROM {table}").all(), key=repr)
+            for table in sorted(TABLES_BEFORE_0005)
+        }
+
+
+def test_the_invitation_migration_adds_one_empty_table_and_changes_nothing_else(empty_engine):
+    found = _r3b3_database(empty_engine)
+    before = _snapshot_before_0005(empty_engine)
+    assert _version(empty_engine) == [EMAIL_CASE]
+
+    upgrade_database(empty_engine)
+
+    assert _version(empty_engine) == [HEAD]
+    assert _tables(empty_engine) == TABLES | {"alembic_version"}
+    assert _snapshot_before_0005(empty_engine) == before  # every row of every old table
+    with empty_engine.connect() as connection:
+        assert connection.exec_driver_sql("SELECT count(*) FROM identity_invitations").scalar() == 0
+        assert connection.exec_driver_sql("PRAGMA foreign_key_check").all() == []
+        assert connection.exec_driver_sql("PRAGMA integrity_check").scalars().all() == ["ok"]
+    with create_session_factory(empty_engine)() as db:
+        assert authenticate(db, found["telegram"].token, now=LATER) is not None  # nobody signed out
+
+
+def test_the_invitation_migration_puts_no_limit_on_the_number_of_users_in_the_schema(empty_engine):
+    upgrade_database(empty_engine)
+
+    with create_session_factory(empty_engine)() as db, db.begin():
+        users = [new_user(db, display_name=f"User {number}") for number in range(5)]
+        for user in users:
+            new_conversation(db, user)
+    with empty_engine.connect() as connection:
+        assert connection.exec_driver_sql("SELECT count(*) FROM users").scalar() == 5
+        # a trigger is the only other way for a schema to say "two"
+        assert connection.exec_driver_sql(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'trigger'"
+        ).scalar() == 0
+
+
+def test_downgrading_the_invitations_drops_only_that_table(tmp_path):
+    migrated = create_db_engine(f"sqlite:///{tmp_path / 'migrated.db'}")
+    pristine = create_db_engine(f"sqlite:///{tmp_path / 'pristine.db'}")
+    try:
+        found = _r3b3_database(migrated)
+        upgrade_database(pristine, EMAIL_CASE)
+        upgrade_database(migrated)
+        with create_session_factory(migrated)() as db, db.begin():  # an invitation is outstanding
+            raw_insert(
+                db,
+                "identity_invitations",
+                id=uuid.uuid4().hex,
+                user_id=found["elena"].hex,
+                provider="telegram",
+                token_hash=hash_secret("an invitation"),
+                created_at=stored(CREATED),
+                expires_at=stored(CREATED + timedelta(hours=2)),
+            )
+        before = _snapshot_before_0005(migrated)
+
+        downgrade_database(migrated, EMAIL_CASE)
+
+        assert _version(migrated) == [EMAIL_CASE]
+        assert _tables(migrated) == TABLES_BEFORE_0005 | {"alembic_version"}
+        assert _fingerprint(migrated) == _fingerprint(pristine)  # the 0004 schema, exactly
+        assert _snapshot_before_0005(migrated) == before
+        with create_session_factory(migrated)() as db:
+            assert authenticate(db, found["telegram"].token, now=LATER) is not None
+
+        upgrade_database(migrated)  # and forward again: an empty table, as it began
+        with migrated.connect() as connection:
+            assert connection.exec_driver_sql("SELECT count(*) FROM identity_invitations").scalar() == 0
+    finally:
+        migrated.dispose()
+        pristine.dispose()
+
+
+def _index_sql(engine, name: str) -> str:
+    with engine.connect() as connection:
+        return connection.exec_driver_sql(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?", (name,)
+        ).scalar()
+
+
+def test_the_one_outstanding_rule_is_the_same_partial_index_in_the_migrated_and_the_modeled_schema(tmp_path):
+    # Guard the guard: the fingerprint compares an index by name, columns and uniqueness,
+    # and not by its WHERE, which is the whole rule here.
+    migrated = create_db_engine(f"sqlite:///{tmp_path / 'migrated.db'}")
+    modeled = create_db_engine(f"sqlite:///{tmp_path / 'modeled.db'}")
+    try:
+        upgrade_database(migrated)
+        Base.metadata.create_all(modeled)
+
+        name = "uq_identity_invitations_one_outstanding"
+        assert _index_sql(migrated, name) == _index_sql(modeled, name)
+        assert _index_sql(migrated, name) == (
+            f"CREATE UNIQUE INDEX {name} ON identity_invitations (user_id) "
+            "WHERE consumed_at IS NULL AND revoked_at IS NULL"
+        )
+    finally:
+        migrated.dispose()
+        modeled.dispose()
+
+
 # --- downgrade --------------------------------------------------------------------
 
 
@@ -903,8 +1028,10 @@ def _offline_sql(direction: str) -> str:
         command.downgrade(config, f"{PROVENANCE}:{INITIAL}", sql=True)
     elif direction == "down_from_challenges":
         command.downgrade(config, f"{CHALLENGES}:{PROVENANCE}", sql=True)
+    elif direction == "down_from_email_case":
+        command.downgrade(config, f"{EMAIL_CASE}:{CHALLENGES}", sql=True)
     elif direction == "down_from_head":
-        command.downgrade(config, f"{HEAD}:{CHALLENGES}", sql=True)
+        command.downgrade(config, f"{HEAD}:{EMAIL_CASE}", sql=True)
     else:
         command.downgrade(config, f"{HEAD}:base", sql=True)
     return config.output_buffer.getvalue()
@@ -930,7 +1057,7 @@ def test_the_upgrade_renders_as_postgresql_sql():
     assert "%" not in sql  # a doubled percent sign would make the offline SQL unrunnable
     assert f"INSERT INTO alembic_version (version_num) VALUES ('{INITIAL}')" in sql
     assert f"UPDATE alembic_version SET version_num='{HEAD}'" in sql
-    assert sql.count("CREATE INDEX") == 13 and sql.count("CREATE UNIQUE INDEX") == 1
+    assert sql.count("CREATE INDEX") == 15 and sql.count("CREATE UNIQUE INDEX") == 2
 
 
 def test_the_downgrade_renders_as_postgresql_sql():
@@ -979,8 +1106,8 @@ def test_the_email_challenge_revision_renders_as_one_table_and_its_indexes():
 
 
 def test_the_email_case_revision_renders_as_three_updates_and_a_swap_of_one_check_per_table():
-    up, down = _offline_sql("up"), _offline_sql("down_from_head")
-    revision = up.split(f"Running upgrade {CHALLENGES} -> {HEAD}")[1]
+    up, down = _offline_sql("up"), _offline_sql("down_from_email_case")
+    revision = up.split(f"Running upgrade {CHALLENGES} -> {EMAIL_CASE}")[1].split("-- Running upgrade")[0]
 
     statements = [re.sub(r"\s+", " ", part.strip()) for part in revision.split(";")]
     statements = [part for part in statements if part not in ("", "COMMIT")]
@@ -998,13 +1125,43 @@ def test_the_email_case_revision_renders_as_three_updates_and_a_swap_of_one_chec
         assert statements[add].startswith(f"ALTER TABLE {table} ADD CONSTRAINT {name} CHECK (provider <> 'email' OR (")
         assert "substr(subject, strpos(subject, '@')) = lower(substr(subject, strpos(subject, '@')))" in statements[add]
         assert "subject = lower(subject)" not in statements[add]
-    assert statements[7].startswith("UPDATE alembic_version SET version_num='" + HEAD + "'")
+    assert statements[7].startswith("UPDATE alembic_version SET version_num='" + EMAIL_CASE + "'")
     assert len(statements) == 8  # nothing else is created, altered, updated or dropped
     assert "telegram" not in revision  # the data step names no Telegram row
     # the way back swaps the old rule in, and undoes no revocation
     assert down.count("DROP CONSTRAINT") == 2 and down.count("ADD CONSTRAINT") == 2
     assert down.count("CHECK (provider <> 'email' OR (subject = lower(subject) AND ") == 2
     assert "UPDATE allowlist_entries" not in down and "UPDATE sessions" not in down
+
+
+def test_the_invitation_revision_renders_as_one_table_and_its_indexes():
+    up, down = _offline_sql("up"), _offline_sql("down_from_head")
+    revision = up.split(f"Running upgrade {EMAIL_CASE} -> {HEAD}")[1]
+
+    statements = [re.sub(r"\s+", " ", part.strip()) for part in revision.split(";")]
+    statements = [part for part in statements if part not in ("", "COMMIT")]
+    assert statements[0].startswith("CREATE TABLE identity_invitations (")
+    assert "FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE" in statements[0]
+    assert "CHECK (provider = 'telegram')" in statements[0]
+    assert "CHECK (consumed_at IS NULL OR revoked_at IS NULL)" in statements[0]
+    assert "CHECK (length(token_hash) = 64)" in statements[0]
+    assert "CHECK (expires_at > created_at)" in statements[0]
+    assert statements[1] == (
+        "CREATE INDEX ix_identity_invitations_user_id_created_at ON identity_invitations "
+        "(user_id, created_at)"
+    )
+    assert statements[2] == (
+        "CREATE INDEX ix_identity_invitations_expires_at ON identity_invitations (expires_at)"
+    )
+    # PostgreSQL's own partial unique index, with the predicate of the SQLite one
+    assert statements[3] == (
+        "CREATE UNIQUE INDEX uq_identity_invitations_one_outstanding ON identity_invitations "
+        "(user_id) WHERE consumed_at IS NULL AND revoked_at IS NULL"
+    )
+    assert statements[4].startswith("UPDATE alembic_version SET version_num='" + HEAD + "'")
+    assert len(statements) == 5  # nothing else is created, altered, updated or dropped
+    assert "ALTER TABLE" not in revision and "DROP" not in revision and "UPDATE users" not in revision
+    assert re.findall(r"^DROP [^;]*", down, re.MULTILINE) == ["DROP TABLE identity_invitations"]
 
 
 def test_rendering_sql_offline_creates_no_database_file(tmp_path, monkeypatch):
@@ -1073,7 +1230,7 @@ def test_the_migration_and_the_models_build_the_same_schema_in_postgresql_sql():
 
 def test_the_migration_and_the_models_create_the_same_indexes_in_postgresql_sql():
     assert _indexes_in(_offline_sql("up")) == _indexes_in(_models_as_postgresql())
-    assert len(_indexes_in(_models_as_postgresql())) == 14  # 13 plain, 1 unique
+    assert len(_indexes_in(_models_as_postgresql())) == 17  # 15 plain, 2 unique
 
 
 def test_the_postgresql_comparison_does_see_a_difference(monkeypatch):

@@ -248,12 +248,17 @@ def test_the_head_is_the_one_the_migrations_in_the_repository_end_with(db_url):
             ]
     finally:
         engine.dispose()
-    assert repository_head() == "0004_email_identity_case"
+    assert repository_head() == "0005_identity_invitations"
 
 
 @pytest.mark.parametrize(
     "revision",
-    ["0001_persistence_foundation", "0002_session_provenance", "0003_email_login_challenges"],
+    [
+        "0001_persistence_foundation",
+        "0002_session_provenance",
+        "0003_email_login_challenges",
+        "0004_email_identity_case",
+    ],
 )
 def test_a_schema_behind_the_head_is_refused_and_not_migrated(capsys, tmp_path, revision):
     url = database_at(tmp_path, revision)

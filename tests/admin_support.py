@@ -32,6 +32,7 @@ TABLES = (
     "identity_links",
     "sessions",
     "email_login_challenges",
+    "identity_invitations",
     "conversations",
     "messages",
 )
@@ -76,6 +77,16 @@ def run_cli(capsys, url, *argv: str) -> Run:
     environ = {} if url is None else {DATABASE_URL_ENV: url}
     capsys.readouterr()
     code = main(["provision-email", *argv], environ=environ)
+    captured = capsys.readouterr()
+    return Run(code, captured.out, captured.err)
+
+
+def run_admin(capsys, url, *argv: str, clock=None) -> Run:
+    """Any command, in this process, against `url` (None: the variable is not set), with
+    the real clock unless `clock` is given."""
+    environ = {} if url is None else {DATABASE_URL_ENV: url}
+    capsys.readouterr()
+    code = main(list(argv), environ=environ, clock=clock)
     captured = capsys.readouterr()
     return Run(code, captured.out, captured.err)
 

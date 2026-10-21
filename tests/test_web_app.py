@@ -398,7 +398,7 @@ async def test_starting_and_stopping_leaves_a_migrated_database_as_it_was(tmp_pa
     upgrade_database(engine)
     engine.dispose()
     before = _snapshot(target)
-    assert before[1] == [("0004_email_identity_case",)]
+    assert before[1] == [("0005_identity_invitations",)]
 
     async with serving(create_app(settings_for(target))) as client:
         await client.get("/healthz")
