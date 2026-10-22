@@ -131,6 +131,23 @@ def test_only_the_ways_of_signing_in_that_exist_are_drawn(telegram, email):
         assert page.by_id("login-telegram")["href"] == "/auth/telegram/login"  # the existing full-page route
 
 
+@pytest.mark.parametrize(
+    "telegram, email",
+    [(True, False), (False, True), (True, True), (False, False)],
+)
+def test_the_first_visit_hint_is_drawn_beside_telegram_and_only_there(telegram, email):
+    # R4C-Auth A3: a person who has not linked their Telegram yet is pointed at their invitation
+    # link, which is the only way in for them; the hint is plain text (the page never builds or
+    # knows an invitation) and exists only where the Telegram button does.
+    html = ui.render_shell(telegram=telegram, email=email)
+
+    hint = "Откройте ссылку-приглашение"
+    assert (hint in html) is telegram
+    assert "/auth/invite" not in html and "invitation" not in html.lower()  # no link, no code, no route
+    if telegram:
+        assert html.index("login-telegram") < html.index(hint)  # under the button, not above it
+
+
 @pytest.mark.asyncio
 async def test_the_flags_follow_what_the_running_application_has(tmp_path):
     (tmp_path / "telegram").mkdir()

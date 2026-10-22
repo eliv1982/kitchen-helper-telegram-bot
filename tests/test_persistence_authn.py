@@ -873,6 +873,144 @@ def test_the_user_is_part_of_the_statement_that_revokes(engine, factory, session
     assert revoked_at_by_session(session) == {issued.session_id: None, theirs.session_id: None}
 
 
+# --- a login in a browser that holds a session of somebody else ----------------------------
+
+BORIS_SUB = "9876987698769876987"
+
+
+def link_rows(session):
+    session.expire_all()
+    return sorted(
+        (row.provider, row.subject, row.last_login_at)
+        for row in session.execute(
+            sa.select(IdentityLink.provider, IdentityLink.subject, IdentityLink.last_login_at)
+        )
+    )
+
+
+def test_the_exception_is_one_for_the_ordinary_login_and_the_invitation_alike():
+    from house_helper.persistence import invitations
+
+    assert invitations.SignedInAsAnotherUser is authn.SignedInAsAnotherUser
+
+
+def test_a_login_in_a_browser_holding_a_live_session_of_another_user_is_refused_and_changes_nothing(
+    session, user, issued, someone_else
+):
+    other, theirs = someone_else
+    third = new_user(session, display_name="Third")
+    allow(session, third, "telegram", "3333333333333333333")  # an allowed identity that never signed in
+    session.commit()
+    before = (link_rows(session), count(session, Session), revoked_at_by_session(session))
+
+    for subject in (BORIS_SUB, "3333333333333333333"):  # a known identity, and a first login
+        with pytest.raises(authn.SignedInAsAnotherUser) as refused:
+            log_in(session, subject, now=NOW + timedelta(hours=1), browser_session_token=issued.token)
+        session.rollback()  # (what WebDatabase.run does: the UPDATE that began the login goes too)
+
+        assert str(refused.value) == ""  # nothing about either user
+        assert (link_rows(session), count(session, Session), revoked_at_by_session(session)) == before
+
+    assert authenticate(session, issued.token, now=NOW) is not None  # the browser's own session, untouched
+    assert authenticate(session, theirs.token, now=NOW) is not None
+
+
+def test_the_same_user_signing_in_again_gets_a_new_session_and_the_old_one_stays(session, user, issued):
+    again = log_in(session, now=NOW + timedelta(hours=1), browser_session_token=issued.token)
+    session.commit()
+
+    assert again.user_id == user.id and again.token != issued.token
+    assert authenticate(session, issued.token, now=NOW + timedelta(hours=2)) is not None
+    assert authenticate(session, again.token, now=NOW + timedelta(hours=2)) is not None
+
+
+def ended(session, user, issued, someone_else):
+    revoke_session(session, issued.token, now=NOW)
+    return NOW + timedelta(hours=1)
+
+
+def expired(session, user, issued, someone_else):
+    return NOW + authn.SESSION_LIFETIME  # a session is over at its expiry
+
+
+def identity_revoked(session, user, issued, someone_else):
+    revoke(session, "telegram", SUB, now=NOW)
+    return NOW + timedelta(hours=1)
+
+
+def user_disabled(session, user, issued, someone_else):
+    user.disabled_at = NOW
+    return NOW + timedelta(hours=1)
+
+
+@pytest.mark.parametrize("end", [ended, expired, identity_revoked, user_disabled], ids=lambda f: f.__name__)
+def test_a_session_that_is_not_live_is_no_obstacle(session, user, issued, someone_else, end):
+    other, _ = someone_else
+    now = end(session, user, issued, someone_else)
+
+    signed_in = log_in(session, BORIS_SUB, now=now, browser_session_token=issued.token)
+
+    assert signed_in.user_id == other.id
+
+
+@pytest.mark.parametrize(
+    "token",
+    [None, "", "not a token", "x" * 43, "x" * 500, 12345],
+    ids=["none", "empty", "malformed", "unknown", "long", "not text"],
+)
+def test_a_token_that_names_no_session_is_no_obstacle(session, user, issued, someone_else, token):
+    other, _ = someone_else
+
+    signed_in = log_in(session, BORIS_SUB, browser_session_token=token)
+
+    assert signed_in.user_id == other.id
+
+
+def test_a_denied_identity_is_denied_whoever_the_browser_is_signed_in_as(session, user, issued):
+    with pytest.raises(LoginDenied):
+        log_in(session, "unknown-subject", browser_session_token=issued.token)
+
+
+def test_the_browsers_token_is_looked_at_only_to_compare_and_is_written_nowhere(session, user, issued, someone_else):
+    log_in(session, now=NOW + timedelta(hours=1), browser_session_token=issued.token)
+    session.commit()
+
+    for table in ("sessions", "identity_links", "allowlist_entries", "oidc_states", "users"):
+        assert issued.token not in row_text(session, table)
+
+
+@pytest.mark.parametrize("refused", [False, True], ids=["allowed", "refused"])
+def test_a_login_with_a_browsers_token_still_starts_with_a_write(engine, factory, user, issued, someone_else, refused):
+    def login(s):
+        if refused:
+            with pytest.raises(authn.SignedInAsAnotherUser):
+                log_in(s, BORIS_SUB, browser_session_token=issued.token)
+        else:
+            log_in(s, browser_session_token=issued.token)
+
+    assert first_statement(engine, factory, login) == "UPDATE"
+
+
+def test_the_comparison_is_made_after_the_identity_was_found_allowed_and_before_a_link_or_session_is_written(
+    engine, factory, user, issued
+):
+    with factory() as setup, setup.begin():
+        third = new_user(setup, display_name="Third")
+        allow(setup, third, "telegram", "3333333333333333333")
+
+    def refuse(s):
+        with pytest.raises(authn.SignedInAsAnotherUser):
+            log_in(s, "3333333333333333333", browser_session_token=issued.token)
+
+    with factory() as writer, statements(engine) as seen:
+        with writer.begin():
+            refuse(writer)
+
+    written = [text.lstrip().split(None, 1)[0].upper() for text in seen]
+    assert not any(text.lstrip().upper().startswith("INSERT") for text in seen), seen  # no link, no session
+    assert written[0] == "UPDATE"
+
+
 # --- the order of statements: writers write first -------------------------------------
 
 

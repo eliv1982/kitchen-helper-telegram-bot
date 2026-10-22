@@ -37,7 +37,14 @@ from house_helper.persistence.database import (
 )
 from house_helper.persistence import authn as authn_module
 from house_helper.persistence.allowlist import allow, allowed_user, is_allowed, revoke
-from house_helper.persistence.authn import authenticate, complete_login, hash_secret, new_secret
+from house_helper.persistence.authn import (
+    OidcLoginSecrets,
+    authenticate,
+    complete_login,
+    consume_oidc_login,
+    hash_secret,
+    new_secret,
+)
 from house_helper.persistence.email_login import (
     IssueOutcome,
     issue_email_login,
@@ -62,7 +69,8 @@ INITIAL = "0001_persistence_foundation"
 PROVENANCE = "0002_session_provenance"
 CHALLENGES = "0003_email_login_challenges"
 EMAIL_CASE = "0004_email_identity_case"
-HEAD = "0005_identity_invitations"
+INVITATIONS = "0005_identity_invitations"
+HEAD = "0006_oidc_state_invitation"
 REPO_ROOT = Path(house_helper.persistence.__file__).resolve().parents[2]
 
 
@@ -91,12 +99,14 @@ def test_the_history_is_one_line_with_one_head():
     assert script.get_heads() == [HEAD]
     assert [revision.revision for revision in script.walk_revisions()] == [
         HEAD,
+        INVITATIONS,
         EMAIL_CASE,
         CHALLENGES,
         PROVENANCE,
         INITIAL,
     ]
-    assert script.get_revision(HEAD).down_revision == EMAIL_CASE
+    assert script.get_revision(HEAD).down_revision == INVITATIONS
+    assert script.get_revision(INVITATIONS).down_revision == EMAIL_CASE
     assert script.get_revision(EMAIL_CASE).down_revision == CHALLENGES
     assert script.get_revision(CHALLENGES).down_revision == PROVENANCE
     assert script.get_revision(PROVENANCE).down_revision == INITIAL
@@ -890,9 +900,9 @@ def test_the_invitation_migration_adds_one_empty_table_and_changes_nothing_else(
     before = _snapshot_before_0005(empty_engine)
     assert _version(empty_engine) == [EMAIL_CASE]
 
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, INVITATIONS)
 
-    assert _version(empty_engine) == [HEAD]
+    assert _version(empty_engine) == [INVITATIONS]
     assert _tables(empty_engine) == TABLES | {"alembic_version"}
     assert _snapshot_before_0005(empty_engine) == before  # every row of every old table
     with empty_engine.connect() as connection:
@@ -924,7 +934,7 @@ def test_downgrading_the_invitations_drops_only_that_table(tmp_path):
     try:
         found = _r3b3_database(migrated)
         upgrade_database(pristine, EMAIL_CASE)
-        upgrade_database(migrated)
+        upgrade_database(migrated, INVITATIONS)
         with create_session_factory(migrated)() as db, db.begin():  # an invitation is outstanding
             raw_insert(
                 db,
@@ -947,7 +957,7 @@ def test_downgrading_the_invitations_drops_only_that_table(tmp_path):
         with create_session_factory(migrated)() as db:
             assert authenticate(db, found["telegram"].token, now=LATER) is not None
 
-        upgrade_database(migrated)  # and forward again: an empty table, as it began
+        upgrade_database(migrated, INVITATIONS)  # and forward again: an empty table, as it began
         with migrated.connect() as connection:
             assert connection.exec_driver_sql("SELECT count(*) FROM identity_invitations").scalar() == 0
     finally:
@@ -980,6 +990,151 @@ def test_the_one_outstanding_rule_is_the_same_partial_index_in_the_migrated_and_
     finally:
         migrated.dispose()
         modeled.dispose()
+
+
+# --- 0006 on a database that holds R4C data --------------------------------------------
+#
+# Policy under test: one nullable column (with its key and index) is added to oidc_states,
+# and nothing else changes: every row of every table stays byte for byte, a login in flight
+# finishes as before (NULL is an ordinary login), nobody is signed out, no invitation is
+# touched. The way back deletes the logins bound to an invitation and nothing else.
+
+TABLES_BEFORE_0006_WITH_ROWS = TABLES - {"oidc_states"}
+
+
+def _r4c_database(engine) -> dict:
+    """A database as 0005 left it, with data in it: _r3b3_database's users and a live
+    Telegram session, one outstanding invitation, and two logins in flight."""
+    found = _r3b3_database(engine)
+    upgrade_database(engine, INVITATIONS)
+    with create_session_factory(engine)() as db, db.begin():
+        raw_insert(
+            db,
+            "identity_invitations",
+            id=uuid.uuid4().hex,
+            user_id=found["elena"].hex,
+            provider="telegram",
+            token_hash=hash_secret("an invitation"),
+            created_at=stored(CREATED),
+            expires_at=stored(CREATED + timedelta(hours=2)),
+        )
+        for number in (1, 2):
+            raw_insert(
+                db,
+                "oidc_states",
+                id=uuid.uuid4().hex,
+                state_hash=hash_secret(f"inflight-{number}"),
+                provider="telegram",
+                nonce=f"nonce-{number}",
+                code_verifier=f"verifier-{number}",
+                created_at=stored(CREATED),
+                expires_at=stored(CREATED + timedelta(minutes=10)),
+            )
+    return found
+
+
+def _snapshot_of(engine, tables) -> dict[str, list]:
+    with engine.connect() as connection:
+        return {
+            table: sorted(connection.exec_driver_sql(f"SELECT * FROM {table}").all(), key=repr)
+            for table in sorted(tables)
+        }
+
+
+def test_the_oidc_state_migration_adds_one_nullable_column_and_changes_no_row(empty_engine):
+    found = _r4c_database(empty_engine)
+    others_before = _snapshot_of(empty_engine, TABLES_BEFORE_0006_WITH_ROWS)
+    states_before = _snapshot_of(empty_engine, ["oidc_states"])["oidc_states"]
+    assert _version(empty_engine) == [INVITATIONS]
+
+    upgrade_database(empty_engine)
+
+    assert _version(empty_engine) == [HEAD]
+    assert _tables(empty_engine) == TABLES | {"alembic_version"}
+    assert _snapshot_of(empty_engine, TABLES_BEFORE_0006_WITH_ROWS) == others_before  # the invitation too
+    states_after = _snapshot_of(empty_engine, ["oidc_states"])["oidc_states"]
+    assert [row[:-1] for row in states_after] == states_before  # every old column of every login
+    assert [row[-1] for row in states_after] == [None, None]  # an ordinary login, as before
+    columns = {column["name"]: column for column in sa.inspect(empty_engine).get_columns("oidc_states")}
+    assert list(columns)[-1] == "invitation_id" and columns["invitation_id"]["nullable"] is True
+    with empty_engine.connect() as connection:
+        assert connection.exec_driver_sql("PRAGMA foreign_key_check").all() == []
+        assert connection.exec_driver_sql("PRAGMA integrity_check").scalars().all() == ["ok"]
+    with create_session_factory(empty_engine)() as db:
+        assert authenticate(db, found["telegram"].token, now=LATER) is not None  # nobody signed out
+
+
+def test_a_login_that_was_in_flight_during_the_migration_is_finished_by_the_new_code(empty_engine):
+    _r4c_database(empty_engine)
+    upgrade_database(empty_engine)
+
+    with create_session_factory(empty_engine)() as db, db.begin():
+        secrets = consume_oidc_login(db, "telegram", "inflight-1", now=CREATED + timedelta(minutes=1))
+
+    assert secrets == OidcLoginSecrets(nonce=secrets.nonce, code_verifier=secrets.code_verifier)
+    assert secrets.invitation_id is None  # an ordinary login: the allowlist decides, as ever
+
+
+def test_the_oidc_state_key_and_index_are_the_same_in_the_migrated_and_the_modeled_schema(tmp_path):
+    migrated = create_db_engine(f"sqlite:///{tmp_path / 'migrated.db'}")
+    modeled = create_db_engine(f"sqlite:///{tmp_path / 'modeled.db'}")
+    try:
+        upgrade_database(migrated)
+        Base.metadata.create_all(modeled)
+
+        for engine in (migrated, modeled):
+            keys = sa.inspect(engine).get_foreign_keys("oidc_states")
+            assert [
+                (key["constrained_columns"], key["referred_table"], key["referred_columns"], key["options"])
+                for key in keys
+            ] == [(["invitation_id"], "identity_invitations", ["id"], {"ondelete": "CASCADE"})]
+            assert [key["name"] for key in keys] == ["fk_oidc_states_invitation_id_identity_invitations"]
+            indexes = {index["name"]: index["column_names"] for index in sa.inspect(engine).get_indexes("oidc_states")}
+            assert indexes["ix_oidc_states_invitation_id"] == ["invitation_id"]
+    finally:
+        migrated.dispose()
+        modeled.dispose()
+
+
+def test_downgrading_the_oidc_state_binding_deletes_the_bound_logins_and_restores_the_0005_schema(tmp_path):
+    migrated = create_db_engine(f"sqlite:///{tmp_path / 'migrated.db'}")
+    pristine = create_db_engine(f"sqlite:///{tmp_path / 'pristine.db'}")
+    try:
+        found = _r4c_database(migrated)
+        upgrade_database(pristine, INVITATIONS)
+        upgrade_database(migrated)
+        with create_session_factory(migrated)() as db, db.begin():  # one login is bound to the invitation
+            invitation = db.execute(sa.text("SELECT id FROM identity_invitations")).scalar()
+            db.execute(
+                sa.text("UPDATE oidc_states SET invitation_id = :invitation WHERE nonce = 'nonce-2'"),
+                {"invitation": invitation},
+            )
+        others_before = _snapshot_of(migrated, TABLES_BEFORE_0006_WITH_ROWS)
+
+        downgrade_database(migrated, INVITATIONS)
+
+        assert _version(migrated) == [INVITATIONS]
+        assert _fingerprint(migrated) == _fingerprint(pristine)  # the 0005 schema, exactly
+        assert _snapshot_of(migrated, TABLES_BEFORE_0006_WITH_ROWS) == others_before
+        with migrated.connect() as connection:
+            # the ordinary login stays, the bound one does not survive as an ordinary one
+            assert connection.exec_driver_sql("SELECT nonce FROM oidc_states").scalars().all() == ["nonce-1"]
+            assert connection.exec_driver_sql("PRAGMA foreign_key_check").all() == []
+            assert connection.exec_driver_sql("PRAGMA integrity_check").scalars().all() == ["ok"]
+        with create_session_factory(migrated)() as db:
+            assert authenticate(db, found["telegram"].token, now=LATER) is not None
+
+        upgrade_database(migrated)  # and forward again: the models' schema once more
+        assert _version(migrated) == [HEAD]
+        modeled = create_db_engine(f"sqlite:///{tmp_path / 'modeled.db'}")
+        try:
+            Base.metadata.create_all(modeled)
+            assert _fingerprint(migrated) == _fingerprint(modeled)
+        finally:
+            modeled.dispose()
+    finally:
+        migrated.dispose()
+        pristine.dispose()
 
 
 # --- downgrade --------------------------------------------------------------------
@@ -1030,8 +1185,10 @@ def _offline_sql(direction: str) -> str:
         command.downgrade(config, f"{CHALLENGES}:{PROVENANCE}", sql=True)
     elif direction == "down_from_email_case":
         command.downgrade(config, f"{EMAIL_CASE}:{CHALLENGES}", sql=True)
+    elif direction == "down_from_invitations":
+        command.downgrade(config, f"{INVITATIONS}:{EMAIL_CASE}", sql=True)
     elif direction == "down_from_head":
-        command.downgrade(config, f"{HEAD}:{EMAIL_CASE}", sql=True)
+        command.downgrade(config, f"{HEAD}:{INVITATIONS}", sql=True)
     else:
         command.downgrade(config, f"{HEAD}:base", sql=True)
     return config.output_buffer.getvalue()
@@ -1057,7 +1214,7 @@ def test_the_upgrade_renders_as_postgresql_sql():
     assert "%" not in sql  # a doubled percent sign would make the offline SQL unrunnable
     assert f"INSERT INTO alembic_version (version_num) VALUES ('{INITIAL}')" in sql
     assert f"UPDATE alembic_version SET version_num='{HEAD}'" in sql
-    assert sql.count("CREATE INDEX") == 15 and sql.count("CREATE UNIQUE INDEX") == 2
+    assert sql.count("CREATE INDEX") == 16 and sql.count("CREATE UNIQUE INDEX") == 2
 
 
 def test_the_downgrade_renders_as_postgresql_sql():
@@ -1135,8 +1292,8 @@ def test_the_email_case_revision_renders_as_three_updates_and_a_swap_of_one_chec
 
 
 def test_the_invitation_revision_renders_as_one_table_and_its_indexes():
-    up, down = _offline_sql("up"), _offline_sql("down_from_head")
-    revision = up.split(f"Running upgrade {EMAIL_CASE} -> {HEAD}")[1]
+    up, down = _offline_sql("up"), _offline_sql("down_from_invitations")
+    revision = up.split(f"Running upgrade {EMAIL_CASE} -> {INVITATIONS}")[1].split("-- Running upgrade")[0]
 
     statements = [re.sub(r"\s+", " ", part.strip()) for part in revision.split(";")]
     statements = [part for part in statements if part not in ("", "COMMIT")]
@@ -1158,10 +1315,38 @@ def test_the_invitation_revision_renders_as_one_table_and_its_indexes():
         "CREATE UNIQUE INDEX uq_identity_invitations_one_outstanding ON identity_invitations "
         "(user_id) WHERE consumed_at IS NULL AND revoked_at IS NULL"
     )
-    assert statements[4].startswith("UPDATE alembic_version SET version_num='" + HEAD + "'")
+    assert statements[4].startswith("UPDATE alembic_version SET version_num='" + INVITATIONS + "'")
     assert len(statements) == 5  # nothing else is created, altered, updated or dropped
     assert "ALTER TABLE" not in revision and "DROP" not in revision and "UPDATE users" not in revision
     assert re.findall(r"^DROP [^;]*", down, re.MULTILINE) == ["DROP TABLE identity_invitations"]
+
+
+def test_the_oidc_state_revision_renders_as_three_alters_and_the_way_back_as_a_delete_and_three_drops():
+    up, down = _offline_sql("up"), _offline_sql("down_from_head")
+    revision = up.split(f"Running upgrade {INVITATIONS} -> {HEAD}")[1]
+
+    statements = [re.sub(r"\s+", " ", part.strip()) for part in revision.split(";")]
+    statements = [part for part in statements if part not in ("", "COMMIT")]
+    assert statements[0] == "ALTER TABLE oidc_states ADD COLUMN invitation_id UUID"
+    assert statements[1] == (
+        "ALTER TABLE oidc_states ADD CONSTRAINT fk_oidc_states_invitation_id_identity_invitations "
+        "FOREIGN KEY(invitation_id) REFERENCES identity_invitations (id) ON DELETE CASCADE"
+    )
+    assert statements[2] == "CREATE INDEX ix_oidc_states_invitation_id ON oidc_states (invitation_id)"
+    assert statements[3].startswith("UPDATE alembic_version SET version_num='" + HEAD + "'")
+    assert len(statements) == 4  # nothing else is created, altered, updated or dropped
+    assert "NOT NULL" not in statements[0]  # a nullable column: no existing row is rewritten
+    assert "UPDATE oidc_states" not in revision and "DELETE FROM" not in revision
+
+    uncommented = re.sub(r"^--.*$", "", down, flags=re.MULTILINE)
+    undo = [re.sub(r"\s+", " ", part.strip()) for part in uncommented.split(";")]
+    undo = [part for part in undo if part.startswith(("DELETE FROM oidc_states", "ALTER TABLE", "DROP"))]
+    assert undo == [
+        "DELETE FROM oidc_states WHERE oidc_states.invitation_id IS NOT NULL",
+        "DROP INDEX ix_oidc_states_invitation_id",
+        "ALTER TABLE oidc_states DROP CONSTRAINT fk_oidc_states_invitation_id_identity_invitations",
+        "ALTER TABLE oidc_states DROP COLUMN invitation_id",
+    ]
 
 
 def test_rendering_sql_offline_creates_no_database_file(tmp_path, monkeypatch):
@@ -1230,7 +1415,7 @@ def test_the_migration_and_the_models_build_the_same_schema_in_postgresql_sql():
 
 def test_the_migration_and_the_models_create_the_same_indexes_in_postgresql_sql():
     assert _indexes_in(_offline_sql("up")) == _indexes_in(_models_as_postgresql())
-    assert len(_indexes_in(_models_as_postgresql())) == 17  # 15 plain, 2 unique
+    assert len(_indexes_in(_models_as_postgresql())) == 18  # 16 plain, 2 unique
 
 
 def test_the_postgresql_comparison_does_see_a_difference(monkeypatch):

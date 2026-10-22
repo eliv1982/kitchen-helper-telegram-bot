@@ -89,6 +89,7 @@ router = APIRouter()
 
 _TELEGRAM = """\
     <a id="login-telegram" class="btn btn-primary btn-block" href="/auth/telegram/login">Войти через Telegram</a>
+    <p class="hint">Вы здесь впервые? Откройте ссылку-приглашение, которую вам прислали: она нужна только для первого входа.</p>
 """
 
 _DIVIDER = """\

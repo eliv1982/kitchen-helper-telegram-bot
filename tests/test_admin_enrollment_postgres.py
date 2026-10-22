@@ -2,7 +2,7 @@
 
 What the SQLite tests cannot show: the enrollment commands run at READ COMMITTED under the
 advisory lock that provision-email takes (one lock for every command that creates users), so
-the count behind the enrollment limit is exact under concurrency; migration 0005 applies,
+the count behind the enrollment limit is exact under concurrency; migrations 0005 and 0006 apply,
 reverses and applies again on PostgreSQL, with its partial unique index; and the row locks that
 order a reissue against a web claim (the user's row first, FOR NO KEY UPDATE, then the
 invitation's) really do: whichever comes second waits for the first and then sees it. Also the
@@ -135,10 +135,10 @@ def entries(monitor):
 # --- the migration on a real server ---------------------------------------------------------------------
 
 
-def test_the_migrations_end_at_0005_and_the_table_and_its_partial_index_are_what_the_models_say(
+def test_the_migrations_end_at_0006_and_the_table_and_its_partial_index_are_what_the_models_say(
     scratch_rc, monitor_rc
 ):
-    assert scalar(monitor_rc, "SELECT version_num FROM alembic_version") == "0005_identity_invitations"
+    assert scalar(monitor_rc, "SELECT version_num FROM alembic_version") == "0006_oidc_state_invitation"
     definition = scalar(
         monitor_rc,
         "SELECT indexdef FROM pg_indexes WHERE indexname = 'uq_identity_invitations_one_outstanding'",
@@ -158,7 +158,7 @@ def test_the_invitation_revision_downgrades_and_upgrades_again(scratch_rc, monit
     finally:
         engine.dispose()
 
-    assert scalar(monitor_rc, "SELECT version_num FROM alembic_version") == "0005_identity_invitations"
+    assert scalar(monitor_rc, "SELECT version_num FROM alembic_version") == "0006_oidc_state_invitation"
     assert scalar(monitor_rc, "SELECT count(*) FROM identity_invitations") == 0  # an empty table again
 
 

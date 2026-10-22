@@ -23,12 +23,20 @@ handed to the operator who issued it.
                       used up, in the caller's transaction. Takes the invitation's
                       id only (see below).
 
-Nothing here talks to Telegram or to HTTP, and nothing here signs anyone in. Linking is
-`claim_invitation` followed, in the SAME transaction, by authn.complete_login, which
-creates the identity link and the session through the existing, unchanged path (and so a
-session still records the identity it was opened through). The web claim endpoint that
-does that is a later increment; the contract it must keep is in the docstring of
-claim_invitation.
+and the two units the web sign-in is made of (web/invite_auth.py and web/auth.py):
+
+  begin_invitation_login     START: verify_invitation, then the login's state is stored with
+                             the invitation's id (oidc_states.invitation_id), in one
+                             transaction. Nothing is written for an invitation that is not
+                             live.
+  complete_invitation_login  END: claim_invitation, then authn.complete_login, then the check
+                             that the session is the invited user's, in one transaction.
+
+Nothing here talks to Telegram or to HTTP. Linking is `claim_invitation` followed, in the SAME
+transaction, by authn.complete_login, which creates the identity link and the session through
+the existing, unchanged path (and so a session still records the identity it was opened
+through); complete_invitation_login is exactly that, and the contract it keeps is in the
+docstring of claim_invitation.
 
 Secrets: the secret is 256 random bits from the operating system's CSPRNG (the same
 generator as session tokens); only its SHA-256 hex digest is stored. The raw secret is
@@ -77,8 +85,9 @@ import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as OrmSession
 
+from house_helper.persistence import authn
 from house_helper.persistence.allowlist import allow
-from house_helper.persistence.authn import hash_secret, new_secret
+from house_helper.persistence.authn import SignedInAsAnotherUser, hash_secret, new_secret
 from house_helper.persistence.identifiers import PROVIDER_TELEGRAM, normalize_identity
 from house_helper.persistence.models import AllowlistEntry, IdentityInvitation, User
 
@@ -120,6 +129,18 @@ class IdentityRefused(Exception):
     race on PostgreSQL, below) BEFORE the invitation is used up; either way the caller's
     rollback leaves the invitation valid for the right person. The message carries nothing
     about the identity or about any user."""
+
+
+class InvitationNotUsable(Exception):
+    """The invitation a sign-in was started with can no longer be used (used, withdrawn,
+    superseded, expired, its user disabled or already linked, or unknown). Raised by
+    complete_invitation_login; nothing was written, and the caller's rollback keeps it so."""
+
+
+# (SignedInAsAnotherUser, imported above, is raised here when the browser presenting the
+# invitation is already signed in as a user other than the invitation's: the caller's
+# rollback leaves the invitation valid, so the person can sign out and use it. It is
+# authn's own exception, which the ordinary Telegram login raises too.)
 
 
 class InvitationState(str, enum.Enum):
@@ -350,12 +371,13 @@ def claim_invitation(
     """Put the verified Telegram identity `subject` on the allowlist for the user the
     invitation names, and use the invitation up.
 
-    THE CONTRACT OF THE CALLER (the web claim endpoint, a later increment):
+    THE CONTRACT OF THE CALLER (complete_invitation_login below, for the web callback):
 
       * `subject` is the `sub` of an ID token that Telegram signed and that the caller has
         fully verified (signature, issuer, audience, expiry, nonce). Nothing here can tell.
       * `invitation_id` comes from server-side state that was created after
-        verify_invitation succeeded for this browser, never from a request field.
+        verify_invitation succeeded for this browser (oidc_states.invitation_id, written by
+        begin_invitation_login), never from a request field.
       * It runs in ONE write transaction with authn.complete_login(session, "telegram",
         claimed.subject, ...), which creates the identity link and the session, and the
         caller checks that the session's user is claimed.user_id, rolling back if it is not.
@@ -425,3 +447,96 @@ def claim_invitation(
     except (IntegrityError, ValueError):
         raise IdentityRefused from None
     return ClaimedInvitation(invitation_id=wanted, user_id=user.id, subject=subject)
+
+
+# --- the two units of the web sign-in -----------------------------------------------
+
+
+def begin_invitation_login(
+    session: OrmSession,
+    invitation_id: object,
+    token: object,
+    state: str,
+    nonce: str,
+    code_verifier: str,
+    *,
+    now: datetime,
+    lifetime: timedelta = authn.OIDC_LOGIN_LIFETIME,
+    signed_in_user: Optional[uuid.UUID] = None,
+) -> bool:
+    """START of the web sign-in: store the login's state bound to the invitation, if the
+    secret is a live invitation's. True if it was stored; False (nothing written) for
+    anything else, every reason alike (see verify_invitation).
+
+    This is the only place that binds an invitation to a login, and it does so only after
+    verify_invitation has said yes to the secret that came with this very request: the id
+    that the callback claims is the one verified here, in the same transaction, and nothing
+    a later request says can change it. Nothing is used up.
+
+    `signed_in_user` is the user the presenting browser is already signed in as, if any.
+    SignedInAsAnotherUser if that is not the invitation's user (raised after the secret was
+    found to be live, so it tells nothing to a person who does not hold one); the same user
+    is fine (they are linking a second way in). The write comes first, as in claim_invitation:
+    on SQLite a transaction that read first would fail with a stale snapshot if another
+    writer committed in between.
+    """
+    _take_the_write_lock(session)
+    live = verify_invitation(session, invitation_id, token, now=now)
+    if live is None:
+        return False
+    if signed_in_user is not None:
+        owner = session.scalar(
+            sa.select(IdentityInvitation.user_id).where(IdentityInvitation.id == live.invitation_id)
+        )
+        if owner != signed_in_user:
+            raise SignedInAsAnotherUser
+    authn.begin_oidc_login(
+        session,
+        PROVIDER_TELEGRAM,
+        state,
+        nonce,
+        code_verifier,
+        now=now,
+        lifetime=lifetime,
+        invitation_id=live.invitation_id,
+    )
+    return True
+
+
+def complete_invitation_login(
+    session: OrmSession,
+    invitation_id: object,
+    subject: object,
+    *,
+    now: datetime,
+    lifetime: timedelta = authn.SESSION_LIFETIME,
+    signed_in_user: Optional[uuid.UUID] = None,
+) -> authn.IssuedSession:
+    """END of the web sign-in: link the verified Telegram identity to the invitation's user,
+    use the invitation up and open a session, all in the caller's one transaction.
+
+    `invitation_id` is the one the login's state carried (authn.consume_oidc_login), and
+    `subject` the `sub` of an ID token the caller has fully verified (see claim_invitation).
+    Raises InvitationNotUsable (the invitation is not live any more), IdentityRefused (the
+    identity cannot be linked), SignedInAsAnotherUser (see begin_invitation_login) or
+    authn.LoginDenied; whichever it is, and whatever else is raised, the caller's rollback
+    leaves everything as it was: the invitation is not used up, nothing is on the allowlist,
+    no identity link or session exists.
+
+    The session comes from authn.complete_login, the same function as any other sign-in, so
+    it records the identity link it was opened through and lasts the same time. The check
+    that it is the invited user's is made here and not assumed: a session of anybody else is
+    refused, and the transaction rolled back, because the alternative is to sign in as
+    somebody else.
+    """
+    claimed = claim_invitation(session, invitation_id, subject, now=now)
+    if claimed is None:
+        raise InvitationNotUsable
+    if signed_in_user is not None and signed_in_user != claimed.user_id:
+        raise SignedInAsAnotherUser
+    issued = authn.complete_login(
+        session, PROVIDER_TELEGRAM, claimed.subject, now=now, lifetime=lifetime
+    )
+    if issued.user_id != claimed.user_id:
+        raise authn.LoginDenied
+    return issued

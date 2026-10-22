@@ -11,7 +11,9 @@ to build the application object a server needs. The database engine is created
 when the application starts and disposed when it stops (see app.py).
 
 Sign-in with Telegram (OIDC) is optional and lives in auth.py (the routes, the
-require_user dependency), telegram_oidc.py (the provider side) and logsafety.py;
+require_user dependency), telegram_oidc.py (the provider side) and logsafety.py; the
+Telegram invitation sign-in, which links a provisioned user's Telegram identity and ends
+in the same callback, adds invite_auth.py (its routes) and invite_pages.py (its pages);
 settings.py says how it is configured and what happens when it is not. It is the
 only way into the application: every route that serves a user's data must depend on
 auth.require_user, which resolves the user from the server-side session and never

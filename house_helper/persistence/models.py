@@ -394,12 +394,24 @@ class OidcState(Base):
     """One in-flight OIDC login: what must be remembered between sending the
     browser to the provider and receiving it back. Single use (consumed_at) and
     short-lived (expires_at). state_hash is the SHA-256 hex digest of the
-    `state` value in the redirect."""
+    `state` value in the redirect.
+
+    invitation_id is set only for a login that was started by presenting a Telegram
+    invitation: it names the invitation whose secret the server verified at that very
+    moment (invitations.begin_invitation_login), and it is what the callback claims. It is
+    the only place that binding exists: the callback reads it from this row, which the
+    browser can reach only through the state value that is bound to it by cookie, and
+    never from a request. NULL is an ordinary login (the allowlist decides, as ever). The
+    invitation's own lifecycle is the authority: this row records nothing about whether
+    the invitation is still usable, the claim decides that when the login ends. Deleting
+    the invitation deletes the logins bound to it (they must not turn into ordinary
+    ones). Once stored, the binding does not change."""
 
     __tablename__ = "oidc_states"
     __table_args__ = (
         sa.UniqueConstraint("state_hash"),
         sa.Index(None, "expires_at"),
+        sa.Index(None, "invitation_id"),
         sa.CheckConstraint("length(state_hash) = 64", name="state_hash_length"),
         sa.CheckConstraint("expires_at > created_at", name="expires_after_created"),
         _max_length("provider", 64),
@@ -415,6 +427,9 @@ class OidcState(Base):
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     expires_at: Mapped[datetime]
     consumed_at: Mapped[Optional[datetime]]
+    invitation_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        sa.ForeignKey("identity_invitations.id", ondelete="CASCADE")
+    )
 
 
 class EmailLoginChallenge(Base):
@@ -936,7 +951,12 @@ def _guard_invitation_on_update(mapper: Any, connection: Any, target: Any) -> No
     _forbid_changes(target, "user_id", "provider", "token_hash", "created_at", "expires_at")
 
 
+def _guard_oidc_state_on_update(mapper: Any, connection: Any, target: Any) -> None:
+    _forbid_changes(target, "invitation_id")
+
+
 sa.event.listen(Session, "before_update", _guard_session_on_update)
+sa.event.listen(OidcState, "before_update", _guard_oidc_state_on_update)
 sa.event.listen(EmailLoginChallenge, "before_update", _guard_challenge_on_update)
 sa.event.listen(IdentityInvitation, "before_update", _guard_invitation_on_update)
 sa.event.listen(Message, "before_insert", _guard_retention_on_insert)

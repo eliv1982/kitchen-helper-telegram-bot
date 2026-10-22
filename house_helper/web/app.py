@@ -13,7 +13,9 @@ Starting against a database that is missing or not migrated therefore succeeds,
 and a database error shows when something first uses the database, not before.
 
 The two ways to sign in exist only when configured, each on its own (see
-settings.py): Telegram login (auth.py) and email login (email_auth.py). The routes
+settings.py): Telegram login (auth.py) and email login (email_auth.py); the Telegram
+invitation sign-in (invite_auth.py), which links a provisioned user's Telegram identity,
+is part of Telegram login and exists with it. The routes
 are always there; without the configuration they answer 503, and the process neither
 needs credentials nor opens an HTTP client nor a connection to a mail server. With
 Telegram configured, the lifespan also creates the client used to call Telegram and
@@ -47,7 +49,7 @@ from house_helper.core.backend import ChatBackend
 from house_helper.core.openai_chat import StandaloneOpenAIBackend
 from house_helper.persistence.base import utcnow
 from house_helper.persistence.database import create_db_engine
-from house_helper.web import auth, chat_api, email_auth, health, ui
+from house_helper.web import auth, chat_api, email_auth, health, invite_auth, ui
 from house_helper.web.auth import AuthService
 from house_helper.web.database import WebDatabase
 from house_helper.web.email_auth import EmailLoginService
@@ -167,6 +169,7 @@ def create_app(
     app.include_router(health.router)
     app.include_router(auth.router)
     app.include_router(email_auth.router)
+    app.include_router(invite_auth.router)
     app.include_router(chat_api.router)
     app.include_router(ui.router)
     return app

@@ -32,6 +32,42 @@ is 503, the same. A cookie that names no session, or one that was already ended 
 repeat after a lost answer), is 204 as before, since there is nothing left to end, and
 the answer clears the cookie. Neither answer says who anybody is.
 
+A browser signed in as somebody else. The browser has one session cookie, and the answer to a
+login replaces it. So the callback of ANY Telegram login (ordinary or by invitation) reads the
+session cookie the request carried, and if it names a live session of a user other than the one
+the verified identity belongs to, the answer is 409 signed_in_as_another_user (a page in
+Russian), with the existing session and cookie untouched, no session issued for the other
+user, and nothing else changed (the login's state is spent, as for every login that ends).
+The comparison is made inside the transaction that would issue the session
+(persistence.authn.complete_login, `browser_session_token`), so there is no gap between the
+last look at who the browser is and the issuing; a session that has ended (expired, revoked,
+its identity withdrawn, its user disabled) is no obstacle, and neither is the same user
+signing in again (a new session, the old one kept). What the cookie says is read when the
+request arrives: a session the browser acquired after the callback request was sent is not
+seen (the server cannot see a cookie that was not sent).
+
+Linking a Telegram identity (a login begun with an invitation). The same two routes serve
+it; what differs is where the login starts and what the callback does at the end.
+
+  start     POST /auth/invite/start (invite_auth.py) verifies the invitation's secret, which
+            arrives in a POST body and nowhere else, and only then stores the login's state
+            with the invitation's id (persistence.invitations.begin_invitation_login), so
+            the id the callback claims is the one verified for this request. The cookie
+            that binds a login to its browser is set exactly as for any login.
+  callback  everything below is unchanged (the cookie check, the state consumed first, the
+            code exchanged, the ID token verified). The invitation is whatever the consumed
+            state row says (persistence.authn.consume_oidc_login) and nothing the request
+            says. One transaction then claims it for the verified `sub`, opens the session
+            and checks that it is the invited user's (persistence.invitations.
+            complete_invitation_login), so any failure leaves the invitation valid and
+            nothing linked. A browser signed in as a DIFFERENT user is refused (409) with
+            the invitation untouched, as the email link does it. The answer is a redirect
+            to a page of its own saying it worked (INVITATION_DONE_PATH), and a failure of
+            a login that began with an invitation is a Russian page, not a JSON code (the
+            ordinary login's answers are as they were, but for the refusal below).
+  next time the identity is on the allowlist and linked, so signing in with Telegram needs
+            no invitation: it is the ordinary login, on this device or another.
+
 The flow, and where each protection sits:
 
   login     generates state, nonce and the PKCE verifier (telegram_oidc), stores the
@@ -72,6 +108,7 @@ the statement's parameters, which here are secrets, into its messages).
 import hmac
 import logging
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Optional
 from uuid import UUID
@@ -80,8 +117,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy.exc import SQLAlchemyError
 
-from house_helper.persistence import authn
+from house_helper.persistence import authn, invitations
 from house_helper.persistence.authn import AuthenticatedSession, IssuedSession
+from house_helper.web import invite_pages
 from house_helper.web.database import DatabaseClosed, WebDatabase
 from house_helper.web.settings import AuthSettings, SessionSettings
 from house_helper.web.telegram_oidc import (
@@ -89,6 +127,7 @@ from house_helper.web.telegram_oidc import (
     InvalidIdToken,
     ProviderRejected,
     ProviderUnavailable,
+    AuthorizationRequest,
     TelegramOidc,
     new_authorization,
 )
@@ -99,6 +138,10 @@ logger = logging.getLogger(__name__)
 # /auth/me who is signed in and shows the conversations. (Before the page existed this
 # was /auth/me itself.) A path, never a value from the request.
 LANDING_PATH = "/"
+
+# The answer to a successful sign-in that linked a Telegram identity by invitation: a page
+# that says so (invite_auth.py), from which the person opens the application.
+INVITATION_DONE_PATH = "/auth/invite/done"
 
 MAX_CODE_LENGTH = 2048
 _CODE = re.compile(r"[\x21-\x7e]{1,%d}" % MAX_CODE_LENGTH)
@@ -111,12 +154,24 @@ _PRIVATE_HEADERS = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer
 
 
 class LoginFailure(Exception):
-    """A sign-in that stopped: the HTTP status and the fixed code to answer with."""
+    """A sign-in that stopped: the HTTP status and the fixed code to answer with.
+    `invitation` is True if the login had begun with a Telegram invitation, which is
+    answered with a page in Russian instead of the JSON code."""
 
-    def __init__(self, status_code: int, code: str) -> None:
+    def __init__(self, status_code: int, code: str, *, invitation: bool = False) -> None:
         super().__init__(code)
         self.status_code = status_code
         self.code = code
+        self.invitation = invitation
+
+
+@dataclass(frozen=True)
+class FinishedLogin:
+    """A sign-in that succeeded: the session, and whether it linked a Telegram identity
+    by invitation (the answer then goes to INVITATION_DONE_PATH)."""
+
+    issued: IssuedSession
+    invitation: bool = False
 
 
 def _error(status_code: int, code: str) -> HTTPException:
@@ -177,33 +232,114 @@ class AuthService:
         )
         return authorization
 
+    async def start_invitation_login(
+        self, invitation_id: str, token: str, signed_in_user: Optional[UUID]
+    ) -> Optional[AuthorizationRequest]:
+        """The start of a login that links a Telegram identity: the login's state is stored
+        bound to the invitation, in one transaction that first verifies the secret. None
+        (nothing stored) if it is not a live invitation's, whatever the reason. Raises
+        invitations.SignedInAsAnotherUser (see there) and HTTPException 503."""
+        authorization = new_authorization(self.settings)
+        now = self._clock()
+        stored = await self.run(
+            lambda session: invitations.begin_invitation_login(
+                session,
+                invitation_id,
+                token,
+                authorization.state,
+                authorization.nonce,
+                authorization.code_verifier,
+                now=now,
+                lifetime=self.settings.login_lifetime,
+                signed_in_user=signed_in_user,
+            )
+        )
+        if not stored:
+            logger.info("A Telegram invitation was not valid")
+            return None
+        logger.info("A Telegram invitation sign-in was started")
+        return authorization
+
+    async def began_with_invitation(self, state: str) -> bool:
+        """Whether `state` is that of a login begun with an invitation, for wording a
+        failure of the callback to a person who did begin with one; False when it cannot
+        be told (it never fails: a failure is worded as an ordinary login's)."""
+        try:
+            return await self._database.run(
+                lambda session: authn.is_invitation_login(session, PROVIDER, state)
+            )
+        except (DatabaseClosed, SQLAlchemyError):
+            return False
+
     async def finish_login(
-        self, state: str, code: Optional[str], *, provider_error: bool
-    ) -> IssuedSession:
-        """Raises LoginFailure (and HTTPException 503 for a database failure)."""
+        self,
+        state: str,
+        code: Optional[str],
+        *,
+        provider_error: bool,
+        session_token: Optional[str] = None,
+    ) -> FinishedLogin:
+        """Raises LoginFailure (and HTTPException 503 for a database failure before the
+        state is known). `session_token` is the browser's session cookie, read for every
+        login and for nothing but one comparison: a browser signed in as another user than
+        the one signing in is refused (409), whatever way the login began."""
         now = self._clock()
         login = await self.run(
             lambda session: authn.consume_oidc_login(session, PROVIDER, state, now=now)
         )
         if login is None:
             logger.info("A sign-in callback carried an unknown, used or expired state")
-            raise LoginFailure(400, "invalid_login_request")
+            raise LoginFailure(
+                400, "invalid_login_request", invitation=await self.began_with_invitation(state)
+            )
+        # Which invitation, if any, comes from the consumed state row and from nowhere else.
+        invitation = login.invitation_id is not None
+        try:
+            return await self._finish(login, code, provider_error, session_token)
+        except LoginFailure:
+            raise
+        except HTTPException as unavailable:
+            # (From self.run, which has logged the class of the database error.) The same
+            # answer as the route would give it, but worded for the invitation if it is one.
+            raise LoginFailure(
+                unavailable.status_code, str(unavailable.detail), invitation=invitation
+            ) from None
+        except Exception as exc:
+            # Whatever else: a bug. Logged by class only (see the module docstring).
+            logger.error("An unexpected error stopped a sign-in (%s)", type(exc).__name__)
+            raise LoginFailure(500, "server_error", invitation=invitation) from None
+
+    async def _finish(
+        self,
+        login: authn.OidcLoginSecrets,
+        code: Optional[str],
+        provider_error: bool,
+        session_token: Optional[str],
+    ) -> FinishedLogin:
+        invitation = login.invitation_id is not None
         if provider_error:
             logger.info("Telegram sent the browser back with an error")
-            raise LoginFailure(400, "invalid_login_request")
+            # (A cancelled or refused sign-in at Telegram: the person is told so in words
+            # for the invitation page; an ordinary login's code is as it was.)
+            raise LoginFailure(
+                400, "login_failed" if invitation else "invalid_login_request", invitation=invitation
+            )
         if code is None or _CODE.fullmatch(code) is None:
             logger.info("A sign-in callback carried no usable code")
-            raise LoginFailure(400, "invalid_login_request")
+            raise LoginFailure(400, "invalid_login_request", invitation=invitation)
 
         try:
             subject = await self._oidc.redeem(code, login.code_verifier, login.nonce)
         except ProviderUnavailable:
-            raise LoginFailure(502, "provider_unavailable") from None
+            raise LoginFailure(502, "provider_unavailable", invitation=invitation) from None
         except ProviderRejected:
-            raise LoginFailure(400, "login_failed") from None
+            raise LoginFailure(400, "login_failed", invitation=invitation) from None
         except InvalidIdToken as exc:
             logger.warning("The ID token was rejected: %s", exc.reason)
-            raise LoginFailure(400, "login_failed") from None
+            raise LoginFailure(400, "login_failed", invitation=invitation) from None
+
+        if invitation:
+            return await self._link_by_invitation(login.invitation_id, subject, session_token)
 
         now = self._clock()
         try:
@@ -214,13 +350,52 @@ class AuthService:
                     subject,
                     now=now,
                     lifetime=self.settings.session_lifetime,
+                    browser_session_token=session_token,
                 )
             )
         except authn.LoginDenied:
             logger.warning("A verified Telegram identity is not on the allowlist")
             raise LoginFailure(403, "not_allowed") from None
+        except authn.SignedInAsAnotherUser:
+            logger.info("A sign-in was refused: the browser is signed in as another user")
+            raise LoginFailure(409, "signed_in_as_another_user") from None
         logger.info("User %s signed in", issued.user_id)
-        return issued
+        return FinishedLogin(issued)
+
+    async def _link_by_invitation(
+        self, invitation_id: UUID, subject: str, session_token: Optional[str]
+    ) -> FinishedLogin:
+        """The end of a login that began with an invitation: claim it for the verified
+        `sub`, open the session, check whose it is, all in one transaction (see
+        persistence.invitations.complete_invitation_login)."""
+        current = await self.authenticate(session_token)
+        signed_in_user = None if current is None else current.user_id
+        now = self._clock()
+        try:
+            issued = await self.run(
+                lambda session: invitations.complete_invitation_login(
+                    session,
+                    str(invitation_id),
+                    subject,
+                    now=now,
+                    lifetime=self.settings.session_lifetime,
+                    signed_in_user=signed_in_user,
+                )
+            )
+        except invitations.InvitationNotUsable:
+            logger.info("A Telegram invitation could not be used: it is not valid any more")
+            raise LoginFailure(400, "invitation_not_usable", invitation=True) from None
+        except invitations.IdentityRefused:
+            logger.warning("A verified Telegram identity could not be linked by an invitation")
+            raise LoginFailure(409, "identity_not_linkable", invitation=True) from None
+        except invitations.SignedInAsAnotherUser:
+            logger.info("An invitation sign-in was refused: the browser is signed in as another user")
+            raise LoginFailure(409, "signed_in_as_another_user", invitation=True) from None
+        except authn.LoginDenied:
+            logger.error("An invitation sign-in was refused: the session could not be issued")
+            raise LoginFailure(400, "login_failed", invitation=True) from None
+        logger.info("User %s linked Telegram by invitation and signed in", issued.user_id)
+        return FinishedLogin(issued, invitation=True)
 
     async def authenticate(self, token: Optional[str]) -> Optional[AuthenticatedSession]:
         if token is None:
@@ -295,10 +470,25 @@ async def require_user(
 router = APIRouter(prefix="/auth")
 
 
-def _failure(auth: AuthService, status_code: int, code: str) -> JSONResponse:
-    """An answer to the sign-in endpoints that failed. The login cookie is spent in
-    any case: it belongs to one attempt."""
-    response = JSONResponse({"detail": code}, status_code=status_code, headers=_PRIVATE_HEADERS)
+def _failure(
+    auth: AuthService, status_code: int, code: str, *, invitation: bool = False
+) -> Response:
+    """An answer to the sign-in endpoints that failed: the JSON code, or a page in Russian
+    for the person (invite_pages) when the login began with an invitation, and for the
+    refusal of a browser that is signed in as another user (the JSON codes of the other
+    refusals of an ordinary login are as they were). The login cookie is spent in any
+    case: it belongs to one attempt. The session cookie is never touched here."""
+    page = None
+    if invitation:
+        page = invite_pages.failure_page(code)
+    elif code == "signed_in_as_another_user":
+        page = invite_pages.login_other_user_page()
+    if page is not None:
+        response: Response = Response(
+            page.html, status_code=page.status_code, media_type="text/html", headers=page.headers
+        )
+    else:
+        response = JSONResponse({"detail": code}, status_code=status_code, headers=_PRIVATE_HEADERS)
     auth.clear_cookie(response, auth.settings.login_cookie_name)
     return response
 
@@ -333,13 +523,23 @@ async def telegram_callback(
         or not hmac.compare_digest(state.encode("utf-8"), bound_state.encode("utf-8"))
     ):
         logger.info("A sign-in callback did not match the login of this browser")
-        return _failure(auth, 400, "invalid_login_request")
+        # The state is not trusted for anything here: it is only looked up to word the
+        # failure for a person who began with an invitation (see began_with_invitation).
+        invitation = (
+            state is not None
+            and authn.is_state_value(state)
+            and await auth.began_with_invitation(state)
+        )
+        return _failure(auth, 400, "invalid_login_request", invitation=invitation)
     try:
-        issued = await auth.finish_login(
-            state, query.get("code"), provider_error="error" in query
+        finished = await auth.finish_login(
+            state,
+            query.get("code"),
+            provider_error="error" in query,
+            session_token=request.cookies.get(auth.settings.session_cookie_name),
         )
     except LoginFailure as failure:
-        return _failure(auth, failure.status_code, failure.code)
+        return _failure(auth, failure.status_code, failure.code, invitation=failure.invitation)
     except HTTPException as unavailable:
         return _failure(auth, unavailable.status_code, str(unavailable.detail))
     except Exception as exc:
@@ -347,11 +547,12 @@ async def telegram_callback(
         logger.error("An unexpected error stopped a sign-in (%s)", type(exc).__name__)
         return _failure(auth, 500, "server_error")
 
-    response = RedirectResponse(LANDING_PATH, status_code=303, headers=_PRIVATE_HEADERS)
+    target = INVITATION_DONE_PATH if finished.invitation else LANDING_PATH
+    response = RedirectResponse(target, status_code=303, headers=_PRIVATE_HEADERS)
     auth.set_cookie(
         response,
         auth.settings.session_cookie_name,
-        issued.token,
+        finished.issued.token,
         int(auth.settings.session_lifetime.total_seconds()),
     )
     auth.clear_cookie(response, auth.settings.login_cookie_name)

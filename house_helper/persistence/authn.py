@@ -24,6 +24,19 @@ login: R1's composite foreign key already guarantees that a link exists only for
 an allowlist entry of the very user it names, so nothing here can attach an
 identity to a different user, or merge two users.
 
+A login never signs a browser out of somebody else's session: the answer to a login
+replaces the browser's one session cookie, so complete_login, given that cookie
+(`browser_session_token`), refuses with SignedInAsAnotherUser when it names a live
+session of a different user than the one signing in. The check is in the same
+transaction as the issuing of the session; the caller rolls back and the browser's
+session is left exactly as it was.
+
+The one way a Telegram identity gets onto the allowlist from the web is a login that was
+started with an invitation: begin_oidc_login then stores the invitation's id with the
+login's state (oidc_states.invitation_id), consume_oidc_login hands it back to the
+callback, and invitations.complete_invitation_login claims it. The id is only ever read
+from that row, never from a request; see persistence/invitations.py.
+
 Transactions: none of the functions commits; the caller owns the transaction
 (web.database.WebDatabase.run is one). The writers (begin_oidc_login,
 consume_oidc_login, complete_login, revoke_session, revoke_session_of, and
@@ -109,12 +122,24 @@ class LoginDenied(Exception):
     WebDatabase.run does when the exception propagates out of the function."""
 
 
+class SignedInAsAnotherUser(Exception):
+    """The browser completing a login already holds a live session of a user other than
+    the one signing in (complete_login's `browser_session_token`; the invitation and the
+    emailed link refuse the same way). Raised, never returned, and like LoginDenied after
+    writes that the caller's rollback undoes: nothing is issued, linked or changed, and
+    the browser's own session is not touched. The message carries nothing about either
+    user."""
+
+
 @dataclass(frozen=True)
 class OidcLoginSecrets:
-    """What a started login remembered for the callback."""
+    """What a started login remembered for the callback. `invitation_id` is the
+    Telegram invitation the login was started with (see begin_oidc_login), None for an
+    ordinary login; it is not a secret, and not a thing the browser ever sends."""
 
     nonce: str = field(repr=False)
     code_verifier: str = field(repr=False)
+    invitation_id: Optional[UUID] = None
 
 
 @dataclass(frozen=True)
@@ -171,12 +196,18 @@ def begin_oidc_login(
     *,
     now: datetime,
     lifetime: timedelta = OIDC_LOGIN_LIFETIME,
+    invitation_id: Optional[UUID] = None,
 ) -> None:
     """Remember a login that is about to be sent to the provider.
 
     Also deletes the logins that have expired (consumed or not): they can never
     be completed, and this is the only thing that removes them. The delete is the
     first statement, which makes the whole function a write-first transaction.
+
+    `invitation_id` binds the login to a Telegram invitation. Only
+    invitations.begin_invitation_login passes it, and only after verify_invitation
+    has said yes to the secret that came with this very request: nothing else may
+    decide what a login will claim. It is stored once and never changes.
     """
     session.execute(
         sa.delete(models.OidcState)
@@ -191,6 +222,7 @@ def begin_oidc_login(
             code_verifier=code_verifier,
             created_at=now,
             expires_at=now + lifetime,
+            invitation_id=invitation_id,
         )
     )
     session.flush()
@@ -224,11 +256,31 @@ def consume_oidc_login(
     if claimed.rowcount != 1:
         return None
     row = session.execute(
-        sa.select(models.OidcState.nonce, models.OidcState.code_verifier).where(
-            models.OidcState.state_hash == state_hash
-        )
+        sa.select(
+            models.OidcState.nonce,
+            models.OidcState.code_verifier,
+            models.OidcState.invitation_id,
+        ).where(models.OidcState.state_hash == state_hash)
     ).one()
-    return OidcLoginSecrets(nonce=row.nonce, code_verifier=row.code_verifier)
+    return OidcLoginSecrets(
+        nonce=row.nonce, code_verifier=row.code_verifier, invitation_id=row.invitation_id
+    )
+
+
+def is_invitation_login(session: OrmSession, provider: str, state: str) -> bool:
+    """True if `state` names a login (of any age, used or not) that was started with a
+    Telegram invitation. Reads only, and it decides nothing about anybody's access: the
+    callers use it to choose how to word a failure for a person who began with an
+    invitation. It says nothing about whether the invitation is still usable."""
+    if not is_state_value(state):
+        return False
+    bound = session.scalar(
+        sa.select(models.OidcState.invitation_id).where(
+            models.OidcState.state_hash == hash_secret(state),
+            models.OidcState.provider == provider,
+        )
+    )
+    return bound is not None
 
 
 # --- the end of a login: a session ------------------------------------------------
@@ -241,6 +293,7 @@ def complete_login(
     *,
     now: datetime,
     lifetime: timedelta = SESSION_LIFETIME,
+    browser_session_token: Optional[str] = None,
 ) -> IssuedSession:
     """Sign in the identity `(provider, subject)`: a new session for its user.
 
@@ -251,6 +304,17 @@ def complete_login(
     exists for it, for the user that entry names), its last_login_at is set, and
     a session is created with a fresh random token and the link it was opened
     through (the identity just verified, never another one of the user's).
+
+    `browser_session_token` is the session cookie the browser sent, if any; the answer
+    to this login replaces that cookie. If it names a live session (authenticate's
+    meaning of live) of a user other than the one signing in, SignedInAsAnotherUser is
+    raised, before a link or a session is created, and the caller's rollback leaves the
+    browser's session and everything else as it was. A token that names no live
+    session, or a live session of the same user, is no obstacle. The check is made here,
+    in the transaction that issues the session and after the identity was found to be
+    allowed (so a denied identity is denied whoever the browser is signed in as), not
+    before the provider was asked: a session that ends in between does not count, one
+    that is live at this moment does.
     """
     try:
         provider, subject = normalize_identity(provider, subject)
@@ -269,6 +333,11 @@ def complete_login(
     user = allowed_user(session, provider, subject, lock=True)
     if user is None:
         raise LoginDenied
+
+    if browser_session_token is not None:
+        current = authenticate(session, browser_session_token, now=now)
+        if current is not None and current.user_id != user.id:
+            raise SignedInAsAnotherUser
 
     link = _link(session, provider, subject)
     if link is None:

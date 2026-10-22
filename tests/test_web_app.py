@@ -118,7 +118,8 @@ def test_creating_the_application_touches_neither_the_database_nor_the_disk(tmp_
 
 
 def test_the_application_exposes_health_sign_in_chat_the_page_and_nothing_else(tmp_path):
-    # The sign-in routes (R3A Telegram, R3B-2 email), the chat API (R4A: the
+    # The sign-in routes (R3A Telegram, R3B-2 email, R4C-Auth A3 Telegram invitation: the
+    # page, its start and the page after it, none of which serves a person's data), the chat API (R4A: the
     # conversations and their messages) and the page (R4B: the shell at "/" and its few
     # static files) are the only additions to /healthz: no recipe, preference or other
     # user-data route may exist, and not even the interactive API pages FastAPI would
@@ -139,6 +140,9 @@ def test_the_application_exposes_health_sign_in_chat_the_page_and_nothing_else(t
         "/auth/logout": ["post"],
         "/auth/email/request": ["post"],
         "/auth/email/confirm": ["get", "post"],
+        "/auth/invite": ["get"],
+        "/auth/invite/start": ["post"],
+        "/auth/invite/done": ["get"],
         "/api/conversations": ["get", "post"],
         "/api/conversations/{conversation_id}/messages": ["get", "post"],
         "/": ["get"],
@@ -398,7 +402,7 @@ async def test_starting_and_stopping_leaves_a_migrated_database_as_it_was(tmp_pa
     upgrade_database(engine)
     engine.dispose()
     before = _snapshot(target)
-    assert before[1] == [("0005_identity_invitations",)]
+    assert before[1] == [("0006_oidc_state_invitation",)]
 
     async with serving(create_app(settings_for(target))) as client:
         await client.get("/healthz")
