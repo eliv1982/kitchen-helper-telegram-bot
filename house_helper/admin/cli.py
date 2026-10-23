@@ -2,15 +2,18 @@
 
 Commands: provision-email (the first user and their email address); enroll-user,
 reissue-invitation, revoke-invitation and enrollment-status (the initial users, who link
-their own Telegram account with a one-time invitation; see enrollment.py).
+their own Telegram account with a one-time invitation; see enrollment.py); purge-expired
+(deletes expired sign-in artifacts and conversation history older than 365 days; see
+retention.py).
 
 Output is one line per result, `<status> [<code>]: <message>`: `ok` goes to stdout,
 `refused` and `error` to stderr, and the exit status says which kind it was:
 
-  0  ok           created, unchanged, reapproved, enrolled, reissued, revoked, a report
+  0  ok           created, unchanged, reapproved, enrolled, reissued, revoked, purged, a report
   1  error        an unexpected failure (the class name is printed, nothing else)
   2  usage        the command line, or a value on it, cannot be used
   3  refused      the database is in a state in which the command declines to act
+                  (purge-expired: it stayed locked by another writer)
   4  error        the database cannot be used: not configured, missing, not at the head
 
 What is never printed: the database URL (not even in an error), a driver's error text
@@ -35,7 +38,9 @@ import sys
 from datetime import datetime, timezone
 from typing import Callable, Mapping, Optional, Sequence
 
-from house_helper.admin import enrollment
+import sqlalchemy as sa
+
+from house_helper.admin import enrollment, retention
 from house_helper.admin.enrollment import EnrollmentRefusal
 from house_helper.admin.provisioning import (
     InvalidInput,
@@ -187,6 +192,24 @@ def _build_parser() -> argparse.ArgumentParser:
         "if there is one, otherwise the one that ended last. It shows no "
         "Telegram id, no secret and no digest.",
     )
+    purge = enrollment_command(
+        "purge-expired",
+        "delete expired sign-in artifacts and conversation history older than 365 days",
+        "Delete, for real, what has expired: sessions, sign-in states, emailed sign-in links and "
+        "invitations past their own expiry (used or withdrawn ones too, once they have expired), "
+        "and conversation history (messages, the turn requests that hold a copy of an answer, "
+        "and conversations left empty) older than 365 x 24 hours. Recent messages of an old "
+        "conversation are kept. Nothing else is touched: not users, not sign-in identities, not "
+        "anything this command does not name. Safe to repeat and safe to run beside the "
+        "application (work is done in short batches; it waits for the database's write lock "
+        "and stops with a refusal if it never gets it). The command line has no way to choose "
+        "the time: the cutoff is always now minus 365 days. The report is counts only.",
+    )
+    purge.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="count what would be deleted, in one read-only transaction; change nothing",
+    )
     return parser
 
 
@@ -208,6 +231,8 @@ def main(
     try:
         if args.command == "provision-email":
             return _provision_email(args, environ)
+        if args.command == "purge-expired":
+            return _purge_expired(args, environ, clock)
         return _ENROLLMENT_COMMANDS[args.command](args, environ, clock)
     except KeyboardInterrupt:
         _say(sys.stderr, "error", "interrupted", "interrupted; an unfinished change was rolled back.")
@@ -430,6 +455,108 @@ def _print_status(status: enrollment.EnrollmentStatus) -> None:
             f"telegram: {user.telegram.value}; invitation: {invitation}",
             file=sys.stdout,
         )
+
+
+# --- purge-expired ----------------------------------------------------------------
+
+
+def _purge_expired(args: argparse.Namespace, environ: Mapping[str, str], clock: Callable) -> int:
+    """Open the database, delete (or count) what has expired, print the counts. The same
+    mapping of failures to exit statuses as the other commands; a run that stopped half way
+    says how much its committed batches had deleted, because that is gone for good."""
+    try:
+        engine = open_target(environ)
+    except TargetError as error:
+        _say(sys.stderr, "error", error.code, error.message)
+        return ExitCode.DATABASE
+    try:
+        report = retention.purge_expired(engine, now=clock(), dry_run=args.dry_run)
+    except retention.PurgeAborted as aborted:
+        return _purge_stopped(aborted)
+    except TargetError as error:  # the schema is not the head (changed since the first look)
+        _say(sys.stderr, "error", error.code, error.message)
+        return ExitCode.DATABASE
+    finally:
+        engine.dispose()
+    _print_purge(report)
+    return ExitCode.OK
+
+
+def _purge_progress(aborted: retention.PurgeAborted) -> str:
+    deleted = sum(aborted.done.values())
+    return (
+        f"{deleted} row(s) had already been deleted by batches that committed "
+        f"({_counts_inline(aborted.done)}); the batch in progress was rolled back"
+    )
+
+
+def _purge_stopped(aborted: retention.PurgeAborted) -> int:
+    cause = aborted.__cause__
+    again = "Run the same command again: it is safe to repeat and finishes the job."
+    if isinstance(cause, KeyboardInterrupt):
+        _say(
+            sys.stderr,
+            "error",
+            "interrupted",
+            f"interrupted in stage {aborted.stage}: {_purge_progress(aborted)}. {again}",
+        )
+        return INTERRUPTED
+    # Only the driver's own message says "busy": SQLAlchemy's text also quotes the statement,
+    # which on PostgreSQL contains "SKIP LOCKED".
+    if isinstance(cause, sa.exc.OperationalError) and any(
+        word in str(cause.orig).lower() for word in ("locked", "busy")
+    ):
+        _say(
+            sys.stderr,
+            "refused",
+            "database_busy",
+            f"the database stayed locked by another writer for longer than the command waits "
+            f"(stage {aborted.stage}): {_purge_progress(aborted)}. {again}",
+        )
+        return ExitCode.REFUSED
+    # The text of the exception can carry SQL and parameters: the class only.
+    _say(
+        sys.stderr,
+        "error",
+        "purge_failed",
+        f"unexpected {type(cause).__name__} in stage {aborted.stage}: {_purge_progress(aborted)}. {again}",
+    )
+    return ExitCode.INTERNAL
+
+
+def _counts_inline(counts: Mapping[str, int]) -> str:
+    return ", ".join(f"{name} {count}" for name, count in counts.items())
+
+
+def _print_purge(report: retention.PurgeReport) -> None:
+    cutoff = _timestamp(report.cutoff)
+    scope = (
+        f"conversation history created at or before {cutoff} (365 x 24 hours before "
+        f"{_timestamp(report.now)}) and sign-in artifacts past their own expiry"
+    )
+    if report.dry_run:
+        _say(
+            sys.stdout,
+            "ok",
+            "dry_run",
+            f"would delete {report.total} row(s): {scope}. Nothing was changed.",
+        )
+    elif report.total:
+        _say(sys.stdout, "ok", "purged", f"deleted {report.total} row(s): {scope}.")
+    else:
+        _say(sys.stdout, "ok", "unchanged", f"nothing has expired ({scope}); nothing was deleted.")
+    for name, count in report.deleted.items():
+        print(f"  {name}: {count}", file=sys.stdout)
+    print(
+        f"  (included in turn_requests) in flight and abandoned, cancelled first: "
+        f"{report.cancelled_in_flight}",
+        file=sys.stdout,
+    )
+    print(
+        f"  (not deleted yet) expired messages still linked by a request that cannot be "
+        f"deleted yet: {report.held_back_messages}",
+        file=sys.stdout,
+    )
 
 
 def _timestamp(moment: datetime) -> str:

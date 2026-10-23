@@ -2,3 +2,6 @@
 # into CRLF (bash would then fail on the first line). The runbook runs them as `bash script.sh`,
 # so no executable bit is needed either.
 *.sh text eol=lf
+# The same for the systemd units and their environment template (R4C-D2): systemd reads them
+# on the Linux host, and a CRLF would end up inside a value or a command line.
+systemd/* text eol=lf

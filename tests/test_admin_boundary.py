@@ -48,7 +48,7 @@ OTHER_PACKAGES = ("house_helper.web", "house_helper.core")
 
 
 def test_the_scan_sees_the_files_it_is_meant_to_scan():
-    assert {"__main__.py", "cli.py", "enrollment.py", "provisioning.py", "target.py"} <= {
+    assert {"__main__.py", "cli.py", "enrollment.py", "provisioning.py", "retention.py", "target.py"} <= {
         p.name for p in _python_files(ADMIN_DIR)
     }
 
