@@ -24,7 +24,7 @@
 - **R3B-3 Admin Bootstrap — no longer only proposed:** the narrow operator CLI `python -m house_helper.admin provision-email` is implemented and was ACCEPTED by the owner after a final independent Codex PASS; it is RELEASED only once GitHub CI succeeds (see `STATUS.md`). Its scope is exactly: create the first `User` with an approved email allowlist entry in one transaction (email-first), or re-approve an explicitly confirmed revoked email. It does not create Telegram identities, a second user, merges or migrations. The command contract is in the root `README.md`, section "Первый пользователь"; the code and tests are the authority.
 - **Telegram initial linking — operator side RELEASED in R4C-Auth A2 (2026-10-21), Web side RELEASED in R4C-Auth A3 (2026-10-22) — code only, not live deployed:** the owner ACCEPTED (after a final independent Codex PASS) and released as `c20a26e` a closed, operator-controlled enrollment: the operator creates a user and issues a Telegram invitation (two hours, single use, revocable; migration `0005_identity_invitations`; `enroll-user`, `reissue-invitation`, `revoke-invitation`, `enrollment-status`). The limit of two users is a temporary policy of the enrollment command, not a database rule. The owner then ACCEPTED (after a final independent Codex PASS) and released as `9159842` the Web side: the person opens a secret-in-fragment invitation link, signs in through Telegram OIDC, and the verified `sub` is linked to the invited user — invitation consumption, `sub` allowlisting, identity link and session issuance in one atomic transaction, with the invitation bound to the OIDC state on the server (migration `0006_oidc_state_invitation`). This completes the accepted Telegram Web onboarding decision in code: initial `sub` acquisition is only through a verified Telegram login, never typed in or guessed; the two users stay independent; later logins use the ordinary Telegram button; the 14-day absolute session (KHD-11) is unchanged. **It is not verified against a real Telegram, BotFather is not configured, nothing is deployed, migration `0006` is applied nowhere and no user or invitation exists** (see `STATUS.md`). The earlier email-first linking workflow remains a **proposal**, not an accepted security design. Remembered-device authentication is not decided or built.
 - **R3C idle timeout:** deferred; current absolute session lifetime remains 14 days.
-- **Live domain, proxy topology, SMTP provider and real Telegram integration:** not selected or verified as of the handoff.
+- **Live domain, proxy topology, SMTP provider and real Telegram integration:** not selected or verified as of the handoff. *[Updated 2026-10-23: the domain (`house.elivcloud.org`) and the proxy topology (the existing Traefik) are now recorded as accepted deployment direction, KHD-23, with the R4C-D1 kit — neither is verified live. The SMTP provider and real Telegram integration remain not selected / not verified.]*
 
 
 ## Approved direction — House Helper domains, UX and diagnostics (2026-10-18)
@@ -53,6 +53,28 @@ These decisions were confirmed by the project owner in the Kitchen Helper projec
 ### Implementation boundary
 
 Do **not** modify the accepted R3B-3 Admin Bootstrap code or its audit to implement these decisions. Design the Kitchen Web UI and its error correlation in a later scoped increment; implement n8n notifications only after local structured error reporting exists and its privacy/safety boundaries are verified. Future Garden/Vegetable Garden/Home features need their own product criteria before implementation.
+
+## Accepted deployment direction — R4C-D1 (2026-10-23)
+
+These decisions record the deployment approach the owner ACCEPTED with R4C-D1 (final independent Codex PASS, owner ACCEPT; code RELEASED as `2f51d2f`). They describe a **repository-only kit: nothing is deployed**, and none of them is evidence of a live deployment. They add no product decision. The target host and proxy come from the read-only R4C-0 infrastructure inventory (2026-10-19). Procedures live in `deploy/RUNBOOK.md`, not here; the gates are in `STATUS.md`.
+
+| ID | Decision | Status |
+|---|---|---|
+| **KHD-23** | Reuse the existing Netherlands VPS (`eliv-server`) with its existing Traefik, Let's Encrypt resolver and external Docker network. The target public URL is `https://house.elivcloud.org`. No new VPS, domain, second proxy or certificate manager. | ACCEPTED — R4C-D1; kit RELEASED, NOT deployed; DNS and TLS not provisioned |
+| **KHD-24** | The initial application image is built on the existing VPS from an approved commit's checkout. | ACCEPTED — R4C-D1; not performed |
+| **KHD-25** | Database migrations are separate, explicit operator steps; they never run automatically on Web startup. A startup guard refuses to serve a database whose schema is not the image's. (Applies KHD-09.) | ACCEPTED — R4C-D1; RELEASED in the kit |
+| **KHD-26** | SQLite on a persistent Docker volume. Every upgrade is preceded by a verified backup (the upgrade script refuses to migrate otherwise), and rollback is the saved database plus the version that wrote it, not `alembic downgrade`. Backup and recovery procedures must be rehearsed before they are relied on. | ACCEPTED — R4C-D1; tooling RELEASED; off-host copy, schedule, retention and a live recovery rehearsal NOT done |
+| **KHD-27** | Runtime configuration and secrets are supplied outside the repository: the repository holds only a sanitized template of names, and the real environment file is created on the host outside the checkout (mode 0600). | ACCEPTED — R4C-D1; template RELEASED, no real file exists |
+| **KHD-28** | The initial HSTS `max-age` is 86400 seconds, subject to live validation; a longer value is for after HTTPS has been proven in real browsers. | ACCEPTED as the initial value — R4C-D1; live validation NOT done |
+| **KHD-29** | No live deployment — DNS, VPS, BotFather, a real database, real users — happens without separate, explicit owner approval. Every kit step that changes something outside the repository is marked **[OWNER]**. | ACCEPTED — R4C-D1; in force |
+
+### Why / alternatives / boundaries
+
+- **Reuse vs new infrastructure:** R4C-0 found Traefik, the resolver, the network and spare capacity already on the VPS; a second proxy, a certificate manager, another VPS or another domain were rejected as unnecessary. The kit does not touch the shared Traefik or the other applications on the host.
+- **Build on the VPS:** no image registry or build pipeline is introduced. Image delivery by building on the server is documented but has not been exercised on the VPS.
+- **Explicit migrations and verified backup first:** a schema change cannot be undone by running it backwards (`alembic downgrade` deletes data), so a migration happens only right after a backup that has been checked and verified; a start-up that migrates by itself was rejected (KHD-09).
+- **Short initial HSTS:** a browser keeps the commitment, so it starts short and is raised only after live validation.
+- **Not decided here:** the off-host backup destination, backup frequency and retention; the scheduled cleanup of authentication artifacts and the 365-day physical deletion (a separate increment, proposed as R4C-D2 — Scheduled Cleanup & Retention, scope to be designed; both stay mandatory before their respective real-user-data use, KHD-04); Remembered Device; operational SMTP/email activation; any additional Kitchen functionality.
 
 ## Change discipline
 
