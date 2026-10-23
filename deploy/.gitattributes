@@ -1,0 +1,4 @@
+# Shell scripts run on the Linux host: a Windows checkout must never turn their line endings
+# into CRLF (bash would then fail on the first line). The runbook runs them as `bash script.sh`,
+# so no executable bit is needed either.
+*.sh text eol=lf

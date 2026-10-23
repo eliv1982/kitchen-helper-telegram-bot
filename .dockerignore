@@ -1,0 +1,15 @@
+# The build context is an allowlist: nothing enters the image unless it is named below.
+# The repository root holds a developer's real .env (git-ignored, but a Docker build does
+# not read .gitignore), database files and virtual environments; a blanket "copy
+# everything" must never be able to carry any of them into an image layer.
+*
+
+!requirements.txt
+!alembic.ini
+!house_helper
+!deploy/ops
+!deploy/logging.json
+
+# Caches inside the allowed directories.
+**/__pycache__
+**/*.py[cod]

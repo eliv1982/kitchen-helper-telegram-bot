@@ -11,3 +11,11 @@ __pycache__/
 *.db-shm
 *.db-wal
 *.sqlite3
+
+# Deployment (deploy/): a real environment file and local backups never belong in the
+# repository. The template, deploy/house-helper.env.example, is tracked and does not match.
+deploy/*.env
+deploy/backups/
+*.db.part
+*.db.sha256
+*.db.sha256.part

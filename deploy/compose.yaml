@@ -1,0 +1,207 @@
+# House Helper web application, for the existing Docker + Traefik host (see RUNBOOK.md).
+#
+# Run it from this directory, or with `-f deploy/compose.yaml` from the repository root:
+#
+#   docker compose build                                       the image, from this checkout
+#   docker compose run --rm -T house-helper-ops exec --exclusive -- alembic upgrade head
+#                                                              migrations (see RUNBOOK.md)
+#   docker compose up -d house-helper                          the application
+#
+# What this file does NOT do, on purpose:
+#   * publish a port. The application is reachable only through Traefik, over the shared
+#     network; there is no `ports:` entry anywhere in this file;
+#   * run a migration. `house-helper-ops` is the only place migrations, backups and the
+#     enrollment commands run, and it is not started by `up`;
+#   * contain a secret. The credentials come from the file named by HOUSE_HELPER_ENV_FILE,
+#     which lives outside version control (see house-helper.env.example);
+#   * touch Traefik itself or any other service: it only attaches labels to its own container.
+#
+# Variables read by Compose itself (not by the application), all optional:
+#   HOUSE_HELPER_HOST        the public host name, also the Traefik router rule
+#                            (default house.elivcloud.org). HOUSE_HELPER_PUBLIC_URL is derived
+#                            from it below, so the two cannot disagree.
+#   HOUSE_HELPER_ENV_FILE    the application's environment file (default ./house-helper.env)
+#   HOUSE_HELPER_IMAGE_TAG   the image tag (default "local"); use the git commit, so that a
+#                            rollback names the exact build that matches a database backup
+#   HOUSE_HELPER_GIT_SHA     recorded in the image's revision label
+#   HOUSE_HELPER_HSTS_SECONDS  HSTS max-age (default 86400; raise it once HTTPS is proven)
+
+name: house-helper
+
+x-hardening: &hardening
+  # The root filesystem is read-only: the application writes /data (the volume) and /tmp
+  # (memory) and nothing else. The process has no capability and cannot gain one. The 64 MB
+  # /tmp is for the web process; the operator tool's copies of the database, which can be far
+  # larger, go to /staging (below), on disk.
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=64m,uid=10001,gid=10001,mode=0700
+
+x-database: &database
+  # Absolute, inside the volume. Set here, not in the environment file, so that a typo there
+  # cannot point the application at a database that is not on the volume.
+  HOUSE_HELPER_DATABASE_URL: sqlite:////data/house_helper.db
+
+services:
+  house-helper:
+    image: house-helper:${HOUSE_HELPER_IMAGE_TAG:-local}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        VCS_REF: ${HOUSE_HELPER_GIT_SHA:-unknown}
+    # Never fetch an image of this name from a registry: it is built from this checkout.
+    pull_policy: never
+    restart: unless-stopped
+    init: true
+    <<: *hardening
+    env_file: ${HOUSE_HELPER_ENV_FILE:-house-helper.env}
+    environment:
+      <<: *database
+      HOUSE_HELPER_PUBLIC_URL: https://${HOUSE_HELPER_HOST:-house.elivcloud.org}
+    volumes:
+      - data:/data
+    networks:
+      - proxy
+    # uvicorn waits 30 s for requests in flight, then the application waits up to 20 s for
+    # chat turns and 10 s for the database (house_helper/web/turn_runner.py, database.py).
+    stop_grace_period: 75s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+          pids: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: "n8n_n8n_network"
+      traefik.http.services.house-helper.loadbalancer.server.port: "8000"
+
+      # --- headers. The application sets its own CSP, framing, referrer, nosniff and
+      # cross-origin headers on its pages (house_helper/web/ui.py and the auth pages), with
+      # a referrer policy that differs by route. The proxy therefore adds only what the
+      # application cannot: HSTS (a property of the HTTPS host), and two headers whose value
+      # is identical to the application's, so that JSON and error responses carry them too.
+      # No CSP and no Referrer-Policy here: a proxy value would replace the application's.
+      traefik.http.middlewares.house-helper-headers.headers.stsSeconds: "${HOUSE_HELPER_HSTS_SECONDS:-86400}"
+      traefik.http.middlewares.house-helper-headers.headers.contentTypeNosniff: "true"
+      traefik.http.middlewares.house-helper-headers.headers.frameDeny: "true"
+
+      # --- rate limits, per client address (Traefik is the edge here, so that is the
+      # connection's address; behind a CDN this would need sourceCriterion.ipStrategy).
+      # A token bucket: `average` per `period` refills it, `burst` is its size.
+      # Starting a sign-in writes a row, so it is the strictest.
+      traefik.http.middlewares.house-helper-limit-signin.ratelimit.average: "10"
+      traefik.http.middlewares.house-helper-limit-signin.ratelimit.period: "1m"
+      traefik.http.middlewares.house-helper-limit-signin.ratelimit.burst: "5"
+      traefik.http.middlewares.house-helper-limit-auth.ratelimit.average: "60"
+      traefik.http.middlewares.house-helper-limit-auth.ratelimit.period: "1m"
+      traefik.http.middlewares.house-helper-limit-auth.ratelimit.burst: "30"
+      traefik.http.middlewares.house-helper-limit-api.ratelimit.average: "60"
+      traefik.http.middlewares.house-helper-limit-api.ratelimit.period: "1m"
+      traefik.http.middlewares.house-helper-limit-api.ratelimit.burst: "30"
+
+      # --- routers. Traefik picks the matching router with the highest priority; the
+      # priorities are explicit so that the choice never depends on how long a rule is.
+      # Every router has the same host, TLS and certificate resolver, and lists the headers
+      # first so that a rate-limit refusal (429) carries them as well.
+      #
+      # 30: the requests that begin a sign-in (/auth/telegram/login creates a login row,
+      #     /auth/invite/start checks an invitation and creates one; /auth/email/* is
+      #     answered 503 while email login is off, and limited the same if it is switched on)
+      traefik.http.routers.house-helper-signin.rule: "Host(`${HOUSE_HELPER_HOST:-house.elivcloud.org}`) && (Path(`/auth/telegram/login`) || Path(`/auth/invite/start`) || PathPrefix(`/auth/email/`))"
+      traefik.http.routers.house-helper-signin.priority: "30"
+      traefik.http.routers.house-helper-signin.entrypoints: "websecure"
+      traefik.http.routers.house-helper-signin.tls: "true"
+      traefik.http.routers.house-helper-signin.tls.certresolver: "letsencrypt"
+      traefik.http.routers.house-helper-signin.service: "house-helper"
+      traefik.http.routers.house-helper-signin.middlewares: "house-helper-headers,house-helper-limit-signin"
+      # 20: the rest of /auth/: the Telegram callback, the invitation page, /auth/me, logout
+      traefik.http.routers.house-helper-auth.rule: "Host(`${HOUSE_HELPER_HOST:-house.elivcloud.org}`) && PathPrefix(`/auth/`)"
+      traefik.http.routers.house-helper-auth.priority: "20"
+      traefik.http.routers.house-helper-auth.entrypoints: "websecure"
+      traefik.http.routers.house-helper-auth.tls: "true"
+      traefik.http.routers.house-helper-auth.tls.certresolver: "letsencrypt"
+      traefik.http.routers.house-helper-auth.service: "house-helper"
+      traefik.http.routers.house-helper-auth.middlewares: "house-helper-headers,house-helper-limit-auth"
+      # 20: the chat API (each message is a paid call to the assistant's provider)
+      traefik.http.routers.house-helper-api.rule: "Host(`${HOUSE_HELPER_HOST:-house.elivcloud.org}`) && PathPrefix(`/api/`)"
+      traefik.http.routers.house-helper-api.priority: "20"
+      traefik.http.routers.house-helper-api.entrypoints: "websecure"
+      traefik.http.routers.house-helper-api.tls: "true"
+      traefik.http.routers.house-helper-api.tls.certresolver: "letsencrypt"
+      traefik.http.routers.house-helper-api.service: "house-helper"
+      traefik.http.routers.house-helper-api.middlewares: "house-helper-headers,house-helper-limit-api"
+      # 10: everything else (the page, /static/, /healthz)
+      traefik.http.routers.house-helper.rule: "Host(`${HOUSE_HELPER_HOST:-house.elivcloud.org}`)"
+      traefik.http.routers.house-helper.priority: "10"
+      traefik.http.routers.house-helper.entrypoints: "websecure"
+      traefik.http.routers.house-helper.tls: "true"
+      traefik.http.routers.house-helper.tls.certresolver: "letsencrypt"
+      traefik.http.routers.house-helper.service: "house-helper"
+      traefik.http.routers.house-helper.middlewares: "house-helper-headers"
+
+  # Operator one-shots: migrations, backups, the enrollment commands. Not started by `up`
+  # (the profile), run with `docker compose run --rm -T house-helper-ops <dbtool command>`.
+  #   * the same image and volume as the application, so a command sees the same database
+  #     with the code that wrote it;
+  #   * the ENTRYPOINT is the operator tool (deploy/ops/dbtool.py), so nothing else can be run
+  #     here by accident: every command that touches the database goes through its lock
+  #     (`backup`, `restore`, `check-idle`, `verify`, or `exec --shared|--exclusive -- <program>`
+  #     for an enrollment or a migration). That lock is what keeps a restore away from a
+  #     running web service; RUNBOOK.md, "The maintenance lock", says what it cannot do;
+  #   * /staging is a disk-backed volume of its own for the tool's scratch copies. It is
+  #     anonymous: new for every run, owned by the application's user (copied from the image's
+  #     /staging), invisible to every other container, and deleted with the container by
+  #     `--rm`, so an interrupted command leaves nothing behind. It is separate from /data, so
+  #     scratch copies neither compete with the live database for space nor share its directory;
+  #   * no network at all, and no environment file: it never needs a credential;
+  #   * no log driver: `enroll-user` prints an invitation secret on stdout, and a backup is
+  #     streamed on stdout; neither may be kept in Docker's log files.
+  house-helper-ops:
+    profiles: ["ops"]
+    image: house-helper:${HOUSE_HELPER_IMAGE_TAG:-local}
+    pull_policy: never
+    restart: "no"
+    init: true
+    <<: *hardening
+    entrypoint: ["python", "/opt/house-helper/ops/dbtool.py"]
+    command: ["--help"]
+    environment:
+      <<: *database
+      HOUSE_HELPER_STAGING_DIR: /staging
+    volumes:
+      - data:/data
+      - type: volume
+        target: /staging
+    network_mode: none
+    logging:
+      driver: none
+    healthcheck:
+      disable: true
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+          pids: 128
+
+volumes:
+  data:
+    # A fixed name, so that it does not depend on the project's or the directory's name.
+    # Created on first use and owned by uid 10001 (the image's /data); `docker compose down`
+    # keeps it, only `down -v` or `docker volume rm` deletes it.
+    name: house-helper-data
+
+networks:
+  proxy:
+    # The network Traefik and the other applications on this host share (R4C-0).
+    external: true
+    name: n8n_n8n_network

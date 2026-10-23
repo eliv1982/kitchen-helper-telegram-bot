@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "disable_existing_loggers": false,
+  "formatters": {
+    "plain": {
+      "format": "%(asctime)s %(levelname)s %(name)s: %(message)s",
+      "datefmt": "%Y-%m-%dT%H:%M:%S%z"
+    }
+  },
+  "handlers": {
+    "stdout": {
+      "class": "logging.StreamHandler",
+      "formatter": "plain",
+      "stream": "ext://sys.stdout"
+    }
+  },
+  "loggers": {
+    "uvicorn": {"handlers": ["stdout"], "level": "INFO", "propagate": false},
+    "uvicorn.error": {"level": "INFO"},
+    "uvicorn.access": {"handlers": ["stdout"], "level": "INFO", "propagate": false},
+    "house_helper": {"handlers": ["stdout"], "level": "INFO", "propagate": false},
+    "httpx": {"level": "WARNING"},
+    "httpcore": {"level": "WARNING"},
+    "openai": {"level": "WARNING"},
+    "sqlalchemy": {"level": "WARNING"}
+  },
+  "root": {"handlers": ["stdout"], "level": "WARNING"}
+}
