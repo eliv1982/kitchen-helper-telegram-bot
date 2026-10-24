@@ -7,7 +7,7 @@
 | KHD-01 | Kitchen Helper prioritizes a real cooking Web MVP for the owner's mother, not a generic household platform. | ACCEPTED — Stage 2A summary |
 | KHD-02 | All end-user UI, messages, recipe text and errors are in Russian. | ACCEPTED — Stage 2A summary |
 | KHD-03 | Three equally important chat intents: ingredients, specific dish, free inspiration. | ACCEPTED — Stage 2A summary |
-| KHD-04 | Multiple user conversations, durable history, device sync; each message expires after 365 days. | ACCEPTED product requirement; not implemented as Web product |
+| KHD-04 | Multiple user conversations, durable history, device sync; each message expires after 365 days. | ACCEPTED product requirement; not implemented as Web product. *[Updated 2026-10-24: the 365-day physical deletion is RELEASED as code in R4C-D2 (KHD-30), scheduled on no host.]* |
 | KHD-05 | Saved recipes and long-term preferences are separate from history and survive history cleanup. | ACCEPTED product requirement; not fully implemented |
 | KHD-06 | Preference extraction distinguishes explicit preferences, justified hypotheses and one-off wishes; user corrections take precedence. | ACCEPTED product requirement; not implemented |
 | KHD-07 | Shared User with independently approved Telegram OIDC and passwordless email identities; closed allowlist. No automatic merging. | ACCEPTED; backend pieces RELEASED |
@@ -74,7 +74,25 @@ These decisions record the deployment approach the owner ACCEPTED with R4C-D1 (f
 - **Build on the VPS:** no image registry or build pipeline is introduced. Image delivery by building on the server is documented but has not been exercised on the VPS.
 - **Explicit migrations and verified backup first:** a schema change cannot be undone by running it backwards (`alembic downgrade` deletes data), so a migration happens only right after a backup that has been checked and verified; a start-up that migrates by itself was rejected (KHD-09).
 - **Short initial HSTS:** a browser keeps the commitment, so it starts short and is raised only after live validation.
-- **Not decided here:** the off-host backup destination, backup frequency and retention; the scheduled cleanup of authentication artifacts and the 365-day physical deletion (a separate increment, proposed as R4C-D2 — Scheduled Cleanup & Retention, scope to be designed; both stay mandatory before their respective real-user-data use, KHD-04); Remembered Device; operational SMTP/email activation; any additional Kitchen functionality.
+- **Not decided here:** the off-host backup destination, backup frequency and retention; the scheduled cleanup of authentication artifacts and the 365-day physical deletion (a separate increment, proposed as R4C-D2 — Scheduled Cleanup & Retention, scope to be designed; both stay mandatory before their respective real-user-data use, KHD-04) *[Updated 2026-10-24: R4C-D2 was designed, accepted and released as code — KHD-30–KHD-32 below; both still stay open until scheduled on the host and seen to run]*; Remembered Device; operational SMTP/email activation; any additional Kitchen functionality.
+
+## Accepted retention direction — R4C-D2 (2026-10-23)
+
+These decisions record the retention approach the owner ACCEPTED with R4C-D2 (final independent Codex PASS, owner ACCEPT; code RELEASED as `489ff30`). They describe **released code that is not installed, not scheduled and not deployed; no real database has been processed**, and none of them is evidence that any real data has been cleaned. They implement KHD-04 and add no product decision. The command and procedures live in `deploy/RUNBOOK.md` (section 14); the gates are in `STATUS.md`.
+
+| ID | Decision | Status |
+|---|---|---|
+| **KHD-30** | Retention is enforced by physical SQL deletion, row by row. A message or turn request is deleted 365 × 24 hours after its own creation; a sign-in artifact (session, OIDC state, emailed sign-in link, Telegram invitation) at its own `expires_at`, used or not; a conversation only when it is empty and idle for 365 days. `users`, allowlist entries and identity links are never touched, and the cleanup names its tables one by one so that future favourites and long-term preferences (KHD-05) are not deleted with the history they came from. (Implements KHD-04.) | ACCEPTED — R4C-D2; code RELEASED, scheduled on no host |
+| **KHD-31** | One explicit operator command, `purge-expired`: it deletes by default, `--dry-run` is the explicit preview (a snapshot, not a promise), and it has no option for a date, an age or a table. It runs beside the web service under the shared maintenance lock. No scheduler runs inside the application; scheduling is an opt-in systemd timer on the host, installed only on the owner's approval. | ACCEPTED — R4C-D2; command and units RELEASED, nothing installed |
+| **KHD-32** | Deletion is logical, not forensic erasure. The cleanup does not `VACUUM` or checkpoint the database; a deleted row survives in every older backup, so until the backup retention, off-host copy and encryption are decided the 365-day promise holds for the live database only. R4C-D2 invents no backup policy. | ACCEPTED — R4C-D2; backup policy UNDECIDED, a BLOCKER before real data |
+
+### Why / alternatives / boundaries
+
+- **Delete by default vs a dry-run default:** a scheduled run that only counts would delete nothing, so the dry-run default was dropped; the explicit flag is the way to look.
+- **No date or scope option:** a mistyped date would delete a year of history.
+- **Host timer vs scheduler inside the application:** keeps the web process free of background work and the schedule an operator-visible, disable-able fact on the host.
+- **D1 left unchanged:** `upgrade.sh`, `compose.yaml` and `dbtool.py` are D1's. A cleanup holding the shared lock can make `upgrade.sh` report a failed migration that never started; the documented precaution is to stop the timer around an upgrade or a restore. Making the script tell a refused migration from a failed one is **not decided** and left to a later owner decision.
+- **Not decided here:** the backup destination, frequency, retention and encryption; where a failed cleanup run is reported; `VACUUM` or checkpointing as a later, separately tested step; what the users are told about retention.
 
 ## Change discipline
 

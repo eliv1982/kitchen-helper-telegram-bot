@@ -1,6 +1,9 @@
 # House Helper web application: deployment runbook (R4C-D1)
 
-**Status of this document: a repository-only kit. Nothing here has been run on the VPS.**
+**Status of this document: a repository-only kit. Nothing here has been run on the VPS.** Section 14
+(scheduled cleanup, R4C-D2) was added after the kit's release: its code is RELEASED in Git as `489ff30`
+(independent audit passed, owner accepted, CI green). Nothing in it is installed, scheduled or run on any host,
+and no real database has been processed.
 The commands were exercised locally on disposable resources (Docker 29.8, Compose 5.6,
 Traefik 3.6.25 on loopback); see section 13 for what that does and does not prove. This
 revision answers an independent audit of the first version (restore while the database is in
@@ -27,7 +30,8 @@ VPS or domain is introduced, and the shared Traefik and the other applications a
 | `deploy/backup.sh` | the one way a backup is taken: made, size- and checksum-checked, verified by a disposable container, then published as a pair (`.db.sha256` first, `.db` last = the commit) without overwriting anything |
 | `deploy/upgrade.sh` | the one way a version is upgraded: no schema change unless the backup above succeeded first |
 | `deploy/new-env-file.sh` | creates the secret environment file; refuses to touch one that exists |
-| `deploy/.gitattributes` | keeps the scripts' line endings LF on a Windows checkout |
+| `deploy/.gitattributes` | keeps the scripts' and units' line endings LF on a Windows checkout |
+| `deploy/systemd/house-helper-purge.service`, `.timer`, `.env.example` | **R4C-D2, opt-in, installed by nothing:** the systemd oneshot service and daily timer that run the cleanup (section 14) |
 | `deploy/RUNBOOK.md` | this document |
 
 ## 2. Design
@@ -88,8 +92,8 @@ VPS or domain is introduced, and the shared Traefik and the other applications a
 - **Limits:** 1 CPU, 512 MB, 256 processes. `stop_grace_period: 75s`: uvicorn drains for 30 s,
   then the application waits up to 20 s for chat turns and 10 s for the database.
 - **`house-helper-ops`** (profile `ops`, not started by `up`): same image and volume, **no network,
-  no environment file, no log driver**. Migrations, backups and the enrollment commands run
-  here. The log driver is off because `enroll-user` prints a secret and a backup is streamed on
+  no environment file, no log driver**. Migrations, backups, the enrollment commands and the
+  cleanup of expired data (section 14) run here. The log driver is off because `enroll-user` prints a secret and a backup is streamed on
   stdout; Docker's log files must hold neither. Its **entrypoint is the operator tool**, so what
   you type after the service name is a `dbtool` command: `check-config`, `check-schema`, `backup`,
   `verify`, `check-idle`, `restore`, or `exec --shared|--exclusive -- <program>` (an enrollment,
@@ -484,6 +488,9 @@ bash deploy/upgrade.sh --old-tag a1b2c3d4e5f6 --dry-run     # every check that c
 bash deploy/upgrade.sh --old-tag a1b2c3d4e5f6               # the upgrade (about a minute of downtime)
 ```
 
+If the cleanup timer of section 14 is enabled, stop it first (section 14.4): a cleanup that holds the maintenance lock when
+step 3 starts makes the migration refuse, and the script's message then says more than is true.
+
 It reads no variable from your shell (not a stale `$F`, not `HOUSE_HELPER_IMAGE_TAG`): the old tag is an
 argument, the new tag is the commit of the checkout. In order, with `set -euo pipefail`:
 
@@ -710,31 +717,32 @@ the application version that wrote it**. In the table, `OLD` is the tag of that 
 Sign-in state is in the database, so a restore signs users out only if the backup predates their
 session. After any restore, check the schema, sign in, and send one message.
 
-## 12. Security and retention gates (status at commit `ddba682` + this kit)
+## 12. Security and retention gates (status at commit `ddba682` + this kit; the two retention rows updated by R4C-D2)
 
 None of these is waived. "Verified" means locally, on disposable resources: on 2026-10-22 for the first
 version of the kit and on 2026-10-23 for the remediation of its audit.
 
-### Pre-live deployment gates (not implemented by this kit)
+### Pre-live deployment gates (built by R4C-D2, code released in Git, running nowhere)
 
-Two product requirements are **separate increments that do not exist yet**. They are gates, not options,
-and nothing in this document (a short beta, two users, an owner-only trial, a time limit on the trial)
-substitutes for either of them:
+Two product requirements are **gates, not options**, and nothing in this document (a short beta, two users,
+an owner-only trial, a time limit on the trial) substitutes for either of them. R4C-D2 built them (section 14;
+code `489ff30`, audited and accepted), but a gate stays open until the work is **scheduled on the host and seen to run**:
 
 1. **Scheduled cleanup of authentication artifacts** must be implemented, tested and running **before real use**,
    that is before any real person signs in.
 2. **365-day physical deletion of conversation history** must be implemented, tested and running **before any
    real user data is stored** (the rule in `docs/STATUS.md`). Hiding expired rows from reads is not deletion.
 
-Until both exist the deployment may be rehearsed with disposable data only: no real users are enrolled and no real
-conversation is stored. Building either is outside this kit (it changes the application) and needs its own
-decision and review.
+Until both are running (the checklist is section 14.9) the deployment may be rehearsed with disposable data only:
+no real users are enrolled and no real conversation is stored. Building them changed the application (the command
+`purge-expired`, `house_helper/admin/retention.py`), which is outside the kit R4C-D1 released; it was audited on its
+own and is not part of what D1's audits covered.
 
 | Gate | Status |
 |---|---|
-| **Scheduled cleanup** of expired sessions, OIDC states, invitations, email challenges | **NOT IMPLEMENTED. Pre-live gate 1: required before real use.** No scheduler or purge job exists; the only deletes in the code are expired OIDC states at each login start and one address's expired email challenges. **Proposed narrow follow-up:** an operator command `python -m house_helper.admin purge-expired` (dry run by default, batched, tested on SQLite and PostgreSQL), run by a systemd timer through `hhops exec --shared`. No in-process scheduler. |
-| **365-day physical deletion** of conversation history | **NOT IMPLEMENTED. Pre-live gate 2: required before any real user data is stored; not waived.** Messages and turn requests carry `expires_at` <= 365 days and expired rows are hidden from reads and model context, but nothing deletes them. **Proposed follow-up:** `purge-expired --messages` in the same command, with a retention test on backups (a deleted row survives in every older backup, section 10). |
-| **Backup retention and off-host** | Backup, verify and restore **verified**; off-host target, encryption, retention and schedule **undecided and not installed.** BLOCKER before real data. |
+| **Scheduled cleanup** of expired sessions, OIDC states, invitations, email challenges | **CODE RELEASED IN GIT (R4C-D2, `489ff30`); NOT SCHEDULED ON ANY HOST, NOT DEPLOYED. Pre-live gate 1: required before real use.** `python -m house_helper.admin purge-expired` deletes each of them past its own expiry, in short batches, beside the web service (`hhops exec --shared`); `--dry-run` only counts. The opt-in systemd timer and service are in `deploy/systemd/` and are installed by nothing. **Open until** an image carrying the command is the running version on the VPS, the timer is enabled and its first run has been seen in the journal (section 14.9). |
+| **365-day physical deletion** of conversation history | **CODE RELEASED IN GIT (R4C-D2, `489ff30`); NOT SCHEDULED ON ANY HOST, NOT DEPLOYED. Pre-live gate 2: required before any real user data is stored; not waived.** The same command deletes messages and the turn requests that hold a copy of an answer 365 x 24 hours after their own creation, keeps the recent messages of an old conversation and removes conversations left empty. It is logical SQL deletion, not forensic erasure, and a deleted row survives in every older backup (section 14.7): the backup retention below bounds how real the promise is. **Open until** the same conditions as the row above. |
+| **Backup retention and off-host** | Backup, verify and restore **verified**; off-host target, encryption, retention and schedule **undecided and not installed.** BLOCKER before real data. R4C-D2 decides none of it (section 14.7). |
 | **Restore interlock** | **Verified** with unit tests on Linux and on a real Compose stack: a restore is refused while the web service runs (the lock is held by the uvicorn process itself), refused while a writer that ignores the lock is mid-transaction, a backup works beside the running service, a failed restore puts the old database back. **Cooperative**, with the limits stated in section 2 (a process that ignores the lock and starts after the final check; a damaged file cannot be probed; anything outside Docker). |
 | **Scratch space** | **Verified:** an 84 MB database (above the 64 MiB `/tmp` that failed in the first version) is backed up, verified and restored; too little space is refused before any write. Declared maximum database: 1 GiB (`MAX_DATABASE_BYTES`); a real 1 GiB database was **not** exercised (it needs about 2.2 GiB of free disk to restore). |
 | **Upgrade gate** | **Verified** with real Docker: with the database one revision behind, `upgrade.sh` stopped at the verification step and the schema stayed unchanged; a normal upgrade ran through and the new version became healthy; an upgrade whose new web service failed its health check after the migration stopped only the web service, confirmed it, and printed a recovery whose commands, run as printed, brought the old version back healthy from the backup (details in section 13). Failure injection with a fake `docker` covers every step and every Docker answer after the start (container lookup fails or is empty, `inspect` fails, no health status, `unhealthy`, timeout), a stop that fails or cannot be confirmed, signals, an incomplete backup pair, a checksum file that is valid but for another file (and every other deviation from the one canonical line), and a command nothing checks. Not run on the VPS. |
@@ -805,8 +813,29 @@ runbook's order). Run on Windows (Git Bash) and on Linux (WSL Ubuntu, Bash 5.2, 
 Docker, and not on the VPS. `SIGKILL` and a power cut still run nothing: the pair is valid, temporary files may
 remain.
 
+**Added by R4C-D2 (2026-10-23), the scheduled cleanup; code and units, no host changed.** On Docker Desktop 29.8.2 / Compose
+5.6.0 with a throwaway `n8n_n8n_network`, the throwaway volume `house-helper-data`, a placeholder environment file and synthetic
+rows only: the image built from the working tree (uid 10001); the empty volume migrated to `0006`; **the unit's exact command**
+(`docker compose -f deploy/compose.yaml --profile ops run --rm -T house-helper-ops exec --shared -- python -m house_helper.admin
+purge-expired`, run from another working directory) did a dry run that changed nothing, then deleted the four expired rows beside
+the real web service (healthy, holding the shared lock) with the report on the client's standard output although the service has
+no log driver, then reported `unchanged`; a migration (`exec --exclusive`) was refused with `maintenance_lock_busy` beside the
+web service; a text planted in a message older than 365 days was in the database file before and absent after. Everything was
+removed by name afterwards and the Docker host was left as found. `systemd-analyze verify` (systemd 255, a throwaway root with
+stand-ins for Docker and `purge.env`) accepted both units, and `systemd-analyze calendar` the schedule. The opt-in PostgreSQL tests
+passed on `postgres:16-alpine` (18 tests; a first run found that a REPEATABLE READ database default made a second concurrent run
+fail with a serialization error, which is why the cleanup now sets its own isolation level; the independent audit then
+reproduced a foreign-key failure when a run skipped a request that another run held and went on to delete the message the
+request links, which is why a parent is now judged by the child rows that exist, section 14.3). **Not done:** the units were never
+installed or run by systemd, so `Persistent=`, `TimeoutStartSec` and the journal were not exercised; the web service had no open
+database connection during the container run (its health check touches no database), so live writers beside the cleanup were
+exercised in-process only; no real data, no VPS, no real credential; a `docker compose` client killed mid-run was not tested.
+The independent audit of this work ended in a PASS and the owner accepted it (both reported by the owner); the code was
+released as `489ff30` and its push-triggered CI was green on Python 3.10 and 3.12. CI is not a run on any host.
+
 **Documented, not tested:** the first-install and upgrade sequences end to end on the VPS image
-delivery by building on the server, off-host backup, the cron/timer, rollback to an older image of a
+delivery by building on the server, off-host backup, the backup schedule (and the cleanup timer of section 14: its
+units exist, were checked as text and never ran on any host), rollback to an older image of a
 different schema (the upgrade test used an unchanged schema), the DoH commands, an OTLP sink (the flags
 exist in 3.6.25; no collector was run), behaviour on PostgreSQL (SQLite only is deployed), a 1 GiB database.
 
@@ -818,3 +847,291 @@ shared flat network (section 2); dependencies are version-pinned but not hash-pi
 carries the bot-only libraries `aiogram`/`aiohttp` (about 23 MB) because `requirements.txt` is one
 list, and a split into web and bot requirement files would remove them; the maintenance lock is
 cooperative (section 2).
+
+## 14. Scheduled cleanup and retention (R4C-D2)
+
+**Status: code RELEASED in Git as `489ff30` (independent audit passed, owner accepted, push-triggered CI green).
+Not installed, not scheduled, not deployed.** Nothing in this section has run on the VPS, no unit was copied to
+any host and no timer exists on any host, and no real database has been processed: the command was run only on disposable
+databases with synthetic rows. Every step marked **[OWNER]** changes
+something outside the repository and needs the owner's explicit approval first. The code is
+`house_helper/admin/retention.py`; the units are in `deploy/systemd/`. It adds no migration and changes no table.
+
+### 14.1 What is deleted, and what never is
+
+One command deletes two kinds of rows, for real (an SQL `DELETE`; hiding expired rows from reads, which the
+application already does, is not deletion). **A sign-in artifact goes when its own `expires_at` has passed**, whether it
+was used, withdrawn or never touched: a used or revoked row stays until its own deadline (so no revocation or
+replay evidence disappears early and no new retention period exists), and after it is gone every reader sees
+"unknown", which each already treats exactly like "expired". **History is judged row by row**, 365 x 24 hours after
+the row's own creation.
+
+| Data (table) | Deadline | Deleted when | Kept, and why |
+|---|---|---|---|
+| Login sessions (`sessions`) | 14 days after sign-in | `expires_at` <= now | live sessions; a session revoked but not yet expired stays until its own deadline (it never authenticates meanwhile) |
+| OIDC login states (`oidc_states`) | 10 minutes | `expires_at` <= now | pending logins; a consumed state stays until its deadline, so a replay is refused as "used", afterwards as "unknown" |
+| Emailed sign-in links (`email_login_challenges`) | 10 minutes | `expires_at` <= now | live and used-but-unexpired links; the 60-second request cooldown looks only at the last 60 seconds, well inside the 10 minutes |
+| Telegram invitations (`identity_invitations`) | 2 hours | `expires_at` <= now **and** no login state is still bound to it | active, used-but-unexpired and withdrawn-but-unexpired ones. The identity an invitation linked (`allowlist_entries`, `identity_links`) is not an artifact and is never touched |
+| Turn requests (`turn_requests`; `result_payload` is a copy of an answer) | 365 days after creation | `expires_at` <= now **or** `created_at` <= now - 365 x 24 h, and not in flight under a live lease. A request still in flight whose lease is over (its worker is gone) is first set to `cancelled`, then deleted | a request whose lease is still live, and its messages, until the lease ends |
+| Messages (`messages`) | 365 days after creation | the same rule, **and** no request that links the message still exists (the database refuses otherwise) | recent messages of an old conversation; an expired message a request still links waits for the next run (reported as *held back*) |
+| Conversations (`conversations`) | none of their own | no message and no request left **and** no activity for 365 days (`updated_at` and `created_at` both at or before the cutoff) | any conversation with a message; a conversation created minutes ago and still empty |
+
+**Never touched:** `users`, `allowlist_entries`, `identity_links`, `alembic_version`, and every table the command does
+not name. The favourites and long-term preferences of the product requirements (KHD-05) are **not in the schema
+yet**; when they arrive they are independent tables owned by a user, and this command, which names its tables one by
+one, will not know them. A test with such tables shows them untouched when the history they came from is deleted. The
+converse is guarded too: a test fails when a table appears in the schema that the cleanup does not name and the test does
+not list as kept, so that a future table holding conversation text cannot escape the 365 days unnoticed.
+Nothing else in this database holds conversation text: a conversation's `title` is never set, the answer copy in
+`turn_requests` is deleted with its request, and there are no summaries. Outside this database: the Telegram bot's
+history is in that process's memory and is not in the image; whatever OpenAI keeps of the messages it answered is
+governed by the account's settings there, not by this command.
+
+**The boundary.** The cutoff is `now - 365 x 24 hours`, computed once per run from one UTC clock. A row created at
+exactly the cutoff is deleted (at that instant it has already expired for every read, which show a message only while
+its `expires_at` is after now); one created a microsecond later is kept. The second clause of the rule (`created_at`
+<= cutoff) is the policy ceiling spelled from the creation time: it removes a row whose stored deadline is wrong
+(a restored or hand-edited database; the CHECK constraints refuse such a row on a migrated one).
+
+### 14.2 The command
+
+```bash
+hhops exec --shared -- python -m house_helper.admin purge-expired --dry-run   # counts only: one read-only transaction
+hhops exec --shared -- python -m house_helper.admin purge-expired             # deletes
+```
+
+(`hhops` is defined in section 3. `--shared` is the lock mode of section 14.3, and it is the only mode that works
+beside the web service.) **Normal execution deletes; `--dry-run` is the explicit way to look.** An earlier proposal
+for a dry-run default was dropped because a scheduled run that only counts would delete nothing. The command line has
+no option for the time, the age or a table, on purpose: a mistyped date would delete a year of history. A dry run
+is a **preview from one snapshot**: it counts what the stages would delete from the database as it is while the one
+read transaction runs, taking it that every stage deletes everything it may. A real run at the same instant deletes the
+same rows only if the database does not change in between and the run meets nothing to skip: a login or a request that
+changes state, another cleanup that deletes first, or (on PostgreSQL, which is not the deployment) a row that another
+transaction holds, which the run leaves for the next one and so deletes less than the preview counted. On a database
+nobody else touches the two are equal (tests compare them over random databases and on the worlds of the tests).
+
+The report is one status line and one line per category, counts and two timestamps only (never an id, a name, an
+address, a token, a digest or a message):
+
+```text
+ok [purged]: deleted 14 row(s): conversation history created at or before 2025-10-23T03:30:00Z (365 x 24 hours before 2026-10-23T03:30:00Z) and sign-in artifacts past their own expiry.
+  sessions: 3
+  oidc_states: 1
+  email_login_challenges: 0
+  identity_invitations: 1
+  turn_requests: 2
+  messages: 6
+  conversations: 1
+  (included in turn_requests) in flight and abandoned, cancelled first: 0
+  (not deleted yet) expired messages still linked by a request that cannot be deleted yet: 0
+```
+
+`ok [unchanged]` when nothing had expired, `ok [dry_run]` for a dry run. **Exit status:** 0 ok; 1 an unexpected failure
+(`error [purge_failed]`, the stage and the class name of the exception, nothing else); 2 usage; 3 refused
+(`refused [database_busy]`: the database stayed locked by another writer for 30 seconds; or `maintenance_lock_busy` from
+the operator tool: a restore or migration holds the directory); 4 the database cannot be used (not configured, missing,
+not at the schema head: `schema_not_head`). A run that stops half way (1, 3 or 130) prints how many rows its committed
+batches had already deleted. It is safe to repeat in every case.
+
+### 14.3 The lock, and how it behaves beside the application
+
+The command does not take a lock of its own: `exec --shared` takes the **shared** maintenance lock of section 2, the one
+the web service, a backup and the enrollment commands hold.
+
+| While the cleanup runs | Result |
+|---|---|
+| the web service runs, or starts | works: both hold the lock shared (tested with a stand-in for the service) |
+| a backup, an enrollment command | works: also shared |
+| a migration (`exec --exclusive`), `restore`, `check-idle` | **refused** (`maintenance_lock_busy`, exit 3) until the cleanup ends |
+| the cleanup starts while a migration or restore holds the directory | **refused** the same way; nothing is deleted |
+| a second cleanup at the same time | safe: see below; the second one finds less to do (on SQLite it waits its turn for each batch) |
+
+It is cooperative like the rest (section 2): it protects nothing against a process that never asks for the lock.
+
+What makes it safe beside live writers is the shape of the work, not the lock. Every batch is **one statement** (`DELETE
+... WHERE id IN (SELECT id ... LIMIT 500)`), in **its own short transaction**, and that statement is the transaction's
+first: SQLite takes its write lock there and then and waits its turn (up to 30 seconds), so there is no read-then-write
+snapshot to go stale, and the lock is held for 500 deletions at a time, not for the whole run. A pause of 50 ms between
+full batches lets the web service's writers in. Because a batch decides and deletes in one statement, two runs at the
+same time never delete a row twice and never see each other half done (a test runs two at once, and a run beside an
+application that is writing, and finds nothing lost or duplicated). The order is the one the foreign keys demand (the
+database refuses to delete a message a request still links, so requests go first), and a parent is deleted only when no
+child row of it **exists** at that moment: an eligible child that an earlier stage did not delete still holds its parent
+back, and the parent waits for the next run. On SQLite, where a statement waits for the write lock and skips nothing,
+the stages leave nothing behind and this changes no result. On PostgreSQL (not the deployment; opt-in tests) a batch
+skips rows that another transaction holds (`FOR UPDATE SKIP LOCKED`) instead of waiting for them, so a second cleanup
+runs without error and without deleting under a row it skipped; what it skipped the next run deletes, and every count
+in the report is a row that the run itself deleted. A run that is killed (SIGKILL, power
+cut, `docker stop`) loses at most the batch in progress, which SQLite rolls back when it next opens the database;
+everything committed before stays.
+
+**The host clock is the only input that decides what is deleted.** A clock set far into the future deletes history early
+and irreversibly (except from backups). The host must keep time (NTP); nothing in the cleanup can tell a wrong clock from
+a right one.
+
+### 14.4 Scheduling with systemd (opt-in) **[OWNER]**
+
+Two units and an environment template, `deploy/systemd/house-helper-purge.service`, `house-helper-purge.timer` and
+`house-helper-purge.env.example`. **Nothing installs, enables or starts them**, `docker compose up` does not run the
+cleanup, and the web service does not schedule anything: no scheduler runs inside the application. The service runs
+`docker compose ... --profile ops run --rm -T house-helper-ops exec --shared -- python -m house_helper.admin
+purge-expired`: the existing operator one-shot, unchanged, with its restrictions (no network, no environment file, no log
+driver, read-only root filesystem, no capability, 1 CPU, 256 MB). The report goes to the journal.
+
+| | |
+|---|---|
+| **Default schedule** | every day at 03:30 UTC (04:30 or 05:30 in the Netherlands), plus up to 5 minutes of random delay |
+| **Missed runs** | `Persistent=true`: if the host was off or the timer was not running at that time, one run happens when the timer next starts (never one per missed day) |
+| **Overlap** | a oneshot service cannot start while it is running (a start request joins the running job); `TimeoutStartSec=1h` ends a hung run, and the batch in progress rolls back. A manual run beside a scheduled one is safe (section 14.3) |
+| **Failure** | the unit fails, visibly (`systemctl --failed`, the journal). **No alert is configured**; deciding where a failure is reported is the owner's |
+| **Account** | root, like the Docker daemon it talks to (Docker access is root-equivalent). Another account: a drop-in with `User=` |
+
+Install (once; the three values in `purge.env` are the checkout, the same environment file the web service uses, and
+the image tag that is **running**):
+
+```bash
+sudo install -d -m 0755 /etc/house-helper
+sudo install -m 0644 deploy/systemd/house-helper-purge.env.example /etc/house-helper/purge.env
+sudoedit /etc/house-helper/purge.env
+sudo install -m 0644 deploy/systemd/house-helper-purge.service deploy/systemd/house-helper-purge.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+systemd-analyze verify /etc/systemd/system/house-helper-purge.service /etc/systemd/system/house-helper-purge.timer
+```
+
+First run by hand, watched, **before** the timer is enabled (a dry run first, section 14.2, shows what it will delete):
+
+```bash
+sudo systemctl start house-helper-purge.service          # returns when the run has ended
+systemctl status house-helper-purge.service --no-pager   # Result: success; "status=0/SUCCESS"
+journalctl -u house-helper-purge.service -n 30 --no-pager
+sudo systemctl enable --now house-helper-purge.timer
+systemctl list-timers house-helper-purge.timer           # NEXT is the time of the next run
+```
+
+Status, and disabling (the timer only; nothing else changes, and a run in progress finishes):
+
+```bash
+systemctl list-timers house-helper-purge.timer
+systemctl status house-helper-purge.timer house-helper-purge.service --no-pager
+journalctl -u house-helper-purge.service --since '7 days ago' --no-pager
+sudo systemctl disable --now house-helper-purge.timer
+sudo rm /etc/systemd/system/house-helper-purge.service /etc/systemd/system/house-helper-purge.timer
+sudo systemctl daemon-reload
+```
+
+**Changing the cadence** (the schedule is the owner's to choose; the cleanup is idempotent at any cadence). Do not edit the
+installed file; add a drop-in, whose empty `OnCalendar=` line clears the default first:
+
+```bash
+sudo systemctl edit house-helper-purge.timer      # in the editor: [Timer] / OnCalendar= / OnCalendar=*-*-* 04:15:00 UTC
+systemd-analyze calendar '*-*-* 04:15:00 UTC'     # when that spelling next fires
+sudo systemctl restart house-helper-purge.timer
+```
+
+**After every upgrade and every rollback** (sections 9 and 11), set `HOUSE_HELPER_IMAGE_TAG` in `/etc/house-helper/purge.env`
+to the tag that is now running, in the same step. Forgetting it fails closed: an image whose schema is not the database's
+is refused (`schema_not_head`, exit 4) and nothing is deleted; an image older than R4C-D2 has no such command and the run
+fails with a usage error (exit 2).
+
+**Before an upgrade or a restore, stop the timer, and start it again afterwards.** A migration and a restore need the
+directory to themselves (section 2), so they are refused while a cleanup is running, and the cleanup is refused while they
+run. The cleanup lasts seconds, but if it happens to hold the lock when `deploy/upgrade.sh` reaches its migration (step 3),
+the migration is refused and the script reports `the migration FAILED ... do not retry it`, although nothing was migrated:
+the refusal (`maintenance_lock_busy`) is in the output just above that line. Do not restore on that message alone; read the
+refusal, and run the upgrade again. To rule the clash out:
+
+```bash
+sudo systemctl stop house-helper-purge.timer
+systemctl is-active house-helper-purge.service     # must print: inactive
+# ... the upgrade (section 9) or the restore (section 10) ...
+sudo systemctl start house-helper-purge.timer
+```
+
+R4C-D2 does not change `upgrade.sh`; making the script tell a refused migration from a failed one is left to a later
+decision of the owner.
+
+### 14.5 Troubleshooting
+
+| What you see | Cause | What to do |
+|---|---|---|
+| `Failed to load environment files` | `/etc/house-helper/purge.env` is missing | install it (14.4) |
+| `Dependency failed ... docker.service` | Docker is not running | start Docker; the timer's next run (or `systemctl start`) retries |
+| Compose: `env file ... not found` | `HOUSE_HELPER_ENV_FILE` in `purge.env` names a file that does not exist (Compose resolves the whole project, including the web service's env file, before it runs any service) | fix the path |
+| `refused [maintenance_lock_busy]`, exit 3 | a migration or a restore holds the directory, or ran a moment ago | nothing is wrong: the next run (the timer has `Persistent=true`) catches up; run it by hand once the work is finished |
+| `refused [database_busy]`, exit 3 | another writer held SQLite's write lock for over 30 seconds | run again; if it repeats, find the long writer. Nothing partial is harmful |
+| `error [schema_not_head]`, exit 4 | the image tag in `purge.env` is not the running version, or a migration is pending | set the tag (14.4); `hhops check-schema` says which side is ahead |
+| `invalid choice: 'purge-expired'` (usage, exit 2) | the tag names an image built before R4C-D2 | set the tag to a current image |
+| `error [purge_failed]`, exit 1 | a failure in one stage (the message names the stage and the class of the exception, nothing else) | run `--dry-run`, check the disk (`df`) and the journal of Docker; run again |
+| the container of a killed run remains | the Compose client died with it | the procedure of section 2 (`docker ps -a --filter label=com.docker.compose.oneoff=True`, then `docker rm -v <id>`); never `docker volume prune` |
+| the timer never fires | not enabled, or the calendar spelling is wrong | `systemctl list-timers --all`, `systemd-analyze calendar '...'` |
+
+### 14.6 Recovery after a failed or interrupted run
+
+Rows deleted by batches that committed are gone and stay gone; the batch in progress is rolled back (by SQLite, when it next
+opens the database); the message of a failed run says how many rows were already deleted. The recovery is **to run the same
+command again**: it finds what is left and finishes. If the database itself is in doubt (a disk error), take a backup
+(`backup.sh` checks integrity and the schema before it publishes anything, section 10); the restore procedure is unchanged.
+A deleted row cannot be brought back by the application, only by restoring a backup, and **a restored backup that predates a
+cleanup holds the rows that were deleted since**: run the cleanup once by hand after any restore (expired rows are hidden from
+every read meanwhile, but not yet deleted).
+
+### 14.7 Timing, and what deletion means
+
+**Timing is a tolerance, not a guarantee.** A row is deleted by the first *successful* run after the moment it expired. With
+the default schedule that is within about a day and five minutes of the deadline when every run succeeds, and longer by however
+long a failing run goes unfixed. Nothing claims that a row disappears at the instant it turns 365 days old. Reads hide it from
+that instant.
+
+**Logical deletion is not forensic erasure.** The rows are gone from every table and index of the live database. What SQLite
+does with the space is its own:
+
+- the freed pages go to the free list and are reused by later writes; the file does not shrink;
+- the write-ahead log (`house_helper.db-wal`) holds earlier page images until SQLite checkpoints them and later overwrites them,
+  so deleted text can remain in it for a while;
+- the cleanup switches on `secure_delete` for its own connection, so that the bytes of the pages **it** frees are overwritten
+  with zeros in the database file. A test shows the text gone from the file after a checkpoint, and shows that a plain `DELETE`
+  with the setting off leaves it. This is a mitigation: it does not reach the log, anything the application's own connections
+  deleted earlier, older backups, snapshots of the volume or the disk beneath the file. (Observed, not guaranteed by this
+  repository: in the image as built on 2026-10-23, Debian's SQLite 3.46.1, `PRAGMA secure_delete` already answers 1, so the
+  application's own deletions overwrite too; a Windows build of Python answers 0. The cleanup sets it explicitly so that it
+  does not depend on the build.);
+- the cleanup **does not `VACUUM`, checkpoint or replace the database**. `VACUUM` rewrites the whole file, blocks every writer
+  while it runs and needs free disk space of the order of the database's size; none of these was shown to be compatible with the running
+  service and the backup and restore design, so none is done automatically. A future decision, with its own test.
+
+**Backups.** A deleted row survives in every older backup. The backup retention, the off-host target and encryption are
+**undecided (section 10, section 12); R4C-D2 invents no policy for them**, and until the owner decides, the 365-day promise
+holds for the live database only. This is a blocker before real data, as section 12 says.
+
+### 14.8 Checking it by hand
+
+```bash
+hhops exec --shared -- python -m house_helper.admin purge-expired --dry-run    # what would go; nothing changes
+hhops exec --shared -- python -m house_helper.admin purge-expired              # run it
+hhops exec --shared -- python -m house_helper.admin purge-expired              # again: "ok [unchanged]", every count 0
+hhops exec --shared -- python -m house_helper.admin enrollment-status          # unchanged by the cleanup, except for the invitation line
+```
+
+The last command shows the one visible effect on another command: `enrollment-status` reports the latest invitation of each
+user, and once an invitation's own two hours are over and a cleanup has run, its row is gone, so the line reads `invitation:
+none` instead of `used`, `revoked` or `expired`. The `telegram: linked` part comes from the allowlist and does not change.
+
+### 14.9 Before this counts as running: checklist **[OWNER]**
+
+- [x] The independent audit of R4C-D2 is accepted and the code is released in Git (`489ff30`). This is the only item
+      on this list that is done.
+- [ ] An image built from a commit that contains `purge-expired` is the running version, and `purge.env` names its tag.
+- [ ] The database is at the schema head (D2 adds no migration: `0006_oidc_state_invitation`).
+- [ ] A `--dry-run` was read and the numbers made sense, first on a disposable database, then on the real one.
+- [ ] The host's clock is synchronised (14.3).
+- [ ] The timer: installed and enabled as in 14.4, the first run started by hand and its journal line read, and `list-timers`
+      showing the next one.
+- [ ] Where a failed run is reported is decided (nothing is configured: 14.4).
+- [ ] Sections 9 and 11 are followed with the extra steps: the timer stopped before an upgrade or a restore and started
+      after (14.4), the tag in `purge.env` changed (14.4), and a restore rehearsal includes "run the cleanup afterwards"
+      (14.6).
+- [ ] The backup retention, off-host copy and encryption are decided (14.7); without them the deletion promise is for the live
+      database only.
+- [ ] What the users are told about retention matches 14.7: deletion within about a day of the 365 days, older backups, and
+      OpenAI's own settings.

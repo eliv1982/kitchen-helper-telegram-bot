@@ -23,11 +23,13 @@ from tests.test_deploy_kit import (
     COMPOSE,
     DEPLOY,
     REPO_ROOT,
+    RUNBOOK,
     SECRET_NAME,
     code_lines,
     needs_compose,
     read,
     resolve,
+    section,
 )
 
 UNITS = DEPLOY / "systemd"
@@ -220,3 +222,94 @@ def test_a_plain_up_still_knows_only_the_web_service(tmp_path):
         env=environ, capture_output=True, text=True, timeout=60,
     )
     assert done.returncode == 0 and done.stdout.split() == ["house-helper"]
+
+
+# --- the runbook says what the units do ------------------------------------------------------------------
+
+
+def flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def test_section_14_exists_with_its_parts_and_says_the_code_is_released_but_not_installed():
+    text = section(14)
+    headings = re.findall(r"^### (14\.\d) ", text, re.MULTILINE)
+    assert headings == [f"14.{i}" for i in range(1, 10)]
+    assert flat(text).startswith(
+        "## 14. Scheduled cleanup and retention (R4C-D2) **Status: code RELEASED in Git as `489ff30` (independent audit "
+        "passed, owner accepted, push-triggered CI green). Not installed, not scheduled, not deployed.**"
+    )
+    # Released code is not a deployment: the section never says a unit is installed or that anything is deployed.
+    for claim in ("DEPLOYED", "is installed", "was installed", "has been installed"):
+        assert claim not in text, claim
+    # The audit is over: no part of the runbook still waits for it.
+    for stale in ("awaiting independent audit", "PENDING AUDIT", "Not released, not accepted"):
+        assert stale not in read(RUNBOOK), stale
+    assert "no real database has been processed" in flat(text)
+
+
+def test_section_14_covers_each_topic_the_stage_required():
+    text = flat(section(14))
+    for needed in (
+        # the retention policy and its record categories
+        "sessions", "oidc_states", "email_login_challenges", "identity_invitations", "turn_requests", "messages",
+        "conversations", "365 x 24 hours", "Never touched:", "favourites and long-term preferences",
+        # the command and the dry run
+        "purge-expired --dry-run", "counts only", "Normal execution deletes; `--dry-run` is the explicit way to look",
+        # scheduling: configuration, activation, deactivation, status
+        "systemctl enable --now house-helper-purge.timer", "systemctl disable --now house-helper-purge.timer",
+        "systemctl list-timers house-helper-purge.timer", "journalctl -u house-helper-purge.service",
+        "OnCalendar=", "Persistent=true", "Changing the cadence",
+        # troubleshooting, locks, recovery
+        "14.5 Troubleshooting", "maintenance_lock_busy", "database_busy", "schema_not_head",
+        "exec --shared", "refused", "Recovery after a failed or interrupted run", "run the same command again",
+        # timing, SQLite and backups
+        "Timing is a tolerance, not a guarantee", "Nothing claims that a row disappears at the instant it turns 365 days old",
+        "Logical deletion is not forensic erasure", "secure_delete", "does not `VACUUM`, checkpoint or replace the database",
+        "A deleted row survives in every older backup", "invents no policy",
+        # the checklist
+        "Before this counts as running: checklist",
+    ):
+        assert needed in text, needed
+
+
+def test_section_14_names_the_command_and_units_the_way_the_unit_runs_them():
+    text = flat(section(14))
+    assert "--profile ops run --rm -T house-helper-ops exec --shared -- python -m house_helper.admin purge-expired" in text
+    named = {name.rstrip(".") for name in re.findall(r"house-helper-purge[\w.@-]*", text)}
+    assert named <= {"house-helper-purge.service", "house-helper-purge.timer", "house-helper-purge.env.example"}, named
+    for name in named:
+        assert (UNITS / name).exists(), name
+    assert "/etc/house-helper/purge.env" in text and "HOUSE_HELPER_IMAGE_TAG" in text
+    # The runbook's shown schedule is the timer's.
+    assert "every day at 03:30 UTC" in text and "*-*-* 03:30:00 UTC" in read(TIMER)
+
+
+def test_nothing_in_section_14_installs_or_starts_anything_without_an_owner_marker():
+    text = section(14)
+    assert "**[OWNER]**" in text.split("### 14.4")[1].split("###")[0].splitlines()[0]  # the heading of the install steps
+    assert "Nothing installs, enables or starts them" in flat(text)
+    assert "no scheduler runs inside the application" in flat(text)
+
+
+def test_the_runbook_warns_that_a_cleanup_can_clash_with_an_upgrade_and_says_how_to_avoid_it():
+    # The cleanup holds the shared lock; a migration needs it exclusively. If they meet, upgrade.sh
+    # reports a failed migration for one that never started. The kit does not change the script
+    # (R4C-D1's), so the precaution is a step, and it is where an operator upgrading will read it.
+    text = flat(section(14))
+    for needed in (
+        "Before an upgrade or a restore, stop the timer, and start it again afterwards",
+        "the migration is refused", "although nothing was migrated", "maintenance_lock_busy",
+        "sudo systemctl stop house-helper-purge.timer", "systemctl is-active house-helper-purge.service",
+        "must print: inactive", "sudo systemctl start house-helper-purge.timer",
+        "R4C-D2 does not change `upgrade.sh`",
+    ):
+        assert needed in text, needed
+    assert "stop it first (section 14.4)" in flat(section(9))
+    assert "the timer stopped before an upgrade or a restore" in text  # and it is on the checklist
+
+
+def test_the_gate_rows_name_the_command_and_stay_open_until_the_timer_has_run():
+    gates = flat(section(12))
+    assert gates.count("CODE RELEASED IN GIT (R4C-D2, `489ff30`); NOT SCHEDULED ON ANY HOST, NOT DEPLOYED.") == 2
+    assert "purge-expired" in gates and "section 14.9" in gates

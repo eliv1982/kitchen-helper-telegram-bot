@@ -94,6 +94,10 @@ def known_variable_names() -> set:
 # Read by the operator tool (deploy/ops/dbtool.py), not by the application.
 TOOL_VARIABLES = {"HOUSE_HELPER_STAGING_DIR"}
 
+# Read by the cleanup's systemd service (deploy/systemd/, R4C-D2) from its environment file, not by
+# the application, the operator tool or Compose itself.
+SCHEDULER_VARIABLES = {"HOUSE_HELPER_CHECKOUT"}
+
 COMPOSE_ONLY_VARIABLES = {
     "HOUSE_HELPER_HOST",
     "HOUSE_HELPER_ENV_FILE",
@@ -555,7 +559,7 @@ def test_the_logging_configuration_shows_application_logs_and_hides_sql_and_clie
 def test_the_runbook_names_no_variable_the_application_does_not_read():
     text = read(RUNBOOK)
     mentioned = set(re.findall(r"\b(?:HOUSE_HELPER_[A-Z_]+|OPENAI_[A-Z_]+|TEMPERATURE|MAX_TOKENS|BOT_TOKEN)\b", text))
-    allowed = known_variable_names() | COMPOSE_ONLY_VARIABLES | TOOL_VARIABLES | {"BOT_TOKEN"}
+    allowed = known_variable_names() | COMPOSE_ONLY_VARIABLES | TOOL_VARIABLES | SCHEDULER_VARIABLES | {"BOT_TOKEN"}
     # Prefix mentions such as HOUSE_HELPER_SMTP_* are written with a trailing wildcard.
     unknown = {
         name
@@ -582,7 +586,7 @@ def test_every_file_the_runbook_points_at_exists():
 def test_the_runbook_keeps_the_conditions_it_promises():
     text = read(RUNBOOK)
     for needed in (
-        "NOT IMPLEMENTED",  # the purge and cleanup gates are stated, not waived
+        "NOT SCHEDULED ON ANY HOST",  # the purge and cleanup gates are stated as released code that runs nowhere, not waived or done
         "RequestPath=drop",  # the verified proxy log setting
         "`RequestPath=redact`, or `queryparameters.defaultmode=redact` | **still leaks**",
         "alembic downgrade` is **not** a rollback",
@@ -673,9 +677,13 @@ def test_the_retention_requirements_are_gates_that_nothing_in_the_kit_waives():
     gates = section(12)
     assert "Pre-live gate 1: required before real use" in gates
     assert "Pre-live gate 2: required before any real user data is stored; not waived" in gates
-    assert gates.count("**NOT IMPLEMENTED") == 2
+    # R4C-D2 built both and its code is released. They are stated as exactly that (code in Git, on no
+    # host), and as still open until the timer has run: neither as missing nor as done.
+    assert gates.count("**CODE RELEASED IN GIT (R4C-D2, `489ff30`); NOT SCHEDULED ON ANY HOST, NOT DEPLOYED.") == 2
+    assert gates.count("**Open until**") == 2
+    assert "NOT IMPLEMENTED" not in gates
     assert "substitutes for either of them" in gates
-    assert "outside this kit" in gates  # this remediation implements neither
+    assert "outside the kit R4C-D1 released" in " ".join(gates.split())  # the code is a change to the application
     assert "STATUS.md" in gates
 
 
