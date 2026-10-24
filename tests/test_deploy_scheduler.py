@@ -25,13 +25,16 @@ from tests.test_deploy_kit import (
     REPO_ROOT,
     RUNBOOK,
     SECRET_NAME,
+    assert_timer_installed_first_run_unverified,
     code_lines,
     needs_compose,
     read,
     resolve,
+    retention_gate_rows,
     section,
 )
 
+STATUS = REPO_ROOT / "docs" / "STATUS.md"
 UNITS = DEPLOY / "systemd"
 SERVICE = UNITS / "house-helper-purge.service"
 TIMER = UNITS / "house-helper-purge.timer"
@@ -231,21 +234,29 @@ def flat(text: str) -> str:
     return " ".join(text.split())
 
 
-def test_section_14_exists_with_its_parts_and_says_the_code_is_released_but_not_installed():
+def test_section_14_exists_with_its_parts_and_says_where_the_cleanup_stands():
     text = section(14)
     headings = re.findall(r"^### (14\.\d) ", text, re.MULTILINE)
     assert headings == [f"14.{i}" for i in range(1, 10)]
-    assert flat(text).startswith(
+    status = flat(text.split("### 14.1")[0])
+    # The release record is history: it does not change when the timer is installed.
+    assert status.startswith(
         "## 14. Scheduled cleanup and retention (R4C-D2) **Status: code RELEASED in Git as `489ff30` (independent audit "
-        "passed, owner accepted, push-triggered CI green). Not installed, not scheduled, not deployed.**"
+        "passed, owner accepted, push-triggered CI green)."
     )
-    # Released code is not a deployment: the section never says a unit is installed or that anything is deployed.
-    for claim in ("DEPLOYED", "is installed", "was installed", "has been installed"):
-        assert claim not in text, claim
+    # Released code, an installed timer and a seen run are three different things. The installation is the
+    # owner's report (the repository cannot show it), the first run has not been seen, and no outcome of a run
+    # on the real database is claimed. The note closing the checklist says the same thing.
+    assert_timer_installed_first_run_unverified(status, "status paragraph")
+    assert "owner-reported" in status
+    assert re.search(r"no result of a run on the real database is claimed", status, re.I)
+    assert_timer_installed_first_run_unverified(text[text.index("Reported state"):], "closing note of 14.9")
+    # What was true before the install is not left standing beside what is true now.
+    for outdated in ("Not installed, not scheduled, not deployed", "NOT SCHEDULED ON ANY HOST", "no timer exists on any host"):
+        assert outdated not in text, outdated
     # The audit is over: no part of the runbook still waits for it.
     for stale in ("awaiting independent audit", "PENDING AUDIT", "Not released, not accepted"):
         assert stale not in read(RUNBOOK), stale
-    assert "no real database has been processed" in flat(text)
 
 
 def test_section_14_covers_each_topic_the_stage_required():
@@ -311,5 +322,52 @@ def test_the_runbook_warns_that_a_cleanup_can_clash_with_an_upgrade_and_says_how
 
 def test_the_gate_rows_name_the_command_and_stay_open_until_the_timer_has_run():
     gates = flat(section(12))
-    assert gates.count("CODE RELEASED IN GIT (R4C-D2, `489ff30`); NOT SCHEDULED ON ANY HOST, NOT DEPLOYED.") == 2
+    for row in retention_gate_rows():
+        assert "CODE RELEASED IN GIT (R4C-D2, `489ff30`)" in row, row
+        # Installing the timer does not close a gate: the row stays open until the first run is in the journal.
+        assert_timer_installed_first_run_unverified(row, row[:60])
+        assert "Open until" in row and "journal" in row, row
     assert "purge-expired" in gates and "section 14.9" in gates
+
+
+def test_the_checklist_keeps_the_timer_unchecked_until_the_first_run_has_been_read():
+    items = [line for line in section(14).split("### 14.9")[1].splitlines() if line.startswith("- [")]
+    timer = [item for item in items if item.startswith(("- [ ] The timer:", "- [x] The timer:"))]
+    assert len(timer) == 1, timer
+    assert timer[0].startswith("- [ ]"), "installing the timer does not tick the item that waits for its first run"
+
+
+# --- the documented state, as the documents give it on 2026-10-24 ----------------------------------------
+# Four things that must not be confused: the technical deployment is done; the retention timer is installed
+# and active; its first scheduled run has not been seen; the Functional Alpha has not started. When one of
+# them changes, the documents change with it and so do these checks (the helper they share is in test_deploy_kit.py).
+
+
+def current_state() -> tuple:
+    """(introduction, {item: state}) of 'Current deployment state' in docs/STATUS.md, whitespace-flattened."""
+    text = read(STATUS)
+    start = text.index("## Current deployment state")
+    end = text.find("\n## ", start + 1)
+    lines = text[start: end if end != -1 else len(text)].splitlines()
+    rows = {}
+    for line in lines:
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if line.startswith("|") and len(cells) == 2 and not set(cells[0]) <= set("-: "):
+            rows[cells[0]] = flat(cells[1])
+    return flat(" ".join(line for line in lines if not line.startswith("|"))), rows
+
+
+def test_the_documented_state_keeps_deployment_timer_first_run_and_functional_alpha_apart():
+    introduction, rows = current_state()
+    header = flat(read(RUNBOOK).split("\n## ", 1)[0])
+    # 1. The technical deployment is done, with this kit, and it is only that: no real user, no beta, no Functional Alpha.
+    assert "technical deployment" in header
+    assert re.search(r"technical instance of House Helper is live", introduction)
+    assert re.search(r"not a functional alpha", introduction, re.I)
+    assert "no real users" in header.lower()
+    assert re.search(r"no real users", rows["Users"], re.I)
+    # 2 and 3. The retention timer is installed and active; its first scheduled run has not been seen.
+    assert_timer_installed_first_run_unverified(header, "RUNBOOK status paragraph")
+    assert_timer_installed_first_run_unverified(rows["Retention cleanup"], "STATUS.md, Retention cleanup")
+    # 4. The Functional Alpha has not started.
+    assert re.search(r"\bnot started\b", rows["Functional Alpha"], re.I)

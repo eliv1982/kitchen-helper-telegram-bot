@@ -586,7 +586,7 @@ def test_every_file_the_runbook_points_at_exists():
 def test_the_runbook_keeps_the_conditions_it_promises():
     text = read(RUNBOOK)
     for needed in (
-        "NOT SCHEDULED ON ANY HOST",  # the purge and cleanup gates are stated as released code that runs nowhere, not waived or done
+        "CODE RELEASED IN GIT (R4C-D2, `489ff30`)",  # the purge and cleanup gates name the released code; where it runs is the gate tests' business
         "RequestPath=drop",  # the verified proxy log setting
         "`RequestPath=redact`, or `queryparameters.defaultmode=redact` | **still leaks**",
         "alembic downgrade` is **not** a rollback",
@@ -612,6 +612,29 @@ def section(number: int) -> str:
 
 def fenced_blocks(text: str) -> list:
     return re.findall(r"```(?:bash)?\n(.*?)```", text, re.DOTALL)
+
+
+def retention_gate_rows() -> list:
+    """The two retention rows of the gate table in section 12, whitespace-flattened."""
+    names = ("Scheduled cleanup", "365-day physical deletion")
+    rows = [
+        " ".join(line.split())
+        for line in section(12).splitlines()
+        if line.startswith(tuple(f"| **{name}**" for name in names))
+    ]
+    assert len(rows) == len(names), rows
+    return rows
+
+
+def assert_timer_installed_first_run_unverified(text: str, where: str) -> None:
+    """The cleanup as the documents report it on 2026-10-24: the timer is installed and active, and its first
+    automatic run has not been seen. Those are two facts and the first never implies the second, so each
+    has its own check. The wording around them is free."""
+    flat_text = " ".join(text.split())
+    assert re.search(r"installed and active", flat_text, re.I), where
+    assert re.search(
+        r"first (?:automatic )?(?:run|execution)\b[^.|]*?\bnot (?:yet )?(?:been )?verified", flat_text, re.I
+    ), where
 
 
 def test_no_unsafe_command_of_the_first_version_is_left_in_the_runbook():
@@ -677,9 +700,13 @@ def test_the_retention_requirements_are_gates_that_nothing_in_the_kit_waives():
     gates = section(12)
     assert "Pre-live gate 1: required before real use" in gates
     assert "Pre-live gate 2: required before any real user data is stored; not waived" in gates
-    # R4C-D2 built both and its code is released. They are stated as exactly that (code in Git, on no
-    # host), and as still open until the timer has run: neither as missing nor as done.
-    assert gates.count("**CODE RELEASED IN GIT (R4C-D2, `489ff30`); NOT SCHEDULED ON ANY HOST, NOT DEPLOYED.") == 2
+    # R4C-D2 built both and its code is released. They are stated as exactly that (code in Git, timer
+    # installed, first run not yet seen), and as still open until that run has been read in the journal:
+    # neither as missing nor as done, and not any longer as code that runs nowhere.
+    for row in retention_gate_rows():
+        assert "**CODE RELEASED IN GIT (R4C-D2, `489ff30`);" in row, row
+        assert_timer_installed_first_run_unverified(row, row[:60])
+        assert "NOT SCHEDULED ON ANY HOST" not in row and "NOT DEPLOYED" not in row, row
     assert gates.count("**Open until**") == 2
     assert "NOT IMPLEMENTED" not in gates
     assert "substitutes for either of them" in gates
