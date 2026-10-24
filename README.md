@@ -1,10 +1,249 @@
-# Kitchen Helper — Telegram Bot
+# House Helper
+
+[![CI](https://github.com/eliv1982/kitchen-helper-telegram-bot/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/eliv1982/kitchen-helper-telegram-bot/actions/workflows/ci.yml)
+
+House Helper is a modular household assistance application that started as a Telegram cooking bot. Its first domain, **Kitchen**, focuses on practical recipe guidance and everyday cooking workflows, with a shared application core designed for multiple interfaces and future household domains.
+
+> **Status, 2026-10-24.** A technical web deployment exists at <https://house.elivcloud.org> and is under technical validation. It is not a public demo: sign-in providers and the OpenAI integration are not enabled there for real users, no sign-in method is available, and there is no public sign-up. The complete end-user Kitchen experience has not been tested live in production; the Functional Alpha is pending. Details: [Deployment status](#deployment-status).
+
+This is a personal project under active development. The repository keeps its original name (`kitchen-helper-telegram-bot`) and the Telegram bot is still part of it. The product's interface and the assistant's replies are in Russian; code and this overview are in English. The detailed operator and developer notes are in Russian: see the [technical reference](#technical-reference-russian).
+
+## Why the project exists
+
+It started as a Telegram bot that suggests simple dishes from the ingredients a person already has. The first intended users are family members: Russian-speaking, using both a phone and a desktop, for whom a browser interface matters and for whom earlier conversations should not be lost ([product baseline](docs/product/PRODUCT_BASELINE.md)).
+
+That shaped the design: Russian-language replies and interface, a responsive web page, a closed set of known users instead of public sign-up, and conversation history stored per user. Cooking is the first domain, with the aim of making cooking guidance more accessible and useful in everyday situations, where a good answer depends on context: what is at hand, how much time there is, what was already discussed.
+
+## What exists today
+
+"Tested" means covered by the automated test suite, which runs offline: it makes no real calls to Telegram, OpenAI or a mail server.
+
+| Component | What it is | Status |
+|---|---|---|
+| **Kitchen domain** | A prompt-guided conversational assistant in Russian for three kinds of request: what to cook from the ingredients on hand, how to cook a named dish, and open-ended "what should I cook". It handles follow-ups, adjacent questions (substitutions, storage, thawing) and keeps to food and the kitchen, with safety boundaries (no medical advice, no unverified canning advice, a kind reply to a person in distress). The same system prompt serves the bot and the web app. | Implemented. The prompt's clauses are pinned by tests. There is no recipe database, saved-recipe feature or preference storage yet, and the web chat has not been evaluated against the real model. |
+| **Shared core** (`house_helper/core`) | Transport-neutral pieces used by both interfaces: conversation identity, outcome types, limits, the Kitchen prompt and an AI-backend interface. | Implemented, tested. |
+| **Telegram bot** (`bot.py`) | `/start`, `/reset`, a bounded in-memory history (20 messages), a 2000-character message limit, a typing indicator and error handling for Telegram and OpenAI failures. | Implemented, tested. A separate process with no database; it is not part of the container image. |
+| **Web application** (`house_helper/web`) | FastAPI service: sign-in routes, a conversation API (create and list conversations, read history, send a message under an idempotency key) and a responsive Russian browser UI served by the app itself (plain HTML, CSS and JavaScript, no build step). | Implemented, tested (Python tests plus UI scenarios run under Node.js). Deployed technically; sign-in is disabled there. |
+| **Persistence and identity** (`house_helper/persistence`) | SQLAlchemy 2 models and six Alembic migrations: users, allowlist entries, identity links, sessions, sign-in state, invitations, conversations, messages, turn records. One user can have several ways to sign in; ownership is enforced through the schema. | Implemented, tested on SQLite. SQLite is what the deployment uses; PostgreSQL is covered only by opt-in test suites that CI does not run. |
+| **Authentication** | Telegram sign-in (OpenID Connect, Authorization Code with PKCE) and passwordless email links. Closed allowlist, no self-registration. Telegram is linked to a user through a one-time invitation issued by the operator. Server-side sessions, 14 days. | Implemented, tested against stand-ins. Never run against real Telegram or a real mail server. Not enabled in the technical deployment. |
+| **Retention and operator tooling** (`house_helper/admin`) | Operator commands: `provision-email`, `enroll-user`, `reissue-invitation`, `revoke-invitation`, `enrollment-status`, `purge-expired`. Messages expire after 365 days; `purge-expired` deletes expired data. | Implemented, tested. The cleanup's systemd timer is installed and active on the technical deployment; its first automatic run, scheduled for 2026-10-25, has not been verified yet (see [Security and data lifecycle](#security-and-data-lifecycle)). |
+| **Deployment kit** (`Dockerfile`, `deploy/`) | Docker image and Compose file for a host that already runs Traefik, backup, verify and restore tooling, a fail-closed upgrade script, opt-in systemd units for the cleanup, and an English [runbook](deploy/RUNBOOK.md). | Implemented. Used for the technical deployment. An encrypted off-host backup and a restore rehearsal are not yet completed. |
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Interfaces
+        TG["Telegram bot<br/>bot.py · aiogram"]
+        WEB["Web application<br/>house_helper/web · FastAPI<br/>sign-in · chat API · browser UI"]
+    end
+
+    subgraph Core["Shared core · house_helper/core"]
+        KITCHEN["Kitchen domain<br/>system prompt"]
+        COMMON["Identity · outcomes · limits"]
+        BACKEND["AI backend interface<br/>OpenAI adapters"]
+    end
+
+    DB[("Persistence · house_helper/persistence<br/>SQLAlchemy + Alembic<br/>SQLite in the deployment")]
+    ADMIN["Operator CLI<br/>house_helper/admin"]
+
+    OPENAI(["OpenAI API"])
+    TGAPI(["Telegram<br/>Bot API · OIDC sign-in"])
+    SMTP(["SMTP server<br/>email sign-in links"])
+
+    TG --> Core
+    WEB --> Core
+    WEB --> DB
+    ADMIN --> DB
+    TG --> TGAPI
+    BACKEND -.-> OPENAI
+    WEB -.-> TGAPI
+    WEB -.-> SMTP
+```
+
+Dashed arrows are integrations that the technical deployment does not enable yet. Only the Kitchen domain exists; no other household domain has any code.
+
+- **Two interfaces, one core.** The bot and the web app are separate processes and do not import each other. Both use `house_helper/core`: the same system prompt, limits, conversation identity, outcome types and AI-backend interface.
+- **Different memory.** The bot keeps its context in process memory and has no database. The web app stores users, sessions and conversations through `house_helper/persistence`, and each stored turn follows a small lifecycle (begin, complete or fail) so a retried request does not produce a second answer.
+- **Schema changes are explicit.** The web app never creates or migrates the database; migrations are a separate operator step with a verified backup first.
+- **Users are created by an operator only.** `house_helper/admin` is run by hand; neither the web app nor the bot imports it.
+
+In the deployment kit, requests take this path: browser, then Traefik (TLS), then one `house-helper` container running uvicorn, then SQLite on a Docker volume. The container publishes no port of its own.
+
+## Deployment status
+
+*As of 2026-10-24.*
+
+| | State |
+|---|---|
+| Technical web deployment | **Exists** at <https://house.elivcloud.org>: the web application in a single Docker container behind an existing Traefik reverse proxy, served over HTTPS with a Let's Encrypt certificate. The container is healthy; the HTTPS and `/healthz` checks pass. |
+| Deployed version | Commit `6370bf7` (`6370bf78980e5e8fa8df33361e76620d57fffe79`), image `house-helper:6370bf78980e`. |
+| Database | SQLite, at migration `0006_oidc_state_invitation`. |
+| Purpose of this instance | **Technical validation** of the deployment path (image, reverse proxy, TLS, response headers, health check) before any real user is enabled. |
+| Browser check | A visual smoke test of the live page in a real browser passed: it showed the House Helper branding and the setup screen that appears while sign-in is disabled. |
+| Sign-in providers (Telegram, email) | **Not enabled.** |
+| OpenAI | **Not enabled for real users.** |
+| Users | **None enrolled.** |
+| Scheduled cleanup | The systemd timer for `purge-expired` is **installed and active**. Its first automatic execution is scheduled for 2026-10-25 and has **not been verified yet**. |
+| Backups | An encrypted off-host backup and a restore rehearsal are **not yet completed**. |
+| What a visitor can do | Open the page, which reports that sign-in is not connected yet. No sign-in method is enabled, so the chat cannot be used. There is no public sign-up and no demo account. |
+| Functional Alpha | **Pending (not started).** |
+
+On 2026-10-24 the public endpoints were checked from outside: `GET /healthz` returns 200, `GET /auth/me` returns 503 `login_unavailable` (no sign-in method is configured), the page shell reports both sign-in methods as off, and the responses carry HSTS, a strict Content-Security-Policy and frame-denial headers.
+
+**Functional Alpha** is the next milestone: the first use of the Kitchen chat by real users, with real sign-in and real AI replies. It is pending. The open items that stand between the current instance and real users are tracked in [`docs/STATUS.md`](docs/STATUS.md); the main ones, none of them claimed as done, are:
+
+- Real Telegram sign-in: a BotFather client and redirect URL, then a first real login. Telegram sign-in has so far run only against a stand-in. Email sign-in is a fallback whose operational activation is deferred; it would need a real mail path (SMTP with SPF, DKIM and DMARC).
+- The first users enrolled through one-time invitations.
+- An OpenAI project with an enforced spend limit, then a review of real answers and of truncated replies.
+- The first automatic run of the scheduled cleanup (the timer is installed; the run is due on 2026-10-25) observed and checked; a backup schedule with an encrypted off-host copy and a recovery rehearsal on the host; an alert path for failures.
+- Ingress rate limits verified on the live proxy; checks on real phones and in more than one browser (apart from one visual smoke test of the live page, the UI has been tried only in headless Chrome).
+
+## Security and data lifecycle
+
+### Implemented measures
+
+These are in the code and covered by automated tests. They are design measures, not guarantees; see the list of what is not claimed below.
+
+- **Closed access.** There is no public sign-up. An operator creates every user; a sign-in method works only if its identifier is on that user's allowlist. A Telegram identity is linked only by a verified Telegram sign-in that presents a one-time invitation (two hours, single use, revocable); it is never typed in, guessed from a username, or matched by email.
+- **Sessions.** Random 256-bit tokens in an `HttpOnly`, `Secure`, `SameSite=Lax`, `__Host-` prefixed cookie; only the SHA-256 digest is stored; the lifetime is 14 days and is not extended. Revoking a sign-in method revokes the sessions opened through it.
+- **Sign-in flows.** Telegram: PKCE, `state` and `nonce`, with the ID token's signature, issuer and audience checked. Email: the answer is the same whether or not the address is known, the secret sits in the URL fragment so it never reaches a server log, and opening the link does not consume it (a separate confirmation does).
+- **Per-user data.** The owner of a conversation comes from the server-side session, never from the request. Another person's conversation and a nonexistent one give the same `404`.
+- **Request handling.** The JSON endpoints accept only JSON, with size limits; a request whose `Origin` is not the application's own is rejected, and CORS is not enabled. Each message is sent under an idempotency key. The browser page uses a Content-Security-Policy without inline scripts and renders all text as text.
+- **Container and secrets.** The image runs as a non-root user with a read-only root filesystem, all Linux capabilities dropped, `no-new-privileges`, CPU, memory and process limits, and no published port. The build context is an allowlist, so `.env` files, databases and tests cannot enter an image. Credentials come from an environment file kept outside the repository; the repository holds only a template of names.
+- **Dependencies.** Direct dependencies are pinned to exact versions.
+
+### Data lifecycle
+
+- **What is stored.** Per-user conversations and message text, turn records (which hold a copy of the answer so a retry can return it), sessions, short-lived sign-in state, and SHA-256 digests of secrets. There are no passwords. The Telegram bot keeps its context only in memory, lost on restart or `/reset`.
+- **Retention.** Every message and turn record carries an `expires_at` at most 365 days after creation; expired rows are hidden from reads and from the model's context. `purge-expired` physically deletes them, and deletes sign-in artifacts (sessions, sign-in states, email links, invitations) at their own expiry. Users, allowlist entries and identity links are never deleted by it.
+- **Limits of deletion.** Deletion is logical, not forensic erasure. A deleted row survives in older backups, so the 365-day promise holds for the live database only until a backup retention policy exists; that policy is not decided.
+- **Third party.** When the OpenAI integration is enabled, message text is sent to OpenAI to produce replies. The Telegram bot tells users so on `/start`.
+
+### Not claimed
+
+- That sign-in has been verified with real Telegram or a real mail server, or that the chat has been tested against the real model in production.
+- That the scheduled cleanup has run. Its timer is installed and active, but the first automatic execution (2026-10-25) is not yet verified.
+- That backups are taken off-host, or that recovery has been rehearsed on the live host. The tooling exists; the operational setup is a documented open gate.
+- That the service is monitored, or that a failure raises an alert.
+- That ingress controls are verified in production. The rate-limit settings exist as Traefik labels and were exercised only on a throwaway proxy, not on the live one. The chat API itself has no per-user or per-address rate limit and no cap on concurrent model calls.
+- That the timing difference in the email-request endpoint is closed. It is a known, documented gap to handle before public exposure.
+- That an independent penetration test has been done.
+
+## Project evolution
+
+```text
+Telegram Kitchen Bot -> Shared Application Core -> Persistent Web Application -> Technical Deployment -> Functional Alpha (pending)
+```
+
+| Step | What changed |
+|---|---|
+| **Telegram Kitchen Bot** | The original product: `bot.py`, OpenAI replies, conversation context in memory. |
+| **Shared Application Core** | The conversation logic moved out of the bot into a transport-neutral core (`house_helper/core`); the bot became a thin adapter over it, and the Kitchen prompt and limits became shared. |
+| **Persistent Web Application** | A database layer with migrations, a FastAPI service, Telegram and email sign-in, an authenticated chat API and a Russian browser UI, built on the same core. |
+| **Technical Deployment** | Invitation-based enrollment of the first users, a Docker and Traefik deployment kit with backup and upgrade tooling, the retention command, and a technical instance at `house.elivcloud.org`. |
+| **Functional Alpha** | Pending, see [Deployment status](#deployment-status). |
+
+There was no ground-up rewrite: the bot is still `bot.py`, now delegating to the core that the web application also uses. The increments are tracked as stages and releases (`R1`, `R2`, `R3A`, `R4A`, `R4B`, `R4C`, and so on) in [`docs/STATUS.md`](docs/STATUS.md).
+
+## Roadmap
+
+Everything in this section is planned. None of it is implemented.
+
+| Area | Direction |
+|---|---|
+| **Kitchen usability and household measures** | Smoother everyday use of the Kitchen chat, and support for household measures (spoons, cups and similar everyday units). |
+| **Food preservation guidance** | Guidance on storing, freezing and preserving food. Today the assistant only answers short storage and freezing questions and avoids unverified canning advice, so this needs careful, sourced content. |
+| **Equipment-aware cooking (KH-F04)** | **Planned feature.** Appliance onboarding, so that suggestions fit the equipment a household actually has. |
+| **Family recipe digitization (KH-F05)** | **Planned feature.** Turning printed or handwritten family recipes into structured recipes, with a human review step before anything is saved. This builds on saved recipes, which do not exist yet. |
+| **Other household domains** | A possible expansion beyond the kitchen. The documented direction ([`docs/DECISIONS.md`](docs/DECISIONS.md), KHD-15 to KHD-19) is one assistant identity, with the user choosing the domain explicitly. No code exists for any other domain. |
+
+Also documented but not built: saved recipes, long-term preferences, voice input and output, optional error-monitoring notifications, and remembered-device sign-in (still only a proposal).
+
+## Development
+
+### Stack
+
+- Python 3.10+
+- [aiogram](https://docs.aiogram.dev/) 3.x for the Telegram bot and the official [openai](https://github.com/openai/openai-python) SDK
+- [FastAPI](https://fastapi.tiangolo.com/) and [uvicorn](https://www.uvicorn.org/) for the web application
+- [SQLAlchemy](https://www.sqlalchemy.org/) 2 and [Alembic](https://alembic.sqlalchemy.org/) for persistence
+- [PyJWT](https://pyjwt.readthedocs.io/), [cryptography](https://cryptography.io/) and [httpx](https://www.python-httpx.org/) for Telegram sign-in
+- [python-dotenv](https://github.com/theskumar/python-dotenv) for the bot's `.env`
+- A front end of plain HTML, CSS and JavaScript, with no build step and no external scripts
+- pytest, with Node.js for the browser-UI test scenarios
+- Docker, Docker Compose and Traefik for deployment
+
+### Quick start
+
+```bash
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements-dev.txt
+pytest
+```
+
+The Telegram bot needs a token from [@BotFather](https://t.me/BotFather) and an OpenAI key:
+
+```bash
+cp .env.example .env               # Windows: copy .env.example .env
+# set BOT_TOKEN and OPENAI_API_KEY in .env (never commit this file)
+python bot.py
+```
+
+The web application needs no `BOT_TOKEN`. Create the database schema, then start it:
+
+```bash
+alembic upgrade head               # uses HOUSE_HELPER_DATABASE_URL, default: house_helper.db
+python -m uvicorn house_helper.web.asgi:app --host 127.0.0.1 --port 8000
+```
+
+The web process does not read `.env` by itself; add `--env-file .env` to take settings such as `OPENAI_API_KEY` from it. With no sign-in method configured, the page at `http://127.0.0.1:8000/` says so. Setting up sign-in, creating the first user and enrolling users are described in the Russian [technical reference](#technical-reference-russian) below; the deployment procedure is in the English [runbook](deploy/RUNBOOK.md).
+
+### Tests and CI
+
+The tests make no real network calls: `tests/network_guard.py` blocks outgoing connections other than loopback during a run, and a test that tries fails. GitHub Actions ([`ci.yml`](.github/workflows/ci.yml)) runs the suite on Python 3.10 and 3.12 for every push and pull request to `main`. At commit `6370bf7` it passed with 5,888 tests on Python 3.12 and 5,887 on 3.10. A further 86 (3.12) and 87 (3.10) are skipped: they are opt-in suites that need a real PostgreSQL server, which CI does not provide, plus one test that needs Python 3.12.
+
+### Working method
+
+Work is split into staged increments. Each one is reviewed independently before it is committed, and a release is recorded only after CI is green. Product and architecture decisions are kept in a register with their status (accepted, deferred, not built). The documents below are working records, written increment by increment.
+
+### Documentation
+
+| Document | Content |
+|---|---|
+| [`docs/STATUS.md`](docs/STATUS.md) | Current deployment state, release ledger, evidence for each release, open gates before real users |
+| [`docs/DECISIONS.md`](docs/DECISIONS.md) | Decision register |
+| [`docs/product/PRODUCT_BASELINE.md`](docs/product/PRODUCT_BASELINE.md) | Product baseline: users, scenarios, accepted requirements |
+| [`docs/architecture/ARCHITECTURE_BASELINE.md`](docs/architecture/ARCHITECTURE_BASELINE.md) | Architecture baseline and security invariants |
+| [`docs/README.md`](docs/README.md) | Index of the documents above and how they are kept up to date |
+| [`deploy/RUNBOOK.md`](deploy/RUNBOOK.md) | Deployment, upgrade, backup and restore, scheduled cleanup (English) |
+
+Some of these documents still carry the earlier name "Kitchen Helper" in their titles.
+
+## Technical reference (Russian)
+
+The sections below are the detailed developer and operator reference. They are in Russian and were written release by release. Notes marked as the state at a release are dated records; the current deployment state is in [Deployment status](#deployment-status) above.
+
+| Topic | Section |
+|---|---|
+| Telegram bot: features, configuration, running, context | [Возможности](#возможности), [Как создать `.env`](#как-создать-env), [Запуск бота](#запуск-бота) |
+| Web application, environment, deployment kit | [Запуск веб-приложения (основа)](#запуск-веб-приложения-основа) |
+| Telegram sign-in (OIDC) | [Вход через Telegram (OIDC)](#вход-через-telegram-oidc) |
+| Email sign-in | [Вход по ссылке из письма (email)](#вход-по-ссылке-из-письма-email) |
+| Creating the first user | [Первый пользователь: `provision-email`](#первый-пользователь-provision-email-команда-оператора) |
+| Enrolling users, Telegram invitations | [Начальные пользователи: приглашения Telegram](#начальные-пользователи-приглашения-telegram-команды-оператора), [Привязка в браузере](#привязка-в-браузере-страница-приглашения-r4c-auth-a3) |
+| Web chat API | [Веб-чат (API)](#веб-чат-api) |
+| Web UI | [Веб-интерфейс (кухня)](#веб-интерфейс-кухня) |
+| Limits, privacy, tests, CI | [Ограничения текущей версии](#ограничения-текущей-версии), [Приватность и обработка данных](#приватность-и-обработка-данных), [Тесты](#тесты), [CI](#ci) |
+
+---
 
 ## О проекте
 
-Kitchen Helper — Telegram-бот, который помогает быстро придумать простое домашнее блюдо из продуктов, которые есть у пользователя. Бот использует OpenAI API для генерации ответов и хранит контекст диалога в памяти процесса.
+House Helper — модульный бытовой помощник. Первый модуль, «Кухня» (Kitchen Helper), помогает с домашней готовкой: подсказывает, что приготовить из имеющихся продуктов, как приготовить названное блюдо, чем заменить продукт и как хранить еду. У модуля два интерфейса: Telegram-бот (контекст диалога хранится только в памяти процесса, базы данных у бота нет) и веб-приложение (вход, API веб-чата и страница на русском языке; диалоги хранятся в базе данных). Это pet-проект в активной разработке. Рецептов как отдельной сущности, избранного и настроек пока нет; других модулей (сад, дом и т. п.) нет.
 
-Это pet-проект в активной разработке. Текущая версия реализует только описанную ниже функциональность Kitchen Helper — расширения (сад/дом, напоминания и т.д.) пока не реализованы. Веб-часть — основа (FastAPI, `GET /healthz`, вход через Telegram OIDC и по ссылке из письма, см. «Запуск веб-приложения»; привязка Telegram по приглашению — выпущена в коде (R4C-Auth A3, RELEASED), но не развёрнута и не проверена на настоящем Telegram, см. «Начальные пользователи: приглашения Telegram»), API веб-чата (диалоги и сообщения, см. «Веб-чат (API)») и страница «Кухонный помощник» на `/`, которая ими пользуется (см. «Веб-интерфейс (кухня)»). Страница **реализована и проверена только локально**: публичного развёртывания (бета-версии) нет — ни публичного HTTPS-адреса, ни ограничений на входе, ни автоочистки по сроку хранения, ни проверки на настоящем помощнике и настоящей почте. Рецептов как отдельной сущности и настроек ещё нет.
+Состояние развёртывания (технический экземпляр `https://house.elivcloud.org`; провайдеры входа и OpenAI для реальных пользователей не включены) описано в английском разделе «Deployment status» выше.
 
 ## Возможности
 
@@ -22,7 +261,7 @@ Kitchen Helper — Telegram-бот, который помогает быстро
 - [aiogram](https://docs.aiogram.dev/) 3.x — Telegram Bot API
 - [openai](https://github.com/openai/openai-python) — официальный SDK OpenAI
 - [python-dotenv](https://github.com/theskumar/python-dotenv) — переменные окружения из `.env`
-- [FastAPI](https://fastapi.tiangolo.com/) + [uvicorn](https://www.uvicorn.org/) — веб-приложение (вход, API веб-чата и страница «House Helper»; запускается локально, публично не развёрнуто)
+- [FastAPI](https://fastapi.tiangolo.com/) + [uvicorn](https://www.uvicorn.org/) — веб-приложение (вход, API веб-чата и страница «House Helper»; о техническом развёртывании — английский раздел «Deployment status» выше)
 - [PyJWT](https://pyjwt.readthedocs.io/) + [cryptography](https://cryptography.io/) + [httpx](https://www.python-httpx.org/) — вход через Telegram OIDC (проверка подписи ID-токена, обмен кода)
 
 ## Структура файлов
@@ -47,7 +286,7 @@ Kitchen Helper — Telegram-бот, который помогает быстро
 | `house_helper/persistence/conversations.py`, `turns.py` | Диалоги и история (владение, чтение без записи, контекст модели); минимальный жизненный цикл хода: `begin_turn` / `complete_turn` / `fail_turn` с «арендой» и сравнением-и-заменой |
 | `house_helper/persistence/authn.py` | Хранение входа: состояние OIDC-входа (только хэш `state`, одноразовое), завершение входа через allowlist, серверные сессии (только хэш токена), отзыв |
 | `house_helper/admin/` | Команды оператора, запускаются вручную: `python -m house_helper.admin provision-email` (первый пользователь и его email, см. «Первый пользователь») и `enroll-user`, `reissue-invitation`, `revoke-invitation`, `enrollment-status` (начальные пользователи и их одноразовые приглашения Telegram, см. «Начальные пользователи») и `purge-expired` (удаляет истёкшие артефакты входа и историю старше 365 дней; см. `deploy/RUNBOOK.md`, раздел 14). Веб-приложение и бот этот пакет не импортируют |
-| `house_helper/persistence/invitations.py` | Одноразовые приглашения Telegram: выдача (с отзывом прежних), отзыв, проверка секрета, «погашение» с записью проверенного `sub` в allowlist пользователя, на которого выписано приглашение. В базе только SHA-256 секрета. Приглашение принимает веб-часть (`web/invite_auth.py`, `web/auth.py`): она выпущена в коде (R4C-Auth A3, RELEASED), но не развёрнута и не проверена на настоящем Telegram |
+| `house_helper/persistence/invitations.py` | Одноразовые приглашения Telegram: выдача (с отзывом прежних), отзыв, проверка секрета, «погашение» с записью проверенного `sub` в allowlist пользователя, на которого выписано приглашение. В базе только SHA-256 секрета. Приглашение принимает веб-часть (`web/invite_auth.py`, `web/auth.py`): она выпущена в коде (R4C-Auth A3, RELEASED) и входит в техническое развёртывание, где вход через Telegram не включён; на настоящем Telegram она не проверена |
 | `api_client.py` | Ленивая инициализация клиента OpenAI, запросы, system prompt, логирование usage |
 | `tests/` | Автоматические тесты (без реальных сетевых запросов к Telegram/OpenAI). `tests/js/` — сценарии на Node.js для страницы (поддельный сервер, мини-DOM, настоящий сервер на loopback) |
 | `requirements.txt` / `requirements-dev.txt` | Зависимости проекта (версии закреплены точно) |
@@ -125,7 +364,7 @@ python -m uvicorn house_helper.web.asgi:app --host 127.0.0.1 --port 8000
 - База данных задаётся переменной `HOUSE_HELPER_DATABASE_URL` (по умолчанию — файл `house_helper.db` в рабочей папке). Для веб-процесса нужен файл SQLite или другая СУБД; SQLite в памяти (`sqlite://`) не поддерживается.
 - Приложение **не создаёт и не меняет схему базы данных**. Миграции применяются отдельной командой: `alembic upgrade head`.
 - Проверка: `curl http://127.0.0.1:8000/healthz`.
-- **Развёртывание на VPS (Docker, Compose, Traefik)** — пакет `Dockerfile`, `deploy/compose.yaml`, шаблон переменных, инструмент `deploy/ops/dbtool.py` (блокировка каталога данных, проверка схемы, резервная копия, проверка копии, восстановление), сценарии `deploy/backup.sh` и `deploy/upgrade.sh` (обновление выполняется только после проверенной резервной копии) и пошаговая инструкция [`deploy/RUNBOOK.md`](deploy/RUNBOOK.md) (на английском). Это **подготовленный в репозитории комплект: на сервере ничего не запускалось**, DNS, BotFather и пользователи не настраивались; каждый шаг, меняющий что-либо вне репозитория, выполняется только по явному разрешению владельца. Очистка по сроку (R4C-D2, коммит `489ff30`): команда `purge-expired` и необязательные юниты systemd (`deploy/systemd/`, раздел 14 инструкции) выпущены в коде, но **не установлены**, и ни одна настоящая база не обрабатывалась.
+- **Развёртывание на VPS (Docker, Compose, Traefik)** — пакет `Dockerfile`, `deploy/compose.yaml`, шаблон переменных, инструмент `deploy/ops/dbtool.py` (блокировка каталога данных, проверка схемы, резервная копия, проверка копии, восстановление), сценарии `deploy/backup.sh` и `deploy/upgrade.sh` (обновление выполняется только после проверенной резервной копии) и пошаговая инструкция [`deploy/RUNBOOK.md`](deploy/RUNBOOK.md) (на английском). Комплект использован для технического развёртывания `https://house.elivcloud.org` (состояние — в английском разделе «Deployment status» выше): провайдеры входа и OpenAI для реальных пользователей там не включены; каждый шаг, меняющий что-либо вне репозитория, выполняется только по явному разрешению владельца. Очистка по сроку (R4C-D2, коммит `489ff30`): команда `purge-expired` и необязательные юниты systemd (`deploy/systemd/`, раздел 14 инструкции) выпущены в коде; таймер установлен и активен на техническом экземпляре, а первый автоматический запуск назначен на 2026-10-25 и ещё не проверен.
 
 ### Вход через Telegram (OIDC)
 
@@ -159,7 +398,7 @@ python -m uvicorn house_helper.web.asgi:app --host 127.0.0.1 --port 8000
 Как это устроено и что важно знать:
 
 - **Допуск только по allowlist**, саморегистрации нет. Пользователь определяется по `sub` из проверенного ID-токена (не по username и не по имени); неизвестный, отозванный или отключённый — отказ `403`.
-- **Пользователей заводит только оператор; публичной регистрации нет.** Первого пользователя вместе с его email создаёт команда `provision-email` (раздел «Первый пользователь» ниже); начальных пользователей беты, владельца и его маму, — **двоих** — команда `enroll-user` вместе с приглашением Telegram (раздел «Начальные пользователи: приглашения Telegram»; третьего пользователя она не создаёт). Прежний порядок «сначала Telegram» (создать `User` и записать для него `sub` кодом) **выведен из эксплуатации**: запись allowlist `telegram` вручную **не создаётся**, `sub` нельзя ни вводить руками, ни угадывать. Telegram к уже существующему пользователю привязывается по проверенному ID-токену Telegram и приглашению: веб-часть (страница `/auth/invite` и привязка при входе) **выпущена в коде (R4C-Auth A3, RELEASED), но не развёрнута**, а **настоящий вход через Telegram не проверялся ни разу**. Маршруты входа через Telegram работают для тех, у кого запись `telegram` уже есть.
+- **Пользователей заводит только оператор; публичной регистрации нет.** Первого пользователя вместе с его email создаёт команда `provision-email` (раздел «Первый пользователь» ниже); начальных пользователей беты, владельца и его маму, — **двоих** — команда `enroll-user` вместе с приглашением Telegram (раздел «Начальные пользователи: приглашения Telegram»; третьего пользователя она не создаёт). Прежний порядок «сначала Telegram» (создать `User` и записать для него `sub` кодом) **выведен из эксплуатации**: запись allowlist `telegram` вручную **не создаётся**, `sub` нельзя ни вводить руками, ни угадывать. Telegram к уже существующему пользователю привязывается по проверенному ID-токену Telegram и приглашению: веб-часть (страница `/auth/invite` и привязка при входе) **выпущена в коде (R4C-Auth A3, RELEASED) и входит в техническое развёртывание, где вход через Telegram не включён**, а **настоящий вход через Telegram не проверялся ни разу**. Маршруты входа через Telegram работают для тех, у кого запись `telegram` уже есть.
 
 - **Сессия** — случайный токен (256 бит) в cookie `__Host-hh_session` (`HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`, без `Domain`), срок 14 дней, не продлевается. В базе хранится только SHA-256 токена. Сессия перестаёт действовать при выходе, по истечении срока, при отключении пользователя и пока запись allowlist **того способа входа, через который она открыта**, отсутствует или отозвана (проверяется на каждый запрос). Другие способы входа того же пользователя такую сессию не поддерживают.
 - **Выход называет, чей он (`X-Expected-User`).** Страница, которая попросила выйти и не получила ответа, спрашивает снова, а к тому времени единственная cookie браузера может оказаться чужой (в другой вкладке того же браузера вошёл другой человек). Поэтому `POST /auth/logout` несёт заголовок `X-Expected-User: <user_id>` — тот `user_id`, который `GET /auth/me` назвал странице, пока она была открыта; он отправляется с первой попыткой и с каждой повторной. Сервер берёт сессию из cookie **этого** запроса и отзывает её, **только если она принадлежит названному пользователю**: условие `user_id` входит в сам `UPDATE`, так что сессия другого человека этим запросом не затрагивается ни при каких обстоятельствах. Заголовок — только сравнение, а не учётные данные: он ничего не выбирает, не аутентифицирует и не даёт прав (запрос без cookie или с чужой cookie ничего не отзовёт, чьё бы имя в нём ни стояло); `user_id` в теле, строке запроса или в любом другом заголовке по-прежнему не читается.
@@ -360,7 +599,7 @@ pytest tests/test_admin_postgres.py -v -rs
 
 Начальные пользователи — владелец и его мама. У каждого своя запись `User` и свои, независимые диалоги. Telegram-вход каждый привязывает **сам**, одноразовым приглашением, которое выдаёт оператор; привязка происходит только после проверенного входа через Telegram (OIDC), а не по имени, email, username или числовому id.
 
-> **Состояние этапа.** Обе части выпущены в коде (R4C-Auth A2 — `c20a26e`, A3 — `9159842`, RELEASED), но не развёрнуты. Готова операторская часть (таблица `identity_invitations`, миграция `0005_identity_invitations`, модуль `persistence/invitations.py` и четыре команды ниже) и веб-часть (страница приглашения и привязка при входе через Telegram, миграция `0006_oidc_state_invitation`, подраздел «Привязка в браузере» ниже). Веб-часть проверена **только** на подставном Telegram (`tests/auth_support.FakeTelegram`): реальный вход через Telegram не выполнялся, BotFather не настроен, развёртывания нет. Пользователь, созданный `enroll-user`, **нигде не может войти**, пока приглашение не принято: запись allowlist появляется только при приёме.
+> **Состояние этапа на момент выпуска (2026-10-21/22; текущее состояние развёртывания — в английском разделе «Deployment status» выше).** Обе части выпущены в коде (R4C-Auth A2 — `c20a26e`, A3 — `9159842`, RELEASED), но не развёрнуты. Готова операторская часть (таблица `identity_invitations`, миграция `0005_identity_invitations`, модуль `persistence/invitations.py` и четыре команды ниже) и веб-часть (страница приглашения и привязка при входе через Telegram, миграция `0006_oidc_state_invitation`, подраздел «Привязка в браузере» ниже). Веб-часть проверена **только** на подставном Telegram (`tests/auth_support.FakeTelegram`): реальный вход через Telegram не выполнялся, BotFather не настроен, развёртывания нет. Пользователь, созданный `enroll-user`, **нигде не может войти**, пока приглашение не принято: запись allowlist появляется только при приёме.
 
 Команды (та же подготовка базы и тот же `HOUSE_HELPER_DATABASE_URL`, что у `provision-email`; база должна быть на `head`, команды её не создают и не мигрируют):
 
@@ -413,7 +652,7 @@ invitation code: INVITATION-ID.SECRET
 
 ### Привязка в браузере: страница приглашения (R4C-Auth A3)
 
-> **Состояние.** **RELEASED — выпущено в коде** (коммит `9159842`, принято владельцем после независимой проверки), но **не развёрнуто в рабочей среде** (CODE RELEASED ≠ LIVE DEPLOYED). Проверено только тестами и на подставном Telegram. Миграция `0006` не применялась ни к одной настоящей базе. **Настоящий вход через Telegram не проверялся**, BotFather не настроен, `house.elivcloud.org` не развёрнут (DNS и TLS не настроены), настоящих пользователей и приглашений нет, проверки на настоящем телефоне и в разных браузерах не было. Вход по email сохранён без изменений, но его промышленное включение отложено; запоминание устройства пока не сделано.
+> **Состояние на момент выпуска (2026-10-22; текущее состояние развёртывания — в английском разделе «Deployment status» выше).** **RELEASED — выпущено в коде** (коммит `9159842`, принято владельцем после независимой проверки), но **не развёрнуто в рабочей среде** (CODE RELEASED ≠ LIVE DEPLOYED). Проверено только тестами и на подставном Telegram. Миграция `0006` не применялась ни к одной настоящей базе. **Настоящий вход через Telegram не проверялся**, BotFather не настроен, `house.elivcloud.org` не развёрнут (DNS и TLS не настроены), настоящих пользователей и приглашений нет, проверки на настоящем телефоне и в разных браузерах не было. Вход по email сохранён без изменений, но его промышленное включение отложено; запоминание устройства пока не сделано.
 
 Человек открывает ссылку `https://<адрес приложения>/auth/invite#ИДЕНТИФИКАТОР.СЕКРЕТ`, нажимает «Продолжить через Telegram», подтверждает свой аккаунт в Telegram и попадает в приложение под своим пользователем. Приглашение расходуется **только** после успешной проверки ID-токена Telegram и привязки; без Telegram-входа (`HOUSE_HELPER_PUBLIC_URL`, Client ID и Client Secret, см. «Вход через Telegram») маршруты ниже отвечают `503`.
 
@@ -444,7 +683,7 @@ invitation code: INVITATION-ID.SECRET
 - **Обновление, «Назад» и кэш «вперёд-назад».** После того как скрипт убрал фрагмент, в адресе страницы кода уже нет. Если страницу **обновить** или браузер **загрузит её заново** при возврате из Telegram кнопкой «Назад», она покажет «ссылка неполная или повреждена», кнопка останется выключенной: откройте ссылку-приглашение заново (пока оно действует и не использовано). Если же браузер **восстановит страницу из кэша «вперёд-назад» (bfcache)**, вместе с ней восстановится и код, оставшийся в памяти страницы: скрипт по событию `pageshow` включает кнопку («Вход через Telegram не завершён…»), и можно нажать её ещё раз; код при этом нигде не сохранён, кроме памяти страницы. Страница отдаётся с `Cache-Control: no-store`; восстанавливают ли её из bfcache конкретные браузеры, **не проверялось**. Закрытая страница (фрагмент не убрался) из кэша не оживает.
 - Нет ограничения частоты запросов на `POST /auth/invite/start` (секрет 256 бит, а состояния сохраняются только для действующих приглашений), нет повторного запроса «забыл код»: код выдаёт оператор.
 
-Условия живой проверки (не выполнялась; вне этого этапа): `HOUSE_HELPER_PUBLIC_URL=https://house.elivcloud.org`, `HOUSE_HELPER_TELEGRAM_CLIENT_ID`, `HOUSE_HELPER_TELEGRAM_CLIENT_SECRET` (и `HOUSE_HELPER_TELEGRAM_ID_TOKEN_ALG`, если в BotFather выбран не RS256); в BotFather — Allowed URLs: origin `https://house.elivcloud.org` и адрес возврата `https://house.elivcloud.org/auth/telegram/callback`; DNS и TLS для `house.elivcloud.org`; `alembic upgrade head` (до `0006_oidc_state_invitation`) на остановленном приложении с резервной копией; затем `enroll-user`, ссылка `https://house.elivcloud.org/auth/invite#КОД` для каждого человека.
+Условия живой проверки (не выполнялась; вне этого этапа; DNS, TLS и `alembic upgrade head` до `0006` на техническом экземпляре с 2026-10-24 уже выполнены, остальное — нет): `HOUSE_HELPER_PUBLIC_URL=https://house.elivcloud.org`, `HOUSE_HELPER_TELEGRAM_CLIENT_ID`, `HOUSE_HELPER_TELEGRAM_CLIENT_SECRET` (и `HOUSE_HELPER_TELEGRAM_ID_TOKEN_ALG`, если в BotFather выбран не RS256); в BotFather — Allowed URLs: origin `https://house.elivcloud.org` и адрес возврата `https://house.elivcloud.org/auth/telegram/callback`; DNS и TLS для `house.elivcloud.org`; `alembic upgrade head` (до `0006_oidc_state_invitation`) на остановленном приложении с резервной копией; затем `enroll-user`, ссылка `https://house.elivcloud.org/auth/invite#КОД` для каждого человека.
 
 Тесты: `tests/test_persistence_invitation_login.py` (оба блока транзакций, откат, гонки), `tests/test_web_invite.py` (поток, оба пользователя, вход после привязки), `tests/test_web_invite_failures.py` (сбои, подмена состояния, чужой пользователь, откат, гонки), `tests/test_web_invite_secrecy.py` (секрет нигде не виден; Telegram не настроен), `tests/test_web_invite_pages.py` (страницы и скрипт; сам скрипт исполняется в Node, если он установлен; в том числе закрытая страница, когда фрагмент не удалось убрать), `tests/test_web_auth_cross_user.py` (обычный Telegram-вход в браузере другого пользователя: `409`, сессия не меняется, вкладки, гонки), `tests/test_persistence_authn.py` (параметр `browser_session_token`), миграция — в `tests/test_persistence_migrations.py`.
 
@@ -467,7 +706,7 @@ invitation code: INVITATION-ID.SECRET
 - **Отключение клиента** (закрытая вкладка) ход не прерывает: ответ сохраняется, повтор с тем же ключом отдаёт его. Остановка приложения даёт ходам 10 секунд закончиться, затем прерывает оставшиеся и ещё до 10 секунд ждёт, пока они (и их транзакции в базе, которые нельзя остановить на лету) завершатся: прерванный ход помечается `failed` (`interrupted`), если база принимает запись в этот срок. Если нет (транзакция застряла дольше срока, база уже закрыта, процесс убит), запрос остаётся `processing`, пока не истечёт его аренда; тогда тот же ключ повторяет попытку, а другое сообщение диалога вытесняет брошенный ход. Потерянным может оказаться только ответ, который не успели сохранить; дважды ответ не сохраняется никогда.
 - **Контекст модели** — не больше 20 сообщений вместе с текущим (целые обмены, начиная с вопроса), только завершённые обмены; истёкшие сообщения в него не входят. История в API этим числом не ограничена.
 - **Ответ, оборванный по `MAX_TOKENS`,** приходит с `"truncated": true`, а в конце текста добавлена пометка «Напишите «продолжи»…».
-- **Срок хранения 365 дней** записан в `expires_at` сообщений и запросов; истёкшие сообщения не читаются и не попадают в контекст. **Физическое удаление** выполняет команда оператора `python -m house_helper.admin purge-expired` (R4C-D2): она выпущена в коде (коммит `489ff30`, независимый аудит пройден), но **не установлена и не запущена по расписанию ни на одном сервере**, ни одна настоящая база ею не обработана. Порядок работы, неточность по времени (удаление происходит при ближайшем успешном запуске, а не в миг истечения срока), оговорки о SQLite и о старых резервных копиях — в `deploy/RUNBOOK.md`, раздел 14. Запущенное по расписанию удаление остаётся условием развёртывания перед реальными пользователями.
+- **Срок хранения 365 дней** записан в `expires_at` сообщений и запросов; истёкшие сообщения не читаются и не попадают в контекст. **Физическое удаление** выполняет команда оператора `python -m house_helper.admin purge-expired` (R4C-D2): она выпущена в коде (коммит `489ff30`, независимый аудит пройден); таймер systemd установлен и активен на сервере технического экземпляра, а **первый автоматический запуск назначен на 2026-10-25 и ещё не проверен**. Порядок работы, неточность по времени (удаление происходит при ближайшем успешном запуске, а не в миг истечения срока), оговорки о SQLite и о старых резервных копиях — в `deploy/RUNBOOK.md`, раздел 14. Проверенный первый запуск по расписанию остаётся условием перед реальными пользователями.
 - Обращение к модели выполняется вне транзакций базы; ход ограничен 60 секундами, «аренда» хода — 90 секунд от момента, когда ход принят под блокировкой диалога (ожидание блокировки или соединения до этого в срок не входит). Сохранить ответ можно только пока аренда не истекла: запоздавший ответ отбрасывается (`409 turn_in_progress`, тот же ключ генерирует заново).
 
 Ошибки одной формы `{"detail": <код>, "message": <по-русски>, "retryable": <bool>, "correlation_id": "hh-…"}` (плюс `retry_after_seconds`, `user_message_id`). Идентификатор делает сервер для каждого запроса (клиентский не читается) и пишет в `X-Correlation-ID`, в тело ошибки и в строку лога; в логе нет текста исключений, SQL-параметров, содержимого сообщений и cookie.
@@ -489,7 +728,7 @@ invitation code: INVITATION-ID.SECRET
 
 **Настройка помощника** — те же переменные, что у бота, кроме `BOT_TOKEN` (веб-процессу он не нужен): `OPENAI_API_KEY` (без него диалоги создаются и читаются, а на отправку сообщения приходит `503 chat_unavailable`), `OPENAI_MODEL`, `TEMPERATURE`, `MAX_TOKENS`, `OPENAI_TIMEOUT_SECONDS`, `OPENAI_MAX_RETRIES` (диапазоны — в таблице выше). Неверное значение при заданном ключе останавливает запуск; сообщение называет переменную, но не значение. Файл `.env` веб-процесс сам не читает (`uvicorn --env-file .env`). Клиент OpenAI создаётся при первом сообщении, не при запуске.
 
-Что в API первой версии **не** сделано: заголовки диалогов, удаление и сброс диалога, страницы в списке диалогов, потоковая передача ответа, ограничение частоты и числа диалогов (ставится на обратном прокси), автоочистка по сроку (команда `purge-expired` появилась позже, в R4C-D2, и по расписанию нигде не запущена), привязка Telegram, избранное, голос, n8n-уведомления, другие области (сад, дом).
+Что в API первой версии **не** сделано: заголовки диалогов, удаление и сброс диалога, страницы в списке диалогов, потоковая передача ответа, ограничение частоты и числа диалогов (ставится на обратном прокси), автоочистка по сроку (команда `purge-expired` появилась позже, в R4C-D2; таймер установлен, первый запуск по расписанию ещё не проверен), привязка Telegram, избранное, голос, n8n-уведомления, другие области (сад, дом).
 
 ## Веб-интерфейс (кухня)
 
@@ -497,7 +736,7 @@ invitation code: INVITATION-ID.SECRET
 
 Если вход не подключён (нет ни Telegram, ни почты, и сервер на `/auth/me` отвечает `503 {"detail": "login_unavailable"}`), страница показывает спокойный экран «Вход пока не подключен. Мы готовим тестовую версию House Helper.», а не ошибку. Любой другой ответ, который не удалось понять (другой 503, 5xx, обрыв связи, чужая страница), по-прежнему показывается как сбой с кнопкой «Повторить».
 
-**Статус: реализовано и проверено локально; публично не развёрнуто.** Всё, что описано ниже, проверялось на локальном стенде и тестами. Публичной бета-версии нет: публичный HTTPS-адрес, настоящая почта (SMTP) и вход через Telegram, настоящий ключ OpenAI и оценка качества ответов, ограничения на входе, очистка по сроку хранения — отдельные этапы (см. «Не сделано в этой версии»).
+**Статус на момент выпуска R4B (2026-10-19): реализовано и проверено локально; публично не развёрнуто.** Позже появился технический экземпляр на `https://house.elivcloud.org` (английский раздел «Deployment status» выше): вход и OpenAI там не включены, страница сообщает, что вход не подключён. Всё, что описано ниже, проверялось на локальном стенде и тестами. Публичной бета-версии нет: настоящая почта (SMTP) и вход через Telegram, настоящий ключ OpenAI и оценка качества ответов, ограничения на входе, очистка по сроку хранения — отдельные этапы (см. «Не сделано в этой версии»).
 
 | Маршрут | Назначение |
 |---|---|
@@ -530,7 +769,7 @@ python -m uvicorn house_helper.web.asgi:app --host 127.0.0.1 --port 8000 --env-f
 - **Что страница хранит в браузере.** Только `sessionStorage` вкладки и только пока сообщение не разрешилось: чей это ход (`user_id` из `GET /auth/me` — только чтобы запись не вернулась другому человеку; в запросах он не отправляется, кроме заголовка `X-Expected-User` выхода, куда он берётся из памяти страницы, а не из хранилища), идентификатор разговора, ключ, точный текст, id последнего известного сообщения и время (`hh.pending.v1`, до 8 записей). Запись удаляется, когда сообщение разрешилось, при «Вернуть в поле ввода» (оно есть только у сообщения, которое сервер отклонил по причине самого запроса, `4xx`; `5xx` его не открывает) и при выходе (сразу, не дожидаясь ответа сервера). Повреждённое или чужое значение под этим ключом, **запись другого пользователя** (она не показывается, не учитывается и о её возрасте не говорится; запись без `user_id` — ничья) и каждая запись старше 6 часов **удаляются при чтении**, а не просто пропускаются: текст сообщения не лежит дольше, чем он может пригодиться (об удалённой по возрасту записи страница говорит один раз: проверьте историю). Если браузер не позволяет сохранять (приватный режим, переполнение, запрет), страница работает, но у неподтверждённого сообщения написано, что после закрытия или перезагрузки страницы восстановить его не получится и историю надо посмотреть до повторной отправки: восстановление после перезагрузки не гарантируется. Cookie сессии (`HttpOnly`, скрипту недоступна), токены и истории переписки страница не хранит. Если сессия закончилась, запись остаётся до следующего входа в этой вкладке — вернётся она только тому же пользователю (а восстановленное сообщение показывается только после того, как загружена история его разговора: ею же подтверждается, что разговор принадлежит вошедшему).
 - **Доступность.** Подписи у полей, видимый фокус с клавиатуры, кнопки не меньше 44×44 px, `aria-live` для статусов и ошибок, контраст текста не ниже 4,5:1 (палитра — токены `:root` в `app.css`, пары проверяет тест), `prefers-reduced-motion`.
 
-**Не сделано в этой версии** (отдельные этапы): избранное и настройки, голос, другие области House Helper, заголовки и удаление разговоров, потоковый ответ, автоочистка по сроку (команда `purge-expired` появилась позже, в R4C-D2, и по расписанию нигде не запущена), публичное развёртывание, ограничения на входе.
+**Не сделано в этой версии** (отдельные этапы): избранное и настройки, голос, другие области House Helper, заголовки и удаление разговоров, потоковый ответ, автоочистка по сроку (команда `purge-expired` появилась позже, в R4C-D2; таймер установлен, первый запуск по расписанию ещё не проверен), публичная бета-версия (технический экземпляр уже есть, см. «Deployment status»), ограничения на входе.
 
 ### Проверка в браузере (вручную)
 
@@ -590,7 +829,7 @@ python -m uvicorn house_helper.web.asgi:app --host 127.0.0.1 --port 8000 --env-f
 
 Текст сообщений, которые пользователь отправляет боту для получения рецептов, передаётся во внешний сервис **OpenAI** для генерации ответа. Бот сам не хранит данные в базе — только в оперативной памяти процесса, и полностью очищает их при перезапуске или по команде `/reset`. Не отправляйте боту личные или конфиденциальные данные. Бот сообщает об этом в ответ на `/start`.
 
-Веб-чат, наоборот, хранит сообщения в базе данных: срок хранения каждого сообщения — не более 365 дней (дата записана в `expires_at`, истёкшие сообщения не показываются и не передаются модели); физическое удаление выполняет команда оператора `purge-expired` (выпущена в коде, аудит пройден, по расписанию пока не запущена; в более старых резервных копиях удалённые сообщения сохраняются — `deploy/RUNBOOK.md`, раздел 14). Текст сообщений веб-чата тоже передаётся в OpenAI.
+Веб-чат, наоборот, хранит сообщения в базе данных: срок хранения каждого сообщения — не более 365 дней (дата записана в `expires_at`, истёкшие сообщения не показываются и не передаются модели); физическое удаление выполняет команда оператора `purge-expired` (выпущена в коде, аудит пройден; таймер установлен, первый запуск по расписанию ещё не проверен; в более старых резервных копиях удалённые сообщения сохраняются — `deploy/RUNBOOK.md`, раздел 14). Текст сообщений веб-чата тоже передаётся в OpenAI.
 
 ## Тесты
 

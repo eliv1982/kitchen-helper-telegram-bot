@@ -1,10 +1,13 @@
 # House Helper web application: deployment runbook (R4C-D1)
 
-**Status of this document: a repository-only kit. Nothing here has been run on the VPS.** Section 14
-(scheduled cleanup, R4C-D2) was added after the kit's release: its code is RELEASED in Git as `489ff30`
-(independent audit passed, owner accepted, CI green). Nothing in it is installed, scheduled or run on any host,
-and no real database has been processed.
-The commands were exercised locally on disposable resources (Docker 29.8, Compose 5.6,
+**Status of this document: the kit was released as repository-only (R4C-D1) and has since been used for the
+technical deployment of 2026-10-24** (commit `6370bf7`, image `house-helper:6370bf78980e`, database at
+`0006_oidc_state_invitation`; sign-in and OpenAI disabled, no real users; see `docs/STATUS.md`, "Current deployment
+state"). Section 14 (scheduled cleanup, R4C-D2) was added after the kit's release: its code is RELEASED in Git as
+`489ff30` (independent audit passed, owner accepted, CI green). Its systemd timer is installed and active on the VPS;
+its first automatic execution, scheduled for 2026-10-25, has not been verified. The encrypted off-host backup and a
+restore rehearsal are not yet completed.
+The commands were exercised locally on disposable resources before the deployment (Docker 29.8, Compose 5.6,
 Traefik 3.6.25 on loopback); see section 13 for what that does and does not prove. This
 revision answers an independent audit of the first version (restore while the database is in
 use, scratch space smaller than the database, a migration without a verified backup, and six
@@ -722,7 +725,7 @@ session. After any restore, check the schema, sign in, and send one message.
 None of these is waived. "Verified" means locally, on disposable resources: on 2026-10-22 for the first
 version of the kit and on 2026-10-23 for the remediation of its audit.
 
-### Pre-live deployment gates (built by R4C-D2, code released in Git, running nowhere)
+### Pre-live deployment gates (built by R4C-D2, code released in Git; timer installed, first run not yet verified)
 
 Two product requirements are **gates, not options**, and nothing in this document (a short beta, two users,
 an owner-only trial, a time limit on the trial) substitutes for either of them. R4C-D2 built them (section 14;
@@ -740,8 +743,8 @@ own and is not part of what D1's audits covered.
 
 | Gate | Status |
 |---|---|
-| **Scheduled cleanup** of expired sessions, OIDC states, invitations, email challenges | **CODE RELEASED IN GIT (R4C-D2, `489ff30`); NOT SCHEDULED ON ANY HOST, NOT DEPLOYED. Pre-live gate 1: required before real use.** `python -m house_helper.admin purge-expired` deletes each of them past its own expiry, in short batches, beside the web service (`hhops exec --shared`); `--dry-run` only counts. The opt-in systemd timer and service are in `deploy/systemd/` and are installed by nothing. **Open until** an image carrying the command is the running version on the VPS, the timer is enabled and its first run has been seen in the journal (section 14.9). |
-| **365-day physical deletion** of conversation history | **CODE RELEASED IN GIT (R4C-D2, `489ff30`); NOT SCHEDULED ON ANY HOST, NOT DEPLOYED. Pre-live gate 2: required before any real user data is stored; not waived.** The same command deletes messages and the turn requests that hold a copy of an answer 365 x 24 hours after their own creation, keeps the recent messages of an old conversation and removes conversations left empty. It is logical SQL deletion, not forensic erasure, and a deleted row survives in every older backup (section 14.7): the backup retention below bounds how real the promise is. **Open until** the same conditions as the row above. |
+| **Scheduled cleanup** of expired sessions, OIDC states, invitations, email challenges | **CODE RELEASED IN GIT (R4C-D2, `489ff30`); TIMER INSTALLED AND ACTIVE ON THE VPS (2026-10-24), FIRST RUN NOT YET VERIFIED. Pre-live gate 1: required before real use.** `python -m house_helper.admin purge-expired` deletes each of them past its own expiry, in short batches, beside the web service (`hhops exec --shared`); `--dry-run` only counts. The opt-in systemd timer and service are in `deploy/systemd/`; nothing in the repository installs them. **Open until** the timer's first automatic run (scheduled for 2026-10-25) has been seen in the journal (section 14.9); the running image already carries the command. |
+| **365-day physical deletion** of conversation history | **CODE RELEASED IN GIT (R4C-D2, `489ff30`); TIMER INSTALLED AND ACTIVE ON THE VPS (2026-10-24), FIRST RUN NOT YET VERIFIED. Pre-live gate 2: required before any real user data is stored; not waived.** The same command deletes messages and the turn requests that hold a copy of an answer 365 x 24 hours after their own creation, keeps the recent messages of an old conversation and removes conversations left empty. It is logical SQL deletion, not forensic erasure, and a deleted row survives in every older backup (section 14.7): the backup retention below bounds how real the promise is. **Open until** the same condition as the row above: the first automatic run seen in the journal. |
 | **Backup retention and off-host** | Backup, verify and restore **verified**; off-host target, encryption, retention and schedule **undecided and not installed.** BLOCKER before real data. R4C-D2 decides none of it (section 14.7). |
 | **Restore interlock** | **Verified** with unit tests on Linux and on a real Compose stack: a restore is refused while the web service runs (the lock is held by the uvicorn process itself), refused while a writer that ignores the lock is mid-transaction, a backup works beside the running service, a failed restore puts the old database back. **Cooperative**, with the limits stated in section 2 (a process that ignores the lock and starts after the final check; a damaged file cannot be probed; anything outside Docker). |
 | **Scratch space** | **Verified:** an 84 MB database (above the 64 MiB `/tmp` that failed in the first version) is backed up, verified and restored; too little space is refused before any write. Declared maximum database: 1 GiB (`MAX_DATABASE_BYTES`); a real 1 GiB database was **not** exercised (it needs about 2.2 GiB of free disk to restore). |
@@ -851,9 +854,10 @@ cooperative (section 2).
 ## 14. Scheduled cleanup and retention (R4C-D2)
 
 **Status: code RELEASED in Git as `489ff30` (independent audit passed, owner accepted, push-triggered CI green).
-Not installed, not scheduled, not deployed.** Nothing in this section has run on the VPS, no unit was copied to
-any host and no timer exists on any host, and no real database has been processed: the command was run only on disposable
-databases with synthetic rows. Every step marked **[OWNER]** changes
+The timer is installed and active on the VPS (owner-reported, 2026-10-24); its first automatic execution, scheduled for
+2026-10-25, has not been verified.** The statements about what was tested (section 13) are about the work before the
+deployment: the command was run on disposable databases with synthetic rows. No result of a run on the real database is
+claimed here. Every step marked **[OWNER]** changes
 something outside the repository and needs the owner's explicit approval first. The code is
 `house_helper/admin/retention.py`; the units are in `deploy/systemd/`. It adds no migration and changes no table.
 
@@ -1119,10 +1123,11 @@ none` instead of `used`, `revoked` or `expired`. The `telegram: linked` part com
 
 ### 14.9 Before this counts as running: checklist **[OWNER]**
 
-- [x] The independent audit of R4C-D2 is accepted and the code is released in Git (`489ff30`). This is the only item
-      on this list that is done.
+- [x] The independent audit of R4C-D2 is accepted and the code is released in Git (`489ff30`).
 - [ ] An image built from a commit that contains `purge-expired` is the running version, and `purge.env` names its tag.
-- [ ] The database is at the schema head (D2 adds no migration: `0006_oidc_state_invitation`).
+      (The running image, `house-helper:6370bf78980e`, was built from a later commit that contains the command; what
+      `purge.env` names was not reported.)
+- [x] The database is at the schema head (D2 adds no migration: `0006_oidc_state_invitation`). Reported 2026-10-24.
 - [ ] A `--dry-run` was read and the numbers made sense, first on a disposable database, then on the real one.
 - [ ] The host's clock is synchronised (14.3).
 - [ ] The timer: installed and enabled as in 14.4, the first run started by hand and its journal line read, and `list-timers`
@@ -1135,3 +1140,7 @@ none` instead of `used`, `revoked` or `expired`. The `telegram: linked` part com
       database only.
 - [ ] What the users are told about retention matches 14.7: deletion within about a day of the 365 days, older backups, and
       OpenAI's own settings.
+
+Reported state, 2026-10-24: the timer is installed and active and its first automatic run, scheduled for 2026-10-25, has not
+been verified. The unchecked items above were not reported as done and stay open; the timer item stays unchecked until the
+first run's journal line has been read.
