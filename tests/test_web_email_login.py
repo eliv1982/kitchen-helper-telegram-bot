@@ -82,7 +82,7 @@ async def test_an_allowlisted_address_is_mailed_a_link(tmp_path):
         assert "Если этот адрес есть в списке разрешённых" in body["message"]
         assert "Ссылка действует 10 минут" in body["message"]
         (mail,) = h.mailer.sent
-        assert mail.to == ADDRESS and mail.subject == "Вход в Kitchen Helper"
+        assert mail.to == ADDRESS and mail.subject == "Вход в House Helper"
         link = parse_link(h.mailer.last_url())
         assert link.url.startswith(ORIGIN + "/auth/email/confirm?c=")
         assert UUID(link.challenge_id) and re.fullmatch(r"[A-Za-z0-9_-]{43}", link.token)

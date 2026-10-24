@@ -152,7 +152,7 @@ def create_app(
     one the settings describe, or none at all).
     """
     app = FastAPI(
-        title="Kitchen Helper",
+        title="House Helper",
         lifespan=_lifespan,
         docs_url=None,
         redoc_url=None,

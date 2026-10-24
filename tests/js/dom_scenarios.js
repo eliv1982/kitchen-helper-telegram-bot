@@ -31,6 +31,12 @@ function useShell(html) {
   shellHtml = html;
 }
 
+// The shell of a deployment with no way of signing in at all (what a server with login not connected sends).
+let noLoginShellHtml = null;
+function useNoLoginShell(html) {
+  noLoginShellHtml = html;
+}
+
 const URL_A = `/api/conversations/${CONV_A}/messages`;
 const HOSTILE = [
   '<img src=x onerror=alert(1)>',
@@ -161,6 +167,66 @@ scenario("an_unreachable_service_is_not_the_login_screen_and_retry_goes_on", asy
   await page.settle();
   assert.equal(page.visible("screen-app"), true);
   assert.equal(page.visible("screen-unavailable"), false);
+});
+
+scenario("login_not_connected_shows_the_calm_setup_screen_and_not_the_failure_screen", async () => {
+  const page = await open((env) => env.net.route("GET", "/auth/me", json(503, { detail: "login_unavailable" })), { shell: noLoginShellHtml });
+
+  assert.deepEqual(["gate", "screen-setup"].map(page.visible), [true, true]);
+  assert.deepEqual(["screen-loading", "screen-unavailable", "screen-login", "screen-app", "chat"].map(page.visible), [false, false, false, false, false]);
+  assert.equal(page.el("setup-title").textContent, "House Helper");
+  assert.equal(page.el("setup-text").textContent, "Вход пока не подключен. Мы готовим тестовую версию House Helper.");
+  assert.equal(page.doc.activeElement, page.el("setup-title"));
+  assert.equal(page.el("gate").getAttribute("aria-busy"), "false");
+
+  // Not dressed as a failure: no alert, no error colour, nothing said in the alert region, no id, nothing to press.
+  assert.equal(page.el("setup-text").getAttribute("role"), null);
+  assert.ok(!page.el("setup-text").className.includes("notice-error"));
+  assert.equal(page.el("alerter").textContent, "");
+  assert.equal(page.el("unavailable-text").textContent, "");
+  assert.equal(page.el("unavailable-id").textContent, "");
+  assert.equal(page.el("screen-setup").byTag("button").length, 0);
+
+  // Nothing of the conversations is drawn, nothing is stored, and the page asked once and does not ask again.
+  assert.equal(page.el("conversation-list").elements().length, 0);
+  assert.equal(page.env.storage.record, null);
+  assert.equal(page.env.net.log.length, 1);
+  await page.env.timers.advance(120000);
+  assert.equal(page.env.net.log.length, 1);
+});
+
+scenario("real_failures_still_get_the_failure_screen_when_login_is_not_connected_here", async () => {
+  const answers = [
+    json(503, { detail: "temporarily_unavailable" }),
+    json(503, { detail: "service_unavailable" }),
+    json(500, { detail: "server_error" }),
+    text(502, "<html>Bad Gateway</html>"),
+    text(503, "login_unavailable"),
+    json(502, { detail: "login_unavailable" }),
+    fail(),
+  ];
+  for (const answer of answers) {
+    const page = await open((env) => env.net.route("GET", "/auth/me", answer), { shell: noLoginShellHtml });
+    const label = JSON.stringify(answer);
+
+    assert.equal(page.visible("screen-unavailable"), true, label);
+    assert.equal(page.visible("screen-setup"), false, label);
+    assert.equal(page.visible("screen-login"), false, label);
+    assert.equal(page.el("unavailable-text").getAttribute("role"), "alert", label);
+    assert.ok(page.el("unavailable-text").textContent.length > 0, label);
+    assert.ok(!page.root().includes("login_unavailable"), "a code is never shown to a person: " + label);
+    assert.equal(page.el("unavailable-retry").textContent, Logic.TEXT.retry, label);
+  }
+});
+
+scenario("the_signed_in_page_is_called_house_helper_and_the_gate_screens_stay_out_of_the_way", async () => {
+  const page = await open(oneConversation());
+
+  assert.equal(page.visible("screen-app"), true);
+  assert.deepEqual(["gate", "screen-setup", "screen-unavailable", "screen-login"].map(page.visible), [false, false, false, false]);
+  assert.deepEqual(page.el("screen-app").byClass("brand").map((node) => node.textContent), ["House Helper"]);
+  assert.ok(page.root().includes("House Helper") && !page.root().includes("Кухонный помощник") && !page.root().includes("Kitchen Helper"));
+  assert.ok(page.articleTexts().some((text) => text.includes("Старый вопрос")), "the conversation is drawn as before");
 });
 
 scenario("the_application_lists_conversations_and_shows_the_latest_with_who_said_what", async () => {
@@ -937,4 +1003,4 @@ scenario("the_view_has_everything_the_page_reads", async () => {
   for (const name of used("Logic")) assert.ok(name in Logic, "Logic." + name);
 });
 
-module.exports = { scenarios, useShell };
+module.exports = { scenarios, useShell, useNoLoginShell };

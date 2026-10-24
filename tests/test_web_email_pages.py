@@ -60,6 +60,13 @@ ALL_PAGES = {
 }
 
 
+def test_the_confirmation_page_is_branded_house_helper():
+    page = confirm()
+
+    assert "<title>Вход в House Helper</title>" in page.html and "<h1>Вход в House Helper</h1>" in page.html
+    assert "Kitchen" not in page.html and "Кухонн" not in page.html
+
+
 # --- the policy ---------------------------------------------------------------------------
 
 

@@ -42,7 +42,7 @@ PASSWORD = "mail-password-0f9e8d7c"
 def test_the_message_is_in_russian_and_holds_the_link_once_and_nothing_else_to_open():
     message = compose_login_email(ADDRESS, LINK, timedelta(minutes=10))
 
-    assert message.subject == "Вход в Kitchen Helper"
+    assert message.subject == "Вход в House Helper"
     assert message.to == ADDRESS
     assert re.findall(r"https?://\S+", message.body) == [LINK]
     assert "Ссылка действует 10 минут" in message.body
@@ -148,11 +148,11 @@ def test_the_built_message_has_the_headers_a_receiving_server_expects():
     message = built()
 
     assert message["To"] == ADDRESS
-    assert message["From"] == f"Kitchen Helper <{SENDER}>"
+    assert message["From"] == f"House Helper <{SENDER}>"
     assert message["Auto-Submitted"] == "auto-generated"
     assert message["Message-ID"].endswith("@kitchen.example.test>")
     assert re.fullmatch(r"[A-Z][a-z]{2}, \d{1,2} [A-Z][a-z]{2} \d{4} \d\d:\d\d:\d\d (\+0000|GMT)", str(message["Date"]))
-    assert str(message["Subject"]) == "Вход в Kitchen Helper"
+    assert str(message["Subject"]) == "Вход в House Helper"
     assert message.get_content_type() == "text/plain" and message.get_content_charset() == "utf-8"
 
 

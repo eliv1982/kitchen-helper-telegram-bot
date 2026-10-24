@@ -110,7 +110,7 @@ async def test_the_shell_is_a_russian_html_page_made_for_this_request(tmp_path):
     html = response.text
     assert html.startswith("<!doctype html>") and '<html lang="ru">' in html
     assert '<meta charset="utf-8">' in html and "width=device-width" in html
-    assert "<title>Кухонный помощник</title>" in html
+    assert "<title>House Helper</title>" in html
     assert 'name="robots" content="noindex"' in html
 
 
@@ -240,12 +240,87 @@ def test_all_the_text_a_person_reads_is_russian():
     page = shell_for(telegram=True, email=True)
     words = {word for line in page.text for word in re.findall(r"[A-Za-z][A-Za-z+]*", line)}
 
-    assert words <= {"Telegram", "Ctrl+Enter", "JavaScript"}, words  # names, written as everyone writes them
-    assert any("Кухонный помощник" in line for line in page.text)
+    assert words <= {"Telegram", "Ctrl+Enter", "JavaScript", "House", "Helper"}, words  # names, written as everyone writes them
+    assert any("House Helper" in line for line in page.text)
     for tag, attrs in page.tags:
         for name in ("placeholder", "aria-label", "title"):
             if name in attrs:
                 assert not re.search(r"[A-Za-z]{3,}", attrs[name]), (name, attrs[name])
+
+
+SETUP_TEXT = "Вход пока не подключен. Мы готовим тестовую версию House Helper."
+
+
+@pytest.mark.parametrize(
+    "telegram, email",
+    [(True, False), (False, True), (True, True), (False, False)],
+)
+def test_the_product_is_house_helper_everywhere_the_page_names_itself_and_the_kitchen_is_only_described(telegram, email):
+    import re
+
+    html = ui.render_shell(telegram=telegram, email=email)
+
+    headings = [h.strip() for h in re.findall(r"<h1[^>]*>(.*?)</h1>", html, re.S) if h.strip()]
+    assert headings and set(headings) == {"House Helper"}, headings  # <noscript>, failure, setup and login screens
+    assert "<title>House Helper</title>" in html
+    assert '<p class="brand">House Helper</p>' in html
+    assert "Кухонный помощник" not in html and "Кухонного помощника" not in html and "Kitchen Helper" not in html
+    # What the assistant does today is still said: the kitchen is the first module, not the name of the product.
+    assert "Помощник по домашней кухне" in html
+
+
+def test_the_icon_is_named_for_the_product():
+    icon = (STATIC / "icon.svg").read_text(encoding="utf-8")
+
+    assert 'aria-label="House Helper"' in icon and "Кухонный" not in icon
+
+
+def test_the_setup_screen_is_a_calm_hidden_notice_with_nothing_to_press():
+    import re
+
+    html = ui.render_shell(telegram=False, email=False)
+    page = Shell(html)
+
+    assert "hidden" in page.by_id("screen-setup")  # the script shows it; nothing else does
+    assert page.by_id("screen-setup")["aria-labelledby"] == "setup-title"
+    assert page.by_id("setup-title").get("tabindex") == "-1"  # (the script moves focus to it, as for the other screens)
+    assert page.by_id("setup-text")["class"] == "notice"  # not "notice-error"
+    assert "role" not in page.by_id("setup-text")  # not an alert: nothing is wrong
+    assert SETUP_TEXT in page.text
+    section = re.search(r'<section id="screen-setup".*?</section>', html, re.S).group(0)
+    assert "<button" not in section and "<a " not in section and "<form" not in section
+    # Said in Russian, in the words the product asked for, and with no code, address or detail of the deployment.
+    for forbidden in ("login_unavailable", "503", "Telegram", "SMTP", "OIDC", "client", "secret", "OPENAI", "env"):
+        assert forbidden not in section, forbidden
+
+
+@pytest.mark.parametrize(
+    "telegram, email",
+    [(True, False), (False, True), (True, True), (False, False)],
+)
+def test_the_setup_screen_does_not_depend_on_which_sign_in_choices_are_drawn(telegram, email):
+    page = shell_for(telegram=telegram, email=email)
+
+    assert "screen-setup" in page.ids and "setup-title" in page.ids and "setup-text" in page.ids
+    assert "hidden" in page.by_id("screen-setup")
+
+
+@pytest.mark.asyncio
+async def test_a_deployment_without_login_serves_the_page_with_no_choice_and_answers_the_page_503_login_unavailable(tmp_path):
+    app = create_app(settings_for(tmp_path / "off.db"))
+    async with serving(app) as client:
+        page = await client.get("/")
+        me = await client.get("/auth/me")
+
+    shell = Shell(page.text)
+    body = next(attrs for tag, attrs in shell.tags if tag == "body")
+    assert page.status_code == 200 and SETUP_TEXT in shell.text
+    assert (body["data-telegram"], body["data-email"]) == ("0", "0")
+    assert "login-telegram" not in shell.ids and "email-form" not in shell.ids  # no button leads to a 503
+    # The one answer the page reads as "login is not connected" -- and it gives nobody a session.
+    assert me.status_code == 503 and me.json() == {"detail": "login_unavailable"}
+    assert "set-cookie" not in me.headers
+    assert "login_unavailable" not in page.text  # the code is for the script, never for a person
 
 
 # --- headers ------------------------------------------------------------------------------------------------

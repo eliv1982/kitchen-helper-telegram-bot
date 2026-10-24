@@ -70,6 +70,14 @@ ALL_PAGES = {
 }
 
 
+def test_the_pages_name_the_product_house_helper():
+    for name, page in ALL_PAGES.items():
+        assert "Кухонн" not in page.html and "Kitchen" not in page.html, name
+    assert "<title>Приглашение в House Helper</title>" in INVITATION.html
+    assert "<h1>Приглашение в House Helper</h1>" in INVITATION.html
+    assert "Вы вошли в House Helper." in visible_text(invite_pages.done_page())
+
+
 # --- the policy ---------------------------------------------------------------------------
 
 

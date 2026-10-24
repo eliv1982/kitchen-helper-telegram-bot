@@ -28,6 +28,8 @@
     unavailableText: byId("unavailable-text"),
     unavailableId: byId("unavailable-id"),
     unavailableRetry: byId("unavailable-retry"),
+    setup: byId("screen-setup"),
+    setupTitle: byId("setup-title"),
     login: byId("screen-login"),
     loginTitle: byId("login-title"),
     loginNotice: byId("login-notice"),
@@ -230,6 +232,7 @@
     els.gate.hidden = screen === "app";
     els.loading.hidden = !waiting;
     els.unavailable.hidden = !apart;
+    els.setup.hidden = screen !== "setup";
     els.login.hidden = screen !== "login";
     els.app.hidden = screen !== "app";
     els.chat.hidden = screen !== "app";
@@ -255,6 +258,8 @@
       }
       if (screen === "login") {
         els.loginTitle.focus();
+      } else if (screen === "setup") {
+        els.setupTitle.focus();
       } else if (apart) {
         els.unavailableTitle.focus();
       } else if (screen === "app") {

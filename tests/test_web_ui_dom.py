@@ -1,14 +1,15 @@
 """The page's own script (app.js) run in Node against the shell the server sends.
 
 A mini DOM (tests/js/fake_dom.js) holds the shell that house_helper.web.ui.render_shell makes
-for a deployment with both ways of signing in; the script is run in it against a scripted
+for a deployment with both ways of signing in (and, for the "login not connected" scenarios, the
+one for a deployment with neither); the script is run in it against a scripted
 server and fake timers, and the scenarios of tests/js/dom_scenarios.js press its buttons, type
 into its box and look at what it drew: that hostile text stays text, that the composer, the
 retry buttons, the drawer and the sign-out do what they say.
 
 This is NOT a browser and says nothing about how the page looks: there is no layout, no style,
 no real focus or scrolling, and a real browser can differ. It is also run against the shell with
-both sign-in choices only. What was tried in a real browser, and what was not, is in the README
+both sign-in choices only (the "login not connected" scenarios apart). What was tried in a real browser, and what was not, is in the README
 ("Проверка в браузере"). Needs Node.js; skipped without it.
 """
 
@@ -40,9 +41,12 @@ NAMES = _node("--list")["names"] if NODE is not None else []
 
 @pytest.fixture(scope="module")
 def results(tmp_path_factory):
-    shell = tmp_path_factory.mktemp("dom") / "shell.html"
+    folder = tmp_path_factory.mktemp("dom")
+    shell = folder / "shell.html"
     shell.write_text(ui.render_shell(telegram=True, email=True), encoding="utf-8")
-    return _node(f"--shell={shell}")["results"]
+    no_login = folder / "shell-nologin.html"
+    no_login.write_text(ui.render_shell(telegram=False, email=False), encoding="utf-8")
+    return _node(f"--shell={shell}", f"--shell-nologin={no_login}")["results"]
 
 
 def test_the_scenarios_were_found():

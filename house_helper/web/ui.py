@@ -121,7 +121,7 @@ _SHELL = """\
 <meta name="robots" content="noindex">
 <meta name="color-scheme" content="light">
 <meta name="theme-color" content="#1c3f94">
-<title>Кухонный помощник</title>
+<title>House Helper</title>
 <link rel="icon" type="image/svg+xml" href="/static/icon.svg">
 <link rel="stylesheet" href="/static/app.css">
 </head>
@@ -129,7 +129,7 @@ _SHELL = """\
 <div id="announcer" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></div>
 <div id="alerter" class="visually-hidden" role="alert" aria-atomic="true"></div>
 <noscript>
-  <div class="card card-center"><h1>Кухонный помощник</h1>
+  <div class="card card-center"><h1>House Helper</h1>
   <p>Для работы помощника нужен включённый JavaScript. Включите его в настройках браузера и обновите страницу.</p></div>
 </noscript>
 
@@ -139,14 +139,19 @@ _SHELL = """\
   </section>
 
   <section id="screen-unavailable" class="card card-center" aria-labelledby="unavailable-title" hidden>
-    <h1 id="unavailable-title" tabindex="-1">Кухонный помощник</h1>
+    <h1 id="unavailable-title" tabindex="-1">House Helper</h1>
     <p id="unavailable-text" class="notice notice-error" role="alert"></p>
     <p id="unavailable-id" class="hint" hidden></p>
     <button id="unavailable-retry" class="btn btn-primary" type="button">Повторить</button>
   </section>
 
+  <section id="screen-setup" class="card card-center" aria-labelledby="setup-title" hidden>
+    <h1 id="setup-title" tabindex="-1">House Helper</h1>
+    <p id="setup-text" class="notice">Вход пока не подключен. Мы готовим тестовую версию House Helper.</p>
+  </section>
+
   <section id="screen-login" class="card card-center" aria-labelledby="login-title" hidden>
-    <h1 id="login-title" tabindex="-1">Кухонный помощник</h1>
+    <h1 id="login-title" tabindex="-1">House Helper</h1>
     <p class="lead">Помощник по домашней кухне: подскажет, что приготовить из того, что есть дома, и расскажет, как приготовить блюдо.</p>
     <div id="login-notice" class="notice" role="status" hidden></div>
 @LOGIN@  </section>
@@ -155,7 +160,7 @@ _SHELL = """\
 <div id="screen-app" class="app" data-drawer="closed" hidden>
   <header class="topbar">
     <button id="drawer-toggle" class="btn btn-onblue drawer-toggle" type="button" aria-controls="sidebar" aria-expanded="false"><span class="burger" aria-hidden="true"></span>Разговоры</button>
-    <p class="brand">Кухонный помощник</p>
+    <p class="brand">House Helper</p>
     <button id="logout" class="btn btn-onblue" type="button">Выйти</button>
   </header>
   <div class="workspace">

@@ -129,7 +129,7 @@ def confirm_page(challenge_id: str, masked_address: str) -> Page:
     `challenge_id` must already be a validated challenge id (it is put into the
     page); the masked address is escaped regardless."""
     body = (
-        "<h1>Вход в Kitchen Helper</h1>\n"
+        "<h1>Вход в House Helper</h1>\n"
         f"<p>Вход для адреса <strong>{html.escape(masked_address)}</strong>.</p>\n"
         f'<form id="login" method="post" action="{CONFIRM_ACTION}" autocomplete="off">\n'
         f'<input type="hidden" name="c" value="{html.escape(challenge_id, quote=True)}">\n'
@@ -143,7 +143,7 @@ def confirm_page(challenge_id: str, masked_address: str) -> Page:
         "<noscript><p>Для входа нужен включённый JavaScript — ссылка передаёт секрет браузеру "
         "так, чтобы он не попадал на сервер до вашего подтверждения.</p></noscript>"
     )
-    return _document("Вход в Kitchen Helper", body, script=True, status_code=200)
+    return _document("Вход в House Helper", body, script=True, status_code=200)
 
 
 def _message_page(title: str, message: str, status_code: int) -> Page:

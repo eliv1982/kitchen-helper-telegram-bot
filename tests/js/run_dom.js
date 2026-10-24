@@ -1,7 +1,8 @@
 "use strict";
 /*
  * Runs the scenarios of dom_scenarios.js against the shell in the file given as --shell=PATH
- * (tests/test_web_ui_dom.py writes what house_helper.web.ui.render_shell makes) and prints
+ * (tests/test_web_ui_dom.py writes what house_helper.web.ui.render_shell makes) and, for the
+ * scenarios of a deployment with no way of signing in, the one in --shell-nologin=PATH. Prints
  * {"results": {name: {ok, error?}}} as one JSON line. --list prints the names.
  */
 
@@ -10,7 +11,7 @@ process.env.TZ = "UTC";
 const fs = require("node:fs");
 const assert = require("node:assert/strict");
 const H = require("./harness.js");
-const { scenarios, useShell } = require("./dom_scenarios.js");
+const { scenarios, useShell, useNoLoginShell } = require("./dom_scenarios.js");
 
 const args = Object.fromEntries(
   process.argv.slice(2).map((arg) => {
@@ -44,6 +45,7 @@ async function run(name) {
     return;
   }
   useShell(fs.readFileSync(args.shell, "utf8"));
+  useNoLoginShell(fs.readFileSync(args["shell-nologin"], "utf8"));
   const results = {};
   for (const name of Object.keys(scenarios)) {
     results[name] = await run(name);

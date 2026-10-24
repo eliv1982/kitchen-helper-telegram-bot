@@ -46,7 +46,7 @@ from house_helper.web.settings import EmailSettings
 
 logger = logging.getLogger(__name__)
 
-PRODUCT_NAME = "Kitchen Helper"
+PRODUCT_NAME = "House Helper"
 CONFIRM_PATH = "/auth/email/confirm"
 
 

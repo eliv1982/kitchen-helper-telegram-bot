@@ -200,8 +200,8 @@ def invitation_page() -> Page:
     """The page the invitation link opens: what this is, and the button that starts the
     sign-in. The same page for everybody and every link: it does not know the invitation."""
     body = (
-        "<h1>Приглашение в Кухонный помощник</h1>\n"
-        "<p>Вас пригласили пользоваться Кухонным помощником. Чтобы получить доступ, "
+        "<h1>Приглашение в House Helper</h1>\n"
+        "<p>Вас пригласили пользоваться House Helper. Чтобы получить доступ, "
         "подтвердите свой аккаунт в Telegram.</p>\n"
         '<p><button id="go" type="button" disabled>Продолжить через Telegram</button></p>\n'
         '<p id="status" role="status" hidden></p>\n'
@@ -212,7 +212,7 @@ def invitation_page() -> Page:
         "передаётся браузеру так, чтобы он не попадал на сервер до вашего подтверждения.</p>"
         "</noscript>"
     )
-    return _document("Приглашение в Кухонный помощник", body, script=True, status_code=200)
+    return _document("Приглашение в House Helper", body, script=True, status_code=200)
 
 
 def _message_page(
@@ -235,7 +235,7 @@ def done_page() -> Page:
     """What a person sees once their Telegram account is linked and they are signed in."""
     return _message_page(
         "Готово: Telegram привязан",
-        "Вы вошли в Кухонный помощник. В следующий раз входите кнопкой «Войти через "
+        "Вы вошли в House Helper. В следующий раз входите кнопкой «Войти через "
         "Telegram»: приглашение больше не понадобится.",
         200,
         application_link="Открыть помощника",

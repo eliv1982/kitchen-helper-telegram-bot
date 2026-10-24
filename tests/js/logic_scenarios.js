@@ -133,6 +133,96 @@ scenario("boot_answers_that_are_not_ours_are_unavailable_never_login", async () 
   }
 });
 
+scenario("boot_login_unavailable_is_the_setup_screen_not_a_failure", async () => {
+  const env = makeEnv();
+  // What the server answers when no way of signing in is connected (house_helper/web/auth.py): a code, no id.
+  env.net.route("GET", "/auth/me", json(503, { detail: "login_unavailable" }));
+  const view = await env.boot();
+
+  assert.equal(view.screen, "setup");
+  assert.equal(view.failure, null, "nothing failed: nothing to retry or to number");
+  assert.equal(view.notice, null);
+  assert.equal(view.list.items.length, 0);
+  assert.equal(env.net.log.length, 1, "nothing else is asked, and nothing is retried by itself");
+  await env.timers.advance(120000);
+  assert.equal(env.net.log.length, 1);
+  assert.equal(env.view().screen, "setup");
+});
+
+scenario("boot_login_unavailable_is_only_the_applications_own_503", async () => {
+  const answers = [
+    // the other 503s of the application, and of its proxy: failures
+    json(503, { detail: "service_unavailable", correlation_id: "hh-0000000000000001" }),
+    json(503, { detail: "temporarily_unavailable" }),
+    json(503, {}),
+    text(503, "<html>Service Unavailable</html>"),
+    text(503, "login_unavailable"),
+    text(503, "<html><body>login_unavailable</body></html>"),
+    json(503, { detail: ["login_unavailable"] }),
+    json(503, { detail: "LOGIN_UNAVAILABLE" }),
+    json(503, { message: "login_unavailable" }),
+    // the same code under any other status: not the application saying it
+    json(500, { detail: "login_unavailable" }),
+    json(502, { detail: "login_unavailable" }),
+    json(504, { detail: "login_unavailable" }),
+    json(403, { detail: "login_unavailable" }),
+    json(404, { detail: "login_unavailable" }),
+    json(200, { detail: "login_unavailable" }),
+    fail(),
+  ];
+  for (const answer of answers) {
+    const env = makeEnv();
+    env.net.route("GET", "/auth/me", answer);
+    const view = await env.boot();
+    assert.equal(view.screen, "unavailable", JSON.stringify(answer));
+    assert.ok(view.failure && /[А-Яа-я]/.test(view.failure.text), JSON.stringify(answer));
+    assert.equal(view.failure.retry, "start");
+  }
+});
+
+scenario("setup_screen_is_not_a_dead_end_when_login_is_connected_later", async () => {
+  const env = makeEnv();
+  env.net.route("GET", "/auth/me", json(503, { detail: "login_unavailable" }), notAuthenticated());
+  assert.equal((await env.boot()).screen, "setup");
+
+  await env.ctl.recover(); // the page was reopened or the button of another screen pressed: it asks from the beginning
+  await env.settle();
+  assert.equal(env.view().screen, "login", "now a way of signing in exists, and nobody is signed in");
+  assert.equal(env.view().notice, null);
+});
+
+scenario("login_unavailable_never_opens_the_application_or_touches_a_signed_in_page", async () => {
+  const env = makeEnv().signedIn([conversation(CONV_A, 0)], { [CONV_A]: historyBody(CONV_A, OLD_EXCHANGE) });
+  await env.boot();
+  assert.equal(env.view().screen, "app");
+
+  // The same question, answered "no login here" while somebody's conversations are open: not a setup page, and the
+  // conversations are held back like for any answer that cannot say who is signed in.
+  env.net.route("GET", "/auth/me", json(503, { detail: "login_unavailable" }));
+  env.ctl.recheck();
+  await env.settle();
+  const view = env.view();
+  assert.equal(view.screen, "unverified");
+  assert.equal(view.failure.retry, "verify");
+  assert.ok(view.failure.text.startsWith(Logic.TEXT.unverified) && !view.failure.text.includes("undefined"), view.failure.text);
+  assert.equal(view.thread.items.length, 0);
+  assert.equal(view.list.items.length, 0);
+});
+
+scenario("classify_me_tells_the_setup_state_from_every_other_answer", async () => {
+  const now = Date.UTC(2026, 9, 24, 12, 0, 0);
+  const ok = Logic.classifyMe(
+    { kind: "http", status: 200, jsonOk: true, json: { user_id: "11111111-1111-4111-8111-111111111111", session_expires_at: "2026-10-25T12:00:00Z" } },
+    now
+  );
+  assert.deepEqual([ok.type, ok.userId], ["ok", "11111111-1111-4111-8111-111111111111"], "a signed-in answer is read exactly as before");
+  assert.equal(Logic.classifyMe({ kind: "http", status: 401, jsonOk: true, json: { detail: "not_authenticated" } }, now).type, "auth");
+  assert.equal(Logic.classifyMe({ kind: "http", status: 503, jsonOk: true, json: { detail: "login_unavailable" } }, now).type, "setup");
+  assert.equal(Logic.classifyMe({ kind: "http", status: 503, jsonOk: true, json: { detail: "temporarily_unavailable" } }, now).type, "unavailable");
+  assert.equal(Logic.classifyMe({ kind: "http", status: 503, jsonOk: false, json: null }, now).type, "unavailable");
+  assert.equal(Logic.classifyMe({ kind: "network", timedOut: false }, now).type, "unavailable");
+});
+
 scenario("boot_timeout_is_unavailable", async () => {
   const env = makeEnv();
   env.net.route("GET", "/auth/me", hang());

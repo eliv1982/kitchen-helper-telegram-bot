@@ -106,7 +106,6 @@
   // --- the words ----------------------------------------------------------------------
 
   var TEXT = {
-    appName: "Кухонный помощник",
     authExpired: "Сессия закончилась или была прекращена. Войдите снова.",
     unavailable: "Сервис временно недоступен. Попробуйте ещё раз чуть позже.",
     network: "Нет связи с сервером. Проверьте интернет и попробуйте ещё раз.",
@@ -522,6 +521,10 @@
 
   // GET /auth/me: 200 is a signed-in user, a definite 401 is not, and everything else is a
   // service that cannot say (network, timeout, 5xx, a proxy's page): never "signed out".
+  // The one 5xx that is an answer is the application's own {"detail": "login_unavailable"} (a 503):
+  // it says no way of signing in is connected on this deployment, which is how it was set up, not
+  // a failure ("setup"). It names nobody and lets nobody in; any other 503, or the same words
+  // from anything but the application's JSON, stay failures.
   // A 200 is a session only if it also says when it ends (session_expires_at, an absolute
   // time): without a usable deadline it is an answer that is not the application's, and
   // none is invented. A deadline that is already behind the clock is not a session either.
@@ -533,6 +536,10 @@
     }
     if (response.status === 401) {
       return { type: "auth" };
+    }
+    if (response.status === 503 && readAuthCode(response) === "login_unavailable") {
+      // (text: what a page that is already signed in says, should this ever be the answer to its question)
+      return { type: "setup", text: TEXT.unavailable, correlationId: null };
     }
     if (
       response.status === 200 &&
@@ -1182,6 +1189,16 @@
       emit();
     }
 
+    // No way of signing in is connected here (see classifyMe): the page says so, calmly, and has
+    // nothing to retry. Nobody is signed in and nothing of anyone is shown.
+    function showSetup() {
+      cancelAllTimers();
+      state.screen = "setup";
+      state.notice = null;
+      state.failure = null;
+      emit();
+    }
+
     // `retry` is what the button of this screen does: "start" (ask who is signed in, from the
     // beginning) or "logout" (leave again).
     function showUnavailable(found) {
@@ -1319,6 +1336,8 @@
           await enterApp();
         } else if (found.type === "auth") {
           showLogin(found.expired ? { kind: "error", text: TEXT.authExpired } : null);
+        } else if (found.type === "setup") {
+          showSetup();
         } else {
           showUnavailable(found);
         }
