@@ -5,3 +5,5 @@
 # The same for the systemd units and their environment template (R4C-D2): systemd reads them
 # on the Linux host, and a CRLF would end up inside a value or a command line.
 systemd/* text eol=lf
+# The off-host backup runs on the Linux host as `python3 deploy/offsite_backup.py`.
+offsite_backup.py text eol=lf

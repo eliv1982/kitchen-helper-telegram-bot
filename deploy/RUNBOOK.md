@@ -35,6 +35,7 @@ VPS or domain is introduced, and the shared Traefik and the other applications a
 | `deploy/new-env-file.sh` | creates the secret environment file; refuses to touch one that exists |
 | `deploy/.gitattributes` | keeps the scripts' and units' line endings LF on a Windows checkout |
 | `deploy/systemd/house-helper-purge.service`, `.timer`, `.env.example` | **R4C-D2, opt-in, installed by nothing:** the systemd oneshot service and daily timer that run the cleanup (section 14) |
+| `deploy/ops/dbtool.py sanitize`, `deploy/offsite_backup.py`, `deploy/systemd/house-helper-offsite-backup.service`, `.timer`, `house-helper-offsite.env.example` | **opt-in, installed by nothing:** the encrypted off-host backup (section 15): a snapshot rewritten without deleted rows, packed, encrypted with `age` for a public key, uploaded with `rclone`, read back, and rotated (7 daily + 4 weekly) |
 | `deploy/RUNBOOK.md` | this document |
 
 ## 2. Design
@@ -647,6 +648,7 @@ Encrypt before it leaves the host, for example with `age -r <recipient public ke
 then `rclone`/`scp` the `.age` file; keep the private key off the VPS. Neither tool is installed
 here and no schedule is configured. A nightly job would be a systemd timer or cron entry running
 `backup.sh` (which already verifies), then the copy, alerting on any non-zero exit.
+The repository now holds the mechanism for this copy, not installed and not run against a real account: **section 15**.
 **Retention [OWNER: decide]:** a deleted conversation survives in every older backup, so the backup
 retention bounds how real the 365-day deletion promise is (section 12). A common starting point is
 7 daily and 4 weekly copies.
@@ -1144,3 +1146,473 @@ none` instead of `used`, `revoked` or `expired`. The `telegram: linked` part com
 Reported state, 2026-10-24: the timer is installed and active and its first automatic run, scheduled for 2026-10-25, has not
 been verified. The unchecked items above were not reported as done and stay open; the timer item stays unchecked until the
 first run's journal line has been read.
+
+## 15. Encrypted off-host backup (`age`, `rclone`, Yandex Disk)
+
+**Status: the repository side only.** `deploy/offsite_backup.py`, the `sanitize` command of `dbtool`, three systemd
+templates and their tests exist in the working tree. **Nothing is installed, scheduled or deployed; no key pair exists; the
+tool has never run against a real Yandex Disk account, a real `age` or a real `rclone`** (the tests use fakes for those
+three and the real `dbtool` on synthetic SQLite; section 15.9 lists what is still to be done and by whom). Every step marked
+**[OWNER]** changes something outside the repository.
+
+### 15.1 What a run does
+
+`python3 deploy/offsite_backup.py run ...` (the unit starts exactly this) does six things, in this order, and stops at the
+first that fails:
+
+1. **Backup** with `deploy/backup.sh` (unchanged), into a private 0700 directory under `/run/house-helper-offsite`: SQLite's
+   online backup, checked and verified by a disposable container, published as a `.db` / `.db.sha256` pair. The tool re-checks
+   the pair byte for byte (the exact one-line rule of section 10; not `sha256sum -c`).
+2. **Rewrite** the snapshot with `dbtool sanitize`, in a disposable container with no network, a read-only root, no capability
+   and no volume of the data (the same isolation as the verification inside `backup.sh`). SQLite does not erase a deleted
+   row: it stays in the freed page or in the slack of its page, and the online backup copies those pages as they are. The
+   rewrite is `VACUUM INTO` on the **snapshot** with `secure_delete` on for that connection: a new file from the live rows only.
+   The live database is never opened by it, vacuumed or reconfigured. The result must pass the checks of a backup (integrity,
+   foreign keys, this application's schema, at the head), hold exactly the tables and row counts of its input, and have no free
+   page; its SHA-256 on the host must equal the one the tool reported.
+3. **Verify** the rewritten file in a second disposable container (`dbtool verify --require-head`).
+4. **Pack** one tar of three files: `MANIFEST.json` (format name, UTC time, image tag, the snapshot's size and SHA-256: no host,
+   no path, no count, no content), `snapshot.db.sha256` (the one-line format of section 10) and `snapshot.db`. The tar is read
+   back completely before it is encrypted.
+5. **Encrypt** with `age -R <recipients file>`: public keys only. A recipients file that contains a private key
+   (`AGE-SECRET-KEY-...`) is refused before anything runs. The private key is never needed on the VPS.
+6. **Upload, read back, rename, commit.** `rclone copyto` uploads to `house-helper-<UTC time>-<8 hex>.tar.age.partial` in the one
+   configured folder (`--immutable`: nothing is overwritten); the folder listing must show the same size **and an MD5** that equals
+   the local file's (Yandex Disk lists MD5 and nothing else; a listing without an MD5 stops the run here, with nothing renamed);
+   the object is downloaded again and its **SHA-256** must equal the local file's; only then is it renamed to `...tar.age`
+   (`rclone moveto`) and the listing checked once more. **That name is not yet a recovery point** (a name is not proof: a stop, a
+   failure or an unreadable answer after the rename leaves a final-looking object nobody has confirmed). The **commit** is a
+   second, small object, `...tar.age.commit` (the commit record: the object's name, size, SHA-256, SHA-1 and MD5; no content, no
+   key, no path), uploaded and read back byte for byte. **A recovery point is an object together with a valid record whose size
+   and MD5 are the size and MD5 the listing reports for it. Nothing else is one**: not a name of the right shape, and not an
+   object of the right size whose listing gives no MD5 or another one.
+7. **The final check.** The folder is listed once more and classified exactly as above, whatever the run has just done to it. If
+   that cannot be done (the listing or a record cannot be read), or it does not show the point this run committed as a committed
+   one (its record is gone or damaged, the object changed or vanished, the listing gives no MD5), the run ends with **exit 7**,
+   deletes nothing and does **not** call the point stored. Only after a passed final check does retention run.
+
+Then, only after the final check, **retention** (15.3). A run never starts it on a failure.
+
+What each later run can and cannot say about a point: it re-checks the **size and the MD5** that the listing reports against
+the record (every run, for every point, so that a point changed after its commit is noticed). The **SHA-256** in the record was
+verified once, by the read-back at upload; no later run reads the object again, so none claims to have re-verified it. The MD5
+binds an object to its record against corruption and against a changed or replaced object; it is not a defence against someone
+who can rewrite both the object and its record, and anyone with the token can delete everything anyway (15.9). The real test of a
+point is the restore rehearsal of 15.6.
+
+An object with a final name but **no valid, matching record** is **unresolved**: it is not counted, not relied on by retention, and
+**never deleted by the tool** (it may be a good copy, and only a person can decide). It takes **no retention slot**: the plan is
+made from the committed points alone, so a damaged or unverifiable newest point never pushes a valid older one out. And **while
+any unresolved object is in the folder, retention drops no committed point at all**, however old: a final-looking object the
+tool does not understand may be the copy that is needed, so the tool does not shrink the history around it. New points are still
+made, encrypted and verified; the run says `retention holds back N committed point(s)` and ends with exit 6 for as long as the
+object exists, and the folder grows by one point per run meanwhile. Once an operator has dealt with the object (15.11) the next
+run prunes as the plan says. Every run reports it (exit 6, a line `UNRESOLVED <name>: <why>`) and so does `list`, until an
+operator has looked at it (15.11). A record whose object is gone (the half of a deletion that was interrupted) is an orphan:
+retention removes it, within its budget, and leftover `.partial` uploads are removed as always; neither depends on the
+unresolved object.
+
+**Before step 1, and refused with status 3 if any of it is not as required** (no command of the backup has run yet): the
+recipients file holds only public keys; the rclone config section of the remote (`NAME` in `--remote NAME:FOLDER`) is
+`type = yandex`, has `app_folder = true`, and has a `client_id`, a `client_secret` and a `token` of its own (rclone's
+built-in application is shared and its access is wider); this rclone **knows the Yandex `app_folder` option** (read from
+`rclone config providers`, not guessed from a version number); and the remote **renames server-side** (`rclone backend
+features`: `Move`), because step 6's commit is a rename. The tool never falls back to another mode: an rclone or a config
+that does not meet this is not run, and the message says what is missing. No value of the config file is ever printed.
+
+### 15.2 What is promised, and what is not
+
+- **A failed run deletes nothing that is not its own.** The only remote objects a run deletes are: its own `.partial` when it
+  fails; its own final-named object if the listing right after the rename proves that the rename damaged it; `.partial` files of
+  an earlier killed run; and, after a commit, the points retention drops (the object, then its commit record) and orphaned
+  records. **An unresolved object is never deleted by the tool**, and while one exists retention drops no committed point (15.1;
+  only the orphaned records and the leftover `.partial` uploads are still removed). All deletes go through one function that accepts only a name
+  of the tool's own shape (`house-helper-<time>-<8 hex>.tar.age[.partial|.commit]`) inside the one folder, one object at a time
+  (`rclone deletefile --yandex-hard-delete NAME:FOLDER/<exact name>`). The tool never runs `delete`, `purge`, `sync`, `move` or
+  `cleanup`, so it can neither remove anything else in the folder nor empty the account's Trash. Files in the folder that are
+  not of that shape are reported and left alone.
+- **A delete is believed only when the folder shows it.** After every group of deletes the tool **lists the folder again** and
+  requires each object to be absent. An exit status of 0 from `rclone deletefile` on an object that is still listed is not a
+  prune (the run ends with exit 6 and says what remains); an error status on an object that is no longer listed is not a
+  failure. A commit record is deleted only after its object has been proven gone, so a point whose object could not be removed
+  stays whole and is retried by the next run.
+- **Trash.** Yandex Disk puts a deleted file in its Trash unless a hard delete is requested; the tool requests it for every
+  delete. Whether the provider honours it is checked in the rehearsal (15.9), not assumed.
+- **Plaintext on the host.** The unsanitized pair, the rewritten snapshot and the tar exist, in that order, only in the private
+  directory, each removed as soon as the next stage has what it needs, the whole directory removed on every exit path including
+  `SIGTERM`, `SIGINT` and `SIGHUP`, and the leftovers of a killed run (`SIGKILL`, power) swept at the next start. **This is
+  unlink, not erasure.** The unit puts the directory on tmpfs (`RuntimeDirectory=`), which keeps it off the disk apart from
+  swap; the disposable containers use an anonymous Docker volume for scratch space that Docker deletes with the container. Do
+  not read any of it as forensic secure deletion. **A directory that cannot be removed is never a success:** after a committed
+  backup the run ends with exit 6 (the point is stored; the warning names the directory), after a failure its own failure
+  status stands, and the **next run refuses to start (exit 3, nothing done)** while any leftover directory of the tool cannot be
+  removed, so plaintext is not piled up next to plaintext (15.11 says what to do). Directories of the tool owned by another
+  user are not touched, and stop the run in the same way.
+- **A normal stop and a hard kill are different, and only the first runs the clean-up.** A failure, `SIGTERM`, `SIGINT` and
+  `SIGHUP` (what `systemctl stop` and a timeout send first) run the clean-up described above: plaintext removed, this run's own
+  `.partial` taken back. `SIGKILL` (what systemd sends if the clean-up does not finish within `TimeoutStopSec`, the kernel's
+  out-of-memory killer, `kill -9`) and a power cut run **nothing**. What they leave, and what happens to it: (a) the private
+  directory with whatever plaintext stage the run was in, until the **next run's start** removes it (or the unit's stop, which
+  removes `/run/house-helper-offsite` itself, or a reboot, which empties tmpfs); (b) at most one `...tar.age.partial` on the
+  remote, which **no reader can mistake for a point** (a point is an object with a valid commit record, and a `.partial` has
+  neither the name nor a record) and which the next run removes; or, if the kill came **between the rename and the commit
+  record**, one final-named object **without a record**, which is **unresolved**: no run counts it, relies on it or deletes it,
+  and every run reports it (exit 6) until an operator has looked at it (15.11); (c) nothing else: no lock stays (the kernel
+  drops it), no older point is touched, nothing is half-deleted (a point being dropped by retention loses its object first and
+  its record second, so an interruption leaves at worst an orphaned record, which the next run removes). This is tested with
+  a real kill of a child process at each stage, the rename-to-record gap included.
+- **Nothing private in the log.** Lines carry step names, object names, sizes, the checksum of the **encrypted** object and
+  counts. The output of `age` and `rclone` is **not** forwarded (rclone's can name paths and accounts): the log says which
+  command failed and its exit status; run the same command by hand to read its own message. The progress lines of `backup.sh`
+  and `dbtool` (written to be log-safe: table names and row counts, never content) are forwarded.
+- **One run at a time** (a lock file in the work directory, and systemd's own oneshot rule).
+- **What it does not do.** It does not alert (15.7), does not test that the private key works (15.6 does), does not re-read
+  points after they were committed (each run only re-checks the size and the MD5 the listing reports against the record; the
+  SHA-256 was verified once, at upload), and does not touch the local backups of `backup.sh` or `upgrade.sh` (those are not
+  rotated by anything).
+- **Deleted conversations are bounded by the retention, not eliminated.** The live purge (section 14) removes expired rows
+  from the database and the rewrite keeps them out of every new point, but a point made **before** a row was deleted still
+  holds it until retention drops that point: **up to about 36 days** with a daily schedule (15.3). That is the real tail of the
+  365-day promise for the off-host copy, and a number to tell the users the same way section 14.7 describes the rest.
+
+### 15.3 Retention: 7 daily and 4 weekly
+
+Of the recovery points in the folder (committed ones only: an object with a valid commit record whose size and MD5 equal the
+listing's; unresolved objects, which take no retention slot, and everything not of the tool's shape are neither counted nor
+touched), **keep**
+
+- the newest point of each of the **7 most recent UTC days** that have one (daily);
+- the newest point of each of the **4 most recent ISO weeks** whose newest point is not already kept as a daily one (weekly);
+- always the point this run just committed.
+
+That is at most 11 points. It counts points, not wall-clock time; the newest point is the newest of its day and so is always
+kept; two runs on one day keep one; and a schedule that skips days keeps a longer span. With a daily run the oldest point kept
+is at most about 36 days old (a Monday: the Sunday five weeks before it).
+
+**The strict rule: no pruning while an unresolved object exists.** If the folder holds any `UNRESOLVED` object (15.1), the plan
+above is **not applied**: **no committed point is dropped**, whatever its age, and the log says `retention holds back N committed
+point(s)`. The run still makes and verifies its new point, and still removes orphaned commit records and leftover `.partial`
+uploads, and it ends with exit 6 (15.7) so that the condition is never only a log line. The unresolved object is not deleted or
+trusted. The hold lasts until an operator quarantines or deletes the object (15.11); the points that piled up meanwhile are
+then dropped by the next run, and if that is more than `--max-deletions` allows (below) pass a larger limit **once**.
+
+Guards: retention runs only after a committed point that the final check (15.1, step 7) has confirmed; if the folder, listed
+again, does not show the new point as committed, nothing is deleted and the run ends with exit 7; **`--max-deletions` (default 5)
+is one budget for the whole run**, shared by the
+leftover `.partial` uploads it removes first, the points retention drops (an object and its record count once) and orphaned
+records. A run whose retention would exceed what is left of it **deletes nothing, exits 6 and says so**: the steady state
+deletes one or two a day, so a larger number means the folder is not as expected, or retention is being applied for the first
+time to a long history. After checking `list` (below) pass a larger limit **once**. (The run's own unfinished or damaged upload
+is taken back whatever the budget: it is its own object.)
+
+**The clock is checked, because the names carry it.** Retention orders points by the time in their names, which is the host's
+clock when they were made. It deletes **nothing at all** in a run, and ends with exit 6 saying why, if (a) a committed point
+is dated **more than an hour later than the host clock** (the clock was wrong when it was made, or is wrong now); (b) this
+run's point is dated **more than 7 days after the previous one** (the host did not run that long, or the clock jumped forward;
+the next run is again one day after this one and proceeds); or (c) the clock moved forward by **more than 3 hours during the
+run**, or back far enough that this run's own point is dated in the future. A future-dated point **takes no daily or weekly
+place from a real point and is not deleted**: it is reported by every run and by `list` as `SUSPECT` until an operator has
+dealt with it (15.11), so it is neither silently kept for ever nor allowed to push real points out. A clock that is wrong by
+the same amount for every run from its first wrong run is caught only at that first run (rule b); once the clock is right
+again the points it dated are future-dated points (rule a). There is deliberately no option that overrides the guard.
+
+```bash
+python3 deploy/offsite_backup.py list --rclone-config /etc/house-helper/rclone.conf --remote NAME:house-helper
+```
+
+`list` is read-only (one `rclone lsjson`, and one `rclone cat` of each commit record): it prints every committed point as `keep`
+or `drop` (`hold` instead of `drop` while an unresolved object holds retention back: a run would delete none), then separately the `UNRESOLVED` objects with the reason, the `SUSPECT` future-dated points, the orphaned records
+and how many other objects it would leave alone. It also proves that the token, the remote and the folder work. It exits 0
+whatever it finds: read it.
+
+### 15.4 Prerequisites **[OWNER]**
+
+1. **The key pair, made on the owner's own machine, not on the VPS:** `age-keygen -o house-helper-age-key.txt`. Keep the private
+   file where a loss of the VPS, the laptop or one cloud account does not lose it (a password manager **and** an offline copy);
+   without it every off-host point is unreadable. Put the **public** key line (`age1...`) in `/etc/house-helper/age-recipients.txt`.
+   A second recipient (a spare key kept elsewhere) is supported: one key per line, at most eight.
+2. **A Yandex OAuth application of the owner's own, with only the permission "access to the application folder"**
+   (`cloud_api:disk.app_folder`), so that the token cannot read or delete anything else on the disk. **Do not use rclone's
+   built-in client**: it is shared and its scope is wider. A Yandex Mail account is required (rclone's documentation: without one,
+   a token is issued but every action answers `403 DiskUnsupportedUserAccountTypeError`).
+3. **A stable `rclone` that has the Yandex `app_folder` option: stable 1.75.2 does not; the first stable release planned
+   to is 1.76.0 (owner's information; the option itself was merged into rclone's development branch on 2026-09-08, pull request
+   9850).** The Yandex backend addresses `disk:/` by default, and a token restricted to the application folder is refused
+   there with `403`; `app_folder = true` makes it address `app:/`. What this repository can check, and does, **at every
+   start**: the capability, not the version number (`rclone config providers` must list `app_folder` among the Yandex
+   options, and the tool refuses otherwise: checked against the real 1.75.2, which lacks it); the config (above, 15.1); and
+   that the remote can rename server-side. **Minimum compatible: a stable rclone release whose Yandex backend lists
+   `app_folder`; 1.76.0 is expected to be the first, to be confirmed from its release notes and by `list` before it is
+   relied on.** What it cannot check is the **scope of the token**: that is the owner's OAuth application, and the proof is
+   the rehearsal of 15.5 (with `app_folder = false` set by hand for one command, the same token must be refused with `403`;
+   then set it back). **Never install a development or beta build on the VPS to get the option early**, and never use
+   rclone's built-in application or a token with full disk access to get past a refusal: an rclone that cannot be made to
+   work with the application-folder scope means this design waits, or **is decided again by the owner**.
+4. **`age` and `rclone` installed on the VPS** (`apt-cache policy age` shows whether Ubuntu 24.04's archive has it), and
+   Python 3 (Ubuntu 24.04 has 3.12; the tool needs 3.10 or later and no packages).
+5. **A running image that knows `sanitize`**: built from a commit that contains this change and deployed through the normal
+   upgrade (section 9). An older image answers `invalid choice: 'sanitize'` (exit 2) and the run fails before anything is
+   uploaded. The tag in `/etc/house-helper/purge.env` must be the **running** one.
+6. **The folder name.** The configuration takes `NAME:FOLDER`, a folder of its own inside the application folder (for example
+   `yandex-hh:house-helper`). A bare `NAME:` is refused so that a mistake cannot aim retention at the root.
+7. **Room.** The work directory is tmpfs under `/run`, which is limited to a fraction of memory (`df -h /run`). A run holds
+   about twice the database at any moment (three times is checked up front and the run fails cleanly if it is not free). That
+   is far below any limit for two users; look again if the database approaches the size of that tmpfs.
+
+### 15.5 Installing it (opt-in) **[OWNER]**
+
+The rclone config file (made on a machine with a browser by `rclone config`, then copied) holds one section. These are the
+settings the tool requires; the values of `client_id`, `client_secret` and `token` are the owner's and are never put in the
+repository:
+
+```ini
+[yandex-hh]
+type = yandex
+client_id = <the id of the owner's own Yandex application>
+client_secret = <its secret>
+token = <written by rclone config after the browser consent; the consent screen must say "application folder" only>
+app_folder = true
+```
+
+```bash
+sudo install -m 0644 deploy/systemd/house-helper-offsite.env.example /etc/house-helper/offsite.env
+sudoedit /etc/house-helper/offsite.env                          # the three values; the tag and checkout stay in purge.env
+sudo install -m 0644 /dev/null /etc/house-helper/age-recipients.txt && sudoedit /etc/house-helper/age-recipients.txt   # the PUBLIC key
+sudo install -m 0600 -o root /path/to/rclone.conf /etc/house-helper/rclone.conf        # the access token: root only
+sudo install -m 0644 deploy/systemd/house-helper-offsite-backup.service deploy/systemd/house-helper-offsite-backup.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+systemd-analyze verify /etc/systemd/system/house-helper-offsite-backup.service /etc/systemd/system/house-helper-offsite-backup.timer
+```
+
+First, by hand and watched, **before the timer is enabled**. `list` proves that the token, the remote and the folder work
+(nothing is uploaded; an empty folder is a normal answer, a missing one is made by the first `run`):
+
+```bash
+cd ~/apps/house_helper                                          # the checkout
+sudo python3 deploy/offsite_backup.py list --rclone-config /etc/house-helper/rclone.conf --remote NAME:house-helper
+sudo systemctl start house-helper-offsite-backup.service          # returns when the run has ended
+systemctl status house-helper-offsite-backup.service --no-pager   # Result: success; "status=0/SUCCESS"
+journalctl -u house-helper-offsite-backup.service -n 40 --no-pager
+```
+
+**Prove the scope of the token** once, on a copy of the config (not the installed file): set `app_folder = false` in the copy and
+run `rclone --config the-copy lsd NAME:`; it must be **refused with 403**. If it lists anything, the token is not restricted
+to the application folder: stop, delete that token at Yandex, and register the application again with only the
+application-folder permission. (This is the one thing the tool cannot check for itself, and it is why it also refuses
+an rclone config without the owner's own client id and secret.)
+
+Then the restore rehearsal (15.6) with the private key, on a machine that is not the VPS. **Only after it worked:**
+
+```bash
+sudo systemctl enable --now house-helper-offsite-backup.timer
+systemctl list-timers house-helper-offsite-backup.timer           # NEXT is the time of the next run
+```
+
+Disabling (the timer only; a run in progress finishes): `sudo systemctl disable --now house-helper-offsite-backup.timer`.
+The default is 04:15 UTC, after the cleanup (03:30 UTC), so that a point is made from the database as the cleanup left it;
+change it with a drop-in as the comment in the timer file says.
+
+### 15.6 Restoring from an off-host point **[OWNER]**
+
+On the machine that holds the private key (not the VPS). **Take a point that `list` shows as `keep` or `drop` (a committed
+point), not an `UNRESOLVED` or `SUSPECT` one**: only a committed point has had its bytes read back and its record written. Of
+two committed points take the newest unless you are going back on purpose.
+
+```bash
+# fetch house-helper-<time>-<id>.tar.age from the application folder (the Yandex web interface, or rclone copyto)
+age -d -i house-helper-age-key.txt -o recovery.tar house-helper-20261025T041507Z-0a1b2c3d.tar.age
+python3 deploy/offsite_backup.py unpack recovery.tar --output-dir ./recovered
+```
+
+`unpack` refuses a tar that is not exactly what the tool writes (three named regular files, a manifest of the known shape, the
+checksum file exactly the one line for `snapshot.db`, the snapshot equal to its manifest), extracts only those three files by
+fixed names, never replaces a file, and removes what it extracted if any check fails. It prints the image tag that wrote the
+point. `./recovered/snapshot.db` and `snapshot.db.sha256` are a backup pair as section 10 defines it: copy **both** to the VPS
+and restore with that section's procedure (the exact checksum check, stop the service, `check-idle`, `restore` with the image
+of the manifest's tag, `check-schema`, start). **Run the cleanup once after any restore** (section 14.6): a point predating a
+cleanup holds rows that were deleted since. A restore rehearsal onto a scratch volume, with the date recorded, comes before
+the timer is relied on.
+
+If no committed point is left (everything else is lost), an unresolved object may still be the best copy there is. Treat it
+the same way: `age -d` authenticates every chunk of the file, so a decryption that succeeds and an `unpack` that reports
+"intact" show that the content is whole; what they cannot show is that the tool's own checks ran, so say so when you restore from it.
+
+### 15.7 Statuses and troubleshooting
+
+Exit status: **0** stored, verified, final check passed, retention done, nothing needing review. **1** failed: no new point, and
+nothing of another run touched (the log says which step); an unconfirmed object of this run may remain **unresolved** (15.11).
+**2** usage. **3** refused before anything was done (configuration, a missing tool, or a leftover work directory that cannot be
+removed). **6** the new point **is stored and verified** (its SHA-256 was read back before the commit, and the final check of
+the folder matched its size and MD5 to its commit record), but something needs attention: housekeeping did not complete (a
+listing or a delete failed or could not be confirmed, retention would have exceeded `--max-deletions`, leftover `.partial`
+uploads could not be removed), the work directory of this run could not be removed, an **unresolved** object or a **suspect**
+(future-dated) point is in the folder (while an unresolved one exists retention also drops no committed point), or the clock is
+implausible so retention deleted nothing. Extra objects remain, which is the safe side, and **the run fails again in every run in which the cause persists**: it is never only a log line. **7** the point
+is **not confirmed**: this run wrote the object and its commit record, but the final check (the folder listed and classified
+again afterwards) could not be completed or does not show the point as committed (its record is gone or damaged, the object
+changed or vanished, the listing gives no MD5). It is never described as stored or verified, nothing was deleted, and the
+operator runs `list` before anything else (15.11). **128+N** a signal (the clean-up ran). A failed unit shows in `systemctl
+--failed` and the journal; **no alert is configured** (15.9).
+
+| What you see | Cause | What to do |
+|---|---|---|
+| `Failed to load environment files` | `purge.env` or `offsite.env` is missing | install them (15.5) |
+| `refused: ... is not installed` | `age`, `rclone`, `docker` or `bash` is not on the unit's `PATH` | install it |
+| `refused: this rclone has no app_folder option` | the rclone is older than the first release with the Yandex application-folder mode (1.75.2 and earlier) | install a stable release that lists it (15.4 item 3); nothing was done |
+| `refused: the remote [NAME] does not set app_folder = true` / `... has no client_id and client_secret of its own` / `... is not a Yandex Disk remote` | the rclone config is not an application-folder remote of the owner's own OAuth application | fix the config (15.5); never work around by widening access |
+| `refused: the remote cannot rename server-side` | the commit would not be atomic | do not run; decide again (15.4 item 3) |
+| `refused: --recipients-file ... PRIVATE key` | a private key is in the recipients file | remove it, **treat that key as exposed if it was ever on the VPS** |
+| `FAILED: deploy/backup.sh failed` | read the `\|`-prefixed lines above it (`backup.sh`'s own messages) | as section 10 |
+| `FAILED: dbtool sanitize failed (exit 2)` | the tag names an image older than this feature | deploy a current image, set the tag |
+| `FAILED: dbtool sanitize failed (exit 4)` | the snapshot is not sound / not at the head / not this schema, or `sanitize_mismatch` / `sanitize_incomplete` (the rewrite did not do its job; nothing was released) | read the `\|` line; do **not** bypass |
+| `FAILED: rclone ... failed (exit N)` | the remote, the token or the network | run `rclone --config /etc/house-helper/rclone.conf lsjson NAME:FOLDER` by hand and read its message |
+| `FAILED: the object read back from the remote is not the file that was uploaded` | the provider returned other bytes | nothing was committed; run again; if it repeats, stop and tell the owner |
+| `FAILED: another off-host backup is running` | the lock is held | wait for it; nothing was done |
+| `exit 6 ... IS stored and verified` | the final check passed (the point is committed and its size and MD5 match its record); something after it needs attention, which the same line names | `list`; fix the cause; run again (or once with a larger `--max-deletions`) |
+| `exit 7 FAILED: the final check of the folder did not confirm the recovery point ...` and `NOT reported as stored` | the record or the object was written but the folder, listed again afterwards, does not show a committed point (the line says why: record missing / damaged, object changed or gone, no MD5 listed, or the listing or a record could not be read); nothing was deleted | 15.11: `list` first. If it shows the point as committed, the next run counts it; if `UNRESOLVED`, treat it as such. Do not rely on this run's point until `list` says so |
+| `FAILED: the remote's listing gives no MD5 for the object` (exit 1) | the remote did not list an MD5 for the uploaded object, so it can never be tied to a record; nothing was renamed | run `rclone --config /etc/house-helper/rclone.conf lsjson --hash NAME:FOLDER` by hand: every object must show an MD5. If it does not, stop and tell the owner (15.9) |
+| `FAILED: ... nothing can tie the renamed object to a commit record, so none was written` (exit 1) | the listing right after the rename gave no MD5 | the object was read back before the rename but has **no record**: `UNRESOLVED` (15.11) |
+| `WARNING: could not remove the work directory` (run ends 6, or with its own failure status) | the clean-up could not remove plaintext | remove it by hand **before the next run, which refuses to start while it exists** (15.11; `/run/house-helper-offsite` is tmpfs: a reboot clears it) |
+| `refused: N leftover work directories ... cannot be removed` (exit 3) | a leftover of an earlier run holds plaintext and cannot be removed by this user | 15.11; nothing was done |
+| `WARNING: could not remove the unfinished upload ... (or confirm that it is gone)` | the remote was unreachable during the clean-up, or did not honour the delete | nothing to do: the next run removes it |
+| `FAILED: rclone lsjson failed ... while confirming the rename` | the rename was issued but its result could not be read | the object was read back before it was renamed but has **no commit record**: it is `UNRESOLVED` (15.11); the next run reports it |
+| `FAILED: ... its commit record is not confirmed, so it is NOT a recovery point` | the record could not be written or read back | the object is left untouched and is `UNRESOLVED` or, if the record did arrive whole, a committed point from the next run on; `list` shows which (15.11) |
+| `UNRESOLVED <name>: <why>` (exit 6) | a final-named object without a valid, matching commit record | 15.11: look, then quarantine or delete by hand; the tool never does |
+| `retention holds back N committed point(s) it would drop` (exit 6, with `UNRESOLVED`) | an unresolved object is in the folder, and no committed point is dropped while one exists (15.3) | 15.11: deal with the unresolved object; the next run prunes as planned (a larger `--max-deletions` once, if many are due) |
+| `... is dated ..., later than the host clock` / `... days after the previous one` / `the host clock moved forward by N hours` (exit 6, "retention deleted nothing") | the clock cannot be trusted to decide what to delete | 15.11: check `timedatectl`; nothing was deleted |
+| `... not confirmed deleted and remain in the folder` (exit 6) | the backend accepted a delete and the object is still listed, or the listing that should confirm it failed | `list`; the next run retries; if it persists run the delete by hand and read rclone's own message |
+
+### 15.8 Beside upgrades and restores
+
+The backup holds the **shared** maintenance lock, like the cleanup (section 14.3), so it runs beside the web service and the
+cleanup, and a migration or a restore (exclusive) is refused while it runs. **Before an upgrade or a restore, stop both timers,
+and start them again afterwards** (14.4 has the commands; the same applies to `house-helper-offsite-backup.timer`). After every
+upgrade and every rollback, change `HOUSE_HELPER_IMAGE_TAG` in `/etc/house-helper/purge.env`: both units read it. Forgetting it
+fails closed (a tag whose schema is not the database's is refused, exit 4) and the backups silently stop being made, which is
+why 15.9 asks for an alert.
+
+### 15.9 What is not done: checklist **[OWNER]**
+
+- [ ] The key pair exists, the private key is stored in two places off the VPS, and **the restore of 15.6 was rehearsed from a
+      real uploaded point**, with the date recorded.
+- [ ] A Yandex OAuth application with only the application-folder permission exists, and a **stable** `rclone` whose release
+      notes and `rclone config providers` show the Yandex `app_folder` option works with it (15.4 step 3; 1.75.2 does not,
+      1.76.0 is expected to). **Unverified here: no such release was available, and nothing has run against a live account.**
+      The scope proof of 15.5 (403 with `app_folder = false`) was done.
+- [ ] `list` ran against the real remote; one real `run` was read in the journal; the object in the Yandex web interface is the
+      size the log says; the provider's Trash holds nothing of it (the hard delete is honoured).
+- [ ] The commit record was seen working on the real remote: `rclone cat` of a `.commit` object returns its bytes, the object
+      and its record appear in `list` as a committed point, and the **unresolved path** was rehearsed once on purpose (put a
+      copy of a point under a new final-looking name; `list` must show it `UNRESOLVED`; quarantine it as in 15.11). **Unverified
+      here: nothing has run against a live account or a real `rclone cat`; the tests use a fake rclone that implements only what
+      the tool asks of it.**
+- [ ] The real listing carries an **MD5 for every object**, including a `.partial` straight after its upload and an object
+      straight after its rename: `rclone lsjson --hash NAME:FOLDER` by hand. The tool refuses a point whose listing gives none
+      (exit 1 at the upload, or exit 7 at the final check), so a Yandex listing that omits it (for a moment, or for good) would
+      stop every backup. **Unverified here: the tests list an MD5 because the fake does; nothing has run against a live account.**
+- [ ] The server-side rename was seen working on the real remote (rclone's Yandex backend implements `Move` as a server-side
+      move, per its source; the tool refuses to run if rclone reports otherwise): the object appears under its final name
+      only at the end, and a `.partial` of a run stopped by hand (`systemctl kill -s KILL`, then `list`) is not shown as a point
+      and is removed by the next run.
+- [ ] The running image contains `sanitize` (a real run of `dbtool sanitize` against a copy of the real database was read:
+      `rows per table` equal before and after, no free pages).
+- [ ] The timer is enabled and `list-timers` shows the next run.
+- [ ] A failure notification exists (15.10). Nothing is configured: a silent backup failure, or a backup that is simply no
+      longer made, is the likely way this fails.
+- [ ] The retention (7 daily + 4 weekly, about 36 days of tail) is accepted as the bound on the 365-day promise for the
+      off-host copy, or changed, and what users are told matches (section 14.7).
+- [ ] The owner accepts what the loss of the application-folder token means: whoever holds it can read the encrypted points
+      and delete them (so keep the rclone config root-only), but cannot read their content, and it does not reveal the
+      private key.
+
+### 15.10 Failure notification: the minimum **[OWNER]**
+
+A failed unit shows only in `systemctl --failed` and the journal, which nobody reads daily, and **a backup that stops being
+made (timer disabled, host down, the unit failing before it starts) produces no failure at all**. The smallest mechanism that
+covers both is a **dead-man's switch**: the job pings a URL when it succeeds, and an external service alerts the owner when the
+ping has not come for longer than a day plus a grace period. A failing run (any status except 0, including 6 and 7) sends no ping, so
+one mechanism covers failure and silence. Nothing in the repository sends it; the owner adds it as a **drop-in** (not an edit of the unit), with a monitor of
+their choice (for example a free Healthchecks.io check with a period of one day and a grace of a few hours, which also accepts
+a `/fail` ping), after deciding that a third party may learn that the ping happened (the request carries no data, only the
+check's URL, which is a capability: anyone who knows it can send a ping):
+
+```ini
+# sudo systemctl edit house-helper-offsite-backup.service
+[Service]
+ExecStartPost=/usr/bin/curl -fsS -m 20 --retry 3 -o /dev/null https://hc-ping.com/REPLACE-WITH-THE-CHECKS-UUID
+```
+
+`ExecStartPost=` runs only when the job exited 0. For an immediate alert as well, `OnFailure=` can point (in the same drop-in) at
+a one-shot unit of the owner's that pings the check's `/fail` URL. Alternatives (a message to a Telegram bot with its own token,
+not the application's; mail) need a credential or a mail path that this host does not have today and are not recommended as a
+first step. Whatever is chosen, **test it once by making a run fail** (for example `--max-deletions 0` against a folder that
+needs a delete gives status 6) and by waiting out the grace period with the timer stopped.
+
+
+### 15.11 Operator review: unresolved objects, a suspect clock, plaintext that will not go **[OWNER]**
+
+The tool decides nothing here by itself: each case below is reported by every run (exit 6; exit 7 for a run whose own point was
+not confirmed; exit 3 for the last case) until a person has dealt with it, and the tool deletes none of these objects. **Look
+first, change nothing first.**
+
+```bash
+cd ~/apps/house_helper
+sudo python3 deploy/offsite_backup.py list --rclone-config /etc/house-helper/rclone.conf --remote NAME:house-helper
+```
+
+**An `UNRESOLVED` object** (a final-looking `...tar.age` without a valid commit record that matches it). The reason says which:
+`it has no commit record` (a run was killed or failed between the rename and the record, the record was not confirmed, or the
+rename damaged the object and its removal failed, or the object is not the tool's); `its commit record is not one this tool
+writes for it, or is cut short`; `it is not the object its commit record describes` (the object, or its record, changed after
+the commit: treat it as damaged); `the remote's listing gives no MD5 for it, so it cannot be tied to its commit record` (the
+size may well be right: with no MD5 listed nothing distinguishes the object from a changed one of the same size, so it is not
+accepted; check `rclone lsjson --hash` by hand, and if the listing is whole again the next run counts it); `it is empty`.
+
+**While it is there the tool prunes no committed point** (15.3): the folder grows by one point per run, and every run ends
+with exit 6. Steps 2 and 3 below end that; the next run then drops the points the plan calls for (pass `--max-deletions` larger
+**once** if the hold lasted long enough for more than the default 5 to be due).
+
+1. Decide whether you want it. A fresh committed point is made every day, so an unresolved object is usually not worth keeping.
+   If you do want to judge it, fetch it and run the checks of 15.6 on the key machine: a successful `age -d` and an `unpack` that
+   reports "intact" mean the content is whole.
+2. **Quarantine it (reversible):** rename it out of the tool's shape, together with its record if it has one. The tool then
+   counts it among "other objects" and leaves it alone, and the exit 6 for it stops. Do not use `--yandex-hard-delete` here.
+
+   ```bash
+   sudo rclone moveto --config /etc/house-helper/rclone.conf NAME:house-helper/house-helper-<time>-<id>.tar.age \
+        NAME:house-helper/house-helper-<time>-<id>.tar.age.quarantined
+   ```
+
+3. **Or delete it,** once you have decided (this is the only deletion of such an object, and it is yours):
+   `sudo rclone deletefile --config /etc/house-helper/rclone.conf --yandex-hard-delete NAME:house-helper/<exact name>`.
+4. Run `list` again, or wait for the next run. Renaming a quarantined object back makes it unresolved again; there is no command
+   that promotes it to a point, because a point is made only by a run that has read its bytes back.
+
+**A run that ended with exit 7** (`the final check of the folder did not confirm the recovery point ...`, `NOT reported as
+stored`). This run wrote its object and its commit record and read the record back, but the folder, listed again afterwards,
+does not show a committed point: the line names the reason (the record was removed or damaged in between, the object changed or
+vanished, the listing gave no MD5, or the listing or a record could not be read). Nothing was deleted. Do not count this run's
+point as a backup yet.
+
+1. Run `list`. If the point is listed as a recovery point (a transient read problem), the next run counts it and carries on.
+2. If it is `UNRESOLVED`, handle it as above. A point whose record is missing or damaged has no way back to being a point: the
+   next daily run makes a new one. Until then the previous night's committed point is the newest there is.
+3. If the object itself changed or vanished between the commit and the final listing, treat the account as suspect: someone or
+   something else is writing to the folder (15.9, the token).
+
+**A `SUSPECT` point, or "retention deleted nothing, because the clock cannot be trusted".** Nothing was deleted and nothing will
+be until the cause is gone.
+
+1. On the VPS: `timedatectl` (is `System clock synchronized: yes`? is the date right?). Fix the clock first.
+2. If the **clock now is wrong** (set back, or a jump forward): once it is right, the points it dated are in the past again (or
+   the next run is one day after this one) and the next run proceeds by itself. Nothing to rename.
+3. If a point was **made while the clock was wrong** (its name is dated in the future by more than an hour, and the clock is right
+   now): its content is real, its date is not. Quarantine it as above (object **and** its `.commit`) or delete both once you have
+   decided; the first run after that deletes again. Old points are never touched on account of it.
+4. "More than 7 days after the previous one" after a long outage of the host or the timer needs no action: the next run is
+   one day after this one.
+
+**A leftover work directory that cannot be removed** (`refused: ... leftover work director...`, exit 3, or the warning at the end of
+a run). It may hold plaintext (a database copy, the tar). On the VPS: `ls -la /run/house-helper-offsite`; remove the directories
+named in the message (`sudo rm -r /run/house-helper-offsite/hh-offsite-<random>`), or reboot (tmpfs is emptied); if `rm` fails,
+find out why (`lsattr`, a busy mount, another user's directory) before the next run. This is unlink, not erasure (15.2).

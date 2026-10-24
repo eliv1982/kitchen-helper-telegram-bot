@@ -16,6 +16,8 @@ web service.
                  runs (SQLite's online backup API, not a copy of the file)
   verify         a backup is a sound database with this application's schema (disposable:
                  touches no database, needs no HOUSE_HELPER_DATABASE_URL)
+  sanitize       rewrite a backup so that deleted rows leave no trace in it (disposable, like
+                 verify: it reads a snapshot, never the live database)
   check-idle     nothing is using the database, so a restore may begin (read only)
   restore        install a verified backup as the database, never over an existing one
                  unless told to, and never alongside the old one's -wal/-shm files
@@ -66,7 +68,21 @@ catches a writer or a reader that exists at that moment. What is left depends on
 Either way the requirement is the one the runbook states: exclusive maintenance access, with
 every managed service stopped. The tool enforces it only for what goes through the tool.
 
-Scratch space. Backup, verify and restore stage a full copy of the database. That is on
+Why `sanitize` exists. SQLite does not erase a deleted row: its bytes stay in the freed page
+or in the slack of the page that held it until something overwrites them (PRAGMA secure_delete
+is off unless the library was built with it), and the online backup copies those pages
+as they are. A snapshot of a database that has had conversations deleted therefore still
+holds them, and a copy that leaves the host would carry them past the deletion promise.
+`sanitize` rebuilds a SNAPSHOT (never the live database, whose settings and file it does not
+touch) with VACUUM INTO, which writes a new file from the live rows only, with secure_delete
+on so that the bytes it frees while laying out pages are zeroed too. The result is checked
+as a backup is (integrity, foreign keys, this application's schema, at the head), must hold
+exactly the tables and row counts of its input, and must have no free page. It is not a
+forensic claim about the disk: the scratch copies this tool makes are removed, not wiped.
+Row ids of tables without an explicit INTEGER PRIMARY KEY may be renumbered (VACUUM's rule);
+nothing in this application refers to a row id.
+
+Scratch space. Backup, verify, sanitize and restore stage a full copy of the database. That is on
 disk, in the directory HOUSE_HELPER_STAGING_DIR names (the container's /staging, a volume of
 its own: not the 64 MiB /tmp, not the data volume), in a private subdirectory this tool
 creates and removes. Before it copies anything it checks the free space: the size of the
@@ -958,6 +974,121 @@ def _write_new_file(snapshot: Path, target: Path) -> None:
     _fsync_directory(target.parent)
 
 
+# --- sanitize -------------------------------------------------------------------------------
+
+
+def _vacuum_into(source: Path, destination: Path) -> None:
+    """Write the live rows of the database at `source` to a NEW file at `destination`, which
+    carries over neither free pages nor the stale bytes of deleted rows. `source` is opened
+    read-only and is not changed; secure_delete is a setting of this connection only and is not
+    stored in either file."""
+    if sqlite3.sqlite_version_info < (3, 27, 0):
+        raise _refused(
+            "sanitize_unsupported",
+            f"this SQLite ({sqlite3.sqlite_version}) has no VACUUM INTO; 3.27 or later is needed.",
+        )
+    connection = sqlite3.connect(f"{source.as_uri()}?mode=ro", uri=True, timeout=30, isolation_level=None)
+    try:
+        connection.execute("PRAGMA secure_delete = ON")
+        connection.execute("VACUUM INTO ?", (str(destination),))
+    finally:
+        connection.close()
+
+
+def _free_pages(path: Path) -> int:
+    connection = sqlite3.connect(str(path), timeout=30)
+    try:
+        return int(connection.execute("PRAGMA freelist_count").fetchone()[0])
+    finally:
+        connection.close()
+
+
+def sanitize(environ: Mapping[str, str], source: str, stdin: BinaryIO, output: str, stdout: BinaryIO) -> str:
+    """Rewrite the backup at `source` ("-" is stdin) so that deleted rows leave no trace in
+    it, and write the result to `output` ("-" is stdout; a file is created, never replaced).
+    The input must be a sound backup at this image's head; the result must be too, with the
+    same tables and row counts and no free page, or nothing is released. Disposable: it
+    touches no database and needs no HOUSE_HELPER_DATABASE_URL."""
+    to_stream = output == "-"
+    if to_stream and hasattr(stdout, "isatty") and stdout.isatty():
+        raise ToolError(
+            "refused",
+            "stdout_is_a_terminal",
+            "the sanitized backup is binary data: redirect stdout to a file or a pipe.",
+            ExitCode.USAGE,
+        )
+    target: Optional[Path] = None if to_stream else Path(output)
+    if target is not None and (target.exists() or not target.parent.is_dir()):
+        raise _refused(
+            "output_unusable",
+            "the output file exists or its directory does not; a backup is never overwritten.",
+        )
+    with staging_area(environ, _input_size(source, stdin), "sanitize") as scratch:
+        staged = _stage_input(source, stdin, scratch)
+        size_in = staged.stat().st_size
+        # The stream's length was not known when the space was planned; the copy's is now, and
+        # the rewrite needs room for a second one.
+        free = _free_bytes(scratch)
+        if free < size_in + STAGING_HEADROOM:
+            raise _refused(
+                "staging_space",
+                f"not enough scratch space for the rewrite: {scratch.parent} has {_mib(free)} free; "
+                f"a second copy of {_mib(size_in)} plus {_mib(STAGING_HEADROOM)} is needed. Nothing was changed.",
+            )
+        before = assess(staged, scratch)
+        require_usable(before, require_head=True)
+        cleaned = scratch / "sanitized.db"
+        try:
+            _vacuum_into(staged, cleaned)
+        except sqlite3.Error as exc:
+            if _disk_full(exc):
+                raise _staging_full() from None
+            raise _unusable("sanitize_failed", f"the rewrite failed ({type(exc).__name__}).") from None
+        except OSError as exc:
+            if _disk_full(exc):
+                raise _staging_full() from None
+            raise
+        size = cleaned.stat().st_size
+        if size > MAX_DATABASE_BYTES:
+            raise _refused(
+                "database_too_large",
+                f"the rewritten database is {_mib(size)}, larger than the {_mib(MAX_DATABASE_BYTES)} "
+                "this tool restores. Nothing was released.",
+            )
+        after = assess(cleaned, scratch)
+        require_usable(after, require_head=True)
+        if (after.revision, after.inspection.tables) != (before.revision, before.inspection.tables):
+            raise _unusable(
+                "sanitize_mismatch",
+                "the rewritten database does not hold the same tables and row counts as its input. "
+                "Nothing was released.",
+            )
+        if _free_pages(cleaned) != 0 or _wal_mode(cleaned):
+            raise _unusable(
+                "sanitize_incomplete",
+                "the rewritten database still has free pages or is in WAL mode. Nothing was released.",
+            )
+        digest = _sha256(cleaned)
+        if target is None:
+            with open(cleaned, "rb") as handle:
+                shutil.copyfileobj(handle, stdout, _CHUNK)
+            stdout.flush()
+        else:
+            free = _free_bytes(target.parent)
+            if free < size + STAGING_HEADROOM:
+                raise _refused(
+                    "output_space",
+                    f"the filesystem of {target.parent} has {_mib(free)} free; the result needs "
+                    f"{_mib(size)} plus {_mib(STAGING_HEADROOM)}. Nothing was written.",
+                )
+            _write_new_file(cleaned, target)
+    where = "to stdout" if target is None else f"to {target}"
+    return (
+        f"sanitized backup written {where}: {size} bytes, sha256 {digest}; {after.describe()} "
+        "Free pages and deleted rows of the input were not carried over."
+    )
+
+
 # --- verify and restore -------------------------------------------------------------------
 
 
@@ -1222,6 +1353,13 @@ def _build_parser() -> argparse.ArgumentParser:
     check.add_argument(
         "--require-head", action="store_true", help="refuse a backup older than this image's head"
     )
+    clean = commands.add_parser(
+        "sanitize", help="rewrite a backup so that deleted rows leave no trace in it, touching no database"
+    )
+    clean.add_argument("--input", required=True, help="the backup file, or - for stdin")
+    clean.add_argument(
+        "--output", required=True, help="a new file, or - for stdout (redirect it; never a terminal)"
+    )
     commands.add_parser("check-idle", help="nothing is using the database: a restore may begin")
     install = commands.add_parser("restore", help="install a backup as the database")
     install.add_argument("--input", required=True, help="the backup file, or - for stdin")
@@ -1259,7 +1397,7 @@ def main(
     stdin = sys.stdin.buffer if stdin is None else stdin
     stdout = sys.stdout.buffer if stdout is None else stdout
     # The data may go to stdout, so the report then goes to stderr.
-    report = sys.stderr if args.command == "backup" and args.output == "-" else sys.stdout
+    report = sys.stderr if args.command in ("backup", "sanitize") and args.output == "-" else sys.stdout
     try:
         if args.command == "check-config":
             message = check_config(environ)
@@ -1275,6 +1413,8 @@ def main(
             message = backup(environ, args.output, stdout)
         elif args.command == "verify":
             message = verify(environ, args.input, stdin, require_head=args.require_head)
+        elif args.command == "sanitize":
+            message = sanitize(environ, args.input, stdin, args.output, stdout)
         elif args.command == "check-idle":
             message = check_idle(environ)
         else:

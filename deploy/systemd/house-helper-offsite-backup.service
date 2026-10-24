@@ -1,0 +1,61 @@
+# House Helper: the encrypted off-host backup. A systemd oneshot service, started by
+# house-helper-offsite-backup.timer or by hand. NOT installed or enabled by anything in the
+# repository: deploy/RUNBOOK.md section 15 is the procedure, and every step of it is the owner's.
+#
+# What it runs is deploy/offsite_backup.py (Python 3 of the host, standard library only): it calls
+# deploy/backup.sh for a verified backup, has a disposable container (no network, read-only root)
+# rewrite the snapshot without deleted rows and verify it, packs it with a checksum and a manifest,
+# encrypts it with `age` for PUBLIC keys only (no private key exists on this host), uploads it with
+# `rclone` into the one dedicated folder, reads the upload back, renames it and commits it with a small
+# checksum record (an object without a matching record is never counted as a recovery point), and
+# only then drops the recovery points beyond 7 daily + 4 weekly. A failed run deletes nothing that is
+# not its own. Section 15 says what is promised and what is not.
+#
+# The temporary plaintext lives in /run/house-helper-offsite: tmpfs, mode 0700, created for the run
+# and removed by systemd when the service stops, in addition to the tool's own clean-up. It is not
+# forensic erasure; section 15 says so.
+#
+# The tag and the checkout come from the file the cleanup already uses (purge.env), so that the one
+# edit after an upgrade or a rollback covers both; the paths and the remote come from offsite.env
+# (template: deploy/systemd/house-helper-offsite.env.example). The tag must be the version that is
+# RUNNING: a tag whose schema is not the database's is refused and nothing is uploaded.
+#
+# The report (step names, object names, sizes, checksums of the ENCRYPTED object, counts; never
+# content, keys or credentials) goes to the journal:
+#     journalctl -u house-helper-offsite-backup.service
+#
+# It runs as root, like the Docker daemon it talks to: access to Docker is root-equivalent whoever
+# holds it. rclone.conf holds the access token of the dedicated folder and must be readable by root only.
+
+[Unit]
+Description=House Helper: encrypted off-host backup of the database (7 daily and 4 weekly recovery points)
+Documentation=https://github.com/eliv1982/kitchen-helper-telegram-bot/blob/main/deploy/RUNBOOK.md
+# Docker must already be up. `Requisite=` fails this unit at once, visibly, if it is not; it never
+# starts Docker. The network is wanted, not required: without it the run fails at the upload and
+# removes its plaintext.
+After=docker.service network-online.target
+Requisite=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/house-helper/purge.env
+EnvironmentFile=/etc/house-helper/offsite.env
+RuntimeDirectory=house-helper-offsite
+RuntimeDirectoryMode=0700
+UMask=0077
+# One run at a time is systemd's own rule for a oneshot unit, and the tool takes its own lock too.
+ExecStart=/usr/bin/python3 ${HOUSE_HELPER_CHECKOUT}/deploy/offsite_backup.py run --tag ${HOUSE_HELPER_IMAGE_TAG} --recipients-file ${HOUSE_HELPER_AGE_RECIPIENTS_FILE} --rclone-config ${HOUSE_HELPER_RCLONE_CONFIG} --remote ${HOUSE_HELPER_OFFSITE_REMOTE} --work-dir /run/house-helper-offsite
+# A backup of two users' data takes seconds to minutes. Two hours is a bound for a hung Docker or
+# network, not a budget: when it is over systemd stops the run, and the clean-up removes the plaintext
+# and this run's unfinished upload.
+TimeoutStartSec=2h
+# A stop sends SIGTERM to the tool only (mixed), which stops its children, removes the plaintext and
+# takes back its own unfinished upload; the rest of the group is killed only after the time below.
+KillMode=mixed
+TimeoutStopSec=3min
+NoNewPrivileges=yes
+PrivateTmp=yes
+SyslogIdentifier=house-helper-offsite
+# No [Install] section: only the timer is enabled. Enabling this service on its own would run it at
+# every boot instead of on the schedule.
