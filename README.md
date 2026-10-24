@@ -27,7 +27,7 @@ That shaped the design: Russian-language replies and interface, a responsive web
 | **Persistence and identity** (`house_helper/persistence`) | SQLAlchemy 2 models and six Alembic migrations: users, allowlist entries, identity links, sessions, sign-in state, invitations, conversations, messages, turn records. One user can have several ways to sign in; ownership is enforced through the schema. | Implemented, tested on SQLite. SQLite is what the deployment uses; PostgreSQL is covered only by opt-in test suites that CI does not run. |
 | **Authentication** | Telegram sign-in (OpenID Connect, Authorization Code with PKCE) and passwordless email links. Closed allowlist, no self-registration. Telegram is linked to a user through a one-time invitation issued by the operator. Server-side sessions, 14 days. | Implemented, tested against stand-ins. Never run against real Telegram or a real mail server. Not enabled in the technical deployment. |
 | **Retention and operator tooling** (`house_helper/admin`) | Operator commands: `provision-email`, `enroll-user`, `reissue-invitation`, `revoke-invitation`, `enrollment-status`, `purge-expired`. Messages expire after 365 days; `purge-expired` deletes expired data. | Implemented, tested. The cleanup's systemd timer is installed and active on the technical deployment; its first automatic run, scheduled for 2026-10-25, has not been verified yet (see [Security and data lifecycle](#security-and-data-lifecycle)). |
-| **Deployment kit** (`Dockerfile`, `deploy/`) | Docker image and Compose file for a host that already runs Traefik, backup, verify and restore tooling, a fail-closed upgrade script, opt-in systemd units for the cleanup, and an English [runbook](deploy/RUNBOOK.md). | Implemented. Used for the technical deployment. An encrypted off-host backup and a restore rehearsal are not yet completed. |
+| **Deployment kit** (`Dockerfile`, `deploy/`) | Docker image and Compose file for a host that already runs Traefik, backup, verify and restore tooling, an encrypted offsite backup tool, a fail-closed upgrade script, opt-in systemd units for the cleanup, and an English [runbook](deploy/RUNBOOK.md). | Implemented. Used for the technical deployment. The offsite backup tool is released in the repository (CI green) but is not installed or activated on the VPS; an encrypted off-host backup and a restore rehearsal are not yet completed. |
 
 ## Architecture
 
@@ -77,7 +77,7 @@ In the deployment kit, requests take this path: browser, then Traefik (TLS), the
 | | State |
 |---|---|
 | Technical web deployment | **Exists** at <https://house.elivcloud.org>: the web application in a single Docker container behind an existing Traefik reverse proxy, served over HTTPS with a Let's Encrypt certificate. The container is healthy; the HTTPS and `/healthz` checks pass. |
-| Deployed version | Commit `6370bf7` (`6370bf78980e5e8fa8df33361e76620d57fffe79`), image `house-helper:6370bf78980e`. |
+| Deployed version | Commit `6370bf7` (`6370bf78980e5e8fa8df33361e76620d57fffe79`), image `house-helper:6370bf78980e`. Production still runs this version; later commits on `main`, including the offsite backup tool (`3b6b2bc`), are not deployed. |
 | Database | SQLite, at migration `0006_oidc_state_invitation`. |
 | Purpose of this instance | **Technical validation** of the deployment path (image, reverse proxy, TLS, response headers, health check) before any real user is enabled. |
 | Browser check | A visual smoke test of the live page in a real browser passed: it showed the House Helper branding and the setup screen that appears while sign-in is disabled. |
@@ -85,7 +85,7 @@ In the deployment kit, requests take this path: browser, then Traefik (TLS), the
 | OpenAI | **Not enabled for real users.** |
 | Users | **None enrolled.** |
 | Scheduled cleanup | The systemd timer for `purge-expired` is **installed and active**. Its first automatic execution is scheduled for 2026-10-25 and has **not been verified yet**. |
-| Backups | An encrypted off-host backup and a restore rehearsal are **not yet completed**. |
+| Backups | The repository implementation of the encrypted offsite backup is **released** (commit `3b6b2bc`, CI green) but **not installed or activated on the VPS**. Real `age`, `rclone` and Yandex Disk integration and an isolated restore rehearsal are **pending**. An encrypted off-host backup and a restore rehearsal are therefore **not yet completed**. |
 | What a visitor can do | Open the page, which reports that sign-in is not connected yet. No sign-in method is enabled, so the chat cannot be used. There is no public sign-up and no demo account. |
 | Functional Alpha | **Pending (not started).** |
 
@@ -96,7 +96,7 @@ On 2026-10-24 the public endpoints were checked from outside: `GET /healthz` ret
 - Real Telegram sign-in: a BotFather client and redirect URL, then a first real login. Telegram sign-in has so far run only against a stand-in. Email sign-in is a fallback whose operational activation is deferred; it would need a real mail path (SMTP with SPF, DKIM and DMARC).
 - The first users enrolled through one-time invitations.
 - An OpenAI project with an enforced spend limit, then a review of real answers and of truncated replies.
-- The first automatic run of the scheduled cleanup (the timer is installed; the run is due on 2026-10-25) observed and checked; a backup schedule with an encrypted off-host copy and a recovery rehearsal on the host; an alert path for failures.
+- The first automatic run of the scheduled cleanup (the timer is installed; the run is due on 2026-10-25) observed and checked; the released encrypted offsite backup installed and activated on the host, its first real run against `age`, `rclone` and Yandex Disk, and an isolated restore rehearsal; an alert path for failures.
 - Ingress rate limits verified on the live proxy; checks on real phones and in more than one browser (apart from one visual smoke test of the live page, the UI has been tried only in headless Chrome).
 
 ## Security and data lifecycle
@@ -117,14 +117,14 @@ These are in the code and covered by automated tests. They are design measures, 
 
 - **What is stored.** Per-user conversations and message text, turn records (which hold a copy of the answer so a retry can return it), sessions, short-lived sign-in state, and SHA-256 digests of secrets. There are no passwords. The Telegram bot keeps its context only in memory, lost on restart or `/reset`.
 - **Retention.** Every message and turn record carries an `expires_at` at most 365 days after creation; expired rows are hidden from reads and from the model's context. `purge-expired` physically deletes them, and deletes sign-in artifacts (sessions, sign-in states, email links, invitations) at their own expiry. Users, allowlist entries and identity links are never deleted by it.
-- **Limits of deletion.** Deletion is logical, not forensic erasure. A deleted row survives in older backups, so the 365-day promise holds for the live database only until a backup retention policy exists; that policy is not decided.
+- **Limits of deletion.** Deletion is logical, not forensic erasure. A deleted row survives in older backups, so the 365-day promise holds for the live database only until a backup retention policy is in operation. None is: the offsite backup tool released in the repository is not installed or activated on the VPS.
 - **Third party.** When the OpenAI integration is enabled, message text is sent to OpenAI to produce replies. The Telegram bot tells users so on `/start`.
 
 ### Not claimed
 
 - That sign-in has been verified with real Telegram or a real mail server, or that the chat has been tested against the real model in production.
 - That the scheduled cleanup has run. Its timer is installed and active, but the first automatic execution (2026-10-25) is not yet verified.
-- That backups are taken off-host, or that recovery has been rehearsed on the live host. The tooling exists; the operational setup is a documented open gate.
+- That backups are taken off-host, or that recovery has been rehearsed. The offsite backup tool is released in the repository (CI green) but is not installed or activated on the VPS, it has not run against a real `age`, `rclone` or Yandex Disk, and no isolated restore rehearsal has been done. The operational setup is a documented open gate.
 - That the service is monitored, or that a failure raises an alert.
 - That ingress controls are verified in production. The rate-limit settings exist as Traefik labels and were exercised only on a throwaway proxy, not on the live one. The chat API itself has no per-user or per-address rate limit and no cap on concurrent model calls.
 - That the timing difference in the email-request endpoint is closed. It is a known, documented gap to handle before public exposure.
@@ -202,7 +202,7 @@ The web process does not read `.env` by itself; add `--env-file .env` to take se
 
 ### Tests and CI
 
-The tests make no real network calls: `tests/network_guard.py` blocks outgoing connections other than loopback during a run, and a test that tries fails. GitHub Actions ([`ci.yml`](.github/workflows/ci.yml)) runs the suite on Python 3.10 and 3.12 for every push and pull request to `main`. At commit `6370bf7` it passed with 5,888 tests on Python 3.12 and 5,887 on 3.10. A further 86 (3.12) and 87 (3.10) are skipped: they are opt-in suites that need a real PostgreSQL server, which CI does not provide, plus one test that needs Python 3.12.
+The tests make no real network calls: `tests/network_guard.py` blocks outgoing connections other than loopback during a run, and a test that tries fails. GitHub Actions ([`ci.yml`](.github/workflows/ci.yml)) runs the suite on Python 3.10 and 3.12 for every push and pull request to `main`. At commit `3b6b2bc` it passed with 6,249 tests on Python 3.12 and 6,248 on 3.10. A further 86 (3.12) and 87 (3.10) are skipped: they are opt-in suites that need a real PostgreSQL server, which CI does not provide, plus one test that needs Python 3.12.
 
 ### Working method
 
@@ -217,7 +217,7 @@ Work is split into staged increments. Each one is reviewed independently before 
 | [`docs/product/PRODUCT_BASELINE.md`](docs/product/PRODUCT_BASELINE.md) | Product baseline: users, scenarios, accepted requirements |
 | [`docs/architecture/ARCHITECTURE_BASELINE.md`](docs/architecture/ARCHITECTURE_BASELINE.md) | Architecture baseline and security invariants |
 | [`docs/README.md`](docs/README.md) | Index of the documents above and how they are kept up to date |
-| [`deploy/RUNBOOK.md`](deploy/RUNBOOK.md) | Deployment, upgrade, backup and restore, scheduled cleanup (English) |
+| [`deploy/RUNBOOK.md`](deploy/RUNBOOK.md) | Deployment, upgrade, backup and restore, scheduled cleanup, encrypted offsite backup (English) |
 
 Some of these documents still carry the earlier name "Kitchen Helper" in their titles.
 
