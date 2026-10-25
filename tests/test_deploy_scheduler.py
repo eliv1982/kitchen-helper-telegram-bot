@@ -25,7 +25,7 @@ from tests.test_deploy_kit import (
     REPO_ROOT,
     RUNBOOK,
     SECRET_NAME,
-    assert_timer_installed_first_run_unverified,
+    assert_first_scheduled_run_verified,
     code_lines,
     needs_compose,
     read,
@@ -244,13 +244,18 @@ def test_section_14_exists_with_its_parts_and_says_where_the_cleanup_stands():
         "## 14. Scheduled cleanup and retention (R4C-D2) **Status: code RELEASED in Git as `489ff30` (independent audit "
         "passed, owner accepted, push-triggered CI green)."
     )
-    # Released code, an installed timer and a seen run are three different things. The installation is the
-    # owner's report (the repository cannot show it), the first run has not been seen, and no outcome of a run
-    # on the real database is claimed. The note closing the checklist says the same thing.
-    assert_timer_installed_first_run_unverified(status, "status paragraph")
+    # Released code, an installed timer and an accepted run are three different things. The installation and the
+    # run are the owner's report (the repository cannot show them). The one run on the real database deleted
+    # nothing, so the section says that the deletion itself has not been observed there, and that failure reporting
+    # and the offsite backup are separate and still pending. The note closing the checklist says the same thing.
+    assert_first_scheduled_run_verified(status, "status paragraph")
     assert "owner-reported" in status
-    assert re.search(r"no result of a run on the real database is claimed", status, re.I)
-    assert_timer_installed_first_run_unverified(text[text.index("Reported state"):], "closing note of 14.9")
+    assert re.search(r"deleted nothing", status, re.I)
+    assert re.search(r"has not been observed there", status, re.I)
+    assert re.search(r"failure reporting .*? and the encrypted off-host backup .*? are separate and still pending", status, re.I)
+    closing = text[text.index("Reported state"):]
+    assert_first_scheduled_run_verified(closing, "closing note of 14.9")
+    assert "deleted nothing" in flat(closing) and "not part of this acceptance" in flat(closing)
     # What was true before the install is not left standing beside what is true now.
     for outdated in ("Not installed, not scheduled, not deployed", "NOT SCHEDULED ON ANY HOST", "no timer exists on any host"):
         assert outdated not in text, outdated
@@ -320,27 +325,40 @@ def test_the_runbook_warns_that_a_cleanup_can_clash_with_an_upgrade_and_says_how
     assert "the timer stopped before an upgrade or a restore" in text  # and it is on the checklist
 
 
-def test_the_gate_rows_name_the_command_and_stay_open_until_the_timer_has_run():
+def test_the_gate_rows_name_the_command_and_close_on_the_first_accepted_run_only():
     gates = flat(section(12))
     for row in retention_gate_rows():
         assert "CODE RELEASED IN GIT (R4C-D2, `489ff30`)" in row, row
-        # Installing the timer does not close a gate: the row stays open until the first run is in the journal.
-        assert_timer_installed_first_run_unverified(row, row[:60])
-        assert "Open until" in row and "journal" in row, row
+        # Installing the timer did not close a gate; the first run, read in the journal and accepted, did.
+        assert_first_scheduled_run_verified(row, row[:60])
+        assert "Closed on 2026-10-25" in row and "journal" in row, row
+        assert "Open until" not in row, row
     assert "purge-expired" in gates and "section 14.9" in gates
 
 
-def test_the_checklist_keeps_the_timer_unchecked_until_the_first_run_has_been_read():
+def test_the_checklist_ticks_the_timer_for_the_first_run_and_keeps_the_separate_items_open():
     items = [line for line in section(14).split("### 14.9")[1].splitlines() if line.startswith("- [")]
-    timer = [item for item in items if item.startswith(("- [ ] The timer:", "- [x] The timer:"))]
-    assert len(timer) == 1, timer
-    assert timer[0].startswith("- [ ]"), "installing the timer does not tick the item that waits for its first run"
+
+    def one(prefix: str) -> str:
+        found = [item for item in items if item.startswith(prefix)]
+        assert len(found) == 1, (prefix, found)
+        return found[0]
+
+    # The timer item is ticked for the accepted first run and for nothing more.
+    assert one("- [x] The timer:") and "2026-10-25" in one("- [x] The timer:")
+    # Failure reporting and the off-host backup are separate pending work: the acceptance does not tick them.
+    assert one("- [ ] Where a failed run is reported")
+    assert one("- [ ] The backup retention, off-host copy and encryption")
+    # What was not reported stays open too.
+    for still_open in ("- [ ] A `--dry-run` was read", "- [ ] The host's clock is synchronised"):
+        assert one(still_open)
 
 
-# --- the documented state, as the documents give it on 2026-10-24 ----------------------------------------
-# Four things that must not be confused: the technical deployment is done; the retention timer is installed
-# and active; its first scheduled run has not been seen; the Functional Alpha has not started. When one of
-# them changes, the documents change with it and so do these checks (the helper they share is in test_deploy_kit.py).
+# --- the documented state, as the documents give it on 2026-10-25 ----------------------------------------
+# Five things that must not be confused: the technical deployment is done; the retention timer is installed
+# and active and its first calendar-triggered run was verified and accepted (it deleted nothing); the offsite
+# backup and the reporting of failures are separate and still pending; the Functional Alpha has not started. When
+# one of them changes, the documents change with it and so do these checks (the helper they share is in test_deploy_kit.py).
 
 
 def current_state() -> tuple:
@@ -357,7 +375,7 @@ def current_state() -> tuple:
     return flat(" ".join(line for line in lines if not line.startswith("|"))), rows
 
 
-def test_the_documented_state_keeps_deployment_timer_first_run_and_functional_alpha_apart():
+def test_the_documented_state_keeps_deployment_cleanup_pending_work_and_functional_alpha_apart():
     introduction, rows = current_state()
     header = flat(read(RUNBOOK).split("\n## ", 1)[0])
     # 1. The technical deployment is done, with this kit, and it is only that: no real user, no beta, no Functional Alpha.
@@ -366,8 +384,23 @@ def test_the_documented_state_keeps_deployment_timer_first_run_and_functional_al
     assert re.search(r"not a functional alpha", introduction, re.I)
     assert "no real users" in header.lower()
     assert re.search(r"no real users", rows["Users"], re.I)
-    # 2 and 3. The retention timer is installed and active; its first scheduled run has not been seen.
-    assert_timer_installed_first_run_unverified(header, "RUNBOOK status paragraph")
-    assert_timer_installed_first_run_unverified(rows["Retention cleanup"], "STATUS.md, Retention cleanup")
-    # 4. The Functional Alpha has not started.
+    # 2. The retention timer is installed and active; its first calendar-triggered run was verified and accepted,
+    # and it deleted nothing. Every document that gives the state says the same.
+    readme = next(
+        flat(line) for line in read(REPO_ROOT / "README.md").splitlines() if line.startswith("| Scheduled cleanup |")
+    )
+    for where, text in (
+        ("RUNBOOK status paragraph", header),
+        ("STATUS.md, Retention cleanup", rows["Retention cleanup"]),
+        ("README, Scheduled cleanup", readme),
+    ):
+        assert_first_scheduled_run_verified(text, where)
+    assert "deleted nothing" in rows["Retention cleanup"] and "does **not** show a deletion of real expired rows" in rows["Retention cleanup"]
+    # 3. The offsite backup and the reporting of failures are separate from the accepted run, and still pending.
+    assert "separate and still pending" in rows["Retention cleanup"]
+    assert re.search(r"not installed or activated on the VPS", rows["Backups"]) and "pending" in rows["Backups"]
+    assert re.search(r"an alert path for failures \(none exists", introduction) and "still pending" in introduction
+    assert "Failure reporting, the encrypted off-host backup and a restore rehearsal are separate and not yet completed" in header
+    # 4. The Functional Alpha has not started, and the closure of the cleanup gate does not say otherwise.
     assert re.search(r"\bnot started\b", rows["Functional Alpha"], re.I)
+    assert re.search(r"not a first-user beta and not a Functional Alpha", introduction)

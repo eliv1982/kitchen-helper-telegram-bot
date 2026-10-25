@@ -626,15 +626,18 @@ def retention_gate_rows() -> list:
     return rows
 
 
-def assert_timer_installed_first_run_unverified(text: str, where: str) -> None:
-    """The cleanup as the documents report it on 2026-10-24: the timer is installed and active, and its first
-    automatic run has not been seen. Those are two facts and the first never implies the second, so each
-    has its own check. The wording around them is free."""
+FIRST_RUN = r"first (?:automatic |calendar-triggered |scheduled )*(?:run|execution)\b"
+
+
+def assert_first_scheduled_run_verified(text: str, where: str) -> None:
+    """The cleanup as the documents report it on 2026-10-25: the timer is installed and active, and its first
+    calendar-triggered run (2026-10-25) was verified and accepted by the owner. Those are two facts and the first
+    never implies the second, so each has its own check, and the wording of 2026-10-24 ("not yet verified") must
+    not be left standing beside the new one. The wording around them is free."""
     flat_text = " ".join(text.split())
     assert re.search(r"installed and active", flat_text, re.I), where
-    assert re.search(
-        r"first (?:automatic )?(?:run|execution)\b[^.|]*?\bnot (?:yet )?(?:been )?verified", flat_text, re.I
-    ), where
+    assert re.search(FIRST_RUN + r"[^.|]*?\bverified and accepted", flat_text, re.I), where
+    assert not re.search(FIRST_RUN + r"[^.|]*?\bnot (?:yet )?(?:been )?verified", flat_text, re.I), where
 
 
 def test_no_unsafe_command_of_the_first_version_is_left_in_the_runbook():
@@ -701,13 +704,18 @@ def test_the_retention_requirements_are_gates_that_nothing_in_the_kit_waives():
     assert "Pre-live gate 1: required before real use" in gates
     assert "Pre-live gate 2: required before any real user data is stored; not waived" in gates
     # R4C-D2 built both and its code is released. They are stated as exactly that (code in Git, timer
-    # installed, first run not yet seen), and as still open until that run has been read in the journal:
-    # neither as missing nor as done, and not any longer as code that runs nowhere.
+    # installed, first calendar-triggered run verified and accepted on 2026-10-25), and as closed on that run
+    # alone: not as missing, not as waived, and not any longer as code that runs nowhere or waits for its first run.
     for row in retention_gate_rows():
         assert "**CODE RELEASED IN GIT (R4C-D2, `489ff30`);" in row, row
-        assert_timer_installed_first_run_unverified(row, row[:60])
+        assert_first_scheduled_run_verified(row, row[:60])
         assert "NOT SCHEDULED ON ANY HOST" not in row and "NOT DEPLOYED" not in row, row
-    assert gates.count("**Open until**") == 2
+    assert gates.count("**Closed on 2026-10-25") == 2
+    assert "**Open until**" not in gates
+    # The closure covers the activation only: the run deleted nothing, and the backup row stays a separate blocker.
+    assert "deleted nothing" in " ".join(gates.split()) and "has not been observed" in " ".join(gates.split())
+    backup = next(line for line in gates.splitlines() if line.startswith("| **Backup retention and off-host**"))
+    assert "BLOCKER before real data" in backup and "undecided and not installed" in backup
     assert "NOT IMPLEMENTED" not in gates
     assert "substitutes for either of them" in gates
     assert "outside the kit R4C-D1 released" in " ".join(gates.split())  # the code is a change to the application
