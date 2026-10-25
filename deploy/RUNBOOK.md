@@ -2042,7 +2042,7 @@ When a **stable** rclone whose `rclone config providers` lists the Yandex `app_f
 
 #### 15.12.10 Interfaces for monitoring, and the gates that remain **[OWNER]**
 
-*Preserved for the monitoring work (the other agent's `deploy/monitoring/`, not part of this change). The monitoring must read
+*Preserved for the monitoring work (the other agent's deploy/monitoring/, not part of this change). The monitoring must read
 nothing but these:*
 
 * **The unit** `house-helper-offsite-backup.service` (unchanged name; `ExecStart` gained `--access-mode ${HOUSE_HELPER_OFFSITE_ACCESS_MODE}`),
