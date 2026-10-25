@@ -1163,9 +1163,16 @@ and stay open. Two of them are separate pending work and not part of this accept
 
 **Status: the repository side only.** `deploy/offsite_backup.py`, the `sanitize` command of `dbtool`, three systemd
 templates and their tests exist in the working tree. **Nothing is installed, scheduled or deployed; no key pair exists; the
-tool has never run against a real Yandex Disk account, a real `age` or a real `rclone`** (the tests use fakes for those
-three and the real `dbtool` on synthetic SQLite; section 15.9 lists what is still to be done and by whom). Every step marked
+tool has never run against a real Yandex Disk account or a real `age`, and its `rclone` commands have run only offline
+against a real, pinned stable `rclone` (15.12.6)** (the tests use fakes for those three and the real `dbtool` on synthetic SQLite; section 15.9 lists what is still to be done and by whom). Every step marked
 **[OWNER]** changes something outside the repository.
+
+Two additions of Task A1 (2026-10-25), both repository code and neither installed, configured or activated: a **temporary
+full-disk access mode**, for a stable `rclone` whose Yandex backend has no `app_folder` option and an OAuth token the owner has
+authorised to reach the whole Disk (15.12; owner decision, KHD-33; **off by default**), and `deploy/offsite_rehearsal.py`, the
+restore rehearsal for the owner's own machine (15.13). No OAuth credential and no private key exists in the repository. The tool's
+rclone commands have now also been run **offline against a real, pinned stable rclone (1.75.2)**, which corrected one assumption
+(15.12.6); they have still never run against a Yandex Disk account.
 
 ### 15.1 What a run does
 
@@ -1189,10 +1196,13 @@ first that fails:
 5. **Encrypt** with `age -R <recipients file>`: public keys only. A recipients file that contains a private key
    (`AGE-SECRET-KEY-...`) is refused before anything runs. The private key is never needed on the VPS.
 6. **Upload, read back, rename, commit.** `rclone copyto` uploads to `house-helper-<UTC time>-<8 hex>.tar.age.partial` in the one
-   configured folder (`--immutable`: nothing is overwritten); the folder listing must show the same size **and an MD5** that equals
+   configured folder (the folder was listed first and a name that exists stops the run; `--immutable --ignore-existing` is the
+   second line: an existing object is never overwritten, and **`--ignore-existing` is the flag that does it**: the real stable
+   rclone 1.75.2 overwrote a different existing object under `--immutable` alone, 15.12.6); the folder listing must show the same size **and an MD5** that equals
    the local file's (Yandex Disk lists MD5 and nothing else; a listing without an MD5 stops the run here, with nothing renamed);
    the object is downloaded again and its **SHA-256** must equal the local file's; only then is it renamed to `...tar.age`
-   (`rclone moveto`) and the listing checked once more. **That name is not yet a recovery point** (a name is not proof: a stop, a
+   (`rclone moveto --ignore-existing`: a rename never replaces; a destination that appeared since the folder was listed leaves
+   the partial where it was, fails the run and is itself left untouched) and the listing checked once more. **That name is not yet a recovery point** (a name is not proof: a stop, a
    failure or an unreadable answer after the rename leaves a final-looking object nobody has confirmed). The **commit** is a
    second, small object, `...tar.age.commit` (the commit record: the object's name, size, SHA-256, SHA-1 and MD5; no content, no
    key, no path), uploaded and read back byte for byte. **A recovery point is an object together with a valid record whose size
@@ -1204,6 +1214,18 @@ first that fails:
    deletes nothing and does **not** call the point stored. Only after a passed final check does retention run.
 
 Then, only after the final check, **retention** (15.3). A run never starts it on a failure.
+
+**The closing listing.** After retention (or straight after the final check, when retention had nothing to do) the run lists the
+folder **once more, as the very last thing it does with the remote**, and decides its exit status from that listing for leftover
+`.partial` objects: every `...tar.age.partial` of the tool's shape in it is logged as `LEFTOVER PARTIAL <name>` (with its size and
+MD5, and whether the first listing of the run had already shown it) and makes the exit status **6**, **even though the new point was
+committed and everything else went well**. This is what finds an object that appeared *after* the first listing, while the run was
+uploading, renaming or applying retention, which no earlier listing shows (the final check and the listings of the retention only
+classify the objects with a final name). If the closing listing cannot be taken (rclone fails, the answer is not JSON, any
+unexpected error) the run ends with **6** as well, never 0, says so, and still names the partials the first listing had shown. It
+deletes nothing. It is an observation at one moment, not a guarantee: an object that appears after it is seen by the next run. A
+run that ended with exit 7 takes no closing listing (its status was decided by the final check), and one that failed earlier ends
+with its own failure status; both are already not a success.
 
 What each later run can and cannot say about a point: it re-checks the **size and the MD5** that the listing reports against
 the record (every run, for every point, so that a point changed after its commit is noticed). The **SHA-256** in the record was
@@ -1221,28 +1243,46 @@ made, encrypted and verified; the run says `retention holds back N committed poi
 object exists, and the folder grows by one point per run meanwhile. Once an operator has dealt with the object (15.11) the next
 run prunes as the plan says. Every run reports it (exit 6, a line `UNRESOLVED <name>: <why>`) and so does `list`, until an
 operator has looked at it (15.11). A record whose object is gone (the half of a deletion that was interrupted) is an orphan:
-retention removes it, within its budget, and leftover `.partial` uploads are removed as always; neither depends on the
-unresolved object.
+retention removes it, within its budget, whether or not an unresolved object exists. A leftover `.partial` object is not
+handled like either: it is never deleted by the tool and never holds retention back (15.2, 15.11).
 
 **Before step 1, and refused with status 3 if any of it is not as required** (no command of the backup has run yet): the
 recipients file holds only public keys; the rclone config section of the remote (`NAME` in `--remote NAME:FOLDER`) is
 `type = yandex`, has `app_folder = true`, and has a `client_id`, a `client_secret` and a `token` of its own (rclone's
 built-in application is shared and its access is wider); this rclone **knows the Yandex `app_folder` option** (read from
 `rclone config providers`, not guessed from a version number); and the remote **renames server-side** (`rclone backend
-features`: `Move`), because step 6's commit is a rename. The tool never falls back to another mode: an rclone or a config
-that does not meet this is not run, and the message says what is missing. No value of the config file is ever printed.
+features` of the dedicated folder, never of the remote's root: `Move`), because step 6's commit is a rename. The tool never falls
+back to another mode: an rclone or a config that does not meet this is not run, and the message says what is missing. No value
+of the config file is ever printed. **That is the default mode (`--access-mode app-folder`).** The one exception, explicitly
+requested and temporary, is `--access-mode full-disk-temporary` (15.12): the config must then NOT say `app_folder = true`, the
+option is not required of the rclone, the remote must be exactly `NAME:house-helper-backup`, and the config file must sit where
+only root can change it. `run` and `list` make exactly the same offline authorization, in one function, before anything else and
+before any rclone command.
 
 ### 15.2 What is promised, and what is not
 
-- **A failed run deletes nothing that is not its own.** The only remote objects a run deletes are: its own `.partial` when it
-  fails; its own final-named object if the listing right after the rename proves that the rename damaged it; `.partial` files of
-  an earlier killed run; and, after a commit, the points retention drops (the object, then its commit record) and orphaned
-  records. **An unresolved object is never deleted by the tool**, and while one exists retention drops no committed point (15.1;
-  only the orphaned records and the leftover `.partial` uploads are still removed). All deletes go through one function that accepts only a name
-  of the tool's own shape (`house-helper-<time>-<8 hex>.tar.age[.partial|.commit]`) inside the one folder, one object at a time
+- **A failed run deletes nothing on the remote, and no run ever deletes a `.partial`.** The only remote objects a run
+  deletes are, after a commit, the points retention drops (the object, then its commit record) and orphaned records.
+  **An unresolved object is never deleted by the tool**, and while one exists retention drops no committed point (15.1; only the
+  orphaned records are still removed). All deletes go through one function that accepts only a name of the tool's own shape
+  (`house-helper-<time>-<8 hex>.tar.age[.commit]`; it refuses a `.partial` too) inside the one folder, one object at a time
   (`rclone deletefile --yandex-hard-delete NAME:FOLDER/<exact name>`). The tool never runs `delete`, `purge`, `sync`, `move` or
   `cleanup`, so it can neither remove anything else in the folder nor empty the account's Trash. Files in the folder that are
   not of that shape are reported and left alone.
+- **Why a `.partial` is never deleted, not even the one of a run's own failed upload.** The name `...tar.age.partial` proves
+  nothing about whose object it is: it may be the fragment of a hard kill, the half of an upload that stopped, an object another
+  writer put there, or the upload this very run made and which was replaced afterwards. `rclone deletefile` deletes by name and
+  has no "only if it still has these bytes", so a check made a moment before cannot rule out that the delete removes something
+  else. The tool therefore leaves every `.partial` untouched, **logs each one it sees** (`LEFTOVER PARTIAL <name>`), makes
+  every run that commits a point end with **exit 6** while one exists (`list` shows them too), and leaves the removal to a
+  person who has looked (15.11). **The cost, stated plainly:** a run that failed after its upload had returned (the read-back,
+  the rename or a listing failed, or a signal came), and a hard kill during or after the upload, leave one `.partial`, and
+  every later run reports it until the operator has dealt with it. It is never counted as a point and never holds retention
+  back. A `.partial` that was already there when a run started is just as untouched; the run's own upload has a name of its own
+  (a name that is already taken stops the run before anything is uploaded). For the same reason the object under the run's
+  **final name** is not deleted when the listing right after the rename shows that it is not the file that was read back (the
+  rename may have damaged it, or an object that replaced the partial in between may have been renamed instead, and nothing tells
+  the two apart): it gets no commit record, so it is `UNRESOLVED` (15.1) and is dealt with by hand (15.11).
 - **A delete is believed only when the folder shows it.** After every group of deletes the tool **lists the folder again** and
   requires each object to be absent. An exit status of 0 from `rclone deletefile` on an object that is still listed is not a
   prune (the run ends with exit 6 and says what remains); an error status on an object that is no longer listed is not a
@@ -1261,13 +1301,15 @@ that does not meet this is not run, and the message says what is missing. No val
   removed, so plaintext is not piled up next to plaintext (15.11 says what to do). Directories of the tool owned by another
   user are not touched, and stop the run in the same way.
 - **A normal stop and a hard kill are different, and only the first runs the clean-up.** A failure, `SIGTERM`, `SIGINT` and
-  `SIGHUP` (what `systemctl stop` and a timeout send first) run the clean-up described above: plaintext removed, this run's own
-  `.partial` taken back. `SIGKILL` (what systemd sends if the clean-up does not finish within `TimeoutStopSec`, the kernel's
+  `SIGHUP` (what `systemctl stop` and a timeout send first) run the clean-up described above: plaintext removed, and the
+  log names the run's own `.partial` if one is left (it is **not** deleted, 15.2). `SIGKILL` (what systemd sends if the clean-up
+  does not finish within `TimeoutStopSec`, the kernel's
   out-of-memory killer, `kill -9`) and a power cut run **nothing**. What they leave, and what happens to it: (a) the private
   directory with whatever plaintext stage the run was in, until the **next run's start** removes it (or the unit's stop, which
   removes `/run/house-helper-offsite` itself, or a reboot, which empties tmpfs); (b) at most one `...tar.age.partial` on the
   remote, which **no reader can mistake for a point** (a point is an object with a valid commit record, and a `.partial` has
-  neither the name nor a record) and which the next run removes; or, if the kill came **between the rename and the commit
+  neither the name nor a record), which **no run removes** (every later run logs it as `LEFTOVER PARTIAL` and ends with exit 6
+  until an operator has removed it, 15.11); or, if the kill came **between the rename and the commit
   record**, one final-named object **without a record**, which is **unresolved**: no run counts it, relies on it or deletes it,
   and every run reports it (exit 6) until an operator has looked at it (15.11); (c) nothing else: no lock stays (the kernel
   drops it), no older point is touched, nothing is half-deleted (a point being dropped by retention loses its object first and
@@ -1303,19 +1345,18 @@ is at most about 36 days old (a Monday: the Sunday five weeks before it).
 
 **The strict rule: no pruning while an unresolved object exists.** If the folder holds any `UNRESOLVED` object (15.1), the plan
 above is **not applied**: **no committed point is dropped**, whatever its age, and the log says `retention holds back N committed
-point(s)`. The run still makes and verifies its new point, and still removes orphaned commit records and leftover `.partial`
-uploads, and it ends with exit 6 (15.7) so that the condition is never only a log line. The unresolved object is not deleted or
+point(s)`. The run still makes and verifies its new point, and still removes orphaned commit records, and it ends with
+exit 6 (15.7) so that the condition is never only a log line (a leftover `.partial` is never removed by it, 15.2). The unresolved object is not deleted or
 trusted. The hold lasts until an operator quarantines or deletes the object (15.11); the points that piled up meanwhile are
 then dropped by the next run, and if that is more than `--max-deletions` allows (below) pass a larger limit **once**.
 
 Guards: retention runs only after a committed point that the final check (15.1, step 7) has confirmed; if the folder, listed
 again, does not show the new point as committed, nothing is deleted and the run ends with exit 7; **`--max-deletions` (default 5)
-is one budget for the whole run**, shared by the
-leftover `.partial` uploads it removes first, the points retention drops (an object and its record count once) and orphaned
-records. A run whose retention would exceed what is left of it **deletes nothing, exits 6 and says so**: the steady state
+is one budget for the whole run**, used by the points retention drops (an object and its record count once) and orphaned
+records; a `.partial` is never deleted and so never draws on it. A run whose retention would exceed it **deletes nothing, exits
+6 and says so**: the steady state
 deletes one or two a day, so a larger number means the folder is not as expected, or retention is being applied for the first
-time to a long history. After checking `list` (below) pass a larger limit **once**. (The run's own unfinished or damaged upload
-is taken back whatever the budget: it is its own object.)
+time to a long history. After checking `list` (below) pass a larger limit **once**.
 
 **The clock is checked, because the names carry it.** Retention orders points by the time in their names, which is the host's
 clock when they were made. It deletes **nothing at all** in a run, and ends with exit 6 saying why, if (a) a committed point
@@ -1339,14 +1380,28 @@ whatever it finds: read it.
 
 ### 15.4 Prerequisites **[OWNER]**
 
-1. **The key pair, made on the owner's own machine, not on the VPS:** `age-keygen -o house-helper-age-key.txt`. Keep the private
-   file where a loss of the VPS, the laptop or one cloud account does not lose it (a password manager **and** an offline copy);
-   without it every off-host point is unreadable. Put the **public** key line (`age1...`) in `/etc/house-helper/age-recipients.txt`.
-   A second recipient (a spare key kept elsewhere) is supported: one key per line, at most eight.
+1. **The key pair, made on the owner's own machine, never on the VPS and never inside a checkout of this repository.** Choose a
+   directory that is not under the repository, not on the VPS, not in n8n and not in a synchronised project folder, give it to
+   yourself alone, and write the key there by an **absolute** path:
+
+   ```bash
+   umask 077 && mkdir -p "$HOME/keys/house-helper" && age-keygen -o "$HOME/keys/house-helper/age-key.txt"
+   ```
+
+   `age-keygen` prints the **public** key (`age1...`) and writes the private one only to that file. **Never run it with a bare file
+   name from inside the checkout:** `age-keygen -o age-key.txt` there would put the private key into the working tree, one
+   `git add .` from the history. (`.gitignore` refuses the usual key names and `tests/test_repo_secrets.py` fails the build if a
+   file that looks like a key is tracked or not ignored; both are a second line of defence, not the procedure.) Keep the
+   private file where a loss of the VPS, the laptop or one cloud account does not lose it (a password manager **and** an offline
+   copy); without it every off-host point is unreadable. Put the **public** key line (`age1...`) in
+   `/etc/house-helper/age-recipients.txt`. A second recipient (a spare key kept elsewhere) is supported: one key per line, at most
+   eight. The production tool refuses a recipients file that contains a private key, and the restore rehearsal (15.13) refuses an
+   identity file that sits inside the checkout, is readable by other users, or is used on the production host.
 2. **A Yandex OAuth application of the owner's own, with only the permission "access to the application folder"**
    (`cloud_api:disk.app_folder`), so that the token cannot read or delete anything else on the disk. **Do not use rclone's
    built-in client**: it is shared and its scope is wider. A Yandex Mail account is required (rclone's documentation: without one,
-   a token is issued but every action answers `403 DiskUnsupportedUserAccountTypeError`).
+   a token is issued but every action answers `403 DiskUnsupportedUserAccountTypeError`). (A token with permissions beyond the
+   application folder is not what this item asks for; the owner's limited, temporary decision to use one is 15.12.)
 3. **A stable `rclone` that has the Yandex `app_folder` option: stable 1.75.2 does not; the first stable release planned
    to is 1.76.0 (owner's information; the option itself was merged into rclone's development branch on 2026-09-08, pull request
    9850).** The Yandex backend addresses `disk:/` by default, and a token restricted to the application folder is refused
@@ -1359,14 +1414,17 @@ whatever it finds: read it.
    the rehearsal of 15.5 (with `app_folder = false` set by hand for one command, the same token must be refused with `403`;
    then set it back). **Never install a development or beta build on the VPS to get the option early**, and never use
    rclone's built-in application or a token with full disk access to get past a refusal: an rclone that cannot be made to
-   work with the application-folder scope means this design waits, or **is decided again by the owner**.
+   work with the application-folder scope means this design waits, or **is decided again by the owner**. **The owner has decided
+   it again, for a limited time and only under the conditions of 15.12 (KHD-33):** the explicit `--access-mode full-disk-temporary`.
+   Outside that mode this item stands as written, and rclone's built-in application is refused in both modes.
 4. **`age` and `rclone` installed on the VPS** (`apt-cache policy age` shows whether Ubuntu 24.04's archive has it), and
    Python 3 (Ubuntu 24.04 has 3.12; the tool needs 3.10 or later and no packages).
 5. **A running image that knows `sanitize`**: built from a commit that contains this change and deployed through the normal
    upgrade (section 9). An older image answers `invalid choice: 'sanitize'` (exit 2) and the run fails before anything is
    uploaded. The tag in `/etc/house-helper/purge.env` must be the **running** one.
 6. **The folder name.** The configuration takes `NAME:FOLDER`, a folder of its own inside the application folder (for example
-   `yandex-hh:house-helper`). A bare `NAME:` is refused so that a mistake cannot aim retention at the root.
+   `yandex-hh:house-helper`). A bare `NAME:` is refused so that a mistake cannot aim retention at the root. (In the temporary
+   full-disk mode the folder is not a choice: it is exactly `NAME:house-helper-backup`, 15.12.2.)
 7. **Room.** The work directory is tmpfs under `/run`, which is limited to a fraction of memory (`df -h /run`). A run holds
    about twice the database at any moment (three times is checked up front and the run fails cleanly if it is not free). That
    is far below any limit for two users; look again if the database approaches the size of that tmpfs.
@@ -1432,9 +1490,13 @@ two committed points take the newest unless you are going back on purpose.
 
 ```bash
 # fetch house-helper-<time>-<id>.tar.age from the application folder (the Yandex web interface, or rclone copyto)
-age -d -i house-helper-age-key.txt -o recovery.tar house-helper-20261025T041507Z-0a1b2c3d.tar.age
+age -d -i "$HOME/keys/house-helper/age-key.txt" -o recovery.tar house-helper-20261025T041507Z-0a1b2c3d.tar.age
 python3 deploy/offsite_backup.py unpack recovery.tar --output-dir ./recovered
 ```
+
+(Do this in a scratch directory **outside the checkout**: `recovery.tar` and `recovered/` are plaintext. `.gitignore` refuses those
+names, but the place is yours to choose. 15.13 does the fetch, the comparison with the commit record, the decryption and the checks
+of the archive and the database in one command, and removes everything afterwards; this manual form is for restoring.)
 
 `unpack` refuses a tar that is not exactly what the tool writes (three named regular files, a manifest of the known shape, the
 checksum file exactly the one line for `snapshot.db`, the snapshot equal to its manifest), extracts only those three files by
@@ -1451,13 +1513,14 @@ the same way: `age -d` authenticates every chunk of the file, so a decryption th
 
 ### 15.7 Statuses and troubleshooting
 
-Exit status: **0** stored, verified, final check passed, retention done, nothing needing review. **1** failed: no new point, and
+Exit status: **0** stored, verified, final check passed, retention done, the closing listing taken and showing no leftover `.partial`, nothing needing review. **1** failed: no new point, and
 nothing of another run touched (the log says which step); an unconfirmed object of this run may remain **unresolved** (15.11).
 **2** usage. **3** refused before anything was done (configuration, a missing tool, or a leftover work directory that cannot be
 removed). **6** the new point **is stored and verified** (its SHA-256 was read back before the commit, and the final check of
 the folder matched its size and MD5 to its commit record), but something needs attention: housekeeping did not complete (a
-listing or a delete failed or could not be confirmed, retention would have exceeded `--max-deletions`, leftover `.partial`
-uploads could not be removed), the work directory of this run could not be removed, an **unresolved** object or a **suspect**
+listing or a delete failed or could not be confirmed, retention would have exceeded `--max-deletions`), a leftover **`.partial`**
+object is in the folder (never deleted by the tool, 15.11; it may have appeared while the run was in progress: the **closing
+listing** that ends every run finds it), the closing listing itself could not be taken, the work directory of this run could not be removed, an **unresolved** object or a **suspect**
 (future-dated) point is in the folder (while an unresolved one exists retention also drops no committed point), or the clock is
 implausible so retention deleted nothing. Extra objects remain, which is the safe side, and **the run fails again in every run in which the cause persists**: it is never only a log line. **7** the point
 is **not confirmed**: this run wrote the object and its commit record, but the final check (the folder listed and classified
@@ -1471,7 +1534,12 @@ operator runs `list` before anything else (15.11). **128+N** a signal (the clean
 | `Failed to load environment files` | `purge.env` or `offsite.env` is missing | install them (15.5) |
 | `refused: ... is not installed` | `age`, `rclone`, `docker` or `bash` is not on the unit's `PATH` | install it |
 | `refused: this rclone has no app_folder option` | the rclone is older than the first release with the Yandex application-folder mode (1.75.2 and earlier) | install a stable release that lists it (15.4 item 3); nothing was done |
-| `refused: the remote [NAME] does not set app_folder = true` / `... has no client_id and client_secret of its own` / `... is not a Yandex Disk remote` | the rclone config is not an application-folder remote of the owner's own OAuth application | fix the config (15.5); never work around by widening access |
+| `refused: the remote [NAME] does not set app_folder = true` / `... has no client_id and client_secret of its own` / `... is not a Yandex Disk remote` | the rclone config is not an application-folder remote of the owner's own OAuth application | fix the config (15.5); never work around by widening access (the explicit temporary exception is 15.12) |
+| `refused: ... sets app_folder, which contradicts --access-mode full-disk-temporary` | the config asks for the narrow mode and the unit for the wide one | decide which; 15.12.2 |
+| `refused: in the full-disk-temporary mode --remote must be NAME:house-helper-backup exactly` | the one fixed folder of that mode is the only one accepted | 15.12.2 |
+| `refused: in the full-disk mode ... --rclone-config ... (owned by root / writable by group or others / symbolic link / single link / no access at all)` | the OAuth configuration is not where only root can change it | 15.12.4: fix the owner, the mode or the directory; nothing was done |
+| `usage: argument --access-mode: invalid choice` (exit 2) | the value in `offsite.env` is empty, misspelled or not one of the two | 15.12.2; nothing was done |
+| `FAILED: the rename did not take place: an object named ... that this run did not make appeared in the folder` | something else created the final name between the listing and the rename; `--ignore-existing` left it alone | 15.11: look at the folder, the object is not touched; this run's own `.partial` stays too (the log names it) |
 | `refused: the remote cannot rename server-side` | the commit would not be atomic | do not run; decide again (15.4 item 3) |
 | `refused: --recipients-file ... PRIVATE key` | a private key is in the recipients file | remove it, **treat that key as exposed if it was ever on the VPS** |
 | `FAILED: deploy/backup.sh failed` | read the `\|`-prefixed lines above it (`backup.sh`'s own messages) | as section 10 |
@@ -1484,9 +1552,12 @@ operator runs `list` before anything else (15.11). **128+N** a signal (the clean
 | `exit 7 FAILED: the final check of the folder did not confirm the recovery point ...` and `NOT reported as stored` | the record or the object was written but the folder, listed again afterwards, does not show a committed point (the line says why: record missing / damaged, object changed or gone, no MD5 listed, or the listing or a record could not be read); nothing was deleted | 15.11: `list` first. If it shows the point as committed, the next run counts it; if `UNRESOLVED`, treat it as such. Do not rely on this run's point until `list` says so |
 | `FAILED: the remote's listing gives no MD5 for the object` (exit 1) | the remote did not list an MD5 for the uploaded object, so it can never be tied to a record; nothing was renamed | run `rclone --config /etc/house-helper/rclone.conf lsjson --hash NAME:FOLDER` by hand: every object must show an MD5. If it does not, stop and tell the owner (15.9) |
 | `FAILED: ... nothing can tie the renamed object to a commit record, so none was written` (exit 1) | the listing right after the rename gave no MD5 | the object was read back before the rename but has **no record**: `UNRESOLVED` (15.11) |
+| `WARNING: <name>, listed right after the rename, is not the file this run read back ... it is NOT deleted` (exit 1) | the listing after the rename shows another size or checksum than the file that was read back: the rename damaged it, or an object that replaced the partial in between was renamed instead; nothing tells the two apart | the object has **no record**, so it is `UNRESOLVED` and not deleted (15.2): look at it (15.11) |
 | `WARNING: could not remove the work directory` (run ends 6, or with its own failure status) | the clean-up could not remove plaintext | remove it by hand **before the next run, which refuses to start while it exists** (15.11; `/run/house-helper-offsite` is tmpfs: a reboot clears it) |
 | `refused: N leftover work directories ... cannot be removed` (exit 3) | a leftover of an earlier run holds plaintext and cannot be removed by this user | 15.11; nothing was done |
-| `WARNING: could not remove the unfinished upload ... (or confirm that it is gone)` | the remote was unreachable during the clean-up, or did not honour the delete | nothing to do: the next run removes it |
+| `WARNING: <name>.partial was uploaded by this run, which ended before the rename. It is LEFT in the folder untouched` (the run failed, exit 1 or 128+N) | the upload had returned, then the read-back, the rename or a listing failed, or a signal came; the tool never deletes a `.partial` (15.2) | 15.11: look at it, then remove it by hand; until then every run reports it |
+| `LEFTOVER PARTIAL <name>: left untouched` (exit 6 after a committed run; `list` shows `LEFTOVER PARTIAL <name> (N bytes)`) | a `.partial` is in the folder: the fragment of a hard kill, of a stopped upload or of a failed run, or somebody else's object. The line from the closing listing ends `NOT in the listing taken before this run's upload: it appeared while the run was in progress` if it came in during the run | 15.11: look at it (who writes to the folder, if it appeared during the run?), then quarantine or remove it by hand; the exit 6 stops when it is gone |
+| `the closing listing of the folder could not be taken` (exit 6, with `IS stored and verified`) | the last listing of the run failed or was unreadable, so whether a `.partial` is in the folder now is not known | run `list`; the point is stored, but this run is not called healthy and sends no success ping (15.10); the next run looks again |
 | `FAILED: rclone lsjson failed ... while confirming the rename` | the rename was issued but its result could not be read | the object was read back before it was renamed but has **no commit record**: it is `UNRESOLVED` (15.11); the next run reports it |
 | `FAILED: ... its commit record is not confirmed, so it is NOT a recovery point` | the record could not be written or read back | the object is left untouched and is `UNRESOLVED` or, if the record did arrive whole, a committed point from the next run on; `list` shows which (15.11) |
 | `UNRESOLVED <name>: <why>` (exit 6) | a final-named object without a valid, matching commit record | 15.11: look, then quarantine or delete by hand; the tool never does |
@@ -1524,8 +1595,8 @@ why 15.9 asks for an alert.
       stop every backup. **Unverified here: the tests list an MD5 because the fake does; nothing has run against a live account.**
 - [ ] The server-side rename was seen working on the real remote (rclone's Yandex backend implements `Move` as a server-side
       move, per its source; the tool refuses to run if rclone reports otherwise): the object appears under its final name
-      only at the end, and a `.partial` of a run stopped by hand (`systemctl kill -s KILL`, then `list`) is not shown as a point
-      and is removed by the next run.
+      only at the end, and a `.partial` of a run stopped by hand (`systemctl kill -s KILL`, then `list`) is not shown as a point,
+      is shown as `LEFTOVER PARTIAL`, is **not** removed by the next run (which ends with exit 6) and is removed by hand as in 15.11.
 - [ ] The running image contains `sanitize` (a real run of `dbtool sanitize` against a copy of the real database was read:
       `rows per table` equal before and after, no free pages).
 - [ ] The timer is enabled and `list-timers` shows the next run.
@@ -1535,7 +1606,8 @@ why 15.9 asks for an alert.
       off-host copy, or changed, and what users are told matches (section 14.7).
 - [ ] The owner accepts what the loss of the application-folder token means: whoever holds it can read the encrypted points
       and delete them (so keep the rclone config root-only), but cannot read their content, and it does not reveal the
-      private key.
+      private key. **In the temporary full-disk mode the loss is worse:** the token reaches the whole Disk (15.12.4).
+- [ ] If the temporary full-disk mode is used: every gate of 15.12.10 is closed.
 
 ### 15.10 Failure notification: the minimum **[OWNER]**
 
@@ -1572,9 +1644,117 @@ cd ~/apps/house_helper
 sudo python3 deploy/offsite_backup.py list --rclone-config /etc/house-helper/rclone.conf --remote NAME:house-helper
 ```
 
+**Quarantining one object safely.** Both quarantine steps below (an `UNRESOLVED` object and its record; a leftover `.partial`) and the
+`SUSPECT` case use this procedure, once per object, and nothing else. Run all seven steps **in one shell session** (they define
+functions and variables that the later steps use). It exists because of what the pinned `rclone` 1.75.2 does
+(15.12.6): a plain `rclone moveto A B` **replaces an existing `B` and exits 0**, so a destination named the same way every time
+(`<name>.quarantined`) can silently destroy an object that was quarantined earlier. `--ignore-existing` makes `moveto` skip instead
+(exit 0; with `--error-on-no-transfer` **exit 9**, which the procedure adds so that a skip is loud). Nothing here shows that the skip is
+atomic against a writer that creates the destination between the check and the move: that is why the procedure first stops the
+backup, checks again immediately before the move, and accepts **only the listing taken afterwards, never rclone's exit status**, as
+proof. Nothing in it deletes anything. It was run against the real `rclone` 1.75.2 on its `local` backend, including a destination
+that already exists (`tests/test_deploy_offsite_quarantine.py`, opt-in with the real binary); **not** against Yandex Disk.
+
+1. **Stop the schedule and confirm that no backup is running.** A run owns a `.partial` of its own and lists the folder several
+   times; a rename during it can take that run's object or confuse its listings. Stop the **timer** (do not disable it: step 7 starts
+   it again, and a reboot in between starts it by itself). A run that is under way is **waited for, not killed** (a killed run leaves a
+   `.partial`): repeat the last line until it says `IDLE`.
+
+   ```bash
+   sudo systemctl stop house-helper-offsite-backup.timer
+   idle() { [ "$(systemctl is-active house-helper-offsite-backup.timer)" = inactive ] \
+         && [ "$(systemctl is-active house-helper-offsite-backup.service)" = inactive ] \
+         && ! pgrep -f 'deploy/offsite_backup.py' > /dev/null; }
+   idle && echo "IDLE: nothing is scheduled or running" || echo "NOT IDLE: do not continue"
+   ```
+
+2. **Select the exact source object and inspect it.** Copy its name out of `list` (or the `lsjson` below) into a variable: one
+   exact name, never a wildcard, a pattern or a directory. `show` prints `name size md5` for the exact names it is given if they are in
+   the folder, by comparing strings, and fails if the listing fails. The guard `exact` accepts only the shape of the tool's own
+   objects: `...tar.age`, `...tar.age.partial` or `...tar.age.commit`. `BEFORE` must be **one line**, with a size and an MD5 (not `-`),
+   and must be the object you meant: if it is not, stop. For a `.partial`, "whose is it" (step 3 of its procedure) is decided before this.
+
+   ```bash
+   CONF=/etc/house-helper/rclone.conf
+   REMOTE='NAME:house-helper'          # NAME:house-helper-backup in the temporary full-disk mode (15.12)
+   exact() { [[ "$1" =~ ^house-helper-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}\.tar\.age(\.partial|\.commit)?$ ]]; }
+   show() {
+     local listing
+     listing=$(sudo rclone lsjson --config "$CONF" --files-only --hash "$REMOTE") || return 1
+     printf '%s' "$listing" | python3 -c 'import json, sys; names = sys.argv[1:]; [print(i["Name"], i["Size"], {k.lower(): v for k, v in (i.get("Hashes") or {}).items()}.get("md5", "-")) for i in json.load(sys.stdin) if i["Name"] in names]' "$@"
+   }
+
+   SRC='house-helper-<time>-<id>.tar.age.partial'    # the EXACT name from the listing, between single quotes
+   exact "$SRC" && echo "name ok" || echo "NOT an exact object name of the tool's shape: do not continue"
+   BEFORE=$(show "$SRC"); echo "$BEFORE"
+   ```
+
+3. **Generate a unique destination and check that it does not exist.** The destination is the source's name plus `.quarantined-`, the
+   UTC time and 8 random hex digits, so it is a name this procedure has never used (and not one of the tool's shapes, so the tool leaves it
+   alone). It must print `free`; `TAKEN` also covers a listing that failed.
+
+   ```bash
+   DST="$SRC.quarantined-$(date -u +%Y%m%dT%H%M%SZ)-$(python3 -c 'import secrets; print(secrets.token_hex(4))')"
+   echo "$DST"
+   FREE=$(show "$DST") && [ -z "$FREE" ] && echo "free: no object of that name" || echo "TAKEN, or the listing failed: do not continue"
+   ```
+
+4. **Move, once, without ever replacing.** Every check is repeated immediately before the move, and the command refuses to replace
+   an existing destination. **Do not run this step a second time**, whatever it printed. `rclone exit: 0` means rclone believes it
+   moved (or skipped); `9` means it **skipped** because an object of that name exists (on 1.75.2 nothing was moved or replaced); any
+   other number is a failure. None of these is proof: go to step 5.
+
+   ```bash
+   if idle && exact "$SRC" && [ "$(printf '%s\n' "$BEFORE" | grep -c .)" = 1 ] && FREE=$(show "$DST") && [ -z "$FREE" ]; then
+     sudo rclone moveto --config "$CONF" --ignore-existing --error-on-no-transfer "$REMOTE/$SRC" "$REMOTE/$DST"
+     echo "rclone exit: $?"
+   else
+     echo "NOT RUN: the schedule is not idle, or the name, the single listing line or the free destination did not check out"
+   fi
+   ```
+
+5. **List both names again and compare.** Only this proves the move: **exactly one line**, the destination, with the size and the MD5
+   that step 2 recorded; the source is no longer there. A skipped move is **not** a success: it leaves both objects.
+
+   ```bash
+   AFTER=$(show "$SRC" "$DST"); echo "$AFTER"
+   [ "$AFTER" = "$DST ${BEFORE#* }" ] && echo "MOVED: the source is gone and the destination has the source's size and MD5" \
+     || echo "AMBIGUOUS: go to step 6; do not repeat the move"
+   ```
+
+6. **An ambiguous result is for the operator, not for a retry.** Do not run step 4 again, do not run it with another destination
+   "to see", do not delete either object, and do not rename anything back. Write down `BEFORE`, the exit status of step 4, `AFTER` and
+   `rclone lsjson --hash` of the folder, and read the table; the owner decides.
+
+   | What you see | What it means | What to do |
+   |---|---|---|
+   | step 4 printed `NOT RUN` | a check failed, nothing was sent to rclone | fix the cause the line names (a run under way: wait for it; a name that is not exact; a taken destination: go back to step 3 for a new one) |
+   | exit 9 (or 0) and **both** names are listed | the move was **skipped**: an object of the destination's name appeared after step 3 or step 3's listing was incomplete; nothing was replaced (1.75.2) | leave both; find out who created that object before anything else (15.9: someone else is writing to the folder); only then start again from step 3 |
+   | the source is still listed, the destination is not | nothing moved: rclone failed (its message is above), or the listing lags | list once more after a minute; if it is unchanged, read rclone's message and fix its cause before starting again from step 3 |
+   | neither name is listed | the object was removed by someone else, or the listing is incomplete | list once more; if still neither, look at the Yandex web interface (and its trash) and tell the owner; delete nothing |
+   | the destination is listed with another size or MD5 | the destination is not the object you moved: it was replaced or changed | keep it as it is, treat the account as suspect (15.9), tell the owner |
+   | `show` printed an error | the listing could not be read | list again; nothing else |
+
+7. **Start the schedule again** only when **every** object of this review is done: an object **and** its `.commit` record (do the record
+   as a second round of steps 2 to 6 with `SRC` set to the record's name). A run that meets a record without its object deletes that
+   record as an orphan. Do not leave the timer stopped for days to think: a missing backup costs more than an exit 6. If the state is
+   ambiguous, write it down, start the timer and accept the exit 6 that follows; the tool deletes none of these objects (only an
+   orphaned record). Then look.
+
+   ```bash
+   sudo systemctl start house-helper-offsite-backup.timer
+   systemctl list-timers house-helper-offsite-backup.timer --no-pager
+   cd ~/apps/house_helper && sudo python3 deploy/offsite_backup.py list --rclone-config /etc/house-helper/rclone.conf --remote NAME:house-helper
+   ```
+
+   There is deliberately no procedure to move a quarantined object back: it would make an `UNRESOLVED` object again, or give a
+   `.partial` its exit 6 again, and a recovery point is made only by a run. If the owner wants it, the safe form is the command of step 4
+   with the two names swapped by hand and a destination that `show` lists nothing for.
+
 **An `UNRESOLVED` object** (a final-looking `...tar.age` without a valid commit record that matches it). The reason says which:
 `it has no commit record` (a run was killed or failed between the rename and the record, the record was not confirmed, or the
-rename damaged the object and its removal failed, or the object is not the tool's); `its commit record is not one this tool
+listing right after the rename showed that the object is not the file that was read back, which the tool does not delete (15.2),
+or the object is not the tool's); `its commit record is not one this tool
 writes for it, or is cut short`; `it is not the object its commit record describes` (the object, or its record, changed after
 the commit: treat it as damaged); `the remote's listing gives no MD5 for it, so it cannot be tied to its commit record` (the
 size may well be right: with no MD5 listed nothing distinguishes the object from a changed one of the same size, so it is not
@@ -1587,18 +1767,42 @@ with exit 6. Steps 2 and 3 below end that; the next run then drops the points th
 1. Decide whether you want it. A fresh committed point is made every day, so an unresolved object is usually not worth keeping.
    If you do want to judge it, fetch it and run the checks of 15.6 on the key machine: a successful `age -d` and an `unpack` that
    reports "intact" mean the content is whole.
-2. **Quarantine it (reversible):** rename it out of the tool's shape, together with its record if it has one. The tool then
-   counts it among "other objects" and leaves it alone, and the exit 6 for it stops. Do not use `--yandex-hard-delete` here.
-
-   ```bash
-   sudo rclone moveto --config /etc/house-helper/rclone.conf NAME:house-helper/house-helper-<time>-<id>.tar.age \
-        NAME:house-helper/house-helper-<time>-<id>.tar.age.quarantined
-   ```
-
+2. **Quarantine it (reversible):** rename it out of the tool's shape, together with its record if it has one, with the procedure
+   **Quarantining one object safely** above: steps 1 to 6 for the object (`SRC` = `house-helper-<time>-<id>.tar.age`), then steps 2 to 6
+   again for its record (`SRC` = `house-helper-<time>-<id>.tar.age.commit`), then step 7. The destination is a fresh, unique name each
+   time (never a fixed `.quarantined`), the move cannot replace an existing object, and an ambiguous result stops for review. The
+   tool then counts the renamed objects among "other objects" and leaves them alone, and the exit 6 for it stops. Do not use
+   `--yandex-hard-delete` here.
 3. **Or delete it,** once you have decided (this is the only deletion of such an object, and it is yours):
    `sudo rclone deletefile --config /etc/house-helper/rclone.conf --yandex-hard-delete NAME:house-helper/<exact name>`.
 4. Run `list` again, or wait for the next run. Renaming a quarantined object back makes it unresolved again; there is no command
    that promotes it to a point, because a point is made only by a run that has read its bytes back.
+
+**A leftover `.partial`** (`LEFTOVER PARTIAL <name>: left untouched` in the log, `LEFTOVER PARTIAL <name> (N bytes)` in `list`,
+and exit 6 after a committed run). It is an object named `house-helper-<time>-<id>.tar.age.partial`: the fragment of a hard kill or
+of an upload that stopped, the upload of a run that failed after it had returned (that run's log says `WARNING: ... was uploaded
+by this run, which ended before the rename. It is LEFT in the folder untouched`), or somebody else's object. The tool cannot tell
+which, and `rclone deletefile` deletes by name with no "only if it still has these bytes", so the tool **never deletes a
+`.partial`** (15.2). It is not a recovery point and nothing reads it; it holds retention back from nothing. It only costs space and
+turns every committing run's exit status into 6 until it is gone. Controlled manual cleanup, one object at a time:
+
+1. `list` (above). Note the name and the size. In the temporary full-disk mode the folder is `NAME:house-helper-backup` in every
+   command below.
+2. Stop the backup timer and confirm that no run is under way (step 1 of **Quarantining one object safely**, above: it must print
+   `IDLE`). A run that is uploading owns a `.partial` of its own, and removing or renaming it fails that run. Do not touch one while a
+   run or a manual command is active.
+3. Decide whether it is yours. If the time in its name is the time of a run the journal shows as failed or killed
+   (`journalctl -u house-helper-offsite-backup.service`), it is that run's fragment. If you cannot place it, treat it as somebody
+   else's object and ask before touching it.
+4. **Quarantine it (reversible):** rename it out of the tool's shape with steps 2 to 6 of **Quarantining one object safely**, above
+   (`SRC` = `house-helper-<time>-<id>.tar.age.partial`; the destination is that name plus a fresh `.quarantined-<UTC time>-<8 hex>`).
+   The tool then counts it among "other objects" and leaves it alone, and the exit 6 for it stops. An ambiguous result is not retried
+   (step 6 of the procedure).
+5. **Or delete it,** once you have decided (this is the only deletion of such an object, and it is yours; timer stopped and `IDLE`
+   as in step 2, and the exact name from the listing, as in step 2 of the procedure):
+   `sudo rclone deletefile --config /etc/house-helper/rclone.conf --yandex-hard-delete NAME:house-helper/<exact name of the .partial>`.
+6. Start the timer again (step 7 of the procedure), run `list` again, or wait for the next run, and expect exit 0 again. Delete the
+   quarantined copy (`...partial.quarantined-<UTC time>-<8 hex>`) the same way when you are sure nobody needs it.
 
 **A run that ended with exit 7** (`the final check of the folder did not confirm the recovery point ...`, `NOT reported as
 stored`). This run wrote its object and its commit record and read the record back, but the folder, listed again afterwards,
@@ -1619,8 +1823,8 @@ be until the cause is gone.
 2. If the **clock now is wrong** (set back, or a jump forward): once it is right, the points it dated are in the past again (or
    the next run is one day after this one) and the next run proceeds by itself. Nothing to rename.
 3. If a point was **made while the clock was wrong** (its name is dated in the future by more than an hour, and the clock is right
-   now): its content is real, its date is not. Quarantine it as above (object **and** its `.commit`) or delete both once you have
-   decided; the first run after that deletes again. Old points are never touched on account of it.
+   now): its content is real, its date is not. Quarantine it with **Quarantining one object safely** above (object **and** its
+   `.commit`, then step 7) or delete both once you have decided; the first run after that deletes again. Old points are never touched on account of it.
 4. "More than 7 days after the previous one" after a long outage of the host or the timer needs no action: the next run is
    one day after this one.
 
@@ -1628,3 +1832,277 @@ be until the cause is gone.
 a run). It may hold plaintext (a database copy, the tar). On the VPS: `ls -la /run/house-helper-offsite`; remove the directories
 named in the message (`sudo rm -r /run/house-helper-offsite/hh-offsite-<random>`), or reboot (tmpfs is emptied); if `rm` fails,
 find out why (`lsattr`, a busy mount, another user's directory) before the next run. This is unlink, not erasure (15.2).
+
+### 15.12 Temporary full-disk access mode (an exception) **[OWNER]**
+
+**Status: repository code only (Task A1, 2026-10-25; KHD-33 in `docs/DECISIONS.md`). Nothing here is installed or configured, no OAuth
+credential exists in the repository, and no production system was changed.** This is an *exception*, not the design. The design is
+15.1–15.11: a token that can reach the Yandex application folder only. The exception exists because the stable `rclone` available
+today (1.75.2) has no Yandex `app_folder` option (checked on the real binary, 15.12.6) while the owner has explicitly authorised an
+OAuth token that reaches the whole Disk, to be used **temporarily**, until a stable `rclone` with the option exists and the
+design can be used as written (15.12.9 is the way back).
+
+**What the exception costs.** In 15.1–15.11 the *token* limits the damage of a mistake or a leak to one folder. In this mode the
+token limits nothing: whoever holds it can read, change and delete **everything on the Disk**, and the only things that keep this
+tool inside its own folder are its own code and tests (15.12.3). The loss of the token is therefore the loss of the Disk (revoke it
+at once, 15.12.4), which is why the credential handling below is strict and why the mode is off unless it is asked for.
+
+#### 15.12.1 What changes, and what does not
+
+| | default mode (`app-folder`) | `full-disk-temporary` |
+|---|---|---|
+| selected by | nothing (the default), or `--access-mode app-folder` | `--access-mode full-disk-temporary`, and nothing else |
+| the config says | `app_folder = true` | `app_folder` absent, empty or `false`; `true` is a contradiction and is refused |
+| the rclone must know `app_folder` | yes | no (it is the reason for the mode); a note says when it does |
+| the folder | any `NAME:FOLDER` of 1–4 plain components, never the root | exactly `NAME:house-helper-backup` |
+| own OAuth client id and secret, a token | required | required (rclone's built-in application is refused in both modes) |
+| where the config file may be | a private (`0600`) regular file | additionally: only root can change it or any directory above it (15.12.4) |
+
+Everything else is the same code in both modes and is **not** changed by the mode: age encryption for public keys only, the
+verified backup, the sanitize rewrite, the upload, the read-back, the commit record, the final check, retention (7 daily + 4
+weekly), the deletes (one object at a time, by exact name, confirmed by a fresh listing), the exit statuses and the log.
+
+#### 15.12.2 The authorization contract (exact)
+
+The mode is on only when **all** of this is true; any other state is refused (exit 3) or is a usage error (exit 2) **before any
+command runs, rclone included**, and `run` and `list` give the same answer to every case (one function, `authorize_remote`, called
+first by both):
+
+1. `--access-mode full-disk-temporary`, spelled exactly like that. An empty value (an unset `HOUSE_HELPER_OFFSITE_ACCESS_MODE`
+   expands to nothing), `full-disk`, `FULL-DISK-TEMPORARY`, `full_disk_temporary`, `true`, a value with a space or a suffix: exit
+   2, nothing runs. The tool reads **no environment variable** to choose the mode: a stray `HOUSE_HELPER_OFFSITE_ACCESS_MODE` or
+   `RCLONE_YANDEX_APP_FOLDER` cannot switch it on (the unit passes the first one on the command line, nothing else reads it).
+2. `--remote NAME:house-helper-backup`, exactly: not `NAME:` (the root), not `NAME:house-helper`, not a sub-folder, not a
+   different case, not a trailing slash, not `..`, not a connection string. Everything the validator accepts as a folder in the
+   default mode and is not this one is refused here.
+3. The config section `[NAME]`: `type = yandex`, the owner's own `client_id` and `client_secret`, a `token`, and **no**
+   `app_folder = true` (any value but empty or `false` is a contradiction).
+4. The config file where only root can change it (15.12.4).
+5. The remote renames server-side (the commit is a rename), as always.
+
+With the flag absent, a config like (3) is refused with a message that names the flag; with the flag present, a config that says
+`app_folder = true` is refused with a message that says it contradicts it. In the unit this is one line of `offsite.env`:
+
+```ini
+HOUSE_HELPER_OFFSITE_ACCESS_MODE=app-folder
+```
+
+and the template ships exactly that. To use the exception the owner edits that line **and** the remote line (and, outside the
+repository, the rclone config); nothing is guessed from the config or from a failure.
+
+#### 15.12.3 The safe folder, and what the tool does and does not do with the Disk
+
+* **One folder.** Every rclone command names `NAME:house-helper-backup` or one object directly inside it, and nothing else: `mkdir`,
+  `lsjson --files-only --hash`, `copyto`, `moveto`, `cat` (a commit record) and `deletefile` are the only commands; `backend
+  features` is asked of the folder as well (it answered without a network request, 15.12.6). **No command names the root of the
+  Disk.** Upload, listing, read-back, record, verification, retention deletion and the rehearsal's download all go through the same
+  `Remote` object, which accepts only names of the shape `house-helper-<UTC time>-<8 hex>.tar.age[.partial|.commit]` (and
+  never deletes a `.partial`, 15.2).
+* **Never** `delete`, `purge`, `sync`, `cleanup`, `rmdirs`, a recursive listing, a copy of a directory, or anything on the
+  account's Trash. A test makes the fake remote fail on every other command and on every operand outside the folder.
+* **Nothing outside the folder is read as a point or touched.** Tests plant a perfectly valid point in the *other* mode's folder, in
+  sibling folders (`house-helper-backup2`, `house-helper-backup-old`), at the root of the Disk and next to personal files; none is
+  counted, none is deleted, none changes by a byte. Files inside the folder that are not of the tool's shape are left alone too.
+* **The Disk is not otherwise listed or read.** `list` lists the one folder. No command reads a file's content except this tool's
+  own objects.
+* **No plaintext reaches the Disk.** The only things uploaded are the age-encrypted recovery point and its small commit record
+  (names, sizes, checksums of the *encrypted* object). The tool is given public keys only; the private identity is never on the
+  VPS or in n8n (15.4, 15.13).
+* **Non-destructive upload.** A name that already exists stops the run before the upload; `copyto` and `moveto` carry
+  `--ignore-existing` (15.12.6 says why `--immutable` is not trusted alone); the object is read back and its SHA-256 compared; the
+  rename is checked by a listing; the record is read back; the final check lists and classifies the folder again, and a closing
+  listing, taken last of all, looks for any `.partial` that came in meanwhile (15.1). An interrupted
+  upload leaves a `.partial` that no reader can mistake for a point and that no run deletes (it is reported, and removed by
+  hand, 15.11); a mismatched, unlisted or
+  unverifiable object is `UNRESOLVED` or exit 1/7, never "stored". (Unchanged from 15.1–15.3, now also run against a real rclone.)
+* **Retention** is 15.3, unchanged: it deletes only committed points beyond 7 daily + 4 weekly and orphaned records, only by exact
+  name inside the folder, only after the final check, never while an unresolved object exists, within `--max-deletions`.
+
+#### 15.12.4 Credentials: the OAuth application, the token, the file **[OWNER]**
+
+* **The application.** The owner's own Yandex OAuth application, with the Disk permissions the owner has authorised for this
+  exception and no others (read and write on the Disk; nothing that this tool does not need: `list` and one `run` show what is
+  needed). **Not rclone's built-in application** (shared; refused by the tool). Record who owns the application and where its
+  secret is kept (a password manager), and the date after which it must be replaced or deleted (15.12.9).
+* **The token** is made on a machine with a browser by `rclone config` (a remote of type `yandex` with `client_id`,
+  `client_secret` and **no** `app_folder`), then copied to the VPS once, by the owner. It is never put in the repository, in n8n, in
+  a chat, in a ticket, in a log or in an environment file; `.gitignore` refuses `rclone.conf` and `*.rclone.conf` and
+  `tests/test_repo_secrets.py` fails the build if a file that looks like a token is tracked or not ignored.
+* **The file** is `/etc/house-helper/rclone.conf`, mode `0600`, owner `root:root`, and the tool refuses to use it in this mode
+  unless **every one** of these holds (checked from `/` down to the file, on one open descriptor):
+  - the path is absolute, with no `.` or `..`, and no component of it, directory or file, is a symbolic link;
+  - `/`, `/etc`, `/etc/house-helper` (every directory above the file) is a real directory **owned by root** and **not writable by
+    group or others** (even with the sticky bit: `/tmp` and its kin are refused);
+  - the file is a regular file with a **single** hard link, owned by root, with no permission for group or others, at most 1 MiB;
+  - it is the very file that was opened: the path is looked at again after reading and must still name it.
+
+  ```bash
+  sudo install -d -m 0755 -o root -g root /etc/house-helper
+  sudo install -m 0600 -o root -g root /path/to/rclone.conf /etc/house-helper/rclone.conf
+  namei -l /etc/house-helper/rclone.conf       # every line: root root, nothing writable by group/other, no "l" (link)
+  ```
+* **Why those rules, and the race they close.** Between the tool's check and rclone's use of the file a second process could
+  swap the file, a directory above it or a link, unless nobody but root can. That is what the ownership and write rules mean:
+  the path is *root-controlled*, so only root could do it, and root can read the token anyway. The tool does not try to hand
+  rclone a descriptor: rclone re-opens the path, and saves by replacing it.
+* **Token refresh keeps working, and stays private.** rclone refreshes the OAuth token on its own and persists the new one by
+  **writing a new file beside the old one and renaming it over it** (verified on the real rclone 1.75.2: the old file's inode and a
+  hard link to it kept the old content; the new file kept the old file's mode and, run by root, its owner; no temporary file was
+  left). So the directory must stay writable by root (it is), the unit must not mount it read-only (it does not; if the unit is
+  ever hardened with `ProtectSystem=`, add `ReadWritePaths=/etc/house-helper`: a test pins this), and the unit's `UMask=0077`
+  keeps the new file private. The refreshed file is checked again at the next start. rclone **follows a symbolic link** when it
+  saves (the new content went to the link's target): another reason the tool refuses one. rclone does not tighten a loose mode
+  (`0644` stayed `0644`), so it is this tool's check, not rclone, that refuses a file others can read.
+* **If the token may be exposed** (a copy left on a laptop, a backup of `/etc` that left the host, a message): revoke the
+  application's access at Yandex ID **first**, then replace the file. Everything the token could reach is exposed until it is
+  revoked, which is the whole Disk, not a folder.
+* **Logs and alerts.** The tool prints no token, no client secret, no path of the config file, no rclone message (only which
+  command failed and its exit status), no database content and no key. A test makes every failing rclone and age answer with a
+  message full of all of them and checks the output, for both modes.
+
+#### 15.12.5 Activating it (opt-in) **[OWNER]**
+
+Not done by this change. In this order, each step by the owner, none of them automatic:
+
+1. Everything in 15.4 except the application-folder permission and the `app_folder` rclone: the age key pair (outside the
+   checkout, 15.4 item 1), age and rclone on the VPS, a running image that knows `sanitize`. The rclone is the **pinned stable**
+   release the owner chooses (1.75.2 was the one tested); never a beta or development build.
+2. Edit `/etc/house-helper/offsite.env` (from `deploy/systemd/house-helper-offsite.env.example`): `HOUSE_HELPER_OFFSITE_REMOTE=NAME:house-helper-backup` and `HOUSE_HELPER_OFFSITE_ACCESS_MODE=full-disk-temporary`.
+3. Install the config file as in 15.12.4 (the section has **no** `app_folder`).
+4. By hand, watched, before the timer:
+
+   ```bash
+   sudo python3 deploy/offsite_backup.py list --rclone-config /etc/house-helper/rclone.conf --remote NAME:house-helper-backup --access-mode full-disk-temporary
+   ```
+
+   It prints the NOTICE line first; an empty folder is a normal answer, a missing one is made by the first `run`. Then
+   `sudo systemctl start house-helper-offsite-backup.service`, `systemctl status`, `journalctl -u house-helper-offsite-backup.service -n 40 --no-pager`.
+5. In the Yandex web interface check that the only new thing on the Disk is the folder `house-helper-backup` with the encrypted
+   point and its `.commit`, of the size the log states.
+6. The restore rehearsal of 15.13 from that real point, on your own machine. **Only after it passed** enable the timer (15.5).
+
+#### 15.12.6 What was verified against a real rclone, and what was not
+
+Run on 2026-10-25 against `rclone/rclone:1.75.2` (image digest `sha256:2687085f718d3c628f7fdfb77c52a1d344332aed543110bb88088f2c70d43eb5`,
+binary SHA-256 `b7587df2b9d5840c4e1e3ca75904d8c0e8f8150ab51c76651e7f855d8e80befc`), offline (a network-less container for the probes of
+requests; a closed proxy port for the tests). The tests are `tests/test_deploy_offsite_real_rclone.py`, opt-in:
+`HOUSE_HELPER_REAL_RCLONE=/path/to/rclone HOUSE_HELPER_REAL_RCLONE_VERSION=v1.75.2 pytest tests/test_deploy_offsite_real_rclone.py`.
+
+* `rclone config providers`: the Yandex backend has `client_id`, `client_secret`, `token`, `hard_delete` (which `--yandex-hard-delete`
+  sets) and **no `app_folder`**; there is no `1.76.x` image yet. The default mode refuses this rclone; the full-disk mode accepts it.
+* `rclone backend features NAME:house-helper-backup` (and `NAME:`) answered `"Move": true` **without any network request**, for a
+  folder that does not exist. The tool asks about the folder and never the root.
+* With a fake token and no network, the requests rclone tried were `lsjson` → `path=disk:/house-helper-backup/`, `mkdir` →
+  `path=/house-helper-backup`, `copyto` → `path=disk:/house-helper-backup/<object>`: all inside the folder.
+* Every command line the tool builds is accepted by rclone and does what the fake assumed, on rclone's `local` backend: upload, a
+  listing with hashes, read-back, rename, commit record by `cat`, classification as a committed point, confirmed delete.
+* **A wrong assumption it corrected:** `copyto --immutable` and `moveto --immutable` **replaced** an existing different object and
+  exited 0 on 1.75.2; `--ignore-existing` skipped it. Before this the tool relied on `--immutable` alone. It now passes
+  `--ignore-existing` to both, a skipped upload is caught by the size/MD5 comparison, and a skipped rename fails the run and leaves
+  the foreign object alone (tests with the fake and with the real binary). The listing before the upload and the unique name were
+  always the first line; this is the second.
+* **The manual quarantine of 15.11, against the same binary** (`tests/test_deploy_offsite_quarantine.py`): a plain `rclone moveto A B`
+  onto an **existing** `B` replaced it and exited 0, so the earlier fixed `...quarantined` destination could destroy an earlier
+  quarantined object; `moveto --ignore-existing` left both objects as they were and exited 0; with `--error-on-no-transfer` it
+  exited **9**; a missing source exited 1. The procedure of 15.11 uses a fresh destination, `--ignore-existing --error-on-no-transfer`
+  and a listing afterwards, and the opt-in test runs the RUNBOOK's own shell blocks against the real binary, including a destination
+  that appears between the check and the move. It does **not** show that `--ignore-existing` is atomic against such a writer, nor
+  anything about Yandex Disk's own `Move`; the procedure therefore stops the backup first and trusts only the listing afterwards.
+* rclone's saving of a changed config: 15.12.4.
+
+**Not verified: anything about Yandex Disk itself.** No account, no network: the listing and MD5 of a Yandex object, the 403 and
+quota behaviour, the trash and `--yandex-hard-delete`, the server-side move of the real backend, the OAuth consent screen and the
+scopes actually granted, and the real `age`. The first `list` and `run` of 15.12.5 are where those are seen, and 15.9 lists them.
+
+#### 15.12.7 Retention in this mode
+
+Exactly 15.3 (7 daily + 4 weekly committed points, `--max-deletions`, the strict no-pruning-while-unresolved policy, the clock
+guard), applied to the one folder. Nothing outside it is a point, so nothing outside it is ever a candidate for deletion.
+
+#### 15.12.8 Recovery
+
+15.6 and 15.13, unchanged: a recovery point is decrypted on the owner's own machine with the private key; the rehearsal downloads
+from the same folder with the same mode flag. If the Disk is lost with the token, the points are lost: this is a copy, not the only
+copy (15.9).
+
+#### 15.12.9 Migrating to application-folder permissions (the way back)
+
+When a **stable** rclone whose `rclone config providers` lists the Yandex `app_folder` option exists (the tool says
+`This rclone HAS the app_folder option` in the NOTICE line of every run and `list`), end the exception:
+
+1. Install that stable rclone on the VPS (not a beta). Register a **new** Yandex OAuth application with **only** the
+   application-folder permission, make its token on a machine with a browser with `app_folder = true`, and install the config as
+   in 15.5 (15.12.4's root-controlled path rules are not required in that mode but are good practice for the file).
+2. `HOUSE_HELPER_OFFSITE_ACCESS_MODE=app-folder` and `HOUSE_HELPER_OFFSITE_REMOTE=NAME:house-helper`, with the new config; run
+   `list` and one `run` by hand, and the rehearsal (15.13, without the mode flag).
+3. The old points in `house-helper-backup` are not moved automatically. Keep them until the new folder holds 7 daily + 4 weekly
+   points (about 5 weeks), or copy them by hand (each object **and** its `.commit`), then delete the old folder by hand.
+4. **Revoke the full-disk OAuth application's access at Yandex ID** and delete its secret; delete the old `rclone.conf` from
+   every machine it was copied to. Only then is the exception over: say so in `docs/STATUS.md`.
+
+#### 15.12.10 Interfaces for monitoring, and the gates that remain **[OWNER]**
+
+*Preserved for the monitoring work (the other agent's `deploy/monitoring/`, not part of this change). The monitoring must read
+nothing but these:*
+
+* **The unit** `house-helper-offsite-backup.service` (unchanged name; `ExecStart` gained `--access-mode ${HOUSE_HELPER_OFFSITE_ACCESS_MODE}`),
+  `SyslogIdentifier=house-helper-offsite`, `Type=oneshot`; `ExecStopPost=` and `OnFailure=` drop-ins (15.10) see the usual
+  `SERVICE_RESULT`, `EXIT_CODE`, `EXIT_STATUS`.
+* **The exit status, unchanged and no new code:** 0 stored and clean; 1 failed; 2 usage (including a bad `--access-mode`); 3 refused
+  before anything was done (including every authorization failure of this mode); 6 stored and verified but needs attention; 7 not
+  confirmed; 128+N a signal. **Only 0 is success; 6 is never a success heartbeat** (15.7). The new refusals are 3 (`refused`), the new
+  usage error is 2.
+* **The journal:** names, sizes, checksums of the encrypted object, counts and the fixed texts of 15.7. In this mode every run and
+  every `list` starts with one `NOTICE: TEMPORARY access mode full-disk-temporary ...` line: it is information, not a failure, and an
+  alert may use its absence from a run as "the mode is not on". There is no token, secret, path of the config or rclone message.
+* **A health check** that needs no secret of its own is `list` (read only, exit 0 whatever it finds: read the text).
+* The monitoring must not read `rclone.conf`, the age key, the recipients file's private counterpart or any recovery point.
+
+*Gates that stay open (none is closed by this change): the owner's explicit approval to activate; the real Yandex OAuth
+application and token (15.12.4); a pinned stable rclone on the VPS and `age`; the first real `list` and `run` and the checks of
+15.12.6's "not verified"; the restore rehearsal of 15.13 from a real point; the failure notification of 15.10 and the monitoring,
+live and tested by a failing run; the acceptance of the retention tail (15.9); a date for the end of the exception (15.12.9).*
+
+### 15.13 Restore rehearsal: `deploy/offsite_rehearsal.py` **[OWNER]**
+
+The proof that a point can be restored is a restore. This program does the part of it that can run anywhere, on the point that
+really left the VPS, and it **never** touches production. It is a separate program from the backup on purpose: it is the only place
+the **private** age identity is used, and the production script and the units know nothing of identities (a test pins that).
+
+**Where:** the owner's own machine (any OS with Python 3.10+, `age` and `rclone`). Never the VPS, never n8n, never inside a checkout
+of this repository: the program refuses to run when `/etc/house-helper` exists (the production host), when the identity file is
+inside the checkout, when it is readable by other users (POSIX), when it is a link, or when the scratch directory is inside the
+checkout. It needs a copy of `rclone.conf` for the same remote (make one on that machine with `rclone config`, or copy the VPS one
+over a channel you trust, **and delete it afterwards**; in the full-disk mode that file reaches the whole Disk).
+
+```bash
+python3 deploy/offsite_rehearsal.py --rclone-config "$HOME/keys/house-helper/rclone.conf" --remote NAME:house-helper --identity-file "$HOME/keys/house-helper/age-key.txt" --work-dir "$HOME/scratch/rehearsal" --expect-rows users=2 --expect-rows messages=1
+python3 deploy/offsite_rehearsal.py --rclone-config "$HOME/keys/house-helper/rclone.conf" --remote NAME:house-helper-backup --access-mode full-disk-temporary --identity-file "$HOME/keys/house-helper/age-key.txt" --work-dir "$HOME/scratch/rehearsal" --expect-rows users=2 --point house-helper-20261025T041507Z-0a1b2c3d.tar.age
+```
+
+**What it does,** and stops at the first that fails: (1) the same offline authorization as the backup (mode, folder, config), then the
+identity, host and scratch checks, all before any command runs; (2) lists the folder and chooses a **committed** point (the newest,
+or `--point`): an `UNRESOLVED` object or one that is not in the folder is refused; (3) downloads that one object into a fresh `0700`
+directory under `--work-dir` and requires its size, SHA-256, SHA-1 and MD5 to equal its commit record; (4) decrypts with `age -d -i
+IDENTITY` (the identity is passed as a path and never printed); (5) unpacks with the backup tool's own reader (exactly three files, the
+manifest's shape, the snapshot equal to its size and SHA-256) and checks that the manifest's time is the time in the point's name; (6)
+opens the snapshot **read only** and checks SQLite's integrity, foreign keys, no free page, exactly one plain Alembic revision, and every
+`--expect-rows TABLE=N` (the table exists and has at least N rows; at least one is required, so "expected contents" is something you
+state); (7) removes the scratch directory on every exit path, signals included. A directory that cannot be removed is a failure.
+
+**What it never does:** write to the remote (it lists, reads one commit record and downloads one object; the commands that create,
+move or delete are not in the file), write anywhere but the new directory under `--work-dir`, open an existing file for writing,
+use Docker, `backup.sh` or `restore`, or print a key, a token, a path of the config, a row or an rclone/age message.
+
+| Exit | Meaning |
+|---|---|
+| 0 | retrieved, matched its record, decrypted, unpacked and verified; the scratch directory is gone. **The only status that says the point can be restored.** |
+| 1 | failed before a verdict: rclone or the disk failed, a signal, or the scratch directory could not be removed (a failure of `age` is **not** here: it is exit 4) |
+| 2 | usage |
+| 3 | refused before anything was done: configuration, identity, host, scratch place, no committed point, a `--point` that is not one |
+| 4 | **not restorable**: the bytes differ from the record, `age` fails to decrypt it (any non-zero exit of `age -d`: not a recipient of this point, or the object is damaged), the archive or the database is not sound, or an expectation is not met |
+
+**What it does not replace.** It does not check the schema against the application's migrations or restore into the application. For
+that, after a pass, do 15.6 and section 10 with the image of the manifest's tag onto a **scratch volume** (never the live one), and
+run the cleanup afterwards (14.6). Record in 15.9: the date, the point's name, its encrypted SHA-256 (the verdict prints it), the
+mode, the machine, and the result. Plaintext existed on that machine for the length of the run: it is unlink, not erasure (15.2).

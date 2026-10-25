@@ -7,3 +7,5 @@
 systemd/* text eol=lf
 # The off-host backup runs on the Linux host as `python3 deploy/offsite_backup.py`.
 offsite_backup.py text eol=lf
+# The restore rehearsal runs on the owner's own machine (any OS) but its text is the same text everywhere.
+offsite_rehearsal.py text eol=lf

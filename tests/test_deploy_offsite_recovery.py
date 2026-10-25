@@ -6,8 +6,9 @@ test_deploy_offsite.py:
     the owner's own OAuth application, and a remote that cannot rename server-side all REFUSE, and none of
     them falls back to another access mode;
   * a HARD kill (SIGKILL, power) runs no handler and no clean-up. What it leaves is exactly what the
-    runbook says it leaves, none of it is a recovery point, and the next run puts it right (a kill between
-    the rename and the commit record leaves an UNRESOLVED object, which the next run reports and leaves alone);
+    runbook says it leaves, none of it is a recovery point, and the next run puts it right, except that a
+    `.partial` is reported by every run and deleted by none (a kill between the rename and the commit record
+    leaves an UNRESOLVED object, which the next run reports and leaves alone);
   * a retention that cannot finish is reported by every run in which it cannot, never only logged;
   * the recovery point is usable: decrypted, unpacked and restored with the shipped tools it is the
     database that was backed up, minus the deleted rows.
@@ -166,7 +167,7 @@ KILL_STAGES = ["backup", "sanitize", "age", "upload", "download", "move"]
 
 
 @pytest.mark.parametrize("stage", KILL_STAGES)
-def test_after_a_hard_kill_nothing_looks_like_a_recovery_point_and_the_next_run_puts_everything_right(rig, stage):
+def test_after_a_hard_kill_nothing_looks_like_a_recovery_point_and_the_next_run_puts_everything_right_but_a_partial(rig, stage):
     before = seed(rig, stamps(datetime(2026, 10, 20), 4))
     child = start_child(rig, stage)
     child.kill()  # SIGKILL: no handler, no finally, no clean-up of any kind
@@ -183,15 +184,19 @@ def test_after_a_hard_kill_nothing_looks_like_a_recovery_point_and_the_next_run_
     assert partials == ({FIXED_NAME + ".partial"} if stage in ("upload", "download", "move") else set())
     assert {n: rig.fake.remote_files()[n] for n in before} == before  # and no older point was touched
 
-    # The next run (a new random name; the lock a dead process held is gone with it) recovers by itself.
+    # The next run (a new random name; the lock a dead process held is gone with it) recovers by itself: it sweeps the plaintext
+    # and makes its point. The one thing it does NOT do is delete the .partial the kill left (nothing proves whose it is): it
+    # reports it (exit 6) and leaves every byte of it, until an operator has dealt with it (RUNBOOK 15.11).
+    left = {n: b for n, b in rig.fake.remote_files().items() if n.endswith(".partial")}
     rig.token = "feedface"
-    assert rig.run() == 0, rig.text
+    assert rig.run() == (offsite.EXIT_RETENTION if left else 0), rig.text
     assert "removed the leftover work directory" in rig.text
     assert [n for n in rig.work_leftovers() if n.startswith(offsite.RUN_PREFIX)] == []
     after = rig.fake.remote_files()
-    assert not any(n.endswith(".partial") for n in after)
+    assert {n: b for n, b in after.items() if n.endswith(".partial")} == left
+    assert ("LEFTOVER PARTIAL" in rig.text) == bool(left) and "deletefile" not in rig.fake.rclone_commands()
     new = point_name("20261025T041507Z", "feedface")
-    assert set(after) == set(before) | {new, new + offsite.COMMIT_SUFFIX}
+    assert set(after) == set(before) | {new, new + offsite.COMMIT_SUFFIX} | set(left)
     assert {n: after[n] for n in before} == before
 
 
@@ -258,17 +263,19 @@ def test_a_retention_that_cannot_delete_fails_every_run_in_which_it_cannot(rig):
     assert len(rig.fake.point_objects()) == 12 + 3  # and the folder visibly keeps growing, run after run
 
 
-def test_leftover_partials_beyond_the_limit_are_reported_not_forgotten(rig):
+def test_leftover_partials_are_reported_by_every_run_and_never_removed_however_many_there_are(rig):
     for index in range(7):
         rig.fake.put_remote(point_name("20261020T041500Z", f"{index:08x}") + ".partial", b"half")
-    assert rig.run() == offsite.EXIT_RETENTION
-    assert "2 more leftover partial uploads were not removed" in rig.text
-    left = [n for n in rig.fake.remote_files() if n.endswith(".partial")]
-    assert len(left) == 2
-    rig.log.clear()
-    rig.token = "feedface"
-    assert rig.run() == 0, rig.text  # the next run finishes the job and is clean again
-    assert not [n for n in rig.fake.remote_files() if n.endswith(".partial")]
+    left = {n: b for n, b in rig.fake.remote_files().items()}
+    assert len(left) == 7
+    for day, token in enumerate(("feedface", "cafe0001", "cafe0002"), start=0):
+        rig.log.clear()
+        rig.token = token
+        rig.now = rig.now.replace(day=25 + day)
+        assert rig.run() == offsite.EXIT_RETENTION, rig.text
+        assert "7 leftover .partial object(s) are in the folder" in rig.text and "and 2 more" in rig.text
+        assert {n: b for n, b in rig.fake.remote_files().items() if n.endswith(".partial")} == left   # byte for byte, every run
+    assert "deletefile" not in rig.fake.rclone_commands()
 
 
 def test_an_unexpected_error_during_retention_is_a_retention_failure_not_a_failed_backup(rig, monkeypatch):

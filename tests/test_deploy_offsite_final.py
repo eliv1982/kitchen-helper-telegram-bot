@@ -7,8 +7,8 @@
          else to look at), exit 6 (committed, final check passed, housekeeping needs attention: "stored and
          verified"), exit 7 (the final check failed or does not show the point as committed: never "stored");
   Fix 3  the strict policy: while ANY unresolved object is in the folder retention drops no committed point
-         (new points are still made and verified, the run exits 6 and names the object, stale partial uploads
-         and orphaned records are still tidied), and `list` says so.
+         (new points are still made and verified, the run exits 6 and names the object, orphaned records are
+         still tidied, and a leftover .partial is neither tidied nor in the way), and `list` says so.
 
 The external commands are the fakes of tests/offsite_support.py; dbtool is real.
 """
@@ -179,7 +179,7 @@ def test_the_sha256_read_back_still_decides_when_the_listing_md5_agrees(rig):
     rig.fake.fail("download", "corrupt", 1)
     assert rig.run() == offsite.EXIT_FAILED, rig.text
     assert "not the file that was uploaded" in rig.text and "move" not in rig.fake.events
-    assert rig.fake.remote_files() == {}
+    assert set(rig.fake.remote_files()) == {FIXED_NAME + ".partial"}        # never renamed, no record; the partial is left, not deleted
 
 
 def test_list_shows_an_object_without_a_listed_md5_as_unresolved_and_changes_nothing(rig):
@@ -287,11 +287,11 @@ def test_a_final_check_that_cannot_be_completed_is_not_confirmed_either(rig, fau
 
 def test_what_else_was_wrong_is_not_lost_when_the_final_check_fails(rig):
     stale = point_name("20261020T041500Z", "11111111") + ".partial"
-    rig.fake.put_remote(stale, b"half")
-    rig.fake.fail("delete", "noop", 0)                                       # the leftover cannot be removed
-    rig.fake.fail("lsjson", the_commit_record_goes_missing(rig), 5)          # one more listing: the one that confirms the delete
+    rig.fake.put_remote(stale, b"half")                                      # the leftover is reported, whatever else happens
+    rig.fake.fail("lsjson", the_commit_record_goes_missing(rig), 4)          # the listing of the final check
     assert rig.run() == offsite.EXIT_UNCONFIRMED, rig.text
-    assert f"Also: could not remove the leftover partial upload {stale}" in rig.text
+    assert f"Also: 1 leftover .partial object(s) are in the folder ({stale})" in rig.text
+    assert rig.fake.remote_files()[stale] == b"half" and "deletefile" not in rig.fake.rclone_commands()
 
 
 def maintenance_succeeds(rig):
@@ -389,7 +389,7 @@ def test_an_unresolved_object_leaves_every_older_committed_point_and_record_unto
     assert FIXED_NAME in rig.committed_names() and f"{FIXED_NAME} IS stored and verified" in rig.text
 
 
-def test_an_unresolved_object_does_not_stop_the_tidying_of_leftover_partials_and_orphaned_records(rig):
+def test_an_unresolved_object_does_not_stop_the_tidying_of_orphaned_records_and_a_leftover_partial_is_left_alone(rig):
     seed(rig, HISTORY)
     plant_unresolved(rig)
     stale = point_name("20261020T041500Z", "11111111") + ".partial"
@@ -398,10 +398,11 @@ def test_an_unresolved_object_does_not_stop_the_tidying_of_leftover_partials_and
     rig.fake.put_remote(stray, offsite.commit_record(stray[: -len(RECORD)], DESCRIBED))
     before = rig.fake.remote_files()
     assert rig.run() == offsite.EXIT_RETENTION, rig.text
-    assert sorted(deleted_names(rig)) == sorted([stale, stray])             # these two, and nothing else
+    assert deleted_names(rig) == [stray]                                    # the orphaned record, and nothing else: not the partial
     files = rig.fake.remote_files()
-    assert stale not in files and stray not in files and f"deleted {stray}: an orphaned commit record" in rig.text
-    assert {n: files[n] for n in before if n not in (stale, stray)} == {n: b for n, b in before.items() if n not in (stale, stray)}
+    assert stray not in files and f"deleted {stray}: an orphaned commit record" in rig.text
+    assert files[stale] == b"half" and f"LEFTOVER PARTIAL {stale}: left untouched" in rig.text
+    assert {n: files[n] for n in before if n != stray} == {n: b for n, b in before.items() if n != stray}
     assert PLANTED in files and "retention holds back 5 committed point(s)" in rig.text
 
 
@@ -437,7 +438,8 @@ def test_the_runbook_states_the_strict_policy():
     section_15 = text[text.index("## 15. Encrypted off-host backup"):]
     for needed in (
         "retention drops no committed point at all", "The strict rule: no pruning while an unresolved object exists.",
-        "`retention holds back N committed point(s)`", "still removes orphaned commit records and leftover `.partial` uploads",
+        "`retention holds back N committed point(s)`", "still removes orphaned commit records, and it ends with exit 6",
+        "a leftover `.partial` is never removed by it",
         "`hold` instead of `drop`", "While it is there the tool prunes no committed point",
     ):
         assert needed in section_15, needed

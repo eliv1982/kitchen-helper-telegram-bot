@@ -31,17 +31,27 @@ from typing import Dict, List, Optional, Tuple
 from tests.deploy_support import DEPLOY, URL_ENV, STAGING_ENV, dbtool, make_database
 
 OFFSITE_PATH = DEPLOY / "offsite_backup.py"
+REHEARSAL_PATH = DEPLOY / "offsite_rehearsal.py"
 
 
 def load_offsite():
     spec = importlib.util.spec_from_file_location("deploy_offsite_backup", OFFSITE_PATH)
     module = importlib.util.module_from_spec(spec)
     sys.modules["deploy_offsite_backup"] = module
+    sys.modules["offsite_backup"] = module  # the name deploy/offsite_rehearsal.py loads its sibling under: one module, not two
     spec.loader.exec_module(module)
     return module
 
 
 offsite = load_offsite()
+
+
+def load_rehearsal():
+    spec = importlib.util.spec_from_file_location("deploy_offsite_rehearsal", REHEARSAL_PATH)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["deploy_offsite_rehearsal"] = module
+    spec.loader.exec_module(module)
+    return module
 
 # A public key from age's own documentation. The orchestrator only checks its shape; the fake age
 # does not use it.
@@ -51,6 +61,8 @@ PRIVATE_KEY_SHAPED = "AGE-SECRET-KEY-1" + "Q" * 58  # looks like a private key; 
 TAG = "abc123def456"
 FOLDER = "house-helper"
 REMOTE = f"fake:{FOLDER}"
+FULL_DISK_FOLDER = offsite.FULL_DISK_PREFIX  # the one folder of the temporary full-disk mode
+FULL_DISK_REMOTE = f"fake:{FULL_DISK_FOLDER}"
 FIXED_NOW = datetime(2026, 10, 25, 4, 15, 7, tzinfo=timezone.utc)
 FIXED_STAMP = "20261025T041507Z"
 FIXED_TOKEN = "0a1b2c3d"
@@ -142,6 +154,14 @@ token = {"access_token":"test"}
 app_folder = true
 '''
 
+# The same remote for the temporary full-disk mode: the owner's own OAuth application, and NO app_folder setting.
+RCLONE_CONF_FULL_DISK = '''[fake]
+type = yandex
+client_id = test-client-id
+client_secret = test-client-secret
+token = {"access_token":"test"}
+'''
+
 
 class FakeSystem(offsite.Runner):
     """bash/docker/age/rclone, as far as the orchestrator uses them. `faults` maps (kind, nth) to an
@@ -156,8 +176,10 @@ class FakeSystem(offsite.Runner):
     change the remote between two steps of a run) and the call then behaves normally.
     `hashless` is a set of object names whose listing never carries a checksum."""
 
-    def __init__(self, root: Path, database: Path, remote_account: Optional[Path] = None) -> None:
+    def __init__(self, root: Path, database: Path, remote_account: Optional[Path] = None, folder: str = FOLDER) -> None:
         self.root = root
+        self.folder_name = folder
+        self.remote_spec = f"fake:{folder}"
         self.database = database
         self.account = remote_account or root / "remote-account"
         self.staging = root / "fake-staging"
@@ -182,7 +204,7 @@ class FakeSystem(offsite.Runner):
     # helpers for tests -----------------------------------------------------------------------
 
     def folder(self) -> Path:
-        return self.account / FOLDER
+        return self.account / self.folder_name
 
     def remote_files(self) -> Dict[str, bytes]:
         folder = self.folder()
@@ -358,13 +380,12 @@ class FakeSystem(offsite.Runner):
                 continue
             operands.append(item)
         for operand in operands:
-            if operand.startswith("fake:"):
-                read_only_root = command == "backend" and operand == "fake:"  # `backend features` asks about the remote itself
-                assert read_only_root or operand == REMOTE or operand.startswith(REMOTE + "/"), f"outside the configured folder: {operand}"
+            if operand.startswith("fake:"):  # no command names the remote's root: not even `backend features`
+                assert operand == self.remote_spec or operand.startswith(self.remote_spec + "/"), f"outside the configured folder: {operand}"
         return getattr(self, "_rclone_" + command)(operands, flags)
 
     def _rclone_backend(self, operands, flags):
-        assert operands == ["features", "fake:"], operands  # read only, and of the remote's root, not of the folder
+        assert operands == ["features", self.remote_spec], operands  # read only, and of the dedicated folder, not of the remote's root
         action = self._fault("features")
         if isinstance(action, tuple) and action[0] == "exit":
             return offsite.Result(action[1])
@@ -425,7 +446,8 @@ class FakeSystem(offsite.Runner):
             return offsite.Result(0)
         kind = "record" if destination.endswith(offsite.COMMIT_SUFFIX) else "upload"  # an upload
         self.events.append(kind)
-        assert "--immutable" in flags, "an upload must never overwrite"
+        assert "--immutable" in flags and "--ignore-existing" in flags, "an upload must never overwrite (--ignore-existing is the flag that does it: rclone 1.75.2's --immutable alone overwrote)"
+        assert "--error-on-no-transfer" in flags, "a skipped upload must not look like a stored one (without this flag rclone 1.75.2 exits 0 when --ignore-existing skips it)"
         assert self.rclone_calls[-1][self.rclone_calls[-1].index("--retries") + 1] == "1", "one attempt of the whole command"
         action = self._fault(kind)
         target = self._remote_path(destination)
@@ -434,7 +456,7 @@ class FakeSystem(offsite.Runner):
                 target.write_bytes(Path(source).read_bytes()[:10])
             return offsite.Result(action[1] if action[1] != 99 else 1)
         if target.exists():
-            return offsite.Result(1)
+            return offsite.Result(9)  # --ignore-existing --error-on-no-transfer, as real rclone 1.75.2 does: skipped, nothing written, exit 9
         data = Path(source).read_bytes()
         if action == "corrupt":
             data = data[:50] + bytes([data[50] ^ 0xFF]) + data[51:]
@@ -453,7 +475,10 @@ class FakeSystem(offsite.Runner):
             return offsite.Result(action[1])
         if action == "noop":
             return offsite.Result(0)
+        assert "--ignore-existing" in flags, "a rename must never replace an existing object (a plain moveto does, on rclone 1.75.2)"
         source, destination = self._remote_path(operands[0]), self._remote_path(operands[1])
+        if destination.exists():
+            return offsite.Result(0)  # --ignore-existing: skipped, the source stays where it is, exit 0
         source.replace(destination)
         if action == "corrupt":
             data = destination.read_bytes()
@@ -497,9 +522,17 @@ class FakeSystem(offsite.Runner):
 class Rig:
     """The orchestrator wired to a FakeSystem under tmp_path, with a valid configuration."""
 
-    def __init__(self, tmp_path: Path, *, deleted_rows: bool = True, fresh: bool = True) -> None:
-        """`fresh=False` attaches to the directories of a Rig that already exists (a child process of a test)."""
+    def __init__(self, tmp_path: Path, *, deleted_rows: bool = True, fresh: bool = True, full_disk: bool = False) -> None:
+        """`fresh=False` attaches to the directories of a Rig that already exists (a child process of a test).
+        `full_disk=True` is the temporary full-disk mode: the one fixed folder, a config without app_folder, an rclone
+        like 1.75.2 (no app_folder option), and --access-mode on the command line."""
         self.root = tmp_path
+        self.full_disk = full_disk
+        # Where the full-disk mode trusts the OAuth configuration: in production root and "/"; here the temporary
+        # directory and the user running the tests (the rules are the same, tests/test_deploy_offsite_trust.py
+        # breaks each of them).
+        self.trust = offsite.ConfigTrust(uid=os.getuid() if hasattr(os, "getuid") else 0, root=tmp_path)
+        self.remote = FULL_DISK_REMOTE if full_disk else REMOTE
         data_dir = tmp_path / "data"  # the staging directory must not be inside the data directory
         self.work = tmp_path / "work"
         self.recipients = tmp_path / "recipients.txt"
@@ -509,11 +542,13 @@ class Rig:
             (make_database_with_deleted_rows if deleted_rows else make_database)(data_dir / "live.db")
             self.work.mkdir()
             self.recipients.write_text(f"# the owner's public key{chr(10)}{PUBLIC_KEY}{chr(10)}")
-            self.config.write_text(RCLONE_CONF)
+            self.config.write_text(RCLONE_CONF_FULL_DISK if full_disk else RCLONE_CONF)
             if os.name != "nt":
                 self.config.chmod(0o600)
         self.database = data_dir / "live.db"
-        self.fake = FakeSystem(tmp_path, self.database)
+        self.fake = FakeSystem(tmp_path, self.database, folder=FULL_DISK_FOLDER if full_disk else FOLDER)
+        if full_disk:
+            self.fake.app_folder_support = False  # the reason for the mode: a stable rclone without the option
         self.log: List[str] = []
         self.now = FIXED_NOW
         self.token = FIXED_TOKEN
@@ -521,7 +556,8 @@ class Rig:
     def args(self, *extra: str, tag: str = TAG) -> List[str]:
         return [
             "run", f"--tag={tag}", "--recipients-file", str(self.recipients), "--rclone-config", str(self.config),
-            "--remote", REMOTE, "--work-dir", str(self.work), *extra,
+            "--remote", self.remote, "--work-dir", str(self.work),
+            *(["--access-mode", offsite.ACCESS_FULL_DISK] if self.full_disk else []), *extra,
         ]
 
     def run(self, *extra: str, argv: Optional[List[str]] = None) -> int:
@@ -532,6 +568,7 @@ class Rig:
             token=lambda: self.token,
             deploy_dir=DEPLOY,
             log=self.log.append,
+            config_trust=self.trust,
         )
 
     @property
@@ -543,9 +580,10 @@ class Rig:
         FakeSystem on the same remote, so that the counters and events of the run under test stay as they were."""
         if not self.fake.folder().is_dir():  # nothing was ever uploaded
             return offsite.Folder([], {}, [], [])
-        reader = FakeSystem(self.root, self.database, remote_account=self.fake.account)
+        reader = FakeSystem(self.root, self.database, remote_account=self.fake.account, folder=self.fake.folder_name)
         reader.remote_hashes, reader.hashless = self.fake.remote_hashes, self.fake.hashless   # the remote lists what it lists
-        remote = offsite.Remote(REMOTE, self.config, reader, "/fake/bin/rclone")
+        remote = offsite.Remote(self.remote, self.config, reader, "/fake/bin/rclone",
+                                offsite.ACCESS_FULL_DISK if self.full_disk else offsite.ACCESS_APP_FOLDER)
         return offsite.classify_folder(remote.listing(), remote.read_record)
 
     def committed_names(self) -> set:

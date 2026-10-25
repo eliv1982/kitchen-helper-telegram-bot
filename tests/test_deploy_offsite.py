@@ -7,11 +7,11 @@ rewrite that these tests inspect is the one that ships. The promises under test:
   * a run makes ONE recovery point (snapshot + checksum + manifest in a tar), encrypted for a public key,
     uploaded, read back, renamed to its final name and only then COMMITTED by a record that matches the
     object; a deleted row is not in it;
-  * a run that fails anywhere before the commit leaves the remote exactly as it found it, apart from
-    taking back its own unfinished upload, and never deletes an older recovery point;
+  * a run that fails anywhere before the commit deletes NOTHING on the remote (no older recovery point, and no .partial,
+    not even its own: it cannot be told from a replaced one), and leaves no commit record; what it made stays, reported;
   * retention keeps 7 daily and 4 weekly COMMITTED points, runs only after a commit, deletes only names of
     the tool's own shape in the one configured folder, one object at a time, confirms every delete by
-    listing the folder, shares --max-deletions between its cleanup and its retention, and refuses a mass
+    listing the folder, spends --max-deletions on points and orphaned records only, and refuses a mass
     deletion;
   * temporary plaintext is removed on success, on failure and on a signal, and a failure to remove it is
     never a success (tests/test_deploy_offsite_protocol.py has the commit protocol, the unresolved objects,
@@ -574,58 +574,79 @@ def test_plaintext_is_removed_as_soon_as_the_next_stage_has_what_it_needs(rig):
 # --- a failed run changes nothing that was not its own ----------------------------------------------------
 
 
+NOTHING, PARTIAL, FINAL = "nothing", "its own .partial", "the unmatched final-named object"
+
 FAILURES = [
-    # id, (kind, action, nth), events that happened
-    ("backup fails", ("backup", ("exit", 1), 1), ["backup"]),
-    ("backup pair is wrong", ("backup", "bad_pair", 1), ["backup"]),
-    ("sanitize fails", ("sanitize", ("exit", 4), 1), ["backup", "sanitize"]),
-    ("sanitize stream damaged", ("sanitize", "corrupt", 1), ["backup", "sanitize"]),
-    ("sanitize stream cut", ("sanitize", "truncate", 1), ["backup", "sanitize"]),
-    ("verify fails", ("verify", ("exit", 4), 1), ["backup", "sanitize", "verify"]),
-    ("age fails", ("age", ("exit", 1), 1), ["backup", "sanitize", "verify", "age"]),
-    ("age output is not age", ("age", "plain", 1), ["backup", "sanitize", "verify", "age"]),
-    ("mkdir fails", ("mkdir", ("exit", 1), 1), ["backup", "sanitize", "verify", "age"]),
-    ("first listing fails", ("lsjson", ("exit", 1), 1), ["backup", "sanitize", "verify", "age"]),
-    ("first listing is garbage", ("lsjson", "garbage", 1), ["backup", "sanitize", "verify", "age"]),
-    ("upload fails", ("upload", ("exit", 1), 1), ["backup", "sanitize", "verify", "age", "upload"]),
-    ("upload fails half way", ("upload", ("exit", 99), 1), ["backup", "sanitize", "verify", "age", "upload", "delete"]),
-    ("upload damaged", ("upload", "corrupt", 1), ["backup", "sanitize", "verify", "age", "upload", "delete"]),
-    ("upload cut short", ("upload", "truncate", 1), ["backup", "sanitize", "verify", "age", "upload", "delete"]),
-    ("remote reports another size", ("lsjson", "lie_size", 2), ["backup", "sanitize", "verify", "age", "upload", "delete"]),
-    ("remote reports another md5", ("lsjson", "lie_md5", 2), ["backup", "sanitize", "verify", "age", "upload", "delete"]),
-    ("listing after upload fails", ("lsjson", ("exit", 1), 2), ["backup", "sanitize", "verify", "age", "upload", "delete"]),
-    ("read-back fails", ("download", ("exit", 1), 1), ["backup", "sanitize", "verify", "age", "upload", "download", "delete"]),
-    ("read-back differs", ("download", "corrupt", 1), ["backup", "sanitize", "verify", "age", "upload", "download", "delete"]),
-    ("commit fails", ("move", ("exit", 1), 1), ["backup", "sanitize", "verify", "age", "upload", "download", "move", "delete"]),
-    ("commit does nothing", ("move", "noop", 1), ["backup", "sanitize", "verify", "age", "upload", "download", "move", "delete"]),
-    ("committed object is damaged", ("move", "corrupt", 1), ["backup", "sanitize", "verify", "age", "upload", "download", "move", "delete"]),
+    # id, (kind, action, nth), events that happened, what the failed run leaves on the remote besides the older points
+    ("backup fails", ("backup", ("exit", 1), 1), ["backup"], NOTHING),
+    ("backup pair is wrong", ("backup", "bad_pair", 1), ["backup"], NOTHING),
+    ("sanitize fails", ("sanitize", ("exit", 4), 1), ["backup", "sanitize"], NOTHING),
+    ("sanitize stream damaged", ("sanitize", "corrupt", 1), ["backup", "sanitize"], NOTHING),
+    ("sanitize stream cut", ("sanitize", "truncate", 1), ["backup", "sanitize"], NOTHING),
+    ("verify fails", ("verify", ("exit", 4), 1), ["backup", "sanitize", "verify"], NOTHING),
+    ("age fails", ("age", ("exit", 1), 1), ["backup", "sanitize", "verify", "age"], NOTHING),
+    ("age output is not age", ("age", "plain", 1), ["backup", "sanitize", "verify", "age"], NOTHING),
+    ("mkdir fails", ("mkdir", ("exit", 1), 1), ["backup", "sanitize", "verify", "age"], NOTHING),
+    ("first listing fails", ("lsjson", ("exit", 1), 1), ["backup", "sanitize", "verify", "age"], NOTHING),
+    ("first listing is garbage", ("lsjson", "garbage", 1), ["backup", "sanitize", "verify", "age"], NOTHING),
+    ("upload fails", ("upload", ("exit", 1), 1), ["backup", "sanitize", "verify", "age", "upload"], NOTHING),
+    # "upload fails half way" is not here: an upload that did not return proves nothing about what carries the partial's
+    # name, so the run leaves it alone (tests/test_deploy_offsite_ownership.py). Every failure below happens AFTER the upload
+    # returned. The partial is then probably this run's own, but it is left where it is all the same: no run deletes a
+    # .partial (a delete by name cannot be tied to the content, so it could remove an object that replaced it).
+    ("upload damaged", ("upload", "corrupt", 1), ["backup", "sanitize", "verify", "age", "upload"], PARTIAL),
+    ("upload cut short", ("upload", "truncate", 1), ["backup", "sanitize", "verify", "age", "upload"], PARTIAL),
+    ("remote reports another size", ("lsjson", "lie_size", 2), ["backup", "sanitize", "verify", "age", "upload"], PARTIAL),
+    ("remote reports another md5", ("lsjson", "lie_md5", 2), ["backup", "sanitize", "verify", "age", "upload"], PARTIAL),
+    ("listing after upload fails", ("lsjson", ("exit", 1), 2), ["backup", "sanitize", "verify", "age", "upload"], PARTIAL),
+    ("read-back fails", ("download", ("exit", 1), 1), ["backup", "sanitize", "verify", "age", "upload", "download"], PARTIAL),
+    ("read-back differs", ("download", "corrupt", 1), ["backup", "sanitize", "verify", "age", "upload", "download"], PARTIAL),
+    ("commit fails", ("move", ("exit", 1), 1), ["backup", "sanitize", "verify", "age", "upload", "download", "move"], PARTIAL),
+    ("commit does nothing", ("move", "noop", 1), ["backup", "sanitize", "verify", "age", "upload", "download", "move"], PARTIAL),
+    ("committed object is damaged", ("move", "corrupt", 1), ["backup", "sanitize", "verify", "age", "upload", "download", "move"], FINAL),
 ]
+FAILURE_PARAMS = [pytest.param(f, e, left, id=name) for name, f, e, left in FAILURES]
 
 
-@pytest.mark.parametrize("fault, events", [(f, e) for _, f, e in FAILURES], ids=[i for i, _, _ in FAILURES])
-def test_a_failed_run_leaves_the_remote_as_it_found_it_and_no_plaintext(rig, fault, events):
+def assert_what_a_failed_run_left(rig, before, left):
+    """No older point is touched and NOTHING on the remote is deleted. What the run itself made stays where it is: its own
+    .partial (an upload that returned), or the object under the final name that the listing after the rename did not match;
+    neither has a commit record, so neither is a recovery point (the next run reports it)."""
+    files = rig.fake.remote_files()
+    assert {n: files[n] for n in before} == before
+    extra = set(files) - set(before)
+    assert extra == {NOTHING: set(), PARTIAL: {FIXED_NAME + ".partial"}, FINAL: {FIXED_NAME}}[left]
+    assert [c for c in rig.fake.rclone_calls if c[0] == "deletefile"] == []
+    if rig.fake.remote_hashes:  # a remote that lists no MD5 binds no point to its record
+        assert rig.committed_names() == {n for n in before if offsite.parse_point_name(n)}
+
+
+@pytest.mark.parametrize("fault, events, left", FAILURE_PARAMS)
+def test_a_failed_run_deletes_nothing_leaves_no_older_point_touched_and_no_plaintext(rig, fault, events, left):
     before = seed(rig, stamps(datetime(2026, 10, 15), 6))
     kind, action, nth = fault
     rig.fake.fail(kind, action, nth)
     code = rig.run()
     assert code == offsite.EXIT_FAILED, rig.text
-    assert rig.fake.remote_files() == before        # no new point, no .partial, no older point touched
+    assert_what_a_failed_run_left(rig, before, left)
     assert rig.work_leftovers() == []
     assert all(not p.exists() for p in rig.fake.plaintext_paths)
     assert rig.fake.events == events  # it stopped where the fault was; nothing later ran
-    deleted = [c[-1] for c in rig.fake.rclone_calls if c[0] == "deletefile"]
-    assert all(name.startswith(f"{REMOTE}/house-helper-{FIXED_STAMP}-{FIXED_TOKEN}.tar.age") for name in deleted)  # only this run's own objects
     assert "FAILED" in rig.text and DELETED_MARKER not in rig.text
+    if left == PARTIAL:
+        assert f"{FIXED_NAME}.partial was uploaded by this run, which ended before the rename. It is LEFT in the folder" in rig.text
 
 
 def test_a_remote_whose_backend_reports_no_checksum_is_refused_before_the_rename_not_accepted_on_size_and_the_read_back(rig):
     """The MD5 is what ties an object to its commit record in every later run, so a remote that does not list one is
-    found out at the upload, while the object is still this run's own partial: nothing is renamed, nothing is left."""
+    found out at the upload, while the object is still a partial: nothing is renamed and no record is written (the partial
+    stays where it is, like every .partial)."""
     before = seed(rig, stamps(datetime(2026, 10, 15), 3))
     rig.fake.remote_hashes = False
     assert rig.run() == offsite.EXIT_FAILED, rig.text
     assert "gives no MD5" in rig.text
-    assert rig.fake.remote_files() == before and "download" not in rig.fake.events and "move" not in rig.fake.events
+    assert_what_a_failed_run_left(rig, before, PARTIAL)
+    assert "download" not in rig.fake.events and "move" not in rig.fake.events
     assert rig.work_leftovers() == []
 
 
@@ -742,22 +763,19 @@ def test_names_that_are_not_the_tools_own_are_never_touched(rig):
     assert "left alone" in rig.text
 
 
-def test_a_leftover_partial_upload_of_an_earlier_killed_run_is_removed_and_nothing_else_of_its_shape(rig):
+def test_a_leftover_partial_upload_is_never_deleted_does_not_stop_the_backup_and_fails_the_run_visibly(rig):
+    """A .partial of the tool's shape that was already there (a killed run, a stopped upload, somebody else) is not
+    deleted: nothing proves whose it is. The backup is made and stored all the same, and the leftover is REPORTED (exit 6),
+    not just warned about; an object that is not of the tool's shape is not even looked at."""
     stale = point_name("20261020T041500Z", "11111111") + ".partial"
     rig.fake.put_remote(stale, b"half")
     rig.fake.put_remote("notes.partial", b"not ours")
-    assert rig.run() == 0, rig.text
+    assert rig.run() == offsite.EXIT_RETENTION, rig.text
+    assert f"LEFTOVER PARTIAL {stale}: left untouched" in rig.text and "IS stored and verified" in rig.text
+    assert "notes.partial" not in rig.text
     files = rig.fake.remote_files()
-    assert stale not in files and files["notes.partial"] == b"not ours"
-
-
-def test_a_leftover_partial_that_cannot_be_removed_does_not_stop_the_backup_but_fails_the_run_visibly(rig):
-    stale = point_name("20261020T041500Z", "11111111") + ".partial"
-    rig.fake.put_remote(stale, b"half")
-    rig.fake.fail("delete", ("exit", 1))
-    assert rig.run() == offsite.EXIT_RETENTION, rig.text  # the backup is stored, and the leftover is REPORTED, not just warned about
-    assert "could not remove the leftover partial upload" in rig.text and "IS stored and verified" in rig.text
-    assert FIXED_NAME in rig.fake.remote_files() and stale in rig.fake.remote_files()
+    assert files[stale] == b"half" and files["notes.partial"] == b"not ours" and FIXED_NAME in files
+    assert "deletefile" not in rig.fake.rclone_commands()
     assert rig.committed_names() == {FIXED_NAME}
 
 
@@ -785,14 +803,16 @@ SIGNALS = [("backup", 1), ("sanitize", 1), ("verify", 1), ("age", 1), ("mkdir", 
 
 
 @pytest.mark.parametrize("kind, nth", SIGNALS, ids=[f"{k}#{n}" for k, n in SIGNALS])
-def test_a_signal_at_any_step_before_the_commit_removes_plaintext_and_this_runs_partial(rig, kind, nth):
+def test_a_signal_at_any_step_before_the_commit_removes_plaintext_and_deletes_nothing_on_the_remote(rig, kind, nth):
     before = seed(rig, stamps(datetime(2026, 10, 15), 4))
     rig.fake.fail(kind, "signal", nth)
     code = rig.run()
     assert code == 128 + signal.SIGTERM, rig.text
     assert rig.work_leftovers() == []
     assert all(not p.exists() for p in rig.fake.plaintext_paths)
-    assert rig.fake.remote_files() == before
+    # The signal at the upload arrives before anything is written. After the upload had returned, this run's own .partial stays
+    # (it cannot be told from a replaced one, so nothing deletes it) and the log says so; no point is committed either way.
+    assert_what_a_failed_run_left(rig, before, PARTIAL if (kind, nth) in (("lsjson", 2), ("download", 1), ("move", 1)) else NOTHING)
 
 
 def test_a_signal_while_confirming_the_commit_keeps_the_point_that_was_read_back(rig):

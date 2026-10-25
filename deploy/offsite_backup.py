@@ -3,9 +3,13 @@ that deleted rows leave no trace, pack it with its checksum and a manifest into 
 point, encrypt it for a public key, upload it, check the copy that arrived, and keep 7 daily and
 4 weekly points. Runs on the VPS host (Python 3.10+, standard library only):
 
-    python3 deploy/offsite_backup.py run  --tag TAG --recipients-file F --rclone-config F --remote NAME:DIR
-    python3 deploy/offsite_backup.py list --rclone-config F --remote NAME:DIR        (read only)
+    python3 deploy/offsite_backup.py run  --tag TAG --recipients-file F --rclone-config F --remote NAME:DIR [--access-mode M]
+    python3 deploy/offsite_backup.py list --rclone-config F --remote NAME:DIR [--access-mode M]        (read only)
     python3 deploy/offsite_backup.py unpack RECOVERY.tar --output-dir DIR       (on the machine that decrypts)
+
+The restore rehearsal (download, decrypt with a private identity, restore into a scratch directory, verify)
+is deploy/offsite_rehearsal.py, a separate program for the owner's own machine: this one never holds,
+reads or asks for a private key.
 
 `run` is the whole job and what the opt-in systemd service starts (deploy/systemd/house-helper-offsite-
 backup.*, RUNBOOK section 15). It uses what already exists and rewrites none of it:
@@ -44,15 +48,25 @@ backup.*, RUNBOOK section 15). It uses what already exists and rewrites none of 
 
 What is promised, and what is not:
 
-  * A failed run deletes nothing that is not its own. The only remote objects a run ever deletes are
-    (a) its own NAME.partial when it fails, (b) NAME.partial files an earlier killed run left, (c) its
-    own NAME if the listing right after the rename proves that the rename damaged it, and (d) points
-    (the object, then its record) that retention drops AFTER the new point has been committed, and
-    records whose object is gone. An unresolved object is never deleted by the tool, and while one
-    exists (d) shrinks to the records whose object is gone: no committed point is dropped.
+  * A failed run deletes nothing on the remote, and NO RUN EVER DELETES A `.partial`. The only remote objects a
+    run deletes are the points (the object, then its record) that retention drops AFTER the new point has been
+    committed, and records whose object is gone. An unresolved object is never deleted by the tool, and while
+    one exists that shrinks to the records whose object is gone: no committed point is dropped.
+    A NAME.partial is the one shape whose name proves nothing about whose it is: it may be the fragment of a
+    hard kill or of a stopped upload, an object another writer put there, or this run's own upload. rclone has
+    no delete that is conditional on an object's content, so a delete by name could remove an object that
+    replaced the one meant, whatever was checked a moment before. So the tool leaves every `.partial` exactly
+    where it is, the partial of this run's own failed upload included (the clean-up logs it), reports each one it
+    sees in the folder (a log line `LEFTOVER PARTIAL`, and exit 6 after a committed run; `list` shows them), and
+    leaves the removal to an operator (RUNBOOK 15.11). For the same reason the object under this run's final name
+    is not deleted when the listing after the rename shows that it is not the file that was read back: the rename
+    may have damaged it, or an object that replaced the partial may have been renamed instead, and nothing tells
+    the two apart. It has no commit record, so it is UNRESOLVED (below). Residual cost: after a run that failed once
+    its upload had returned, or after a hard kill, one `.partial` (or one unresolved object) stays and every later
+    run ends with exit 6 until an operator has dealt with it.
     Every delete goes through one function that accepts only a name of this tool's own shape
-    (house-helper-<UTC time>-<8 hex>.tar.age[.partial|.commit]) inside the one configured folder,
-    one object at a time (`rclone deletefile`, never delete/purge/sync/cleanup, nothing on the
+    (house-helper-<UTC time>-<8 hex>.tar.age[.commit]; a .partial is refused there too) inside the one configured
+    folder, one object at a time (`rclone deletefile`, never delete/purge/sync/cleanup, nothing on the
     account's trash). No delete is reported as done on the strength of an exit status: the folder is
     listed again and the object must be absent. Whatever cannot be confirmed gone is reported (exit 6).
   * Retention: of the committed points in the folder (size and MD5 bound to their records; an unresolved
@@ -62,12 +76,12 @@ What is promised, and what is not:
     has confirmed the point just made. And no committed point is dropped while ANY unresolved object
     exists in the folder, however old the point: a final-looking object that is not understood may be
     the copy an operator needs, so nothing older is removed until an operator has dealt with it
-    (RUNBOOK 15.11). New points are still made and verified; orphaned commit records and leftover
-    partial uploads are still tidied.
-    --max-deletions (default 5) is ONE budget of the run, shared by the leftover partial uploads it
-    removes and the points and orphaned records retention drops; retention that would exceed what is
-    left of it deletes nothing and fails (exit 6). Objects that are not of the tool's shape are never
-    touched.
+    (RUNBOOK 15.11). New points are still made and verified; orphaned commit records are still tidied.
+    Leftover `.partial` objects take no part in retention: they are neither counted nor deleted, and they
+    do not hold it back.
+    --max-deletions (default 5) is ONE budget of the run, used by the points and orphaned records retention
+    drops; retention that would exceed it deletes nothing and fails (exit 6). Objects that are not of the
+    tool's shape are never touched.
   * The clock. Names carry the host's clock, which retention then trusts to order points. A committed
     point dated later than the host clock (plus an hour), a point dated more than a week after the
     previous one, or a clock that moved by hours during the run, stops ALL deleting by retention for
@@ -97,14 +111,27 @@ What is promised, and what is not:
     rclone that ignores the setting would address the whole disk; and (c) the remote renames server-side
     (`rclone backend features`), because the commit starts with a rename. It never falls back to another
     access mode.
+  * The one exception, TEMPORARY and OFF unless asked for: `--access-mode full-disk-temporary` (RUNBOOK 15.12),
+    for a stable rclone that has no `app_folder` option yet and an owner who has authorised an OAuth token
+    that reaches the whole disk. It is never inferred from the config, the environment or a failure: only that
+    flag selects it. It changes exactly two of the checks above (a: the config must NOT say `app_folder =
+    true`; b: the option is not required) and adds two rules for a token that no longer limits anything:
+    the remote MUST be NAME:house-helper-backup, one fixed folder at the top of the disk, and no other path
+    is accepted (that folder is what keeps the tool inside its own folder); and the OAuth configuration must
+    sit where only root can change it (read_trusted_config: root-owned directories from "/" down, no link,
+    no group/other write, one hard link, read once from the checked descriptor). `run` and `list` make the
+    same offline authorization (authorize_remote) first, before any command. Every rclone call of every command names that folder
+    or an object of this tool's own shape inside it; none names the root, and rclone's bulk commands (delete,
+    purge, sync, cleanup) are never issued. The upload, the listing, the read-back, the deletes and the
+    retention are the same code in both modes.
 
 Exit status: 0 stored, verified, final check passed, retention done, nothing needing review; 1 failed
 (no new point; nothing of another run touched; an object may remain UNRESOLVED, see above); 2 usage;
 3 refused before anything was done (configuration, missing tool, a leftover work directory that cannot
 be removed); 6 the new point is committed and the final check confirmed it, but something needs
 attention: retention did not complete, plaintext could not be removed, an unresolved or future-dated
-object exists (safe: extra objects remain, and no committed point is pruned while an unresolved one
-does); 7 NOT CONFIRMED: this run wrote the point and its commit
+object or a leftover `.partial` exists (safe: extra objects remain, and no committed point is pruned
+while an unresolved one does); 7 NOT CONFIRMED: this run wrote the point and its commit
 record, but the final check (the listing and classification of the folder afterwards) failed or does not
 show the point as committed. It is not reported as stored, nothing is deleted, and the operator runs
 `list` (RUNBOOK 15.7, 15.11); 128+N a signal. Only 0 means "stored and verified" with nothing left to look at;
@@ -172,6 +199,30 @@ STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 RUN_PREFIX = "hh-offsite-"
 LOCK_NAME = ".house-helper-offsite.lock"
 
+# How far the remote's own access reaches. APP_FOLDER is the design: the OAuth token can reach the Yandex
+# application folder and nothing else. FULL_DISK is a TEMPORARY exception for a stable rclone without the
+# `app_folder` option (RUNBOOK 15.12): the token then reaches the whole disk, and the only thing that keeps
+# this tool inside its own folder is this code, so that mode accepts exactly one remote, NAME:FULL_DISK_PREFIX.
+ACCESS_APP_FOLDER = "app-folder"
+ACCESS_FULL_DISK = "full-disk-temporary"
+ACCESS_MODES = (ACCESS_APP_FOLDER, ACCESS_FULL_DISK)
+FULL_DISK_PREFIX = "house-helper-backup"
+
+
+@dataclasses.dataclass(frozen=True)
+class ConfigTrust:
+    """Who may own the OAuth configuration of the full-disk mode and every directory above it, and where the
+    chain of directories that is checked begins. Production is root and "/": an OAuth token that reaches the
+    whole disk is read from a path only root can change. Not an option of the command line: nothing an operator
+    types widens it (tests build their own, under a temporary directory and for their own user)."""
+
+    uid: int = 0
+    root: Path = Path("/")
+
+
+DEFAULT_TRUST = ConfigTrust()
+CONFIG_LIMIT = 1 << 20
+
 # One rule for what this tool may name, create and delete on the remote. Anything else in the folder
 # is somebody else's and is left alone.
 POINT_PATTERN = r"house-helper-([0-9]{8}T[0-9]{6}Z)-([0-9a-f]{8})\.tar\.age"
@@ -207,7 +258,7 @@ CONTAINER_TIMEOUT = 1800
 AGE_TIMEOUT = 1800
 RCLONE_QUICK_TIMEOUT = 300
 RCLONE_TRANSFER_TIMEOUT = 3600
-CLEANUP_TIMEOUT = 120
+RCLONE_NOTHING_TRANSFERRED = 9  # the exit status of `--error-on-no-transfer` when rclone skipped every file (stable 1.75.2, tested)
 MAX_PROVIDERS_BYTES = 16 << 20
 
 
@@ -603,11 +654,38 @@ def classify_folder(entries: Sequence[Entry], read_record: Callable[[str], bytes
     return folder
 
 
-def validate_remote(spec: str) -> str:
+def leftover_partials(entries: Sequence[Entry]) -> List[str]:
+    """The .partial objects of this tool's shape in a listing. No run deletes one, every run and `list` report them."""
+    return sorted(e.name for e in entries if PARTIAL_RE.fullmatch(e.name))
+
+
+def partial_problem(found: Sequence[str]) -> str:
+    """The sentence that turns a run's status into 6 (or is added to an exit 7) while `found` .partial objects are in the folder."""
+    return (
+        f"{len(found)} leftover .partial object(s) are in the folder ({', '.join(found[:5])}"
+        + (f" and {len(found) - 5} more" if len(found) > 5 else "")
+        + "): this tool never deletes a .partial, because nothing proves whose it is; each stays until an operator has "
+        "looked at it and removed it (RUNBOOK 15.11)"
+    )
+
+
+def validate_remote(spec: str, access_mode: str = ACCESS_APP_FOLDER) -> str:
+    """The one folder this tool works in, as NAME:FOLDER. Raises Refused unless it is a folder of its own on
+    a named remote; in the full-disk mode, unless it is exactly NAME:house-helper-backup. This is the only
+    place the folder is decided: every command of the tool addresses the remote through the Remote built
+    from what this returns."""
+    if access_mode not in ACCESS_MODES:
+        raise Refused("--access-mode is not one this tool knows.")
     if not REMOTE_RE.fullmatch(spec):
         raise Refused(
             "--remote must be NAME:FOLDER, a configured rclone remote and a folder of its own inside it "
             "(letters, digits, _ . - ; not the root of the remote, not a path)."
+        )
+    if access_mode == ACCESS_FULL_DISK and spec.split(":", 1)[1] != FULL_DISK_PREFIX:
+        raise Refused(
+            f"in the {ACCESS_FULL_DISK} mode --remote must be NAME:{FULL_DISK_PREFIX} exactly (one fixed folder at the "
+            "top of the disk: the token reaches the whole disk, so this folder is the only limit). "
+            "Nothing else is accepted, not a sub-folder, not another name."
         )
     return spec
 
@@ -616,8 +694,8 @@ class Remote:
     """The one folder on the remote this tool works in, and the only code that names, creates or
     deletes objects there."""
 
-    def __init__(self, spec: str, config: Path, runner: Runner, rclone: str) -> None:
-        self.spec = validate_remote(spec)
+    def __init__(self, spec: str, config: Path, runner: Runner, rclone: str, access_mode: str = ACCESS_APP_FOLDER) -> None:
+        self.spec = validate_remote(spec, access_mode)
         self.config = config
         self.runner = runner
         self.rclone = rclone
@@ -627,18 +705,18 @@ class Remote:
             raise Failed("refusing to address a remote object of a shape this tool does not create.")
         return f"{self.spec}/{name}"
 
-    def _call(self, step: str, command: str, *operands: str, timeout: float, capture: bool = False) -> Result:
+    def _call(self, step: str, command: str, *operands: str, timeout: float, capture: bool = False, accept: Sequence[int] = (0,)) -> Result:
         argv = [self.rclone, command, "--config", str(self.config), "--log-level", "ERROR", *operands]
         done = self.runner.run(argv, timeout=timeout, capture=capture)
-        if done.returncode != 0:
+        if done.returncode not in accept:
             raise Failed(f"rclone {command} failed (exit {done.returncode}) while {step}.")
         return done
 
     def require_server_side_move(self) -> None:
         """The commit starts with a rename, which must be atomic. An rclone that cannot rename server-side on
         this remote would copy and delete, and a stop in the middle could leave a final name on partial data."""
-        root = self.spec.split(":", 1)[0] + ":"
-        done = self._call("checking the remote's features", "backend", "features", root,
+        # Asked of the dedicated folder, not of the remote's root: no rclone call of this tool names the root.
+        done = self._call("checking the remote's features", "backend", "features", self.spec,
                           timeout=RCLONE_QUICK_TIMEOUT, capture=True)
         try:
             can_move = json.loads(done.stdout.decode("utf-8"))["Features"]["Move"]
@@ -659,19 +737,38 @@ class Remote:
         return parse_listing(done.stdout)
 
     def upload(self, local: Path, name: str) -> None:
-        # --immutable: an object that already has this name is never overwritten. One attempt of the whole
-        # command (a second would meet its own half-written object and be refused); rclone still retries
-        # each request itself (--low-level-retries), and a transient failure that gets through fails the run,
-        # which is then repeated by hand or by the next scheduled one.
-        self._call("uploading", "copyto", "--immutable", "--retries", "1", str(local), self._object(name),
-                   timeout=RCLONE_TRANSFER_TIMEOUT)
+        """Returns only if rclone itself reports that it transferred `local` to `name`: an upload that returns made
+        the object (it can still have been replaced since). Raises Failed otherwise, and then nothing is known about
+        what carries that name."""
+        # An object that already has this name is never overwritten. The name is unique to the run and the folder was
+        # listed first (upload_and_commit refuses an existing name), so this is the second line, for a writer that
+        # appears in between. --ignore-existing is the flag that does it: tested against the real stable rclone
+        # 1.75.2, `copyto --immutable` ALONE overwrote a different existing object and exited 0, while
+        # --ignore-existing skipped it (exit 0, nothing written). --error-on-no-transfer turns that silent skip into
+        # exit 9, so a skipped upload is never taken for a stored one: it fails here, and the object it met is not this
+        # run's (and no partial is deleted in any case, Remote.delete).
+        # --immutable stays, for an rclone whose --immutable does refuse. One attempt of the whole command (a second
+        # would meet its own half-written object and be refused); rclone still retries each request itself
+        # (--low-level-retries), and a transient failure that gets through fails the run, which is then repeated by hand
+        # or by the next scheduled one.
+        done = self._call("uploading", "copyto", "--immutable", "--ignore-existing", "--error-on-no-transfer", "--retries", "1",
+                          str(local), self._object(name), timeout=RCLONE_TRANSFER_TIMEOUT,
+                          accept=(0, RCLONE_NOTHING_TRANSFERRED))
+        if done.returncode == RCLONE_NOTHING_TRANSFERRED:
+            raise Failed(
+                f"rclone skipped the upload (exit {RCLONE_NOTHING_TRANSFERRED}, nothing transferred): an object named {name} that this run "
+                "did not make appeared in the folder after it was listed. It is left untouched and nothing is stored (RUNBOOK 15.7)."
+            )
 
     def download(self, name: str, local: Path) -> None:
         self._call("reading the upload back", "copyto", self._object(name), str(local),
                    timeout=RCLONE_TRANSFER_TIMEOUT)
 
     def move(self, source: str, destination: str) -> None:
-        self._call("committing", "moveto", self._object(source), self._object(destination),
+        # --ignore-existing, as for the upload: a plain `moveto` (and `moveto --immutable`) replaced an existing
+        # destination on the real stable rclone 1.75.2. With it a destination that appeared since the folder was
+        # listed is left alone and the source stays where it is; upload_and_commit sees that and fails the run.
+        self._call("committing", "moveto", "--ignore-existing", self._object(source), self._object(destination),
                    timeout=RCLONE_QUICK_TIMEOUT)
 
     def read_record(self, name: str) -> bytes:
@@ -682,6 +779,10 @@ class Remote:
 
     def delete(self, name: str, timeout: float = RCLONE_QUICK_TIMEOUT) -> None:
         # One object by its exact name; hard delete so that the provider's trash does not keep it.
+        if PARTIAL_RE.fullmatch(name):
+            # The name of a partial proves nothing about whose object it is, and a delete by name cannot be made conditional on
+            # its content: no code path of this tool deletes one (RUNBOOK 15.11 has the operator's way).
+            raise Failed("refusing to delete a .partial object: nothing proves whose it is, so only an operator removes one.")
         self._call("deleting", "deletefile", "--yandex-hard-delete", self._object(name), timeout=timeout)
 
     def delete_confirmed(self, names: Sequence[str], timeout: float = RCLONE_QUICK_TIMEOUT) -> "Deleted":
@@ -938,13 +1039,104 @@ def check_rclone_config(path: Path) -> None:
         raise Refused("--rclone-config holds the remote's access token: make it readable by its owner only (chmod 600).")
 
 
-def check_remote_config(path: Path, remote_spec: str) -> None:
+def read_trusted_config(path: Path, trust: ConfigTrust) -> str:
+    """The text of the full-disk mode's OAuth configuration, read only if it sits where nobody but root can change
+    it, from the very file that was checked.
+
+    The configuration holds a token that reaches the whole disk, so the path to it is part of the secret's
+    protection. POSIX only (this tool runs on the Linux host; on Windows the tests run and no ownership applies).
+      * the path is absolute, has no "." or ".." and lies under `trust.root` ("/");
+      * the trust root and EVERY directory below it down to the file's directory is a real directory (never a
+        symbolic link), owned by `trust.uid` (root), and writable by that owner only: group- or other-writable,
+        even with the sticky bit, is refused. So no other user can rename, replace or link anything on the path
+        between this check and rclone's use of the file, which is the race that matters;
+      * the file is opened once with O_NOFOLLOW, and the checks of its owner, its mode (nothing for group or
+        others), its type (a regular file), its link count (1: no hard link elsewhere) and its size are made on
+        THAT descriptor, which is also where the text is read from. The path is looked at again afterwards and
+        must still be that file.
+    rclone replaces the file when it refreshes the token (a new file in the same directory, renamed over the old
+    one), so the directory must stay writable by root; a refreshed file is checked again at the next start.
+    Messages name no path, only what is wrong and the last component."""
+    if os.name == "nt":
+        try:
+            return path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            raise Refused("--rclone-config cannot be read as an rclone configuration file (or repeats a setting).") from None
+    if not path.is_absolute() or any(part in (".", "..") for part in path.parts):
+        raise Refused("in the full-disk mode --rclone-config must be an absolute path without . or .. components.")
+    try:
+        below = path.relative_to(trust.root)
+    except ValueError:
+        raise Refused("--rclone-config is not under the directory the full-disk mode trusts (/).") from None
+    directory = trust.root
+    for part in (None, *below.parts[:-1]):
+        if part is not None:
+            directory = directory / part
+        try:
+            found = os.lstat(directory)
+        except OSError:
+            raise Refused("a directory on the path of --rclone-config cannot be examined.") from None
+        label = directory.name or "/"
+        if stat.S_ISLNK(found.st_mode) or not stat.S_ISDIR(found.st_mode):
+            raise Refused(f"in the full-disk mode no directory on the path of --rclone-config may be a symbolic link ({label}).")
+        if found.st_uid != trust.uid:
+            raise Refused(f"in the full-disk mode every directory on the path of --rclone-config must be owned by root ({label} is not).")
+        if found.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise Refused(f"in the full-disk mode no directory on the path of --rclone-config may be writable by group or others ({label} is).")
+    # O_NONBLOCK: opening a named pipe planted at this path must not wait for a writer; it is refused below as not a regular file.
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        raise Refused("--rclone-config cannot be opened (missing, a symbolic link, or not readable by this user).") from None
+    try:
+        opened = os.fstat(descriptor)  # every check is on the descriptor, before anything is read from it
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or opened.st_size > CONFIG_LIMIT:
+            raise Refused("in the full-disk mode --rclone-config must be a regular file with a single link, of at most 1 MiB.")
+        if opened.st_uid != trust.uid:
+            raise Refused("in the full-disk mode --rclone-config must be owned by root.")
+        if opened.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+            raise Refused("in the full-disk mode --rclone-config must give group and others no access at all (chmod 600).")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1  # the file object owns it now
+            content = handle.read(CONFIG_LIMIT + 1)
+    except OSError:
+        raise Refused("--rclone-config cannot be read.") from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    try:
+        again = os.lstat(path)
+    except OSError:
+        raise Refused("--rclone-config changed while it was being checked.") from None
+    if (again.st_dev, again.st_ino) != (opened.st_dev, opened.st_ino):
+        raise Refused("--rclone-config changed while it was being checked.")
+    try:
+        return content.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Refused("--rclone-config cannot be read as an rclone configuration file (or repeats a setting).") from None
+
+
+def check_remote_config(
+    path: Path, remote_spec: str, access_mode: str = ACCESS_APP_FOLDER, trust: Optional[ConfigTrust] = None
+) -> None:
     """Fail closed unless the rclone config section of the remote is a Yandex Disk remote with the
-    application's own OAuth client and the application-folder mode on. Reads the file; prints no value."""
+    application's own OAuth client and the application-folder mode on. Reads the file; prints no value.
+
+    In the temporary full-disk mode the application-folder setting must instead be ABSENT (or `false`): a config
+    that says `app_folder = true` asks for the narrower mode and contradicts the flag, and an ambiguous
+    request is not run. The own OAuth client and the token are required in both modes.
+
+    With `trust` and the full-disk mode the file is read by read_trusted_config (its location and ownership are
+    part of the check); without it, or in the application-folder mode, the file is read as it always was."""
     name = remote_spec.split(":", 1)[0]
     parser = configparser.RawConfigParser(delimiters=("=",), strict=True)
     try:
-        parser.read_string(path.read_text(encoding="utf-8"))
+        if access_mode == ACCESS_FULL_DISK and trust is not None:
+            text = read_trusted_config(path, trust)
+        else:
+            text = path.read_text(encoding="utf-8")
+        parser.read_string(text)
     except (OSError, UnicodeDecodeError, configparser.Error):
         raise Refused("--rclone-config cannot be read as an rclone configuration file (or repeats a setting).") from None
     if not parser.has_section(name):
@@ -956,10 +1148,18 @@ def check_remote_config(path: Path, remote_spec: str) -> None:
 
     if value("type") != "yandex":
         raise Refused(f"the remote [{name}] is not a Yandex Disk remote (type = yandex): nothing else is supported.")
-    if value("app_folder").lower() != "true":
+    if access_mode == ACCESS_FULL_DISK:
+        if value("app_folder").lower() not in ("", "false"):
+            raise Refused(
+                f"the remote [{name}] sets app_folder, which contradicts --access-mode {ACCESS_FULL_DISK}: that mode is for "
+                "a configuration without the application-folder setting. Remove the setting, or use --access-mode "
+                f"{ACCESS_APP_FOLDER}."
+            )
+    elif value("app_folder").lower() != "true":
         raise Refused(
-            f"the remote [{name}] does not set app_folder = true. This tool works only inside the Yandex Disk "
-            "application folder and never with access to the whole disk."
+            f"the remote [{name}] does not set app_folder = true. By default this tool works only inside the Yandex Disk "
+            f"application folder and never with access to the whole disk (the temporary exception is the explicit "
+            f"--access-mode {ACCESS_FULL_DISK}, RUNBOOK 15.12)."
         )
     if not value("client_id") or not value("client_secret"):
         raise Refused(
@@ -970,10 +1170,12 @@ def check_remote_config(path: Path, remote_spec: str) -> None:
         raise Refused(f"the remote [{name}] has no token: authorise it with rclone config first.")
 
 
-def check_rclone_capability(runner: Runner, rclone: str, config: Path) -> None:
+def check_rclone_capability(runner: Runner, rclone: str, config: Path, access_mode: str = ACCESS_APP_FOLDER) -> bool:
     """Fail closed unless this rclone knows the Yandex `app_folder` option. An rclone that does not would
     ignore the setting and address the whole disk (or fail with 403 for a restricted token); either way it
-    is not one to run this job with."""
+    is not one to run this job with. In the temporary full-disk mode that option is not required (it is the
+    reason for the mode) but the Yandex backend must be there and readable. Returns whether the option exists,
+    so that the full-disk mode can say when the narrower mode has become possible."""
     done = runner.run([rclone, "config", "providers", "--config", str(config)], timeout=RCLONE_QUICK_TIMEOUT, capture=True)
     if done.returncode != 0 or len(done.stdout) > MAX_PROVIDERS_BYTES:
         raise Refused(f"`rclone config providers` failed (exit {done.returncode}); the rclone version cannot be checked.")
@@ -983,11 +1185,56 @@ def check_rclone_capability(runner: Runner, rclone: str, config: Path) -> None:
         options = {o.get("Name") for o in yandex[0]["Options"]}
     except (ValueError, IndexError, KeyError, TypeError, AttributeError):
         raise Refused("rclone's list of backends is not in a form this tool understands; the rclone version cannot be checked.") from None
-    if "app_folder" not in options:
+    has_app_folder = "app_folder" in options
+    if not has_app_folder and access_mode != ACCESS_FULL_DISK:
         raise Refused(
             "this rclone has no app_folder option for Yandex Disk (stable 1.75.2 does not; the first stable release "
-            "that does is planned as 1.76.0). Install a stable release that has it; nothing was done."
+            "that does is planned as 1.76.0). Install a stable release that has it; nothing was done. (The temporary "
+            f"exception for such an rclone is the explicit --access-mode {ACCESS_FULL_DISK}, RUNBOOK 15.12.)"
         )
+    return has_app_folder
+
+
+def authorize_remote(
+    config_path: Path, remote_spec: str, access_mode: str, trust: Optional[ConfigTrust] = DEFAULT_TRUST
+) -> None:
+    """Every OFFLINE decision about whether this tool may use this remote in this mode. `run` and `list` both make
+    exactly this call, first, before any other check and before any rclone command, so that the authorization of the
+    full-disk mode is one rule and not two. It raises Refused unless: the mode is one the tool knows; the remote is
+    a folder of its own (in the full-disk mode exactly NAME:house-helper-backup); the configuration file is a
+    private regular file; the section of the remote is a Yandex Disk remote with the owner's own OAuth client and a
+    token; and the access setting of the section says what the mode says (`app_folder = true` for app-folder; absent or
+    `false` for full-disk, which also requires the file to sit where only root can change it: read_trusted_config).
+    A missing, empty, misspelled or contradictory authorization stops here. `trust=None` (the rehearsal on the owner's
+    own machine) skips only the location-and-owner rule."""
+    validate_remote(remote_spec, access_mode)
+    check_rclone_config(config_path)
+    check_remote_config(config_path, remote_spec, access_mode, trust)
+
+
+def open_remote(runner: "Runner", rclone: str, config_path: Path, remote_spec: str, access_mode: str) -> tuple:
+    """After authorize_remote: the rclone-side capability (the Yandex backend and, for the app-folder mode, its
+    app_folder option), the Remote for the one folder, and the server-side rename check. Returns (Remote, whether
+    this rclone knows app_folder). Shared by `run` and `list`."""
+    has_app_folder = check_rclone_capability(runner, rclone, config_path, access_mode)
+    remote = Remote(remote_spec, config_path, runner, rclone, access_mode)
+    remote.require_server_side_move()
+    return remote, has_app_folder
+
+
+def full_disk_notice(remote_spec: str, has_app_folder: bool) -> str:
+    """The line every run and every `list` in the temporary full-disk mode prints first: what the mode is, the one
+    folder it is held to, and, when this rclone can do better, that the narrower mode is now possible."""
+    return (
+        f"NOTICE: TEMPORARY access mode {ACCESS_FULL_DISK}. The OAuth token reaches the whole Yandex Disk; this tool "
+        f"touches only {remote_spec}/ and, in it, only objects named house-helper-<UTC time>-<8 hex>.tar.age[.partial|.commit] "
+        "(RUNBOOK 15.12)."
+        + (
+            f" This rclone HAS the app_folder option: move to --access-mode {ACCESS_APP_FOLDER} with an application-folder token "
+            "(RUNBOOK 15.12, migration)."
+            if has_app_folder else ""
+        )
+    )
 
 
 @dataclasses.dataclass
@@ -998,6 +1245,8 @@ class Config:
     recipients_file: Optional[Path] = None
     work_dir: Optional[Path] = None
     max_deletions: int = DEFAULT_MAX_DELETIONS
+    access_mode: str = ACCESS_APP_FOLDER
+    trust: ConfigTrust = DEFAULT_TRUST
 
 
 # --- the job -----------------------------------------------------------------------------------
@@ -1018,21 +1267,17 @@ class Job:
         self.tools: Dict[str, str] = {}
         self.remote: Optional[Remote] = None
         self.run_dir: Optional[Path] = None
-        self.partial: Optional[str] = None  # the .partial this run uploaded and has not yet renamed
+        self.partial: Optional[str] = None  # the .partial whose upload has RETURNED (so it is probably this run's) and has not yet been renamed: left where it is if the run ends first
         self.committed: Optional[str] = None  # the point this run committed (object AND commit record confirmed)
         self.created: Optional[datetime] = None  # the host clock at the start of this run: the time in the point's name
-        self.deletions_used = 0  # of --max-deletions: leftovers of earlier runs and points retention drops, together
         self.problems: List[str] = []  # housekeeping that did not complete: reported at the end, never only warned
-
-    def deletions_left(self) -> int:
-        return max(self.config.max_deletions - self.deletions_used, 0)
+        self.early_partials: List[str] = []  # the .partial objects in the listing taken before this run's upload (the closing listing is the authority)
 
     # preflight ---------------------------------------------------------------------------------
 
     def preflight(self) -> None:
         config = self.config
-        validate_remote(config.remote)
-        check_rclone_config(config.rclone_config)
+        authorize_remote(config.rclone_config, config.remote, config.access_mode, config.trust)
         if not TAG_RE.fullmatch(config.tag):
             raise Refused("--tag is not an image tag.")
         read_recipients(config.recipients_file)
@@ -1046,10 +1291,11 @@ class Job:
             self.tools[name] = found
         if not is_plain_file(self.deploy_dir / "backup.sh"):
             raise Refused("deploy/backup.sh is not next to this script.")
-        check_remote_config(config.rclone_config, config.remote)
-        check_rclone_capability(self.runner, self.tools["rclone"], config.rclone_config)
-        self.remote = Remote(config.remote, config.rclone_config, self.runner, self.tools["rclone"])
-        self.remote.require_server_side_move()
+        self.remote, has_app_folder = open_remote(
+            self.runner, self.tools["rclone"], config.rclone_config, config.remote, config.access_mode
+        )
+        if config.access_mode == ACCESS_FULL_DISK:
+            self.log(full_disk_notice(config.remote, has_app_folder))
 
     # the whole run -----------------------------------------------------------------------------
 
@@ -1221,10 +1467,21 @@ class Job:
         before = remote.listing("checking the folder before the upload")
         if any(entry.name in (name, partial, name + COMMIT_SUFFIX) for entry in before):
             raise Failed("an object of this run's name already exists on the remote; nothing was uploaded.")
-        self.drop_stale_partials(before)
+        self.report_leftover_partials(before)
 
-        self.partial = partial  # from here on a failure takes its own partial back
-        remote.upload(sealed, partial)
+        # No .partial is ever deleted (Remote.delete refuses one): not an earlier run's, not this run's own. An upload that did not
+        # return proves nothing about what carries the name (it may be somebody else's object, or the fragment of an upload that
+        # stopped), and one that did return cannot be taken back by name either: nothing stops the object from having been replaced
+        # since, and rclone cannot delete conditionally. `self.partial` only lets the clean-up say which one was left.
+        try:
+            remote.upload(sealed, partial)
+        except Failed:
+            self.log(
+                f"{partial} was not confirmed as this run's own upload, so it is NOT removed: whatever carries that name is left "
+                "untouched (RUNBOOK 15.11)."
+            )
+            raise
+        self.partial = partial  # from here on the run is known to have uploaded it, and the clean-up reports it if the run ends before the rename
         # The listing must carry an MD5 already here: it is what binds the object to its record later, and a
         # remote that cannot give one is found out now, while the object is still this run's own partial.
         listed = self.find(remote.listing("checking the upload"), partial)
@@ -1243,8 +1500,14 @@ class Job:
         remote.move(partial, name)
         listing = remote.listing("confirming the rename")
         final = self.find(listing, name)
-        if not any(entry.name == partial for entry in listing):
-            self.partial = None  # renamed: there is no partial to take back
+        if any(entry.name == partial for entry in listing):
+            # --ignore-existing left the source where it was: an object with the final name appeared after the folder was
+            # listed. It is not this run's, so it is neither judged nor removed here, and the partial stays as well.
+            raise Failed(
+                f"the rename did not take place: an object named {name} that this run did not make appeared in the folder. It is "
+                f"left untouched, so is this run's {partial}, and nothing is stored (RUNBOOK 15.11)."
+            )
+        self.partial = None  # renamed: no partial of this run is left to report
         try:
             check_entry(final, local)
         except Unverifiable as failure:
@@ -1255,9 +1518,10 @@ class Job:
                 "operator has looked at it (RUNBOOK 15.7)."
             ) from None
         except Failed:
-            # The rename itself damaged it (the listing proves it): this run's own object, by its exact
-            # name, is not a point. Nothing older is touched.
-            self.reject(name)
+            # The listing says the object under the final name is not the file that was read back. The rename may have damaged
+            # it, or an object that replaced the partial since the read-back may have been renamed instead; nothing tells the two
+            # apart, and a delete by name cannot be tied to the content. So it is not deleted. Nothing older is touched.
+            self.leave_unmatched(name)
             raise
         self.write_commit_record(name, local)
         self.committed = name
@@ -1282,40 +1546,73 @@ class Job:
                 "looked at it (RUNBOOK 15.7)."
             ) from None
 
-    def reject(self, name: str) -> None:
-        """Take back this run's own object that the listing proved damaged. The delete is confirmed by a
-        listing; if it cannot be, the object stays WITHOUT a commit record, which is what keeps every later
-        run from counting it, and the log says so."""
-        result = self.remote.delete_confirmed([name], CLEANUP_TIMEOUT)
-        if result.left:
-            self.log(
-                f"WARNING: {name} is damaged and could not be removed (or its removal could not be confirmed). It has no "
-                "commit record, so it is not a recovery point and no run counts it; every run reports it until an "
-                "operator has removed it (RUNBOOK 15.7)."
-            )
-        else:
-            self.log(f"removed {name}: the rename damaged it.")
+    def leave_unmatched(self, name: str) -> None:
+        """Say that the object under this run's final name, listed right after the rename, is not the file that was read
+        back, and leave it. It has no commit record, which is what keeps every later run from counting it: it is
+        UNRESOLVED, reported by every run and by `list`, until an operator has looked at it (RUNBOOK 15.11)."""
+        self.log(
+            f"WARNING: {name}, listed right after the rename, is not the file this run read back. The rename may have damaged it, "
+            "or an object that replaced the partial before the rename may have been renamed instead: nothing tells the two "
+            "apart, so it is NOT deleted. It has no commit record, so it is not a recovery point and no run counts it; every run "
+            "reports it as UNRESOLVED until an operator has looked at it (RUNBOOK 15.11)."
+        )
 
-    def drop_stale_partials(self, entries: Sequence[Entry]) -> None:
-        """Remove the .partial uploads that earlier killed runs left. They draw on the same --max-deletions
-        budget as retention; whatever is not removed, or not confirmed removed, is reported at the end."""
-        stale = sorted(e.name for e in entries if PARTIAL_RE.fullmatch(e.name))
-        take = stale[: self.deletions_left()]
-        if take:
-            self.deletions_used += len(take)
-            for name in take:
-                self.log(f"removing {name}, left by an earlier run that did not finish.")
-            result = self.remote.delete_confirmed(take)  # housekeeping must not stop the backup it is tidying up for ...
-            for name in result.gone:
-                self.log(f"removed {name}.")
-            reason = "; ".join(result.why) or "it is still listed after the delete"
-            for name in result.left:  # ... but it must not go unseen either: the end of the run reports it (exit 6)
-                self.problems.append(f"could not remove the leftover partial upload {name} ({reason})")
-        if len(stale) > len(take):
-            self.problems.append(
-                f"{len(stale) - len(take)} more leftover partial uploads were not removed "
-                f"(--max-deletions {self.config.max_deletions} is one budget for this run's cleanup and retention together)"
+    def report_leftover_partials(self, entries: Sequence[Entry]) -> None:
+        """Say which .partial objects are in the folder before this run's own upload, and delete none. Whose they are
+        cannot be known (a hard kill, a stopped upload, another writer), and a delete by name cannot be made conditional
+        on the content, so only an operator removes one (RUNBOOK 15.11). The end of the run reports them (exit 6) for as
+        long as they exist; retention neither counts nor waits for them."""
+        found = leftover_partials(entries)
+        for name in found:
+            self.log(
+                f"LEFTOVER PARTIAL {name}: left untouched. Nothing proves whose it is or that it is whole, so this tool never "
+                "deletes a .partial; an operator looks at it and removes it (RUNBOOK 15.11)."
             )
+        # Not yet a problem of the run: a run that commits decides from the CLOSING listing (closing_listing), which sees what
+        # was here at the start and what appeared since. Until then this is what an exit 7 reports (pending_problems).
+        self.early_partials = found
+
+    def pending_problems(self) -> List[str]:
+        """What is known to need attention before the closing listing has been taken: the partials the first listing showed, then
+        the rest. Used by the one status that is decided without a closing listing (exit 7)."""
+        return ([partial_problem(self.early_partials)] if self.early_partials else []) + self.problems
+
+    def closing_listing(self) -> List[str]:
+        """The last thing a run does before it decides its status: list the folder AGAIN, after the backup, the commit and the
+        retention, and report every .partial of the tool's shape in THAT listing, whether it was there at the start or appeared
+        since (a writer that comes in during the upload, the rename or the retention is not in any earlier listing). Returns the
+        problems to report: the partials this listing shows, or, if it cannot be taken, the fact that it could not, together with
+        the partials the first listing showed (they are not known to be gone). Nothing is deleted; the exit status is 6 whenever
+        this returns anything. This is an observation at one point in time, not a guarantee against a writer that comes later."""
+        try:
+            entries = self.remote.listing("the closing listing of the folder")
+        except Failed as failure:
+            why = str(failure)
+        except Exception as failure:  # the text of an unexpected exception can quote paths: class only
+            why = f"unexpected {type(failure).__name__}"
+        else:
+            found = leftover_partials(entries)
+            by_name = {e.name: e for e in entries}
+            for name in found:
+                entry = by_name[name]
+                md5 = entry.hashes.get("md5", "")
+                described = f"{entry.size} bytes" + (f", MD5 {md5}" if MD5_RE.fullmatch(md5) else "")
+                seen = "listed before this run's upload too" if name in self.early_partials else (
+                    "NOT in the listing taken before this run's upload: it appeared while the run was in progress"
+                )
+                self.log(
+                    f"LEFTOVER PARTIAL {name}: left untouched ({described}; {seen}). Nothing proves whose it is or that it is "
+                    "whole, so this tool never deletes a .partial; an operator looks at it and removes it (RUNBOOK 15.11)."
+                )
+            for name in self.early_partials:
+                if name not in by_name:
+                    self.log(f"a .partial that the first listing of this run showed is not in the closing listing any more: {name}.")
+            return [partial_problem(found)] if found else []
+        self.log(f"WARNING: the closing listing of the folder failed ({why.rstrip('.')}); this run is not reported as healthy.")
+        return ([partial_problem(self.early_partials)] if self.early_partials else []) + [
+            f"the closing listing of the folder could not be taken ({why.rstrip('.')}), so whether a leftover .partial is in the "
+            "folder now is NOT known; a run is healthy only when that listing was taken and showed none (RUNBOOK 15.11)"
+        ]
 
     @staticmethod
     def find(entries: Sequence[Entry], name: str) -> Entry:
@@ -1327,14 +1624,17 @@ class Job:
     # retention ---------------------------------------------------------------------------------
 
     def retain(self) -> None:
-        """After the commit: the final check, then retention. Three outcomes, three statuses:
+        """After the commit: the final check, then retention, then the closing listing. Three outcomes, three statuses:
 
-          * the final check confirms the point and nothing else needs attention: return (exit 0);
-          * it confirms the point, but the housekeeping after it did not complete: RetentionIncomplete
-            (exit 6). The point is stored; the report says what else needs a look;
+          * the final check confirms the point and nothing else needs attention (the closing listing, taken last of all, was
+            read and shows no leftover .partial): return (exit 0);
+          * it confirms the point, but the housekeeping after it did not complete, or the closing listing shows a .partial or
+            could not be taken: RetentionIncomplete (exit 6). The point is stored; the report says what else needs a look;
           * it cannot confirm the point: Unconfirmed (exit 7), raised before anything is deleted.
 
-        Nothing that could not be pruned or tidied is only logged: it fails the run, every run it persists.
+        Nothing that could not be pruned or tidied is only logged: it fails the run, every run it persists. A .partial that
+        appeared after the first listing (during the upload, the rename or the retention) is in no earlier listing than the
+        closing one, which is why the status is decided only after it.
 
         Retention works on COMMITTED points only (an object, and a valid commit record whose size and MD5
         equal the listing's). Unresolved objects are not counted, relied on or deleted; they are reported,
@@ -1361,6 +1661,8 @@ class Job:
             problems.append(str(failure))
         except Exception as failure:  # the text of an unexpected exception can quote paths: class only
             problems.append(f"unexpected {type(failure).__name__} during retention")
+        # The very last remote operation, whatever retention did: the status below is decided from THIS listing for partials.
+        problems[:0] = self.closing_listing()
         if problems:
             raise RetentionIncomplete(
                 " ".join(p if p.endswith(".") else p + "." for p in problems)
@@ -1368,8 +1670,8 @@ class Job:
                 "before the commit, and the final check of the folder matched its size and MD5 to its commit record."
             )
         self.log(
-            f"stored {self.committed} (the final check matched its size and MD5 to its commit record); "
-            f"{len(plan.keep)} points kept, {dropped} deleted"
+            f"stored {self.committed} (the final check matched its size and MD5 to its commit record; the closing listing "
+            f"showed no leftover .partial); {len(plan.keep)} points kept, {dropped} deleted"
             + (f", {len(folder.others)} other object(s) in the folder left alone." if folder.others else ".")
         )
 
@@ -1396,7 +1698,7 @@ class Job:
             "NOT reported as stored: this run wrote its object and its commit record and read the record back, but the folder, "
             "listed again afterwards, does not show it as a committed point (or could not be read). Nothing was deleted. "
             "Run `list` and see RUNBOOK 15.7 and 15.11."
-            + "".join(f" Also: {p.rstrip('.')}." for p in self.problems)
+            + "".join(f" Also: {p.rstrip('.')}." for p in self.pending_problems())
         )
 
     def report_unresolved(self, folder: Folder) -> List[str]:
@@ -1418,7 +1720,7 @@ class Job:
         leaves a harmless orphaned record and never an object that looks unresolved) and the orphaned records.
         Every step is confirmed by listing the folder again. Returns how many points are completely gone.
         While the folder holds an unresolved object no point is dropped at all: only the orphaned records go.
-        Raises Failed, having deleted nothing, if the work is more than what is left of --max-deletions."""
+        Raises Failed, having deleted nothing, if the work is more than --max-deletions."""
         drops = [p.name for p in plan.drop]
         strays = list(folder.stray_records)
         if drops and folder.unresolved:
@@ -1431,16 +1733,14 @@ class Job:
         wanted = len(drops) + len(strays)
         if not wanted:
             return 0
-        if wanted > self.deletions_left():
+        if wanted > self.config.max_deletions:
             raise Failed(
                 f"retention would delete {wanted} ({len(drops)} points, {len(strays)} orphaned commit records), more than "
-                f"--max-deletions ({self.config.max_deletions}) leaves for it ({self.deletions_left()} left this run, "
-                f"{self.deletions_used} used by leftover partial uploads); nothing was deleted."
+                f"--max-deletions ({self.config.max_deletions}) allows; nothing was deleted."
             )
         for name in drops:
             if name in plan.keep or name == self.committed:
                 raise Failed("internal error: retention chose a point it keeps.")
-        self.deletions_used += wanted
         objects = self.remote.delete_confirmed(drops)
         problems.extend(deletion_problems("point", objects))
         # A record goes only after its object is PROVEN absent; a point whose object is still there stays whole.
@@ -1463,7 +1763,8 @@ class Job:
         """On every exit path of the making of the point. Ignores further signals; never raises. A work
         directory that cannot be removed is recorded in `problems`: the run then ends with exit 6 if the
         point was committed, and with its own failure status otherwise; the warning is logged either way,
-        and the next run refuses to start while the directory is there."""
+        and the next run refuses to start while the directory is there. It deletes nothing on the remote:
+        the partial of an upload that returned is only reported (it cannot be told from a replaced one)."""
         previous = {}
         for number in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGHUP", None)):
             if number is not None:
@@ -1482,28 +1783,16 @@ class Job:
                         "by hand: no new run starts while it exists)"
                     )
             if self.partial is not None:
-                self.take_back_partial(self.partial)
+                self.log(
+                    f"WARNING: {self.partial} was uploaded by this run, which ended before the rename. It is LEFT in the folder "
+                    "untouched: a delete by name cannot be tied to its content, so no run deletes a .partial. Every later run "
+                    "reports it (exit 6) until an operator has looked at it and removed it (RUNBOOK 15.11)."
+                )
                 self.partial = None
         finally:
             for number, handler in previous.items():
                 with contextlib.suppress(Exception):
                     signal.signal(number, handler)
-
-    def take_back_partial(self, name: str) -> None:
-        """Delete this run's own unfinished upload, if it is there. Only that name: the object under
-        the final name was read back before it was renamed, so it is never removed here."""
-        try:
-            try:
-                present = any(e.name == name for e in self.remote.listing("looking for the unfinished upload", CLEANUP_TIMEOUT))
-            except Failed:
-                present = True  # cannot tell: try the delete, which touches only this exact name
-            if present:
-                if self.remote.delete_confirmed([name], CLEANUP_TIMEOUT).left:
-                    self.log(f"WARNING: could not remove the unfinished upload {name} (or confirm that it is gone); the next run removes it.")
-                else:
-                    self.log(f"removed this run's unfinished upload {name}.")
-        except Exception:
-            self.log(f"WARNING: could not remove the unfinished upload {name}; the next run removes it.")
 
     def discard(self, path: Path) -> None:
         """Remove a temporary file or directory as soon as it is not needed. Best effort: the final
@@ -1562,8 +1851,18 @@ def list_points(remote: Remote, log: Callable[[str], None] = say, clock: Optiona
             log(f"  UNRESOLVED  {name}  ({why})")
     if folder.stray_records:
         log(f"{len(folder.stray_records)} orphaned commit record(s) (their object is gone); a run whose retention may delete removes them: {', '.join(folder.stray_records)}")
-    if folder.others:
-        log(f"{len(folder.others)} other object(s) in the folder would be left alone.")
+    partials = leftover_partials(entries)
+    if partials:
+        sizes = {e.name: e.size for e in entries}
+        log(
+            f"ATTENTION: {len(partials)} leftover .partial object(s). Nothing proves whose they are, so this tool never deletes one; "
+            "every run ends with exit 6 until an operator has looked at each and removed it (RUNBOOK 15.11):"
+        )
+        for name in partials:
+            log(f"  LEFTOVER PARTIAL  {name}  ({sizes[name]} bytes)")
+    others = [name for name in folder.others if name not in set(partials)]
+    if others:
+        log(f"{len(others)} other object(s) in the folder would be left alone.")
     return EXIT_OK
 
 
@@ -1577,6 +1876,14 @@ class _Parser(argparse.ArgumentParser):
         raise SystemExit(EXIT_USAGE)
 
 
+def _add_access_mode(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--access-mode", choices=ACCESS_MODES, default=ACCESS_APP_FOLDER,
+        help=f"{ACCESS_APP_FOLDER} (default): the token is limited to the Yandex application folder. {ACCESS_FULL_DISK}: a TEMPORARY, "
+             f"explicitly authorised exception for a token that reaches the whole disk; --remote must then be NAME:{FULL_DISK_PREFIX} (RUNBOOK 15.12)",
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = _Parser(prog="offsite_backup.py", description="Encrypted off-host backup of the House Helper database.", allow_abbrev=False)
     commands = parser.add_subparsers(dest="command", required=True, metavar="command")
@@ -1587,10 +1894,12 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--remote", required=True, help="NAME:FOLDER, the dedicated folder on the rclone remote")
     run.add_argument("--work-dir", required=True, type=Path, help="absolute directory for temporary plaintext (tmpfs)")
     run.add_argument("--max-deletions", type=int, default=DEFAULT_MAX_DELETIONS,
-                     help="most leftovers and old points one run may delete: one budget for its cleanup and its retention together")
+                     help="most old points and orphaned commit records one run's retention may delete (a .partial is never deleted)")
+    _add_access_mode(run)
     show = commands.add_parser("list", help="show the points in the remote folder and what retention would do (read only)")
     show.add_argument("--rclone-config", required=True, type=Path)
     show.add_argument("--remote", required=True)
+    _add_access_mode(show)
     unpack = commands.add_parser("unpack", help="check a decrypted recovery point and extract it")
     unpack.add_argument("tar", type=Path, help="the decrypted recovery-point tar")
     unpack.add_argument("--output-dir", required=True, type=Path, help="an existing directory; nothing in it is replaced")
@@ -1609,6 +1918,7 @@ def main(
     token: Optional[Callable[[], str]] = None,
     deploy_dir: Optional[Path] = None,
     log: Callable[[str], None] = say,
+    config_trust: ConfigTrust = DEFAULT_TRUST,
 ) -> int:
     parser = _build_parser()
     try:
@@ -1627,20 +1937,20 @@ def main(
         if args.command == "unpack":
             return _unpack(args, log)
         if args.command == "list":
+            authorize_remote(args.rclone_config, args.remote, args.access_mode, config_trust)  # first, as in `run`
             rclone = runner.which("rclone")
             if not rclone:
                 raise Refused("rclone is not installed on this host.")
-            check_rclone_config(args.rclone_config)
-            check_remote_config(args.rclone_config, args.remote)
-            check_rclone_capability(runner, rclone, args.rclone_config)
-            remote = Remote(args.remote, args.rclone_config, runner, rclone)
-            remote.require_server_side_move()
+            remote, has_app_folder = open_remote(runner, rclone, args.rclone_config, args.remote, args.access_mode)
+            if args.access_mode == ACCESS_FULL_DISK:
+                log(full_disk_notice(args.remote, has_app_folder))
             return list_points(remote, log, clock)
         if args.max_deletions < 0:
             raise Refused("--max-deletions cannot be negative.")
         config = Config(
             remote=args.remote, rclone_config=args.rclone_config, tag=args.tag,
             recipients_file=args.recipients_file, work_dir=args.work_dir, max_deletions=args.max_deletions,
+            access_mode=args.access_mode, trust=config_trust,
         )
         Job(
             config, runner, deploy_dir or Path(__file__).resolve().parent,

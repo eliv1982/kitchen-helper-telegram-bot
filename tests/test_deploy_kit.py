@@ -98,6 +98,14 @@ TOOL_VARIABLES = {"HOUSE_HELPER_STAGING_DIR"}
 # the application, the operator tool or Compose itself.
 SCHEDULER_VARIABLES = {"HOUSE_HELPER_CHECKOUT"}
 
+# The off-host backup's systemd service reads these from its own environment file
+# (deploy/systemd/house-helper-offsite.env.example): read from that template, so a name cannot be documented that the
+# template does not define. The three HOUSE_HELPER_REAL_RCLONE* names are the switches of the opt-in tests against a
+# real rclone (tests/test_deploy_offsite_real_rclone.py), not settings of anything that runs.
+OFFSITE_VARIABLES = set(
+    re.findall(r"^(HOUSE_HELPER_[A-Z_]+)=", (DEPLOY / "systemd" / "house-helper-offsite.env.example").read_text(encoding="utf-8"), re.MULTILINE)
+) | {"HOUSE_HELPER_REAL_RCLONE", "HOUSE_HELPER_REAL_RCLONE_VERSION", "HOUSE_HELPER_REAL_RCLONE_HAS_APP_FOLDER"}
+
 COMPOSE_ONLY_VARIABLES = {
     "HOUSE_HELPER_HOST",
     "HOUSE_HELPER_ENV_FILE",
@@ -559,7 +567,7 @@ def test_the_logging_configuration_shows_application_logs_and_hides_sql_and_clie
 def test_the_runbook_names_no_variable_the_application_does_not_read():
     text = read(RUNBOOK)
     mentioned = set(re.findall(r"\b(?:HOUSE_HELPER_[A-Z_]+|OPENAI_[A-Z_]+|TEMPERATURE|MAX_TOKENS|BOT_TOKEN)\b", text))
-    allowed = known_variable_names() | COMPOSE_ONLY_VARIABLES | TOOL_VARIABLES | SCHEDULER_VARIABLES | {"BOT_TOKEN"}
+    allowed = known_variable_names() | COMPOSE_ONLY_VARIABLES | TOOL_VARIABLES | SCHEDULER_VARIABLES | OFFSITE_VARIABLES | {"BOT_TOKEN"}
     # Prefix mentions such as HOUSE_HELPER_SMTP_* are written with a trailing wildcard.
     unknown = {
         name

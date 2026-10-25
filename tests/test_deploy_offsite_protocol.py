@@ -6,7 +6,7 @@
   P1-4  a final-looking object is a recovery point only with a valid commit record that matches it;
         everything else is UNRESOLVED: never counted, never relied on, never deleted by the tool;
   clock an implausible clock stops every deletion by retention and cannot displace a real point;
-  budget --max-deletions is ONE budget for the cleanup of leftovers and for retention together.
+  budget --max-deletions is ONE budget, spent on retention alone: no .partial is ever deleted, so none draws on it.
 
 The external commands are the fakes of tests/offsite_support.py; dbtool is real.
 """
@@ -282,32 +282,6 @@ def test_an_interrupted_deletion_leaves_an_orphaned_record_never_an_object_witho
     assert oldest + RECORD not in rig.fake.remote_files() and "an orphaned commit record" in rig.text
 
 
-def test_a_leftover_partial_whose_delete_is_not_honoured_is_reported_not_called_removed(rig):
-    stale = point_name("20261020T041500Z", "11111111") + ".partial"
-    rig.fake.put_remote(stale, b"half")
-    rig.fake.fail("delete", "noop", 0)
-    assert rig.run() == offsite.EXIT_RETENTION, rig.text
-    assert f"could not remove the leftover partial upload {stale}" in rig.text and "still listed" in rig.text
-    assert f"removed {stale}" not in rig.text and stale in rig.fake.remote_files()
-    rig.fake.faults.clear()
-    rig.log.clear()
-    rig.token = "00000001"
-    assert rig.run() == 0, rig.text
-    assert stale not in rig.fake.remote_files() and f"removed {stale}" in rig.text
-
-
-def test_this_runs_own_unfinished_upload_is_confirmed_gone_or_the_log_says_it_is_not(rig):
-    rig.fake.fail("upload", ("exit", 99), 1)        # fails half way: a fragment stays under the partial name
-    rig.fake.fail("delete", "noop", 0)
-    assert rig.run() == offsite.EXIT_FAILED
-    assert "WARNING: could not remove the unfinished upload" in rig.text and "confirm that it is gone" in rig.text
-    assert FIXED_NAME + ".partial" in rig.fake.remote_files()
-    rig.fake.faults.clear()
-    rig.log.clear()
-    rig.token = "00000001"
-    assert rig.run() == 0 and not any(n.endswith(".partial") for n in rig.fake.remote_files())
-
-
 def test_delete_confirmed_asks_for_nothing_when_there_is_nothing_to_delete(rig):
     remote = offsite.Remote(REMOTE, rig.config, rig.fake, "/fake/bin/rclone")
     result = remote.delete_confirmed([])
@@ -425,15 +399,15 @@ def test_a_good_run_writes_its_record_after_the_rename_and_reads_it_back(rig):
     assert f"committed {FIXED_NAME}" in rig.text
 
 
-def test_post_rename_metadata_mismatch_with_a_failed_delete_leaves_an_object_no_later_run_counts_relies_on_or_deletes(rig):
-    """The audit's reproduction: the listing right after the rename disagrees with the file that was read back,
-    and the delete of the damaged object fails. The object keeps its final-looking name. It must never become
-    a recovery point."""
+def test_post_rename_metadata_mismatch_leaves_an_object_no_later_run_counts_relies_on_or_deletes(rig):
+    """The audit's reproduction: the listing right after the rename disagrees with the file that was read back. The
+    object keeps its final-looking name and is NOT deleted (the rename may have damaged it, or another object may have
+    been renamed instead: nothing tells the two apart). It must never become a recovery point."""
     before = seed(rig, HISTORY)
     rig.fake.fail("lsjson", "lie_size_final", 3)
-    rig.fake.fail("delete", ("exit", 1), 1)
     assert rig.run() == offsite.EXIT_FAILED, rig.text
-    assert "WARNING" in rig.text and "could not be removed" in rig.text and "no commit record" in rig.text
+    assert "WARNING" in rig.text and "NOT deleted" in rig.text and "no commit record" in rig.text
+    assert deleted_names(rig) == []
     files = rig.fake.remote_files()
     assert FIXED_NAME in files and FIXED_NAME + RECORD not in files and {n: files[n] for n in before} == before
     assert rig.classify().unresolved == {FIXED_NAME: offsite.NO_RECORD} and FIXED_NAME not in rig.committed_names()
@@ -443,7 +417,6 @@ def test_post_rename_metadata_mismatch_with_a_failed_delete_leaves_an_object_no_
     # out the same plan as if the object did not exist (if it were counted, Oct 19 would be in the plan's drop too)
     # but applies none of it: no committed point is dropped while an unresolved object exists.
     rig.fake.faults.clear()
-    rig.fake.rclone_calls.clear()      # the failed delete above was the first run's own attempt
     rig.log.clear()
     rig.now = FIXED_NOW + timedelta(days=1)
     rig.token = "00000001"
@@ -463,19 +436,15 @@ def test_post_rename_metadata_mismatch_with_a_failed_delete_leaves_an_object_no_
     assert f"UNRESOLVED  {FIXED_NAME}" in rig.text and "NO valid commit record" in rig.text and rig.fake.remote_files() == snapshot
 
 
-def test_a_damaged_object_whose_delete_is_not_honoured_is_unresolved_too(rig):
-    rig.fake.fail("lsjson", "lie_size_final", 3)
-    rig.fake.fail("delete", "noop", 1)
-    assert rig.run() == offsite.EXIT_FAILED
-    assert FIXED_NAME in rig.fake.remote_files() and rig.committed_names() == set()
-    assert "its removal could not be confirmed" in rig.text
-
-
-def test_a_damaged_object_that_can_be_removed_is_removed_and_nothing_is_left_behind(rig):
+def test_an_object_the_listing_after_the_rename_does_not_match_is_not_deleted_even_though_a_delete_would_have_worked(rig):
     before = seed(rig, HISTORY[:3])
     rig.fake.fail("lsjson", "lie_size_final", 3)
     assert rig.run() == offsite.EXIT_FAILED
-    assert rig.fake.remote_files() == before and f"removed {FIXED_NAME}: the rename damaged it" in rig.text
+    files = rig.fake.remote_files()
+    assert {n: files[n] for n in before} == before and FIXED_NAME in files and FIXED_NAME + RECORD not in files
+    assert deleted_names(rig) == [] and "delete" not in rig.fake.events
+    assert rig.committed_names() == {n for n in before if offsite.parse_point_name(n)}
+    assert f"WARNING: {FIXED_NAME}, listed right after the rename, is not the file this run read back" in rig.text
 
 
 @pytest.mark.parametrize(
@@ -692,37 +661,30 @@ def add_partials(rig, count):
         rig.fake.put_remote(point_name("20261020T041500Z", f"{index + 1:08x}") + ".partial", b"half")
 
 
-def spent(rig):
-    """The units the budget counts, as the remote saw them: leftover partials, dropped points (object + record = one), orphaned records."""
-    names = deleted_names(rig)
-    return len([n for n in names if n.endswith(".partial")]) + len([n for n in names if n.endswith(".tar.age")])
+def partials_in(rig):
+    return {n: b for n, b in rig.fake.remote_files().items() if n.endswith(".partial")}
 
 
 @pytest.mark.parametrize(
     "limit, partials, retention_runs",
-    [(5, 2, True), (5, 3, False), (5, 5, False), (4, 5, False), (3, 0, True), (2, 0, False), (7, 4, True), (6, 4, False)],
+    [(5, 2, True), (3, 0, True), (3, 5, True), (7, 4, True), (2, 0, False), (2, 5, False), (0, 4, False)],
 )
-def test_max_deletions_is_one_budget_for_leftover_partials_and_retention_together(rig, limit, partials, retention_runs):
+def test_max_deletions_is_spent_on_retention_alone_and_a_leftover_partial_never_draws_on_it(rig, limit, partials, retention_runs):
     seed(rig, stamps(datetime(2026, 10, 15), 10))        # Oct 15 .. 24: with Oct 25, exactly three points are dropped
     add_partials(rig, partials)
+    before = partials_in(rig)
     code = rig.run("--max-deletions", str(limit))
-    assert code == (0 if retention_runs and partials <= limit else offsite.EXIT_RETENTION), rig.text
-    assert spent(rig) <= limit                                         # never more than the budget, in total
-    removed_partials = min(partials, limit)
-    assert len([n for n in rig.fake.remote_files() if n.endswith(".partial")]) == partials - removed_partials
+    assert code == (0 if retention_runs and not partials else offsite.EXIT_RETENTION), rig.text   # partials are always reported
+    assert partials_in(rig) == before and len(before) == partials                                  # none of them touched, whatever the limit
+    assert not [n for n in deleted_names(rig) if n.endswith(".partial")]
+    assert len(deleted_names(rig)) == (6 if retention_runs else 0)                                   # three points and their three records
     assert len(rig.fake.point_objects()) == (8 if retention_runs else 11)
     if not retention_runs:
-        assert "more than --max-deletions" in rig.text or partials >= limit
-        assert not [n for n in deleted_names(rig) if n.endswith(".tar.age") or n.endswith(RECORD)]
+        assert "more than --max-deletions" in rig.text
 
 
 def test_a_budget_of_zero_removes_nothing_and_says_so(rig):
     add_partials(rig, 2)
     assert rig.run("--max-deletions", "0") == offsite.EXIT_RETENTION
-    assert "2 more leftover partial uploads were not removed" in rig.text and deleted_names(rig) == []
-
-
-def test_a_run_that_fails_still_takes_back_its_own_unfinished_upload_with_a_budget_of_zero(rig):
-    rig.fake.fail("upload", ("exit", 99), 1)
-    assert rig.run("--max-deletions", "0") == offsite.EXIT_FAILED
-    assert not any(n.endswith(".partial") for n in rig.fake.remote_files())        # its own object is not "housekeeping"
+    assert "2 leftover .partial object(s) are in the folder" in rig.text and deleted_names(rig) == []
+    assert len(partials_in(rig)) == 2

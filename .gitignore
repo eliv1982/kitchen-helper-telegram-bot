@@ -19,3 +19,23 @@ deploy/backups/
 *.db.part
 *.db.sha256
 *.db.sha256.part
+
+# Off-host backup (deploy/RUNBOOK.md section 15): secrets and recovery artifacts never belong in the repository.
+# The age PRIVATE key is made OUTSIDE the checkout (15.4); these names are a second line of defence for a slip, and
+# tests/test_repo_secrets.py fails the build if a file that looks like one is tracked or not ignored.
+age-key*
+*-age-key*
+age-identity*
+*.age-identity
+# an rclone configuration holds an OAuth token (in the full-disk mode, one that reaches the whole disk)
+rclone.conf
+rclone-*.conf
+*.rclone.conf
+# recovery points (encrypted or decrypted), the restore rehearsal's output and the tools' scratch directories
+recovery*.tar
+recovered/
+*.tar.age
+*.tar.age.partial
+*.tar.age.commit
+hh-offsite-*/
+hh-rehearsal-*/

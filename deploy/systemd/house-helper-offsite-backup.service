@@ -20,6 +20,11 @@
 # (template: deploy/systemd/house-helper-offsite.env.example). The tag must be the version that is
 # RUNNING: a tag whose schema is not the database's is refused and nothing is uploaded.
 #
+# The access mode (HOUSE_HELPER_OFFSITE_ACCESS_MODE in offsite.env) is "app-folder" unless the owner has written
+# otherwise there: the only other value, "full-disk-temporary", is a TEMPORARY exception for a token that reaches
+# the whole disk and is documented in RUNBOOK 15.12. An empty or missing value stops the unit at argument parsing
+# (exit 2): the mode is never guessed.
+#
 # The report (step names, object names, sizes, checksums of the ENCRYPTED object, counts; never
 # content, keys or credentials) goes to the journal:
 #     journalctl -u house-helper-offsite-backup.service
@@ -45,13 +50,14 @@ RuntimeDirectory=house-helper-offsite
 RuntimeDirectoryMode=0700
 UMask=0077
 # One run at a time is systemd's own rule for a oneshot unit, and the tool takes its own lock too.
-ExecStart=/usr/bin/python3 ${HOUSE_HELPER_CHECKOUT}/deploy/offsite_backup.py run --tag ${HOUSE_HELPER_IMAGE_TAG} --recipients-file ${HOUSE_HELPER_AGE_RECIPIENTS_FILE} --rclone-config ${HOUSE_HELPER_RCLONE_CONFIG} --remote ${HOUSE_HELPER_OFFSITE_REMOTE} --work-dir /run/house-helper-offsite
+ExecStart=/usr/bin/python3 ${HOUSE_HELPER_CHECKOUT}/deploy/offsite_backup.py run --tag ${HOUSE_HELPER_IMAGE_TAG} --recipients-file ${HOUSE_HELPER_AGE_RECIPIENTS_FILE} --rclone-config ${HOUSE_HELPER_RCLONE_CONFIG} --remote ${HOUSE_HELPER_OFFSITE_REMOTE} --access-mode ${HOUSE_HELPER_OFFSITE_ACCESS_MODE} --work-dir /run/house-helper-offsite
 # A backup of two users' data takes seconds to minutes. Two hours is a bound for a hung Docker or
-# network, not a budget: when it is over systemd stops the run, and the clean-up removes the plaintext
-# and this run's unfinished upload.
+# network, not a budget: when it is over systemd stops the run, and the clean-up removes the plaintext.
+# An unfinished upload (NAME.partial) is NOT deleted by anything: it stays, and every later run reports
+# it (exit 6) until an operator has removed it (RUNBOOK 15.11).
 TimeoutStartSec=2h
-# A stop sends SIGTERM to the tool only (mixed), which stops its children, removes the plaintext and
-# takes back its own unfinished upload; the rest of the group is killed only after the time below.
+# A stop sends SIGTERM to the tool only (mixed), which stops its children and removes the plaintext;
+# the rest of the group is killed only after the time below.
 KillMode=mixed
 TimeoutStopSec=3min
 NoNewPrivileges=yes

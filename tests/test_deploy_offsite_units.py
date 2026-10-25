@@ -23,6 +23,7 @@ SERVICE = UNITS / "house-helper-offsite-backup.service"
 TIMER = UNITS / "house-helper-offsite-backup.timer"
 ENVIRONMENT = UNITS / "house-helper-offsite.env.example"
 SCRIPT = DEPLOY / "offsite_backup.py"
+REHEARSAL = DEPLOY / "offsite_rehearsal.py"
 
 
 def template_values(path) -> dict:
@@ -32,7 +33,7 @@ def template_values(path) -> dict:
 # --- the files ----------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("path", [SERVICE, TIMER, ENVIRONMENT, SCRIPT], ids=lambda p: p.name)
+@pytest.mark.parametrize("path", [SERVICE, TIMER, ENVIRONMENT, SCRIPT, REHEARSAL], ids=lambda p: p.name)
 def test_the_files_are_lf_ascii_text_that_end_in_a_newline(path):
     data = path.read_bytes()
     assert b"\r" not in data and not data.startswith(b"\xef\xbb\xbf") and data.endswith(b"\n")
@@ -42,6 +43,7 @@ def test_the_files_are_lf_ascii_text_that_end_in_a_newline(path):
 def test_the_gitattributes_keep_the_script_and_the_units_lf_on_a_windows_checkout():
     attributes = read(DEPLOY / ".gitattributes")
     assert "systemd/* text eol=lf" in attributes and "offsite_backup.py text eol=lf" in attributes
+    assert "offsite_rehearsal.py text eol=lf" in attributes
 
 
 def test_the_script_and_the_units_are_not_part_of_the_image_or_its_build_context():
@@ -127,7 +129,25 @@ def test_the_variables_the_service_uses_are_all_defined_by_the_two_templates_and
     assert used <= purge | offsite_env
     assert {"HOUSE_HELPER_CHECKOUT", "HOUSE_HELPER_IMAGE_TAG"} <= used & purge  # the tag is kept in ONE place
     assert not {"HOUSE_HELPER_CHECKOUT", "HOUSE_HELPER_IMAGE_TAG"} & offsite_env
-    assert offsite_env == {"HOUSE_HELPER_AGE_RECIPIENTS_FILE", "HOUSE_HELPER_RCLONE_CONFIG", "HOUSE_HELPER_OFFSITE_REMOTE"}
+    assert offsite_env == {
+        "HOUSE_HELPER_AGE_RECIPIENTS_FILE", "HOUSE_HELPER_RCLONE_CONFIG", "HOUSE_HELPER_OFFSITE_REMOTE",
+        "HOUSE_HELPER_OFFSITE_ACCESS_MODE",
+    }
+
+
+def test_the_access_mode_is_app_folder_in_the_template_and_reaches_the_tool_through_the_one_variable():
+    # Disabled by default: the template ships the narrow mode, and the unit passes exactly the variable of the template.
+    assert template_values(ENVIRONMENT)["HOUSE_HELPER_OFFSITE_ACCESS_MODE"] == offsite.ACCESS_APP_FOLDER
+    command = values(parse_unit(SERVICE), "Service", "ExecStart")[0]
+    assert "--access-mode ${HOUSE_HELPER_OFFSITE_ACCESS_MODE}" in command
+    assert f"--access-mode {offsite.ACCESS_FULL_DISK}" not in command  # the exception is never spelled out in the unit
+    assert parsed_command().access_mode == offsite.ACCESS_APP_FOLDER
+    # the remote of the template is a folder the default mode accepts; the exception's folder is not the template's
+    assert offsite.validate_remote(parsed_command().remote, offsite.ACCESS_APP_FOLDER)
+    assert offsite.FULL_DISK_PREFIX not in template_values(ENVIRONMENT)["HOUSE_HELPER_OFFSITE_REMOTE"]
+    # the template says, next to the variable, that the other value is a temporary exception and where it is explained
+    text = read(ENVIRONMENT)
+    assert offsite.ACCESS_FULL_DISK in text and "TEMPORARY" in text and "15.12" in text
 
 
 def test_the_backup_script_gets_the_env_file_path_it_needs_from_the_cleanups_template():
