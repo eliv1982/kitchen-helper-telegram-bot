@@ -173,6 +173,7 @@ invents one.
 | `HOUSE_HELPER_TELEGRAM_ID_TOKEN_ALG` | env file | no | only if BotFather is not RS256 |
 | `OPENAI_API_KEY` | env file | for chat | without it a message is answered 503 |
 | `OPENAI_MODEL`, `TEMPERATURE`, `MAX_TOKENS`, `OPENAI_TIMEOUT_SECONDS`, `OPENAI_MAX_RETRIES` | env file | no | defaults `gpt-4.1-mini`, 0.7, 1000, 15, 1 |
+| `OPENAI_REASONING_EFFORT` | env file | for a `gpt-6*` model | unset (the request every earlier model takes: `temperature`, `max_tokens`); `low` for GPT-6 Luna: `reasoning_effort` and `max_completion_tokens` (= `MAX_TOKENS`, reasoning included), no `temperature`; a `gpt-6*` model without it does not start |
 
 Read by Compose only: `HOUSE_HELPER_HOST` (default `house.elivcloud.org`), `HOUSE_HELPER_ENV_FILE`
 (default `deploy/house-helper.env`), `HOUSE_HELPER_IMAGE_TAG` (default `local`),
@@ -469,6 +470,17 @@ Safe delivery:
 6. **OpenAI quality** (a few real kitchen questions in Russian, one long, one off-topic, one
    food-safety edge case): review answers, the "cut off" notice, latency, and the OpenAI usage dashboard.
    The log shows only model, limits and conversation id, never the text.
+
+   *GPT-6 Luna, one request.* Needs an image built from the commit that added `OPENAI_REASONING_EFFORT`
+   (an older image would send `temperature` to the model and fail). In the env file: `OPENAI_MODEL=gpt-6-luna`,
+   `OPENAI_REASONING_EFFORT=low`, `MAX_TOKENS=6000`, `OPENAI_TIMEOUT_SECONDS=50`, `OPENAI_MAX_RETRIES=1`, the
+   project's key; `dc up -d --force-recreate house-helper`. Send ONE short question from the owner's session
+   ("Что приготовить из яиц и сыра?"), then `dc logs house-helper | grep 'OpenAI'`. Expected: `OpenAI request:
+   model=gpt-6-luna, reasoning_effort=low, max_completion_tokens=6000 ...` and `OpenAI usage: ...
+   reasoning_tokens=N`. Read N against `MAX_TOKENS`: well under it is healthy; near it means answers will end
+   empty or cut off, so raise `MAX_TOKENS`. A failure line carries the provider's own code, for example
+   `status=400, code=unsupported_parameter, param=...` or `status=429, code=project_spend_limit_exceeded`.
+   Stop at the first failure and report the line; do not retry in a loop (each request is billed).
 7. **Log hygiene after the first real login:** repeat the canary of section 4.1 against the real host
    (it must still show `leaked 0` in every sink), then `dc logs house-helper | grep -E 'code=|state='`
    and the same grep over every Traefik sink you listed there -> all empty.

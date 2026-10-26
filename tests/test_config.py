@@ -57,7 +57,7 @@ def test_malformed_numeric_setting_does_not_raise_uncontrolled_value_error(field
         ("TEMPERATURE", "-0.1"),
         ("TEMPERATURE", "2.1"),
         ("MAX_TOKENS", "0"),
-        ("MAX_TOKENS", "5000"),
+        ("MAX_TOKENS", "16385"),
         ("OPENAI_TIMEOUT_SECONDS", "0"),
         ("OPENAI_TIMEOUT_SECONDS", "121"),
         ("OPENAI_MAX_RETRIES", "-1"),
@@ -81,7 +81,7 @@ def test_valid_env_produces_settings_with_expected_defaults():
     assert settings.openai_model == "gpt-4.1-mini"
     assert settings.temperature == 0.7
     # Raised from 600, which cut a complete recipe in Russian off in the middle (the
-    # cap itself is still MAX_TOKENS in the environment, 1 to 4096).
+    # cap itself is still MAX_TOKENS in the environment, 1 to 16384).
     assert settings.max_tokens == 1000
     assert settings.openai_timeout_seconds == 15.0
     assert settings.openai_max_retries == 1

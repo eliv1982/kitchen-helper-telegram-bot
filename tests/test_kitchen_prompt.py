@@ -94,10 +94,37 @@ def test_the_prompt_is_russian_and_bounded():
         ("a person in distress is not refused", "не отказывай формально"),
         ("a person in distress is pointed to help", "экстренную службу"),
         ("instructions stay private", "не раскрывай"),
+        ("a recipe states its portions", "число порций, ингредиенты с количествами"),
+        ("times and temperatures in the steps", "с временем и температурой"),
+        ("scaling portions and substituting recalculate", "пересчитай количества и время"),
+        ("a substitution says what changes", "что изменится во вкусе или текстуре"),
+        ("a sensible answer now beats a questionnaire", "отвечай сразу и назови допущения"),
+        ("allergies and exclusions are conditions", "об аллергиях, непереносимости, исключённых продуктах"),
+        ("stated constraints are not broken", "не нарушай их ни в одном варианте"),
+        ("figures are estimates", "пиши «примерно»"),
+        ("an estimate is not a measurement", "Не выдавай оценку"),
+        ("a recipe is never called verified", "не говори, что рецепт проверен или испытан"),
+        ("long-term preserving is treated with caution", "заготовки на долгий срок"),
+        ("doneness of meat, poultry, fish and eggs is treated with caution", "готовность мяса, птицы, рыбы и яиц"),
+        ("no invented regimes", "не придумывай режимы"),
+        ("no safety guarantees", "не гарантируй безопасность"),
+        ("an unsure answer points to a proven source", "посоветуй проверенный источник"),
     ],
 )
 def test_the_prompt_covers(scenario, clause):
     assert clause in PROMPT, scenario
+
+
+def test_the_prompt_leaves_the_products_name_out_because_two_products_share_it():
+    # The bot introduces itself as Kitchen Helper (tests/expected_texts.py) and the web
+    # application is House Helper; one text serves both.
+    assert "Kitchen Helper" not in PROMPT and "House Helper" not in PROMPT
+
+
+def test_the_prompt_gives_a_recipe_room_for_its_quantities_and_still_fits_one_telegram_message():
+    # "обычно до N символов" is what the model aims at; a Telegram message holds 4096.
+    assert "обычно до 2500 символов" in PROMPT
+    assert 2500 < 4096
 
 
 def test_the_prompt_does_not_route_to_domains_that_do_not_exist():

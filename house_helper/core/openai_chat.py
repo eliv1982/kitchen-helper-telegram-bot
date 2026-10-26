@@ -12,17 +12,25 @@ process loads no provider code. The client is created on the first request (a pr
 that never answers a chat message never builds one) and closed by aclose().
 
 Logging: the request line names the model and the limits and the conversation (never
-its text); a failure names the class of the exception and its HTTP status. Never the
-exception's own message: the provider's text can quote the request, and an
-authentication failure quotes the key. The original exception stays attached as
-`__cause__` for whoever handles it in code.
+its text); a failure names the class of the exception, its HTTP status and, when the
+provider sent one that is a plain identifier (insufficient_quota, model_not_found,
+unsupported_parameter, and the parameter's name), that code. Never the exception's own
+message: the provider's text can quote the request, and an authentication failure
+quotes the key. The original exception stays attached as `__cause__` for whoever
+handles it in code.
 
 What this adds to the Telegram path: the provider's finish reason is read, and an
 answer that was cut off at the length cap is reported (`BackendReply.truncated`)
 instead of being passed on as if it were complete.
+
+Reasoning models (ProviderSettings.reasoning_effort set, see provider_settings): the
+length cap counts the reasoning tokens too, so an answer can end at the cap having
+produced no visible text at all. That is an empty response, as before, but the log says
+why (and how many tokens the reasoning used, which is also logged for every answer).
 """
 
 import logging
+import re
 from typing import Any, Optional
 
 from house_helper.core.backend import (
@@ -38,8 +46,13 @@ from house_helper.core.provider_settings import ProviderSettings
 
 logger = logging.getLogger(__name__)
 
-# The provider's own word for "stopped because the answer reached max_tokens".
+# The provider's own word for "stopped because the answer reached the token cap".
 FINISH_REASON_LENGTH = "length"
+
+# What of the provider's error may be logged besides its class and status: its `code` and
+# `param`, when they are plain identifiers ("insufficient_quota", "max_tokens"). They are
+# fixed words of the API, not text it echoes; anything else is left out.
+_IDENTIFIER = re.compile(r"[a-z0-9_.\-]{1,64}")
 
 
 class StandaloneOpenAIBackend:
@@ -82,20 +95,30 @@ class StandaloneOpenAIBackend:
 
         settings = self._settings
         label = f"{conversation.channel}:{conversation.subject}"
-        logger.info(
-            "OpenAI request: model=%s, temperature=%s, max_tokens=%s, conversation=%s, context_len=%s",
-            settings.model,
-            settings.temperature,
-            settings.max_tokens,
-            label,
-            context_len,
-        )
+        if settings.reasoning_effort is None:
+            logger.info(
+                "OpenAI request: model=%s, temperature=%s, max_tokens=%s, conversation=%s, context_len=%s",
+                settings.model,
+                settings.temperature,
+                settings.max_tokens,
+                label,
+                context_len,
+            )
+        else:
+            logger.info(
+                "OpenAI request: model=%s, reasoning_effort=%s, max_completion_tokens=%s, "
+                "conversation=%s, context_len=%s",
+                settings.model,
+                settings.reasoning_effort,
+                settings.max_tokens,
+                label,
+                context_len,
+            )
         try:
             response = await self._get_client().chat.completions.create(
                 model=settings.model,
                 messages=[{"role": "system", "content": KITCHEN_SYSTEM_PROMPT}, *messages],
-                temperature=settings.temperature,
-                max_tokens=settings.max_tokens,
+                **settings.completion_params(),
             )
         except RateLimitError as exc:
             self._log_failure("rate limit exceeded", exc, label)
@@ -112,11 +135,12 @@ class StandaloneOpenAIBackend:
     @staticmethod
     def _log_failure(what: str, exc: BaseException, label: str) -> None:
         logger.error(
-            "OpenAI %s for conversation=%s (%s, status=%s)",
+            "OpenAI %s for conversation=%s (%s, status=%s%s)",
             what,
             label,
             type(exc).__name__,
             getattr(exc, "status_code", None),
+            _error_identifiers(exc),
         )
 
     @staticmethod
@@ -126,25 +150,47 @@ class StandaloneOpenAIBackend:
             logger.error("OpenAI response has no choices for conversation=%s", label)
             raise BackendEmptyResponseError("OpenAI response contains no choices")
 
+        usage = _usage_of(response)
+        truncated = getattr(choices[0], "finish_reason", None) == FINISH_REASON_LENGTH
         message = getattr(choices[0], "message", None)
         content = getattr(message, "content", None) if message else None
         if not isinstance(content, str) or not content.strip():
-            logger.error("OpenAI response has empty or invalid content for conversation=%s", label)
+            if truncated:
+                logger.error(
+                    "OpenAI answer is empty and hit the length cap for conversation=%s "
+                    "(the cap is spent before the first word when the model reasons; reasoning_tokens=%s)",
+                    label,
+                    (usage or {}).get("reasoning_tokens"),
+                )
+            else:
+                logger.error(
+                    "OpenAI response has empty or invalid content for conversation=%s", label
+                )
             raise BackendEmptyResponseError("OpenAI response content is empty or invalid")
 
-        truncated = getattr(choices[0], "finish_reason", None) == FINISH_REASON_LENGTH
         if truncated:
             logger.warning("OpenAI answer was cut off at the length cap for conversation=%s", label)
 
-        usage = _usage_of(response)
         if usage:
             logger.info(
-                "OpenAI usage: input_tokens=%s, output_tokens=%s, total_tokens=%s",
+                "OpenAI usage: input_tokens=%s, output_tokens=%s, total_tokens=%s%s",
                 usage["input_tokens"],
                 usage["output_tokens"],
                 usage["total_tokens"],
+                f", reasoning_tokens={usage['reasoning_tokens']}" if "reasoning_tokens" in usage else "",
             )
         return BackendReply(text=content, usage=usage, truncated=truncated)
+
+
+def _error_identifiers(exc: BaseException) -> str:
+    """", code=insufficient_quota, param=max_tokens": the provider's machine-readable
+    code (and parameter), when it sent plain identifiers; "" otherwise."""
+    parts = []
+    for name in ("code", "param"):
+        value = getattr(exc, name, None)
+        if isinstance(value, str) and _IDENTIFIER.fullmatch(value):
+            parts.append(f", {name}={value}")
+    return "".join(parts)
 
 
 def _usage_of(response: Any) -> Optional[dict[str, int]]:
@@ -154,7 +200,7 @@ def _usage_of(response: Any) -> Optional[dict[str, int]]:
     if usage is None:
         return None
     try:
-        return {
+        counts = {
             "input_tokens": usage.prompt_tokens,
             "output_tokens": usage.completion_tokens,
             "total_tokens": usage.total_tokens,
@@ -162,3 +208,8 @@ def _usage_of(response: Any) -> Optional[dict[str, int]]:
     except AttributeError:
         logger.warning("OpenAI usage metadata malformed; degrading to None")
         return None
+    # Only a reasoning model reports it; counted inside output_tokens, listed apart.
+    reasoning = getattr(getattr(usage, "completion_tokens_details", None), "reasoning_tokens", None)
+    if isinstance(reasoning, int) and not isinstance(reasoning, bool):
+        counts["reasoning_tokens"] = reasoning
+    return counts

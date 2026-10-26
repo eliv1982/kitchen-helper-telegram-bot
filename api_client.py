@@ -5,6 +5,7 @@ from openai import APIConnectionError, APIError, APITimeoutError, AsyncOpenAI, R
 
 import config
 from house_helper.core.kitchen_prompt import KITCHEN_SYSTEM_PROMPT
+from house_helper.core.provider_settings import completion_params
 
 logger = logging.getLogger(__name__)
 
@@ -61,22 +62,34 @@ async def get_chat_response(
     settings = config.get_settings()
     full_messages = [{"role": "system", "content": SYSTEM_MESSAGE}, *messages]
 
-    logger.info(
-        "OpenAI request: model=%s, temperature=%s, max_tokens=%s, user_id=%s, context_len=%s",
-        settings.openai_model,
-        settings.temperature,
-        settings.max_tokens,
-        user_id,
-        context_len,
-    )
+    if settings.openai_reasoning_effort is None:
+        logger.info(
+            "OpenAI request: model=%s, temperature=%s, max_tokens=%s, user_id=%s, context_len=%s",
+            settings.openai_model,
+            settings.temperature,
+            settings.max_tokens,
+            user_id,
+            context_len,
+        )
+    else:
+        logger.info(
+            "OpenAI request: model=%s, reasoning_effort=%s, max_completion_tokens=%s, "
+            "user_id=%s, context_len=%s",
+            settings.openai_model,
+            settings.openai_reasoning_effort,
+            settings.max_tokens,
+            user_id,
+            context_len,
+        )
 
     client = get_client()
     try:
         response = await client.chat.completions.create(
             model=settings.openai_model,
             messages=full_messages,
-            temperature=settings.temperature,
-            max_tokens=settings.max_tokens,
+            **completion_params(
+                settings.openai_reasoning_effort, settings.temperature, settings.max_tokens
+            ),
         )
     except RateLimitError:
         logger.error("OpenAI rate limit exceeded for user_id=%s", user_id)

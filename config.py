@@ -21,6 +21,8 @@ class Settings:
     max_tokens: int
     openai_timeout_seconds: float
     openai_max_retries: int
+    # None: the request every model before GPT-6 takes (see core.provider_settings).
+    openai_reasoning_effort: str | None = None
 
 
 def load_settings(env: dict[str, str] | None = None) -> Settings:
@@ -55,6 +57,7 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
         max_tokens=provider.max_tokens,
         openai_timeout_seconds=provider.timeout_seconds,
         openai_max_retries=provider.max_retries,
+        openai_reasoning_effort=provider.reasoning_effort,
     )
 
 

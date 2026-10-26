@@ -64,7 +64,7 @@ def test_every_variable_can_be_set():
     ("name", "good", "bad"),
     [
         ("TEMPERATURE", ["0", "0.0", "2", "2.0", "1.25"], ["-0.1", "2.01", "abc", "", "nan"]),
-        ("MAX_TOKENS", ["1", "600", "4096"], ["0", "4097", "-1", "1.5", "many", ""]),
+        ("MAX_TOKENS", ["1", "600", "4096", "16384"], ["0", "16385", "-1", "1.5", "many", ""]),
         ("OPENAI_TIMEOUT_SECONDS", ["1", "15", "120"], ["0.99", "120.5", "soon"]),
         ("OPENAI_MAX_RETRIES", ["0", "1", "5"], ["-1", "6", "2.5", "few"]),
     ],
@@ -90,7 +90,7 @@ def test_all_the_problems_are_reported_together_after_what_the_caller_had_found(
         "BOT_TOKEN is not set",
         "OPENAI_API_KEY is not set",
         "TEMPERATURE must be a number, got 'hot'",
-        "MAX_TOKENS must be between 1 and 4096, got 0",
+        "MAX_TOKENS must be between 1 and 16384, got 0",
         "OPENAI_MAX_RETRIES must be between 0 and 5, got 9",
     ]
 
@@ -104,7 +104,7 @@ def test_a_message_can_be_made_to_name_the_variable_and_never_the_value():
     assert settings is None
     assert errors == [
         "TEMPERATURE must be a number",
-        "MAX_TOKENS must be between 1 and 4096",
+        "MAX_TOKENS must be between 1 and 16384",
         "OPENAI_MAX_RETRIES must be between 0 and 5",
     ]
     assert all(secret not in e and "99999" not in e and "77" not in e for e in errors)
@@ -194,7 +194,7 @@ def test_with_a_key_a_malformed_companion_stops_the_start_naming_it_but_not_quot
         load_provider_settings({**KEY, "TEMPERATURE": secret, "MAX_TOKENS": "99999"})
 
     message = str(raised.value)
-    assert "TEMPERATURE must be a number" in message and "MAX_TOKENS must be between 1 and 4096" in message
+    assert "TEMPERATURE must be a number" in message and "MAX_TOKENS must be between 1 and 16384" in message
     assert secret not in message and "99999" not in message and "sk-test-key" not in message
 
 
