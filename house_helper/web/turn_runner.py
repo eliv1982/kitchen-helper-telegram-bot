@@ -39,6 +39,14 @@ What a failure leaves behind, by where it happens:
     after which the same key claims it again. Either way a retry generates again.
   * the process dies: the request stays PROCESSING; same as the line above.
 
+Who may retry. "A retry generates again" holds for the website, where a person chose to
+send the message again. It does not hold for a caller that passes reclaim=False (the Telegram
+bot, for an update that Telegram delivers again): the claim of an attempt is committed before
+the backend is called, so a key with a committed attempt that did not complete (failed,
+retired, or PROCESSING past its lease) is not run again; submit() raises turns.TurnAttempted
+and the provider is not asked a second time. That state is in the database, so it survives
+a restart. What it cannot know is whether the first request reached the provider.
+
 Disconnects. The work of a request does not belong to the connection that asked for
 it: submit() runs it as a task of its own and waits for it behind asyncio.shield, so a
 client that goes away (or a server that cancels the handler) does not interrupt it. The
@@ -104,7 +112,7 @@ from house_helper.core.backend import (
 from house_helper.core.identity import ConversationKey
 from house_helper.core.limits import MAX_HISTORY_MESSAGES
 from house_helper.core.outcomes import OutcomeStatus
-from house_helper.persistence import turns
+from house_helper.persistence import attachments, turns
 from house_helper.persistence.conversations import ConversationNotFound
 from house_helper.persistence.turns import CompletedTurn
 from house_helper.web.database import DatabaseClosed, WebDatabase
@@ -113,6 +121,7 @@ from house_helper.web.diagnostics import ApiError, log_error
 logger = logging.getLogger(__name__)
 
 WEB_CHANNEL = "web"
+TELEGRAM_CHANNEL = "telegram"
 
 # How long the backend gets for one answer. The provider's own timeout (15 s, one
 # retry) is shorter; this is what bounds a hung call the provider's does not.
@@ -184,10 +193,34 @@ class _Call:
         self.accepted = True
 
 
+class TurnNotAuthorized(Exception):
+    """The caller's `authorize` check, made inside the claim's own transaction, said no: the
+    claim was rolled back with the rest of that transaction (nothing stored, no message, no
+    request) and the backend was not called. Not an ApiError: the caller that asked for the
+    check knows what its refusal means."""
+
+
 @dataclass(frozen=True)
 class TurnResult:
     completed: CompletedTurn
     replayed: bool  # answered from an earlier completion of the same key
+
+
+@dataclass(frozen=True)
+class TurnCompletion:
+    """What a completion hook is told: a turn that has just been completed by this very
+    call (never one replayed from an earlier completion), and the channel it came from."""
+
+    user_id: UUID
+    conversation_id: UUID
+    origin: str  # WEB_CHANNEL or TELEGRAM_CHANNEL
+    user_text: str
+    reply_text: str
+
+
+# Called, on the event loop, once for every turn that completed. It must return at once
+# (start a task for anything that takes time): the turn's caller is waiting for it.
+CompletionHook = Callable[[TurnCompletion], None]
 
 
 class WebTurnRunner:
@@ -212,6 +245,7 @@ class WebTurnRunner:
         self._grace = shutdown_grace_seconds
         # The tasks of the turns: the only ones aclose() cancels.
         self._turns: set[asyncio.Task] = set()
+        self._completion_hooks: list[CompletionHook] = []
         # Database units, and the tasks that settle a turn that was cancelled: waited
         # for by drain(), never cancelled by aclose() (cancelling a unit would only
         # stop waiting for a transaction that goes on).
@@ -219,6 +253,11 @@ class WebTurnRunner:
         self._closed = False
 
     # --- the public surface ------------------------------------------------------------
+
+    def add_completion_hook(self, hook: CompletionHook) -> None:
+        """Have `hook` told of every turn this runner completes (see TurnCompletion). A hook
+        that raises is logged by the name of its exception and the turn is not affected."""
+        self._completion_hooks.append(hook)
 
     async def submit(
         self,
@@ -229,16 +268,49 @@ class WebTurnRunner:
         text: str,
         correlation_id: str,
         route: str,
+        origin: str = WEB_CHANNEL,
+        attachment_id: Optional[UUID] = None,
+        reclaim: bool = True,
+        authorize: Optional[Callable[[Any], bool]] = None,
     ) -> TurnResult:
         """Answer `text` in the user's conversation. Raises ApiError (always one of the
-        catalogue's; its `logged` flag says whether the log has it already)."""
+        catalogue's; its `logged` flag says whether the log has it already). `origin` is the
+        channel the message came from; it is what the completion hooks are told.
+        `attachment_id` names an unattached photo of the user (persistence.attachments) that the
+        message takes with it; ApiError attachment_unusable if it cannot.
+
+        `reclaim` says whether a key whose earlier attempt did not complete may be run again.
+        The website's retry may (the person chose to send it again). A caller that has no such
+        choice behind it, the Telegram bot handling an update that Telegram delivers a second
+        time, passes False: then a key whose attempt had begun and did not complete raises
+        turns.TurnAttempted, which is NOT an ApiError and is not logged here, and the provider
+        is not asked again. A completed key is replayed either way.
+
+        `authorize`, if given, is called with the session of the claim's transaction, after the
+        conversation has been locked and the claim made, and must return True for the claim to
+        stand; otherwise the whole transaction is rolled back and TurnNotAuthorized is raised
+        (not an ApiError; the backend is not called and nothing is stored). It is how a caller
+        whose right to ask can be withdrawn while it waits (the Telegram bot: the account may
+        be unlinked, the person's access revoked) makes "still allowed" and "claimed" one
+        atomic step instead of two with a gap."""
         if self._closed:
             error = ApiError("service_unavailable", category="RunnerClosed")
             log_error(error, correlation_id, route)
             raise error
         task = self._track(
             asyncio.ensure_future(
-                self._execute(user_id, conversation_id, idempotency_key, text, correlation_id, route)
+                self._execute(
+                    user_id,
+                    conversation_id,
+                    idempotency_key,
+                    text,
+                    correlation_id,
+                    route,
+                    origin,
+                    attachment_id,
+                    reclaim,
+                    authorize,
+                )
             ),
             self._turns,
         )
@@ -325,17 +397,45 @@ class WebTurnRunner:
         text: str,
         correlation_id: str,
         route: str,
+        origin: str,
+        attachment_id: Optional[UUID] = None,
+        reclaim: bool = True,
+        authorize: Optional[Callable[[Any], bool]] = None,
     ) -> TurnResult:
         try:
-            return await self._run(user_id, conversation_id, key, text, correlation_id)
+            result = await self._run(
+                user_id, conversation_id, key, text, correlation_id, attachment_id, reclaim, authorize
+            )
         except ApiError as error:
             if not error.logged:
                 log_error(error, correlation_id, route)
             raise
+        except (turns.TurnAttempted, TurnNotAuthorized):
+            raise  # states of their own, for the callers that asked for them (see submit)
         except Exception as exc:  # a bug: logged by class, answered like any other failure
             error = ApiError("internal_error", category=type(exc).__name__)
             log_error(error, correlation_id, route)
             raise error from None
+        if not result.replayed:
+            self._tell_hooks(user_id, conversation_id, origin, result)
+        return result
+
+    def _tell_hooks(
+        self, user_id: UUID, conversation_id: UUID, origin: str, result: TurnResult
+    ) -> None:
+        done = result.completed
+        completion = TurnCompletion(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            origin=origin,
+            user_text=done.user_message.text,
+            reply_text=done.assistant_message.text,
+        )
+        for hook in self._completion_hooks:
+            try:
+                hook(completion)
+            except Exception as exc:  # a hook is not part of the turn
+                logger.error("A chat turn completion hook failed: category=%s", type(exc).__name__)
 
     async def _database_work(
         self, work: Callable[[Any], Any], on_accepted: Optional[Callable[[], None]] = None
@@ -350,12 +450,20 @@ class WebTurnRunner:
             raise ApiError("service_unavailable", category=type(exc).__name__) from None
 
     async def _run(
-        self, user_id: UUID, conversation_id: UUID, key: str, text: str, correlation_id: str
+        self,
+        user_id: UUID,
+        conversation_id: UUID,
+        key: str,
+        text: str,
+        correlation_id: str,
+        attachment_id: Optional[UUID] = None,
+        reclaim: bool = True,
+        authorize: Optional[Callable[[Any], bool]] = None,
     ) -> TurnResult:
         # 1. The claim. The clock is read by begin_turn itself, under the conversation
         # lock, so the lease is measured from the claim and not from here.
-        admission = self._start_unit(
-            lambda session: turns.begin_turn(
+        def admit(session: Any) -> Any:
+            started = turns.begin_turn(
                 session,
                 user_id,
                 conversation_id,
@@ -364,8 +472,14 @@ class WebTurnRunner:
                 clock=self._clock,
                 lease=self._lease,
                 max_context_messages=MAX_HISTORY_MESSAGES,
+                attachment_id=attachment_id,
+                reclaim=reclaim,
             )
-        )
+            if authorize is not None and not authorize(session):
+                raise TurnNotAuthorized  # (the exception rolls the claim back with its transaction)
+            return started
+
+        admission = self._start_unit(admit)
         try:
             started = await asyncio.shield(admission.task)
         except asyncio.CancelledError:
@@ -386,6 +500,8 @@ class WebTurnRunner:
             raise ApiError("turn_superseded") from None
         except turns.TurnUnusable:
             raise ApiError("idempotency_key_unusable") from None
+        except attachments.AttachmentUnusable:
+            raise ApiError("attachment_unusable") from None
 
         if isinstance(started, CompletedTurn):
             return TurnResult(started, replayed=True)

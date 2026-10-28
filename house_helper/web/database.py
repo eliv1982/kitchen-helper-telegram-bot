@@ -29,7 +29,11 @@ must not repeat its effect when retried needs an idempotency key (see
 house_helper.persistence.turns). A caller that must know how a unit ended, whoever
 is still waiting, therefore does not call run() from the task that may be cancelled:
 the web turn runner runs every unit as a task of its own that nothing cancels, and
-settles a cancelled turn from the unit's outcome (web.turn_runner). From outside,
+settles a cancelled turn from the unit's outcome (web.turn_runner). A caller that holds a
+lock around the unit, and must not release it while the unit can still change what the
+lock protects (the Telegram bot's binding lock), calls run_to_completion() instead: the
+same unit, but the caller does not leave until the unit has ended, and a cancellation is
+raised then. From outside,
 "waiting for a slot", "queued" and "running" are not told apart; a cancelled call is
 withdrawn only in the first two, so "the awaiting task was cancelled" never means
 "the function did not run".
@@ -224,6 +228,52 @@ class WebDatabase:
         # finish. (A bare Task.cancel() still gets through, and the slot stays taken.)
         with anyio.CancelScope(shield=True):
             return await asyncio.wrap_future(future, loop=loop)
+
+    async def run_to_completion(self, work: Callable[[OrmSession], T]) -> T:
+        """run(), for a caller that holds something the function must not outlive: a lock whose
+        meaning is "nothing of this change is still going on".
+
+        run() lets a bare Task.cancel() through at once and leaves an accepted function running
+        on its thread, so a caller that releases its lock on the way out releases it with the
+        function still able to change what the lock protects. This one does not leave until the
+        function has ended, committed or rolled back: the cancellation (any number of them, of
+        either kind) is noted, the wait goes on, and the cancellation is raised only then. A
+        call that is cancelled before the pool has taken the function (it waits for a slot) is
+        withdrawn at once and never runs, as with run(), so there is nothing to wait for.
+
+        The wait is shielded from anyio's cancellation the way run()'s is, so a cancel scope
+        that stays cancelled cannot make this loop spin without ever yielding to the thread's
+        completion callback. It is bounded by the function itself: nothing here waits for
+        anything else, and the function's own end (or the database's failure to run it) is
+        what returns. A function that never ended would hold the caller's lock for good, which
+        is the safe way for that to fail."""
+        loop = asyncio.get_running_loop()
+        accepted: asyncio.Future = loop.create_future()
+
+        def mark_accepted() -> None:
+            if not accepted.done():
+                accepted.set_result(None)
+
+        unit = asyncio.ensure_future(self.run(work, on_accepted=mark_accepted))
+        cancelled: Optional[asyncio.CancelledError] = None
+        try:
+            # Until the pool has taken the function, the call can still be withdrawn.
+            await asyncio.wait({unit, accepted}, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+            if not accepted.done():
+                unit.cancel()  # still waiting for a slot: it never runs
+        with anyio.CancelScope(shield=True):
+            while not unit.done():
+                try:
+                    await asyncio.wait({unit})
+                except asyncio.CancelledError as exc:
+                    cancelled = cancelled or exc
+        if not unit.cancelled():
+            unit.exception()  # retrieved, whoever the outcome is for
+        if cancelled is not None:
+            raise cancelled
+        return unit.result()
 
     def _refuse_if_closed(self) -> None:
         if self._closed:

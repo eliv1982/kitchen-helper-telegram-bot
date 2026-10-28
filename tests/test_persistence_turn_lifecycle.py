@@ -25,6 +25,7 @@ from house_helper.persistence.turns import (
     ConversationBusy,
     IdempotencyKeyConflict,
     LeaseLost,
+    TurnAttempted,
     TurnInFlight,
     TurnSuperseded,
     TurnUnusable,
@@ -63,11 +64,11 @@ def conversation_id(factory, user_id):
     return run(factory, lambda db: create_conversation(db, user_id, now=NOW)).id
 
 
-def begin(factory, user_id, conversation_id, key="k-1", text="q1", now=NOW, lease=LEASE):
+def begin(factory, user_id, conversation_id, key="k-1", text="q1", now=NOW, lease=LEASE, **options):
     return run(
         factory,
         lambda db: turns.begin_turn(
-            db, user_id, conversation_id, key, text, clock=lambda: now, lease=lease, max_context_messages=20
+            db, user_id, conversation_id, key, text, clock=lambda: now, lease=lease, max_context_messages=20, **options
         ),
     )
 
@@ -892,3 +893,98 @@ def test_a_completion_just_inside_its_lease_and_a_newer_message_leave_a_well_for
             assert isinstance(completed, LeaseLost)
             assert ordered == [("user", "qA"), ("user", "qB")]
             assert admitted.context == [{"role": "user", "content": "qB"}]
+
+
+# --- an attempt that began is not made again for a caller that did not choose to repeat it ----------------
+#
+# reclaim=False is what the Telegram bot passes for an update that Telegram delivers again. The
+# claim of an attempt is committed before the provider is called, so attempt_count > 0 is the
+# durable fact "the provider may have been asked".
+
+
+def test_a_completed_request_is_replayed_whether_or_not_reclaiming_is_allowed(factory, user_id, conversation_id):
+    complete(factory, begin(factory, user_id, conversation_id), "a1")
+    before = snapshot(factory)
+
+    replay = begin(factory, user_id, conversation_id, now=NOW + timedelta(seconds=5), reclaim=False)
+
+    assert isinstance(replay, CompletedTurn) and replay.assistant_message.text == "a1"
+    assert snapshot(factory) == before
+
+
+def test_a_failed_attempt_is_not_made_again_when_reclaiming_is_refused_and_nothing_changes(
+    factory, user_id, conversation_id
+):
+    first = begin(factory, user_id, conversation_id)
+    fail(factory, first, "provider_timeout", now=NOW + timedelta(seconds=2))
+    before = snapshot(factory)
+
+    with pytest.raises(TurnAttempted):
+        begin(factory, user_id, conversation_id, now=NOW + timedelta(minutes=1), reclaim=False)
+
+    assert snapshot(factory) == before
+    assert turn_rows(factory)[0].attempt_count == 1
+    # the person's own retry (the website: reclaim allowed) still works, and counts as attempt 2
+    again = begin(factory, user_id, conversation_id, now=NOW + timedelta(minutes=2))
+    assert (again.attempt, again.retry) == (2, True)
+
+
+def test_an_attempt_whose_lease_ran_out_is_not_made_again_when_reclaiming_is_refused(
+    factory, user_id, conversation_id
+):
+    begin(factory, user_id, conversation_id)  # claimed, then the worker was lost
+    before = snapshot(factory)
+
+    with pytest.raises(TurnAttempted):
+        begin(factory, user_id, conversation_id, now=NOW + LEASE, reclaim=False)
+
+    assert snapshot(factory) == before
+    assert turn_rows(factory)[0].status == "processing"  # not retired by the refusal either
+
+
+def test_an_attempt_that_is_still_live_is_in_flight_not_attempted(factory, user_id, conversation_id):
+    begin(factory, user_id, conversation_id)
+
+    with pytest.raises(TurnInFlight):
+        begin(factory, user_id, conversation_id, now=NOW + timedelta(seconds=30), reclaim=False)
+
+
+def test_a_request_that_was_never_claimed_is_claimed_even_when_reclaiming_is_refused(
+    factory, user_id, conversation_id
+):
+    begin(factory, user_id, conversation_id)
+    with factory() as db, db.begin():
+        db.execute(
+            sa.update(TurnRequest).values(
+                status="pending", attempt_count=0, processing_started_at=None, lease_expires_at=None
+            )
+        )
+
+    claim = begin(factory, user_id, conversation_id, now=NOW + timedelta(seconds=1), reclaim=False)
+
+    assert (claim.attempt, claim.retry) == (1, True)
+
+
+def test_a_new_key_is_claimed_whatever_reclaiming_says(factory, user_id, conversation_id):
+    claim = begin(factory, user_id, conversation_id, "tg-1001", "Привет", reclaim=False)
+
+    assert (claim.attempt, claim.retry) == (1, False)
+
+
+def test_a_conflicting_text_is_still_a_conflict_before_the_attempt_is_considered(factory, user_id, conversation_id):
+    fail(factory, begin(factory, user_id, conversation_id), "provider_error", now=NOW + timedelta(seconds=2))
+
+    with pytest.raises(IdempotencyKeyConflict):
+        begin(factory, user_id, conversation_id, text="another", now=NOW + timedelta(minutes=1), reclaim=False)
+
+
+def test_the_record_that_an_attempt_began_survives_a_restart_of_the_process(engine, factory, user_id, conversation_id):
+    """Nothing but the database holds it: a second session factory on the same engine, a fresh
+    caller with no memory of the first, meets the same answer."""
+    begin(factory, user_id, conversation_id)  # the process dies here; the claim was committed
+    from house_helper.persistence.database import create_session_factory
+
+    fresh = create_session_factory(engine)
+
+    with pytest.raises(TurnAttempted):
+        begin(fresh, user_id, conversation_id, now=NOW + LEASE + timedelta(hours=1), reclaim=False)

@@ -55,6 +55,15 @@
     favoritesStatus: byId("favorites-status"),
     favoritesRetry: byId("favorites-retry"),
     favoriteList: byId("favorite-list"),
+    telegram: byId("telegram"),
+    telegramText: byId("telegram-text"),
+    telegramNotice: byId("telegram-notice"),
+    telegramPrivacy: byId("telegram-privacy"),
+    telegramOpen: byId("telegram-open"),
+    telegramConnect: byId("telegram-connect"),
+    telegramDisconnect: byId("telegram-disconnect"),
+    telegramConfirm: byId("telegram-confirm"),
+    telegramCancel: byId("telegram-cancel"),
     recipe: byId("recipe"),
     recipeTitle: byId("recipe-title"),
     recipeBody: byId("recipe-body"),
@@ -181,6 +190,27 @@
     announce: announce,
   });
 
+  // The panel that connects a Telegram account: its own small controller (chat-logic.js), started when the
+  // conversations are shown and stopped when they are not (signed out, another person, held back for a check).
+  var telegram = Logic.createTelegramLink({
+    fetch: function (input, init) {
+      return window.fetch(input, init);
+    },
+    setTimeout: function (fn, ms) {
+      return window.setTimeout(fn, ms);
+    },
+    clearTimeout: function (id) {
+      window.clearTimeout(id);
+    },
+    now: function () {
+      return Date.now();
+    },
+    onChange: function () {
+      scheduleRender();
+    },
+  });
+  var telegramShown = false;
+
   // --- drawing ---------------------------------------------------------------------------------------
 
   var queued = false;
@@ -219,6 +249,14 @@
     region("screen", { screen: view.screen, notice: view.notice, failure: view.failure, generation: view.generation }, function (data) {
       drawScreens(data);
     });
+    if (view.screen === "app" && !telegramShown) {
+      telegramShown = true;
+      telegram.start();
+    } else if (view.screen !== "app" && telegramShown) {
+      telegramShown = false;
+      telegram.stop();
+    }
+    region("telegram", telegramShown ? telegram.getView() : null, drawTelegram);
     if (view.screen === "app") {
       region("section", view.section, drawSection);
       region("list", view.list, drawList);
@@ -241,6 +279,51 @@
       applyWantedFocus();
     }
   }
+
+  // (`panel`, not `view`: that name is the conversations' view, whose fields tests check by name.)
+  function drawTelegram(panel) {
+    if (panel === null || !panel.visible) {
+      // Hidden means empty: what was shown (an account's name, a pairing code) is not left in the page.
+      els.telegram.hidden = true;
+      els.telegramText.textContent = "";
+      els.telegramNotice.textContent = "";
+      els.telegramPrivacy.textContent = "";
+      els.telegramOpen.removeAttribute("href");
+      els.telegramOpen.hidden = true;
+      return;
+    }
+    els.telegram.hidden = false;
+    els.telegramText.textContent = panel.text;
+    els.telegramNotice.hidden = !panel.notice;
+    els.telegramNotice.textContent = panel.notice || "";
+    els.telegramPrivacy.textContent = panel.privacy;
+    // The one address this script ever sets on an element: the link to the bot that the server made, which
+    // the logic has checked against a strict pattern (https://t.me/<bot>?start=<code>) before it gets here.
+    els.telegramOpen.hidden = !panel.link;
+    if (panel.link) {
+      els.telegramOpen.setAttribute("href", panel.link);
+    } else {
+      els.telegramOpen.removeAttribute("href");
+    }
+    els.telegramConnect.hidden = !panel.canConnect;
+    els.telegramConnect.textContent = panel.retry ? Logic.TEXT.retry : Logic.TELEGRAM_TEXT.connect;
+    els.telegramDisconnect.hidden = !panel.canAskDisconnect;
+    els.telegramConfirm.hidden = !panel.canConfirmDisconnect;
+    els.telegramCancel.hidden = !panel.canCancel;
+  }
+
+  els.telegramConnect.addEventListener("click", function () {
+    telegram.connect();
+  });
+  els.telegramDisconnect.addEventListener("click", function () {
+    telegram.askDisconnect();
+  });
+  els.telegramConfirm.addEventListener("click", function () {
+    telegram.disconnect();
+  });
+  els.telegramCancel.addEventListener("click", function () {
+    telegram.cancelDisconnect();
+  });
 
   // What the person's last action wants focused once the page has been drawn: "recipe" (the title of the
   // recipe pane, which is hidden until it is drawn), "keep" (the safe answer of the question "remove it?"),
@@ -630,6 +713,11 @@
       "data-id": item.type === "message" ? String(item.id) : false,
     });
     node.appendChild(h("p", { class: "visually-hidden", text: mine ? "Вы:" : "Помощник:" }));
+    if (item.photo) {
+      // The photo that came with the message. Its address is this site's own route, which the logic checked
+      // against a strict pattern (Logic.PHOTO_URL); the server serves it to its owner only.
+      node.appendChild(h("img", { class: "msg-photo", src: item.photo.url, alt: "Фото к сообщению", loading: "lazy" }));
+    }
     node.appendChild(textBlocks(item.text));
     node.appendChild(meta);
 
@@ -1070,6 +1158,7 @@
   document.addEventListener("visibilitychange", function () {
     if (document.visibilityState === "visible") {
       controller.recheck();
+      telegram.recheck();
     }
   });
   document.addEventListener("resume", function () {

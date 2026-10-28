@@ -248,7 +248,7 @@ def test_the_head_is_the_one_the_migrations_in_the_repository_end_with(db_url):
             ]
     finally:
         engine.dispose()
-    assert repository_head() == "0007_favorite_recipes"
+    assert repository_head() == "0009_message_attachments"
 
 
 @pytest.mark.parametrize(

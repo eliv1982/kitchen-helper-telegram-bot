@@ -79,8 +79,13 @@ def test_the_page_calls_only_its_own_origin_and_names_no_other_address():
     for method, path in paths:
         assert path.startswith('"/api/') or path.startswith('"/auth/'), path
     assert {method for method, _ in paths} == {"GET", "POST"}
-    # Every request goes through one place, which asks for the cookie of this site only.
-    assert LOGIC.count("deps.fetch(") == 1
+    # Every request goes through one of two places, and each asks for the cookie of this site only: the
+    # conversations' http() and the Telegram panel's call() (a controller of its own, which talks to
+    # /api/telegram and nothing else).
+    assert LOGIC.count("deps.fetch(") == 2
+    assert LOGIC.count('credentials: "same-origin"') == 2
+    telegram_paths = re.findall(r'call\(\s*"(GET|POST|DELETE)",\s*"([^"]*)"', LOGIC)
+    assert telegram_paths and all(path.startswith("/api/telegram") for _, path in telegram_paths)
     assert 'credentials: "same-origin"' in LOGIC and 'redirect: "error"' in LOGIC
     # The fetch mode and the referrer policy are the browser's own (see ui.py: Origin).
     assert not re.search(r"\bmode\s*:", LOGIC) and not re.search(r"referrerPolicy", LOGIC)

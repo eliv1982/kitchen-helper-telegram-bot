@@ -1134,3 +1134,184 @@ async def test_a_failing_on_accepted_does_not_stop_the_unit_or_hide_its_result(t
 
         assert users(engine) == 1 and result is not None  # it ran and committed
         assert "ZeroDivisionError" in caplog.text and "SECRET" not in caplog.text
+
+
+# --- run_to_completion: the caller does not leave before the unit has ended ----------------------
+# For a caller that holds a lock the unit must not outlive (the Telegram bot's binding lock):
+# a cancellation is raised when the unit is over, never before; a call that was still waiting for
+# a slot is withdrawn at once, as with run(). The bot's use of it is tests/test_telegram_unlink_race.py.
+
+
+@pytest.mark.asyncio
+async def test_run_to_completion_returns_what_the_work_returns_and_commits_it(tmp_path):
+    async with opened_database(tmp_path) as (database, engine):
+        result = await asyncio.wait_for(database.run_to_completion(add_user), TIMEOUT)
+
+        assert result is not None and users(engine) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_to_completion_raises_what_the_work_raises_after_the_rollback(tmp_path):
+    class Boom(Exception):
+        pass
+
+    def failing(session):
+        add_user(session)
+        raise Boom
+
+    async with opened_database(tmp_path) as (database, engine):
+        with pytest.raises(Boom):
+            await asyncio.wait_for(database.run_to_completion(failing), TIMEOUT)
+
+        assert users(engine) == 0
+        await every_slot_is_usable(database, MAX_CONCURRENT_UNITS_OF_WORK)
+
+
+@pytest.mark.asyncio
+async def test_a_bare_cancel_is_held_back_until_the_accepted_unit_has_ended_and_then_raised(tmp_path):
+    async with opened_database(tmp_path) as (database, engine):
+        units = Units(engine)
+        call = asyncio.ensure_future(database.run_to_completion(units.write_then_hold))
+        await until(lambda: units.started == 1)
+
+        call.cancel()  # delivered at once to a plain run(); here it waits for the worker
+        await settle()
+        assert not call.done()
+        assert units.finished == 0 and users(engine) == 0  # the worker is still in its transaction
+
+        units.release.set()
+        await asyncio.wait_for(asyncio.wait({call}), TIMEOUT)
+        assert call.cancelled()  # the cancellation is raised, once the unit is over
+        assert units.finished == 1 and users(engine) == 1  # ... and the unit committed, as run() would have
+        await until(lambda: engine.pool.checkedout() == 0)
+        await every_slot_is_usable(database, MAX_CONCURRENT_UNITS_OF_WORK)
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancellations_do_not_end_the_wait(tmp_path):
+    async with opened_database(tmp_path) as (database, engine):
+        units = Units(engine)
+        call = asyncio.ensure_future(database.run_to_completion(units.hold))
+        await until(lambda: units.started == 1)
+
+        for _ in range(5):
+            call.cancel()
+            await settle()
+            assert not call.done()
+
+        units.release.set()
+        await asyncio.wait_for(asyncio.wait({call}), TIMEOUT)
+        assert call.cancelled() and units.finished == 1
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_scope_that_stays_cancelled_neither_spins_nor_ends_the_wait(tmp_path):
+    """The kind Starlette delivers: a scope that keeps delivering its cancellation. Inside the
+    wait it must not be delivered (the loop would never yield to the worker's completion), and the
+    loop must stay responsive meanwhile."""
+    scope = anyio.CancelScope()
+    ticks = 0
+
+    async def ticker():
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await asyncio.sleep(0)
+
+    async def caller(database, units):
+        with scope:
+            await database.run_to_completion(units.write_then_hold)
+
+    async with opened_database(tmp_path) as (database, engine):
+        units = Units(engine)
+        beat = asyncio.ensure_future(ticker())
+        task = asyncio.ensure_future(caller(database, units))
+        await until(lambda: units.started == 1)
+
+        scope.cancel()
+        before = ticks
+        await settle()
+        assert not task.done() and units.finished == 0
+        assert ticks > before  # the event loop went on turning
+
+        units.release.set()
+        await asyncio.wait_for(task, TIMEOUT)  # the scope swallows its own cancellation at its end
+        beat.cancel()
+        assert units.finished == 1 and users(engine) == 1
+        assert engine.pool.checkedout() == 0
+
+
+@pytest.mark.asyncio
+async def test_a_call_cancelled_while_it_waits_for_a_slot_is_withdrawn_at_once_and_never_runs(tmp_path):
+    ran = []
+    async with opened_database(tmp_path, max_concurrent=1) as (database, engine):
+        units = Units(engine)
+        holder = submit(database, units.hold)
+        await until(lambda: units.started == 1)
+        waiting = asyncio.ensure_future(database.run_to_completion(lambda session: ran.append("ran")))
+        await settle()  # it waits for the only slot
+
+        waiting.cancel()
+        await asyncio.wait_for(asyncio.wait({waiting}), TIMEOUT)  # nothing to wait for: it did not start
+        assert waiting.cancelled()
+        assert units.running == 1  # the holder is still there
+
+        units.release.set()
+        assert await asyncio.wait_for(holder, TIMEOUT) == "held"
+        await until(lambda: units.finished == 1)
+        await every_slot_is_usable(database, 1)
+        assert ran == []
+
+
+@pytest.mark.asyncio
+async def test_a_call_cancelled_before_it_has_started_at_all_does_nothing(tmp_path):
+    ran = []
+    async with opened_database(tmp_path) as (database, engine):
+        call = asyncio.ensure_future(database.run_to_completion(lambda session: ran.append("ran")))
+        call.cancel()  # before the loop has run it
+        await asyncio.wait_for(asyncio.wait({call}), TIMEOUT)
+
+        assert call.cancelled() and ran == []
+        await every_slot_is_usable(database, MAX_CONCURRENT_UNITS_OF_WORK)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_beats_the_units_own_failure_and_the_failure_is_not_left_unretrieved(
+    tmp_path, caplog
+):
+    class Boom(Exception):
+        pass
+
+    release, started = threading.Event(), threading.Event()
+
+    def failing(session):
+        add_user(session)
+        started.set()
+        assert release.wait(TIMEOUT)
+        raise Boom("SECRET")
+
+    caplog.set_level(logging.DEBUG)
+    async with opened_database(tmp_path) as (database, engine):
+        call = asyncio.ensure_future(database.run_to_completion(failing))
+        while not started.is_set():
+            await asyncio.sleep(0)
+        call.cancel()
+        await settle()
+        assert not call.done()
+
+        release.set()
+        await asyncio.wait_for(asyncio.wait({call}), TIMEOUT)
+        assert call.cancelled()  # the caller asked to be cancelled; that is what it gets
+        assert users(engine) == 0  # the failed unit rolled back
+        await settle()
+
+    assert "never retrieved" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_run_to_completion_refuses_work_once_the_database_is_closed(tmp_path):
+    async with opened_database(tmp_path) as (database, engine):
+        await database.aclose()
+
+        with pytest.raises(DatabaseClosed):
+            await asyncio.wait_for(database.run_to_completion(add_user), TIMEOUT)

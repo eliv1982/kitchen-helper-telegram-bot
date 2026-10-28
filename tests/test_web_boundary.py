@@ -2,9 +2,12 @@
 starting it does.
 
 house_helper.core and house_helper.persistence stay free of FastAPI and of the web
-package. The web package stays free of the Telegram transport, of provider
-configuration and of anything that changes the schema. The Telegram process does
-not load the web stack.
+package. The web package stays free of the Telegram transport LIBRARY (aiogram) and of the
+old bot's modules, of provider configuration and of anything that changes the schema. (It
+does contain a Telegram bot of its own since the unified conversations: a long-polling
+client over httpx, house_helper/web/telegram_chat.py, that answers through the web turn
+runner. What is kept apart is the old process and its libraries, not the idea of a bot.) The
+old Telegram process does not load the web stack.
 
 The static checks read the modules' import statements (the test session has
 already imported most of these libraries, so sys.modules would prove nothing). The

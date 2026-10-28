@@ -32,12 +32,13 @@ Results are plain values, not ORM objects, so they can leave the worker thread.
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 from uuid import UUID
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Session as OrmSession
 
+from house_helper.persistence import attachments as att
 from house_helper.persistence.models import (
     Conversation,
     Message,
@@ -105,6 +106,8 @@ class MessageView:
     # again after a reload.
     idempotency_key: Optional[str] = None
     error_code: Optional[str] = None
+    # The photo the message came with, if it has one that has not expired (no bytes).
+    attachment: Optional[att.AttachmentRef] = None
 
 
 @dataclass(frozen=True)
@@ -229,8 +232,10 @@ def list_messages(
         query = query.where(Message.id < before)
     rows = session.execute(query).all()
 
+    shown = rows[:limit]
+    photos = att.refs_for_messages(session, [row.id for row in shown], now=now)
     views = []
-    for row in rows[:limit]:
+    for row in shown:
         status = _shown_status(row.status, row.lease_expires_at, now)
         unfinished = row.role == MessageRole.USER.value and status != MESSAGE_COMPLETED
         views.append(
@@ -242,6 +247,7 @@ def list_messages(
                 status=status,
                 idempotency_key=row.idempotency_key if unfinished else None,
                 error_code=row.error_code if unfinished and status == MESSAGE_FAILED else None,
+                attachment=photos.get(row.id),
             )
         )
     views.reverse()
@@ -251,6 +257,14 @@ def list_messages(
 # --- history, as the AI is shown it --------------------------------------------------
 
 
+# How many photos of a context the assistant is shown, the newest first: a picture costs far more
+# than a sentence, and a conversation about one photo does not need the ones before it. An older photo
+# is mentioned in words (PHOTO_NOT_SHOWN), so the assistant knows there was one.
+MAX_CONTEXT_IMAGES = 2
+PHOTO_NOT_SHOWN = " [К этому сообщению было приложено фото, но здесь оно не показано.]"
+PHOTO_WITHOUT_CAPTION = "Человек прислал фото без подписи."
+
+
 def build_context(
     session: OrmSession,
     conversation_id: UUID,
@@ -258,7 +272,8 @@ def build_context(
     *,
     now: datetime,
     max_messages: int,
-) -> list[dict[str, str]]:
+    max_images: int = MAX_CONTEXT_IMAGES,
+) -> list[dict[str, Any]]:
     """The messages to send to the AI for the user message `current_message_id`:
     at most `max_messages` of them, the current one included and last.
 
@@ -275,6 +290,12 @@ def build_context(
     message dropped when the window starts in the middle of an exchange or the exchange
     lost its question to expiry: the AI is never shown an answer without the question
     before it. A plain read.
+
+    A message with a photo (attachments) is shown as its text plus the picture, for the newest
+    `max_images` such messages (the current one among them); the content is then a list of parts,
+    {"type": "text", "text": ...} and {"type": "image", "content_type": ..., "data": <bytes>},
+    which the provider's backend turns into whatever its API takes. Every other message, and
+    every older photo, is plain text.
     """
     reset_after = session.scalar(
         sa.select(sa.func.coalesce(sa.func.max(Message.id), 0)).where(
@@ -288,7 +309,7 @@ def build_context(
         TurnRequest.status == TurnStatus.COMPLETED.value,
     )
     earlier = session.execute(
-        sa.select(Message.role, Message.content)
+        sa.select(Message.id, Message.role, Message.content)
         .where(
             Message.conversation_id == conversation_id,
             Message.id < current_message_id,
@@ -314,6 +335,27 @@ def build_context(
             Message.id == current_message_id, Message.conversation_id == conversation_id
         )
     )
-    context = [{"role": row.role, "content": row.content} for row in earlier]
-    context.append({"role": MessageRole.USER.value, "content": current})
+    wanted = [row.id for row in earlier] + [current_message_id]
+    carrying = att.refs_for_messages(session, wanted, now=now)
+    shown_photos = att.files_for_messages(
+        session, sorted(carrying, reverse=True)[: max(max_images, 0)], now=now
+    )
+
+    def entry(role: str, message_id: int, text: str) -> dict[str, Any]:
+        if message_id not in carrying:
+            return {"role": role, "content": text}
+        photo = shown_photos.get(message_id)
+        if photo is None:
+            return {"role": role, "content": text + PHOTO_NOT_SHOWN}
+        caption = PHOTO_WITHOUT_CAPTION if text == att.PHOTO_PLACEHOLDER else text
+        return {
+            "role": role,
+            "content": [
+                {"type": "text", "text": caption},
+                {"type": "image", "content_type": photo.content_type, "data": photo.data},
+            ],
+        }
+
+    context = [entry(row.role, row.id, row.content) for row in earlier]
+    context.append(entry(MessageRole.USER.value, current_message_id, current))
     return context

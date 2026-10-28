@@ -204,7 +204,10 @@ def test_the_runbook_has_the_section_and_names_every_file_of_the_feature():
 
 
 def test_the_commands_the_runbook_tells_the_owner_to_type_parse_with_the_real_parser():
-    body = section(read(RUNBOOK), "## 15.", "\n## 16.") if "\n## 16." in read(RUNBOOK) else read(RUNBOOK)[read(RUNBOOK).index("## 15."):]
+    text = read(RUNBOOK)
+    start = text.index("## 15.")
+    end = text.find("\n## 16.", start)  # (section 16 exists since the Telegram bot: slice section 15 only)
+    body = text[start:] if end == -1 else text[start:end]
     lines = [line.strip() for line in body.splitlines() if "deploy/offsite_backup.py" in line and line.lstrip().startswith(("sudo python3", "python3"))]
     assert len(lines) >= 2
     seen = set()

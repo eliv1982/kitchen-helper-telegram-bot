@@ -1436,8 +1436,9 @@ scenario("a_history_shows_each_status_and_an_unknown_or_malformed_page_is_not_tr
 
 scenario("every_text_the_page_makes_is_russian", async () => {
   const latin = /[A-Za-z]/;
-  // Placeholders are filled in; "JSON" is the one word the server's own catalogue writes in Latin.
-  const stripPlaceholders = (value) => value.replace(/\{\w+\}/g, "").replace(/JSON/g, "");
+  // Placeholders are filled in; "JSON" and the product name "Telegram" are the words the server's own
+  // catalogue writes in Latin.
+  const stripPlaceholders = (value) => value.replace(/\{\w+\}/g, "").replace(/JSON|Telegram/g, "");
   for (const [name, value] of Object.entries({ ...Logic.TEXT, ...Logic.CODE_MESSAGES })) {
     const shown = stripPlaceholders(value);
     assert.ok(/[А-Яа-яЁё]/.test(shown), `${name} has no Russian`);
@@ -3392,6 +3393,423 @@ scenario("every_favorites_call_is_made_with_the_session_cookie_only_and_names_no
     assert.equal(request.init.redirect, "error");
     assert.deepEqual(Object.keys(request.headers).sort(), request.body === undefined ? ["accept"] : ["accept", "content-type"]);
     assert.ok(!JSON.stringify(request).includes(USER_A));
+  }
+});
+
+// ============================================================================================
+// The Telegram panel: connecting an account (createTelegramLink)
+// ============================================================================================
+
+const BOT = "house_helper_app_bot";
+const CODE = "k3JmQ0v9aZxP4tR7uYw2LbN6cD8eFgHs";
+const PAIR_LINK = `https://t.me/${BOT}?start=${CODE}`;
+const status = (linked, extra = {}) => json(200, linked
+  ? { enabled: true, linked: true, bot_username: BOT, account: { name: "@mama", linked_at: "2026-10-18T12:00:00+00:00" }, ...extra }
+  : { enabled: true, linked: false, bot_username: BOT, ...extra });
+const issued = (overrides = {}) =>
+  json(201, { code: CODE, link: PAIR_LINK, expires_at: "2026-10-18T12:10:00+00:00", expires_in_seconds: 600, ...overrides });
+
+function telegramPanel(routes = {}) {
+  const net = new H.Net();
+  const timers = new H.Timers();
+  H.environments.push({ net });
+  for (const [key, responders] of Object.entries(routes)) {
+    const [method, path] = key.split(" ");
+    net.route(method, path, ...responders);
+  }
+  const changes = { count: 0 };
+  const panel = Logic.createTelegramLink({
+    fetch: net.fetch,
+    setTimeout: timers.setTimeout,
+    clearTimeout: timers.clearTimeout,
+    now: () => timers.now,
+    AbortController,
+    onChange: () => {
+      changes.count++;
+    },
+  });
+  return { panel, net, timers, changes, view: () => panel.getView() };
+}
+
+scenario("telegram_panel_is_invisible_until_started_and_when_the_bot_is_not_here", async () => {
+  const t = telegramPanel({ "GET /api/telegram": [json(200, { enabled: false, linked: false })] });
+  assert.equal(t.view().visible, false);
+  await t.panel.start();
+  assert.equal(t.view().visible, false);
+  assert.equal(t.view().text, "");
+  assert.deepEqual(t.net.requests("POST", "/api/telegram/link"), []);
+});
+
+scenario("telegram_panel_offers_to_connect_and_says_what_it_gives", async () => {
+  const t = telegramPanel({ "GET /api/telegram": [status(false)] });
+  await t.panel.start();
+  const view = t.view();
+  assert.equal(view.visible, true);
+  assert.equal(view.phase, "unlinked");
+  assert.equal(view.canConnect, true);
+  assert.equal(view.canAskDisconnect, false);
+  assert.equal(view.link, null);
+  assert.ok(/общими с сайтом/.test(view.text));
+  assert.equal(view.notice, null, "a bot that works has nothing to apologise for");
+  const request = t.net.requests("GET", "/api/telegram")[0];
+  assert.equal(request.init.credentials, "same-origin");
+  assert.equal(request.init.cache, "no-store");
+  assert.equal(request.headers.cookie, undefined);
+  assert.equal(request.body, undefined);
+});
+
+scenario("telegram_panel_always_says_what_is_copied_where_it_is_processed_and_how_long_it_is_kept", async () => {
+  const idle = telegramPanel({ "GET /api/telegram": [json(200, { enabled: false, linked: false })] });
+  await idle.panel.start();
+  assert.equal(idle.view().privacy, "", "nothing is said where there is no panel");
+
+  for (const reply of [status(false), status(true)]) {
+    const t = telegramPanel({ "GET /api/telegram": [reply] });
+    const before = t.view();
+    assert.equal(before.privacy, "");
+    await t.panel.start();
+    const privacy = t.view().privacy;
+    assert.ok(privacy.includes("дублируется в этот Telegram-чат"), "the copy to Telegram is explained");
+    assert.ok(privacy.includes("только отключением Telegram"), "and how to end it");
+    assert.ok(privacy.includes("OpenAI"), "messages and photos go to OpenAI");
+    assert.ok(privacy.includes("фотографии"));
+    assert.ok(privacy.includes("365 дней"), "history expires");
+    assert.ok(privacy.includes("в избранное") && privacy.includes("пока вы сами их не уберёте"), "favorites do not");
+  }
+});
+
+scenario("telegram_panel_says_when_the_bot_is_not_answering_and_offers_nothing_it_cannot_do", async () => {
+  const down = { available: false };
+  const t = telegramPanel({ "GET /api/telegram": [status(false, down), status(false)] });
+  await t.panel.start();
+  let view = t.view();
+  assert.equal(view.visible, true);
+  assert.equal(view.notice, Logic.TELEGRAM_TEXT.unavailable);
+  assert.equal(view.canConnect, false, "no code is asked for from a bot that is not reading");
+  assert.deepEqual(t.net.requests("POST", "/api/telegram/link"), []);
+  await t.panel.recheck();
+  view = t.view();
+  assert.equal(view.notice, null, "and the notice goes when the bot is back");
+  assert.equal(view.canConnect, true);
+
+  const linked = telegramPanel({ "GET /api/telegram": [status(true, down)] });
+  await linked.panel.start();
+  view = linked.view();
+  assert.equal(view.text, "Подключён: @mama", "an account that is linked stays linked");
+  assert.equal(view.notice, Logic.TELEGRAM_TEXT.unavailable, "but is not shown as working");
+  assert.equal(view.canAskDisconnect, true, "and can still be unlinked");
+
+  const odd = telegramPanel({ "GET /api/telegram": [status(false, { available: "no" })] });
+  await odd.panel.start();
+  assert.equal(odd.view().canConnect, true, "only an explicit false means the bot is down");
+});
+
+scenario("telegram_panel_pairing_shows_the_link_and_the_command_then_notices_the_pairing_by_itself", async () => {
+  const t = telegramPanel({
+    "GET /api/telegram": [status(false), status(false), status(false), status(true)],
+    "POST /api/telegram/link": [issued()],
+  });
+  await t.panel.start();
+  await t.panel.connect();
+  let view = t.view();
+  assert.equal(view.phase, "pairing");
+  assert.equal(view.link, PAIR_LINK);
+  assert.ok(view.text.includes(`/start ${CODE}`) && view.text.includes("@" + BOT), view.text);
+  assert.ok(view.text.includes("10 минут"));
+  assert.equal(view.canConnect, false);
+  assert.deepEqual(t.net.requests("POST", "/api/telegram/link")[0].body, {});
+  assert.deepEqual(t.timers.delays, [3000]);
+
+  await t.timers.advance(3000);
+  await flush();
+  await t.timers.advance(3000);
+  await flush();
+  assert.equal(t.view().phase, "pairing", "not yet");
+  await t.timers.advance(3000);
+  await flush();
+  view = t.view();
+  assert.equal(view.phase, "linked");
+  assert.equal(view.link, null, "the link is gone once it has been used");
+  assert.ok(!view.text.includes(CODE));
+  assert.equal(view.notice, Logic.TELEGRAM_TEXT.pairedNow);
+  assert.equal(t.timers.pending, 0, "polling stopped");
+});
+
+scenario("telegram_panel_an_unused_code_expires_and_nothing_of_it_stays", async () => {
+  const t = telegramPanel({
+    "GET /api/telegram": [status(false)],
+    "POST /api/telegram/link": [issued({ expires_in_seconds: 10 })],
+  });
+  await t.panel.start();
+  await t.panel.connect();
+  for (let i = 0; i < 5; i++) {
+    await t.timers.advance(3000);
+    await flush();
+  }
+  const view = t.view();
+  assert.equal(view.phase, "unlinked");
+  assert.equal(view.link, null);
+  assert.equal(view.notice, Logic.TELEGRAM_TEXT.expired);
+  assert.ok(!JSON.stringify(view).includes(CODE));
+  assert.equal(t.timers.pending, 0);
+});
+
+scenario("telegram_panel_refuses_a_link_that_is_not_the_bots", async () => {
+  const hostile = [
+    "javascript:alert(1)",
+    "https://evil.example/house_helper_app_bot?start=" + CODE,
+    "http://t.me/house_helper_app_bot?start=" + CODE,
+    "https://t.me.evil.example/b_bot?start=" + CODE,
+    `https://t.me/${BOT}?start=${CODE}&x=1`,
+    `https://t.me/${BOT}/../x?start=${CODE}`,
+    `https://t.me/${BOT}?start=<script>`,
+    `//t.me/${BOT}?start=${CODE}`,
+    "",
+    null,
+    12,
+  ];
+  for (const link of hostile) {
+    const t = telegramPanel({ "GET /api/telegram": [status(false)], "POST /api/telegram/link": [issued({ link })] });
+    await t.panel.start();
+    await t.panel.connect();
+    assert.equal(t.view().link, null, String(link));
+    assert.notEqual(t.view().phase, "pairing", String(link));
+    assert.equal(t.timers.pending, 0);
+  }
+  for (const code of ["short", "has space 1234567890abcdef", "<b>12345678901234567890</b>", 5, null]) {
+    const t = telegramPanel({ "GET /api/telegram": [status(false)], "POST /api/telegram/link": [issued({ code })] });
+    await t.panel.start();
+    await t.panel.connect();
+    assert.notEqual(t.view().phase, "pairing", String(code));
+  }
+});
+
+scenario("telegram_panel_linked_shows_the_account_and_unlinking_asks_first", async () => {
+  const t = telegramPanel({
+    "GET /api/telegram": [status(true)],
+    "DELETE /api/telegram/link": [json(200, { linked: false })],
+  });
+  await t.panel.start();
+  let view = t.view();
+  assert.equal(view.phase, "linked");
+  assert.equal(view.text, "Подключён: @mama");
+  assert.equal(view.canAskDisconnect, true);
+  await t.panel.disconnect(); // without asking: nothing happens
+  assert.deepEqual(t.net.requests("DELETE", "/api/telegram/link"), []);
+
+  t.panel.askDisconnect();
+  view = t.view();
+  assert.equal(view.text, Logic.TELEGRAM_TEXT.askUnlink);
+  assert.equal(view.canConfirmDisconnect, true);
+  assert.equal(view.canCancel, true);
+  t.panel.cancelDisconnect();
+  assert.equal(t.view().canAskDisconnect, true);
+  assert.deepEqual(t.net.requests("DELETE", "/api/telegram/link"), []);
+
+  t.panel.askDisconnect();
+  await t.panel.disconnect();
+  view = t.view();
+  assert.equal(view.phase, "unlinked");
+  assert.equal(view.notice, Logic.TELEGRAM_TEXT.unlinkedNow);
+  assert.equal(t.net.requests("DELETE", "/api/telegram/link").length, 1);
+});
+
+scenario("telegram_panel_a_failed_unlinking_keeps_the_account_and_says_why", async () => {
+  const t = telegramPanel({
+    "GET /api/telegram": [status(true)],
+    "DELETE /api/telegram/link": [apiError(503, "service_unavailable", { retryable: true })],
+  });
+  await t.panel.start();
+  t.panel.askDisconnect();
+  await t.panel.disconnect();
+  const view = t.view();
+  assert.equal(view.phase, "linked");
+  assert.equal(view.notice, Logic.CODE_MESSAGES.service_unavailable);
+});
+
+scenario("telegram_panel_an_account_already_linked_in_another_tab_shows_as_linked", async () => {
+  const t = telegramPanel({
+    "GET /api/telegram": [status(false), status(true)],
+    "POST /api/telegram/link": [apiError(409, "telegram_already_linked")],
+  });
+  await t.panel.start();
+  await t.panel.connect();
+  assert.equal(t.view().phase, "linked");
+  assert.equal(t.timers.pending, 0);
+});
+
+scenario("telegram_panel_failures_are_said_in_russian_and_can_be_retried", async () => {
+  const t = telegramPanel({ "GET /api/telegram": [fail(), apiError(503, "service_unavailable", { retryable: true }), apiError(503, "service_unavailable", { retryable: true }), status(false)] });
+  await t.panel.start();
+  assert.equal(t.view().phase, "error");
+  assert.equal(t.view().notice, Logic.TEXT.network);
+  assert.equal(t.view().retry, true);
+  assert.equal(t.view().canConnect, true);
+  await t.panel.connect(); // the button of a failure says "Повторить": it reads again and asks for no code
+  assert.deepEqual(t.net.requests("POST", "/api/telegram/link"), []);
+  assert.equal(t.view().notice, Logic.CODE_MESSAGES.service_unavailable);
+  await t.panel.recheck();
+  assert.equal(t.view().notice, Logic.CODE_MESSAGES.service_unavailable);
+  await t.panel.recheck();
+  assert.equal(t.view().phase, "unlinked");
+  assert.equal(t.view().notice, null);
+
+  const other = telegramPanel({ "GET /api/telegram": [text(502, "<html>bad gateway</html>")] });
+  await other.panel.start();
+  assert.equal(other.view().phase, "error");
+  assert.equal(other.view().notice, Logic.TELEGRAM_TEXT.failed);
+
+  const odd = telegramPanel({ "GET /api/telegram": [json(200, { enabled: "yes", linked: 1 })] });
+  await odd.panel.start();
+  assert.equal(odd.view().phase, "error");
+});
+
+scenario("telegram_panel_a_request_that_fails_while_pairing_does_not_lose_the_code", async () => {
+  const t = telegramPanel({
+    "GET /api/telegram": [status(false), fail(), status(true)],
+    "POST /api/telegram/link": [issued()],
+  });
+  await t.panel.start();
+  await t.panel.connect();
+  await t.timers.advance(3000);
+  await flush();
+  assert.equal(t.view().phase, "pairing");
+  assert.equal(t.view().link, PAIR_LINK);
+  await t.timers.advance(3000);
+  await flush();
+  assert.equal(t.view().phase, "linked");
+});
+
+scenario("telegram_panel_a_lost_session_hides_the_panel_without_a_word", async () => {
+  const t = telegramPanel({ "GET /api/telegram": [status(false), notAuthenticated()], "POST /api/telegram/link": [issued()] });
+  await t.panel.start();
+  await t.panel.connect();
+  await t.timers.advance(3000);
+  await flush();
+  const view = t.view();
+  assert.equal(view.visible, false);
+  assert.ok(!JSON.stringify(view).includes(CODE));
+  assert.equal(t.timers.pending, 0);
+});
+
+scenario("telegram_panel_stopping_forgets_everything_and_ignores_late_answers", async () => {
+  const gate = deferred();
+  const t = telegramPanel({ "GET /api/telegram": [status(true, { account: { name: "@mama" } }), async () => { await gate.promise; return status(true); }] });
+  await t.panel.start();
+  assert.equal(t.view().phase, "linked");
+  const late = t.panel.recheck();
+  t.panel.stop();
+  assert.equal(t.view().visible, false);
+  gate.resolve();
+  await late;
+  await flush();
+  const view = t.view();
+  assert.equal(view.visible, false, "the late answer was not applied");
+  assert.ok(!JSON.stringify(view).includes("@mama"));
+  // and a new start is a fresh one
+  const again = telegramPanel({ "GET /api/telegram": [status(false)] });
+  await again.panel.start();
+  again.panel.stop();
+  await again.panel.start();
+  assert.equal(again.view().phase, "unlinked");
+});
+
+scenario("telegram_panel_does_not_ask_twice_for_a_code_at_once", async () => {
+  const gate = deferred();
+  const t = telegramPanel({
+    "GET /api/telegram": [status(false)],
+    "POST /api/telegram/link": [async () => { await gate.promise; return issued(); }],
+  });
+  await t.panel.start();
+  const first = t.panel.connect();
+  const second = t.panel.connect();
+  assert.equal(t.view().busy, true);
+  assert.equal(t.view().canConnect, false);
+  gate.resolve();
+  await Promise.all([first, second]);
+  assert.equal(t.net.requests("POST", "/api/telegram/link").length, 1);
+});
+
+scenario("telegram_panel_text_is_russian_and_holds_only_what_the_server_said", async () => {
+  const latin = /[A-Za-z]/;
+  for (const [name, value] of Object.entries(Logic.TELEGRAM_TEXT)) {
+    const shown = value.replace(/\{\w+\}/g, "").replace(/Telegram|OpenAI|\/start|Start/g, "");
+    assert.ok(/[А-Яа-яЁё]/.test(shown), `${name} has no Russian`);
+    assert.ok(!latin.test(shown), `${name} has Latin letters: ${shown}`);
+  }
+  const t = telegramPanel({ "GET /api/telegram": [json(200, { enabled: true, linked: true, bot_username: BOT, account: { name: "<img src=x onerror=alert(1)>" } })] });
+  await t.panel.start();
+  assert.equal(t.view().text, "Подключён: <img src=x onerror=alert(1)>", "the name is data: the page draws it as text");
+});
+
+scenario("telegram_panel_refreshes_when_the_page_comes_back_and_never_when_nothing_is_shown", async () => {
+  const t = telegramPanel({ "GET /api/telegram": [status(false), status(true)] });
+  await t.panel.recheck();
+  assert.deepEqual(t.net.requests("GET", "/api/telegram"), [], "not started: nothing is asked");
+  await t.panel.start();
+  await t.panel.recheck();
+  assert.equal(t.view().phase, "linked");
+});
+
+// ============================================================================================
+// A photo that came with a message
+// ============================================================================================
+
+const PHOTO_ID = "5d6c1f3e-0a9b-4e43-9c2f-7b1a8d3e4f50";
+const photoOf = (url, type = "image/jpeg") => [{ id: PHOTO_ID, content_type: type, size: 1234, url }];
+
+scenario("a_photo_with_a_message_is_kept_as_an_address_on_this_site_and_nothing_else", async () => {
+  const url = `/api/attachments/${PHOTO_ID}`;
+  const env = makeEnv().signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [
+      message(1, "user", "Что это?", { attachments: photoOf(url) }),
+      message(2, "assistant", "Это кастрюля."),
+      message(3, "user", "Ещё", { attachments: photoOf(url, "image/png") }),
+    ]),
+  });
+  await env.boot();
+  const items = env.view().thread.items;
+  assert.deepEqual(items.map((i) => i.photo), [{ url }, null, { url }]);
+  assert.ok(!JSON.stringify(items).includes("data:"));
+});
+
+scenario("a_photo_address_that_is_not_the_servers_own_route_is_not_a_photo", async () => {
+  const hostile = [
+    "javascript:alert(1)",
+    "https://evil.example/x.png",
+    "//evil.example/api/attachments/" + PHOTO_ID,
+    "/api/attachments/../../auth/me",
+    "/api/attachments/" + PHOTO_ID + "?x=1",
+    "/api/attachments/" + PHOTO_ID + "/",
+    "/api/attachments/not-a-uuid",
+    "/static/app.js",
+    "data:image/png;base64,AAAA",
+    "",
+    null,
+    42,
+  ];
+  for (const url of hostile) {
+    const env = makeEnv().signedIn([conversation(CONV_A, 0)], {
+      [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что это?", { attachments: photoOf(url) })]),
+    });
+    await env.boot();
+    assert.equal(env.view().thread.items[0].photo, null, String(url));
+    assert.equal(env.view().thread.items[0].text, "Что это?");
+  }
+  const url = `/api/attachments/${PHOTO_ID}`;
+  for (const type of ["image/gif", "text/html", "image/svg+xml", "", null, 5]) {
+    const env = makeEnv().signedIn([conversation(CONV_A, 0)], {
+      [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что это?", { attachments: photoOf(url, type) })]),
+    });
+    await env.boot();
+    assert.equal(env.view().thread.items[0].photo, null, String(type));
+  }
+  for (const list of [null, "x", {}, [], [null], [{}], [{ url }]]) {
+    const env = makeEnv().signedIn([conversation(CONV_A, 0)], {
+      [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что это?", { attachments: list })]),
+    });
+    await env.boot();
+    assert.equal(env.view().thread.items[0].photo, null, JSON.stringify(list));
   }
 });
 

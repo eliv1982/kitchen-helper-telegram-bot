@@ -28,7 +28,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.deploy_support import DEPLOY, REPO_ROOT, posix_only
+from tests.deploy_support import DEPLOY, HEAD, REPO_ROOT, posix_only
 from tests.offsite_support import (
     FIXED_NAME,
     FIXED_NOW,
@@ -143,7 +143,7 @@ def world(tmp_path):
     return World(tmp_path)
 
 
-def small_database(path: Path, *, version_rows=("0007_favorite_recipes",), version_table=True, violation=False, rows=2) -> Path:
+def small_database(path: Path, *, version_rows=(HEAD,), version_table=True, violation=False, rows=2) -> Path:
     """A tiny, clean (no free page) SQLite file with a parent table, optionally a broken foreign key or odd revisions."""
     connection = sqlite3.connect(str(path))
     try:
@@ -187,7 +187,7 @@ def test_a_committed_point_is_retrieved_decrypted_unpacked_and_verified_and_noth
 def test_the_verdict_names_the_point_the_encrypted_checksum_the_image_and_the_counts_but_no_content_and_no_key(world):
     assert world.rehearse() == 0
     digest = hashlib.sha256(world.rig.fake.remote_files()[FIXED_NAME]).hexdigest()
-    assert digest in world.text and "image abc123def456" in world.text and "schema revision 0007_favorite_recipes" in world.text
+    assert digest in world.text and "image abc123def456" in world.text and f"schema revision {HEAD}" in world.text
     for forbidden in (GOOD_KEY, "Q" * 20, str(world.identity), "KEPTROW", "DELETEDROW", "synthetic"):
         assert forbidden not in world.text, forbidden
 

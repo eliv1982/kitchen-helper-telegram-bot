@@ -121,7 +121,8 @@ def test_the_application_exposes_health_sign_in_chat_the_page_and_nothing_else(t
     # The sign-in routes (R3A Telegram, R3B-2 email, R4C-Auth A3 Telegram invitation: the
     # page, its start and the page after it, none of which serves a person's data), the chat API (R4A: the
     # conversations and their messages), the favorites API (the answers a person chose to
-    # keep) and the page (R4B: the shell at "/" and its few static files) are the only
+    # keep), the Telegram pairing API (the link between a person and their Telegram account)
+    # and the page (R4B: the shell at "/" and its few static files) are the only
     # additions to /healthz: no preference or other user-data route may exist, and not even
     # the interactive API pages FastAPI would add by default. A route added later has to
     # change this list on purpose, and a route that serves a person's data has to use
@@ -148,6 +149,9 @@ def test_the_application_exposes_health_sign_in_chat_the_page_and_nothing_else(t
         "/api/conversations/{conversation_id}/messages": ["get", "post"],
         "/api/favorites": ["get", "post"],
         "/api/favorites/{favorite_id}": ["delete", "get"],
+        "/api/telegram": ["get"],
+        "/api/attachments/{attachment_id}": ["get"],
+        "/api/telegram/link": ["delete", "post"],
         "/": ["get"],
         "/static/{name}": ["get"],
     }
@@ -405,7 +409,7 @@ async def test_starting_and_stopping_leaves_a_migrated_database_as_it_was(tmp_pa
     upgrade_database(engine)
     engine.dispose()
     before = _snapshot(target)
-    assert before[1] == [("0007_favorite_recipes",)]
+    assert before[1] == [("0009_message_attachments",)]
 
     async with serving(create_app(settings_for(target))) as client:
         await client.get("/healthz")

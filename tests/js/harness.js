@@ -325,6 +325,8 @@ function makeEnv(options = {}) {
   const crypto = options.crypto === undefined ? fakeCrypto() : options.crypto;
   // Whoever signs in has no favorites unless a scenario says so (a later route is asked first).
   net.route("GET", "/api/favorites", favoritesBody([]));
+  // ...and the bot is not configured unless a scenario says so (the panel then draws nothing).
+  net.route("GET", "/api/telegram", json(200, { enabled: false, linked: false }));
   const changes = { count: 0 };
   const announced = [];
   const controller = Logic.createController({

@@ -402,3 +402,66 @@ def test_the_backend_never_loads_the_telegram_side_or_reads_an_env_file():
     assert report["after_use"] == []  # ... and using it loads no Telegram code, api_client or config
     assert report["dotenv_calls"] == 0
     assert report["reply"] == "ok"
+
+
+# --- a message with a photo ----------------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_photo_reaches_the_api_as_a_data_url_beside_its_text_and_plain_messages_are_untouched(caplog):
+    import base64
+
+    from tests.photo_support import jpeg, png
+
+    caplog.set_level(logging.DEBUG)
+    first, second = jpeg(900, "a"), png(900, "b")
+    messages = [
+        {"role": "user", "content": [
+            {"type": "text", "text": "Что это?"},
+            {"type": "image", "content_type": "image/jpeg", "data": first},
+        ]},
+        {"role": "assistant", "content": "Это сковорода."},
+        {"role": "user", "content": [
+            {"type": "text", "text": "А это?"},
+            {"type": "image", "content_type": "image/png", "data": second},
+        ]},
+    ]
+    client = FakeClient()
+
+    await complete(StandaloneOpenAIBackend(SETTINGS, client=client), messages)
+
+    sent = client.calls[0]["messages"]
+    assert sent[1] == {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Что это?"},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(first).decode()}},
+        ],
+    }
+    assert sent[2] == {"role": "assistant", "content": "Это сковорода."}
+    assert sent[3]["content"][1]["image_url"]["url"].startswith("data:image/png;base64,")
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert base64.b64encode(first).decode()[:40] not in logged and "Что это?" not in logged
+
+
+def test_only_text_and_picture_parts_are_ever_passed_on():
+    from house_helper.core.openai_chat import to_openai_messages
+
+    converted = to_openai_messages(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "вопрос"},
+                    {"type": "image_url", "image_url": {"url": "https://evil.example/x.png"}},
+                    {"type": "file", "file_id": "file-1"},
+                    {"type": "image", "content_type": "image/webp", "data": b"RIFF....WEBPVP8 ", "url": "https://evil.example"},
+                    {},
+                ],
+            }
+        ]
+    )
+
+    parts = converted[0]["content"]
+    assert [part["type"] for part in parts] == ["text", "image_url"]
+    assert "evil" not in repr(parts) and parts[1]["image_url"] == {"url": "data:image/webp;base64,UklGRi4uLi5XRUJQVlA4IA=="}

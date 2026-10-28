@@ -375,32 +375,54 @@ def current_state() -> tuple:
     return flat(" ".join(line for line in lines if not line.startswith("|"))), rows
 
 
+def readme_row(name: str) -> str:
+    return next(flat(line) for line in read(REPO_ROOT / "README.md").splitlines() if line.startswith(f"| {name} |"))
+
+
 def test_the_documented_state_keeps_deployment_cleanup_pending_work_and_functional_alpha_apart():
     introduction, rows = current_state()
     header = flat(read(RUNBOOK).split("\n## ", 1)[0])
-    # 1. The technical deployment is done, with this kit, and it is only that: no real user, no beta, no Functional Alpha.
+    # 1. The technical deployment of 2026-10-24 is the history of the kit; what runs now (REPORTED by the owner on
+    # 2026-10-28) is image 66ab4ec32de3 at schema 0007, and every document that gives the state says the same. It is
+    # the owner's own use and not a beta, not a public demo and not a Functional Alpha.
     assert "technical deployment" in header
     assert re.search(r"technical instance of House Helper is live", introduction)
     assert re.search(r"not a functional alpha", introduction, re.I)
-    assert "no real users" in header.lower()
-    assert re.search(r"no real users", rows["Users"], re.I)
+    for where, text in (
+        ("RUNBOOK status paragraph", header),
+        ("STATUS.md, Image", rows["Image"]),
+        ("README, Deployed version", readme_row("Deployed version")),
+    ):
+        assert "house-helper:66ab4ec32de3" in text and "REPORTED" in text.replace("reported", "REPORTED"), where
+    for where, text in (
+        ("RUNBOOK status paragraph", header),
+        ("STATUS.md, Database", rows["Database"]),
+        ("README, Database", readme_row("Database")),
+    ):
+        assert "`0007_favorite_recipes`" in text, where
+    assert "0009_message_attachments" in header and "not deployed and applied to no database" in header  # the repository is ahead of production
+    assert re.search(r"owner is enrolled and has signed in", rows["Users"])
+    assert re.search(r"second person, and of any other, is not recorded", rows["Users"])  # nothing is claimed beyond the owner
+    assert re.search(r"real Telegram OIDC login PASSED", rows["Sign-in and AI"]) and re.search(r"Email login is \*\*disabled", rows["Sign-in and AI"])
     # 2. The retention timer is installed and active; its first calendar-triggered run was verified and accepted,
     # and it deleted nothing. Every document that gives the state says the same.
-    readme = next(
-        flat(line) for line in read(REPO_ROOT / "README.md").splitlines() if line.startswith("| Scheduled cleanup |")
-    )
     for where, text in (
         ("RUNBOOK status paragraph", header),
         ("STATUS.md, Retention cleanup", rows["Retention cleanup"]),
-        ("README, Scheduled cleanup", readme),
+        ("README, Scheduled cleanup", readme_row("Scheduled cleanup")),
     ):
         assert_first_scheduled_run_verified(text, where)
     assert "deleted nothing" in rows["Retention cleanup"] and "does **not** show a deletion of real expired rows" in rows["Retention cleanup"]
-    # 3. The offsite backup and the reporting of failures are separate from the accepted run, and still pending.
-    assert "separate and still pending" in rows["Retention cleanup"]
-    assert re.search(r"not installed or activated on the VPS", rows["Backups"]) and "pending" in rows["Backups"]
-    assert re.search(r"an alert path for failures \(none exists", introduction) and "still pending" in introduction
-    assert "Failure reporting, the encrypted off-host backup and a restore rehearsal are separate and not yet completed" in header
-    # 4. The Functional Alpha has not started, and the closure of the cleanup gate does not say otherwise.
-    assert re.search(r"\bnot started\b", rows["Functional Alpha"], re.I)
+    # 3. The scheduled backup, purge and monitoring are the owner's accepted work of 2026-10-28 (REPORTED), and no document
+    # claims more than that: none of them records what exactly is installed. The older "not installed or activated"
+    # statements stay only as history, marked as the state of 2026-10-25.
+    assert "separate and still pending" in rows["Retention cleanup"] and "2026-10-28" in rows["Retention cleanup"]
+    backups = rows["Backups, purge and monitoring"]
+    assert "FINAL ACCEPT" in backups and "REPORTED" in backups and "does not record what exactly is installed" in backups
+    assert re.search(r"History, state of 2026-10-25.*not installed or activated on the VPS", backups) and "pending" in backups
+    assert re.search(r"final acceptance", readme_row("Backups and monitoring"), re.I)
+    assert "the owner's accepted work of 2026-10-28 (REPORTED)" in header and "describe procedures, not what runs" in header
+    assert re.search(r"of the items below, the owner's real Telegram sign-in and a real OpenAI text conversation are done", introduction)
+    # 4. The Functional Alpha is not declared started or accepted, and nothing here says otherwise.
+    assert re.search(r"not declared started or accepted", rows["Functional Alpha"], re.I)
     assert re.search(r"not a first-user beta and not a Functional Alpha", introduction)

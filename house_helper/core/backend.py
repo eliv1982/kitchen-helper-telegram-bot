@@ -19,7 +19,7 @@ SDK nor the Telegram-side provider layer just by starting.
 """
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 from house_helper.core.identity import ConversationKey
 
@@ -63,7 +63,10 @@ class ChatBackend(Protocol):
 
     `messages` is the conversation so far, user and assistant turns only,
     ending with the pending user message; the system prompt is the backend's
-    own business. `conversation` names the conversation being answered, on
+    own business. A message's content is a string, or (the web chat only, for a
+    message that came with a photo) a list of parts, {"type": "text", "text": str}
+    and {"type": "image", "content_type": str, "data": bytes}: a backend that
+    cannot show a picture is never given one. `conversation` names the conversation being answered, on
     whatever channel it lives; it and `context_len` are carried over from the
     current call as-is and only label the backend's log lines.
 
@@ -73,7 +76,7 @@ class ChatBackend(Protocol):
 
     async def complete(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         *,
         conversation: ConversationKey,
         context_len: int,

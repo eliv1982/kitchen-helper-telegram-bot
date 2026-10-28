@@ -3,7 +3,7 @@
 Two kinds of rows are deleted, for real (a DELETE, not a filter on reads):
 
   * authentication artifacts past THEIR OWN expiry: sessions, OIDC login states, emailed
-    sign-in links and Telegram invitations. The rule is one for all of them: a row goes
+    sign-in links, Telegram invitations and Telegram pairing codes. The rule is one for all of them: a row goes
     when its expires_at is not after `now` (the exclusive end the application itself uses:
     at expires_at it is over). Whether it was used, withdrawn or revoked does not shorten
     or lengthen that: a used or revoked row stays until its own deadline, which is at most
@@ -19,15 +19,23 @@ Two kinds of rows are deleted, for real (a DELETE, not a filter on reads):
     (a restored or hand-edited database; the CHECKs would stop it on a migrated one) is
     still removed. A conversation that is empty and has seen no activity for 365 days goes
     too. A long-lived conversation keeps its recent messages: rows are judged one by one.
+    The photos that came with messages (message_attachments) are history too, by the same rule:
+    a photo takes the deadline of its message when it is attached, so it goes when the message
+    does, and a photo that was uploaded and never sent (an hour's life) goes with the rest of
+    the expired. They are deleted before the messages, so that they are counted; the foreign key
+    from a photo to its message cascades, so a message can never be left holding one.
 
-Never touched: users, allowlist entries, identity links, anything alembic owns, and any
+Never touched: users, allowlist entries, identity links, the Telegram links (telegram_links:
+the tie between a person and their Telegram account, removed by unlinking and with the user),
+anything alembic owns, and any
 table that is not named here (the favourites are one: favorite_recipes holds copies of answers
 that a person chose to keep, with no deadline and no key to the history, and this module does not
 know it; the long-term preferences of the product requirements are not in this schema yet, and
 when they arrive they will be independent tables too). A new table is therefore safe by default.
 
 Order, which is what the foreign keys demand: sessions, login states, emailed links,
-invitations (after the states bound to them), turn requests, messages, conversations. A
+invitations (after the states bound to them), pairing codes, turn requests, photos, messages,
+conversations. A
 message that a turn request links cannot be deleted, so requests go first (models.TurnRequest
 explains), and a message that a request still links is kept for the next run (it
 is reported as held back; with the application's own writers that is only a request still in
@@ -122,7 +130,9 @@ _sessions = _table(models.Session)
 _oidc_states = _table(models.OidcState)
 _challenges = _table(models.EmailLoginChallenge)
 _invitations = _table(models.IdentityInvitation)
+_link_codes = _table(models.TelegramLinkCode)
 _requests = _table(models.TurnRequest)
+_attachments = _table(models.MessageAttachment)
 _messages = _table(models.Message)
 _conversations = _table(models.Conversation)
 
@@ -134,7 +144,9 @@ class Category(str, enum.Enum):
     OIDC_STATES = "oidc_states"
     EMAIL_LOGIN_CHALLENGES = "email_login_challenges"
     IDENTITY_INVITATIONS = "identity_invitations"
+    TELEGRAM_LINK_CODES = "telegram_link_codes"
     TURN_REQUESTS = "turn_requests"
+    MESSAGE_ATTACHMENTS = "message_attachments"
     MESSAGES = "messages"
     CONVERSATIONS = "conversations"
 
@@ -222,6 +234,11 @@ class _Conditions:
         )
         return sa.and_(self.over(row), ~login_still_bound)
 
+    def attachment(self, row) -> sa.ColumnElement:
+        """A photo is as old as its message (or as an upload that was never sent): the same
+        two clauses as for a message. Nothing depends on it."""
+        return sa.or_(row.c.expires_at <= self.now, row.c.created_at <= self.cutoff)
+
     def request_expired(self, row) -> sa.ColumnElement:
         return sa.or_(row.c.expires_at <= self.now, row.c.created_at <= self.cutoff)
 
@@ -290,7 +307,9 @@ def _stages(conditions: _Conditions):
         (Category.OIDC_STATES, _oidc_states, conditions.over),
         (Category.EMAIL_LOGIN_CHALLENGES, _challenges, conditions.over),
         (Category.IDENTITY_INVITATIONS, _invitations, conditions.invitation),
+        (Category.TELEGRAM_LINK_CODES, _link_codes, conditions.over),
         (Category.TURN_REQUESTS, _requests, conditions.request),
+        (Category.MESSAGE_ATTACHMENTS, _attachments, conditions.attachment),
         (Category.MESSAGES, _messages, conditions.message),
         (Category.CONVERSATIONS, _conversations, conditions.conversation),
     )

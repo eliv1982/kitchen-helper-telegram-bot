@@ -775,6 +775,7 @@ def test_every_table_of_the_schema_has_a_retention_decision():
         "allowlist_entries": "who may sign in (also the record that an identity was revoked)",
         "identity_links": "the Telegram or email identity of a user",
         "favorite_recipes": "answers a person chose to keep: copies with no deadline and no link to the history",
+        "telegram_links": "the tie between a person and their Telegram account: removed by unlinking and with the user",
     }
     assert set(Base.metadata.tables) == purged | set(kept), (
         "a table was added or removed: decide its retention (RUNBOOK section 14.1)"
@@ -783,10 +784,12 @@ def test_every_table_of_the_schema_has_a_retention_decision():
 
 def test_the_purge_names_exactly_the_tables_it_may_delete_from():
     tables = {t.name for t in (retention._sessions, retention._oidc_states, retention._challenges,
-                               retention._invitations, retention._requests, retention._messages,
-                               retention._conversations)}
+                               retention._invitations, retention._link_codes, retention._requests,
+                               retention._attachments, retention._messages, retention._conversations)}
     assert tables == {c.value for c in Category}
-    untouchable = {"users", "allowlist_entries", "identity_links", "favorite_recipes", "alembic_version"}
+    untouchable = {
+        "users", "allowlist_entries", "identity_links", "favorite_recipes", "telegram_links", "alembic_version",
+    }
     assert not tables & untouchable
 
 

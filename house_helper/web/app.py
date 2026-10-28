@@ -30,6 +30,13 @@ created and read, and a message is answered 503. `chat_backend` replaces the bac
 in tests. On the way out the runner is stopped first (it lets running turns finish,
 then cancels what is left), then the backend's client is closed, then the database.
 
+The Telegram bot (telegram_chat.py) exists when the bot's token and username are configured
+(settings.py): the lifespan then builds its Bot API client, starts its polling loop and has the
+turn runner tell it about the turns of the website (to copy them to the person's Telegram).
+Its pairing routes (telegram_api.py) are always routed and answer 503 without it. On the way out
+it is stopped first, before the runner and the database it uses. `bot_transport` replaces the
+network to the Bot API in tests.
+
 The favorites API (favorites_api.py) is always routed as well: it needs no assistant, only the
 database and a signed-in user.
 
@@ -52,13 +59,24 @@ from house_helper.core.backend import ChatBackend
 from house_helper.core.openai_chat import StandaloneOpenAIBackend
 from house_helper.persistence.base import utcnow
 from house_helper.persistence.database import create_db_engine
-from house_helper.web import auth, chat_api, email_auth, favorites_api, health, invite_auth, ui
+from house_helper.web import (
+    auth,
+    chat_api,
+    email_auth,
+    favorites_api,
+    health,
+    invite_auth,
+    telegram_api,
+    ui,
+)
 from house_helper.web.auth import AuthService
 from house_helper.web.database import WebDatabase
 from house_helper.web.email_auth import EmailLoginService
-from house_helper.web.logsafety import install_access_log_redaction
+from house_helper.web.logsafety import install_access_log_redaction, install_bot_token_redaction
 from house_helper.web.mailer import EmailSender, SmtpEmailSender
 from house_helper.web.settings import WebSettings, load_web_settings
+from house_helper.web.telegram_botapi import BotApi
+from house_helper.web.telegram_chat import TelegramChat
 from house_helper.web.telegram_oidc import TelegramOidc
 from house_helper.web.turn_runner import WebTurnRunner
 
@@ -76,6 +94,7 @@ async def _lifespan(app: FastAPI):
     database = WebDatabase(create_db_engine(settings.database_url))
     app.state.database = database
     http: Optional[httpx.AsyncClient] = None
+    bot_http: Optional[httpx.AsyncClient] = None
     backend: Optional[ChatBackend] = app.state.chat_backend
     if backend is None and settings.provider is not None:
         backend = StandaloneOpenAIBackend(settings.provider)
@@ -104,13 +123,32 @@ async def _lifespan(app: FastAPI):
                 app.state.email = EmailLoginService(settings.email, service, sender)
         if backend is not None:
             app.state.chat = WebTurnRunner(database, backend, app.state.clock)
+        if settings.telegram_bot is not None:
+            install_bot_token_redaction()
+            bot_http = httpx.AsyncClient(
+                transport=app.state.bot_transport,
+                timeout=PROVIDER_TIMEOUT,
+                follow_redirects=False,
+            )
+            telegram = TelegramChat(
+                settings.telegram_bot,
+                BotApi(settings.telegram_bot.token, bot_http),
+                database,
+                lambda: app.state.chat,
+                app.state.clock,
+            )
+            app.state.telegram = telegram
+            if app.state.chat is not None:
+                app.state.chat.add_completion_hook(telegram.on_completion)
+            telegram.start()
         # The backend name only: never the URL, which may hold a password.
         logger.info(
             "Web application started (database backend: %s, Telegram login: %s, "
-            "email login: %s, assistant: %s)",
+            "email login: %s, Telegram bot: %s, assistant: %s)",
             settings.database_backend,
             "on" if settings.auth is not None else "off",
             "on" if settings.email is not None else "off",
+            "on" if settings.telegram_bot is not None else "off",
             "on" if backend is not None else "off",
         )
         yield
@@ -118,6 +156,9 @@ async def _lifespan(app: FastAPI):
         app.state.auth = None
         app.state.email = None
         try:
+            telegram, app.state.telegram = app.state.telegram, None
+            if telegram is not None:
+                await telegram.aclose()  # before the runner and the database it answers through
             runner, app.state.chat = app.state.chat, None
             if runner is not None:
                 await runner.aclose()
@@ -126,6 +167,8 @@ async def _lifespan(app: FastAPI):
                 await close_backend()  # only a backend this lifespan built
         finally:
             try:
+                if bot_http is not None:
+                    await bot_http.aclose()
                 if http is not None:
                     await http.aclose()
             finally:
@@ -140,6 +183,7 @@ def create_app(
     clock: Callable[[], datetime] = utcnow,
     email_sender: Optional[EmailSender] = None,
     chat_backend: Optional[ChatBackend] = None,
+    bot_transport: Optional[httpx.AsyncBaseTransport] = None,
 ) -> FastAPI:
     """A new application. `settings` defaults to the process environment.
 
@@ -147,12 +191,13 @@ def create_app(
     pages (/docs, /redoc, /openapi.json) are off: they are routes nobody asked
     for.
 
-    `provider_transport`, `clock`, `email_sender` and `chat_backend` are seams for
+    `provider_transport`, `clock`, `email_sender`, `chat_backend` and `bot_transport` are seams for
     tests: the transport stands in for the network to Telegram (None: the real one),
     the clock is the "now" of every expiry (sessions, logins, links, ID token claims,
     chat leases and timestamps), the sender stands in for the mail server (None: SMTP,
     as configured), and the backend answers chat messages instead of OpenAI (None: the
-    one the settings describe, or none at all).
+    one the settings describe, or none at all), and the bot transport stands in for the
+    network to the Telegram Bot API (None: the real one).
     """
     app = FastAPI(
         title="House Helper",
@@ -166,14 +211,17 @@ def create_app(
     app.state.clock = clock
     app.state.email_sender = email_sender
     app.state.chat_backend = chat_backend
+    app.state.bot_transport = bot_transport
     app.state.auth = None
     app.state.email = None
     app.state.chat = None
+    app.state.telegram = None
     app.include_router(health.router)
     app.include_router(auth.router)
     app.include_router(email_auth.router)
     app.include_router(invite_auth.router)
     app.include_router(chat_api.router)
     app.include_router(favorites_api.router)
+    app.include_router(telegram_api.router)
     app.include_router(ui.router)
     return app

@@ -261,6 +261,12 @@
     provider_error: "Помощник сейчас не может ответить. Попробуйте ещё раз чуть позже.",
     interrupted: "Работа над ответом была прервана. Отправьте сообщение ещё раз.",
     chat_unavailable: "Помощник сейчас недоступен.",
+    attachment_not_found: "Фото не найдено: возможно, оно уже удалено.",
+    attachment_unusable:
+      "Это фото нельзя прикрепить: оно уже использовано или устарело. Отправьте его заново.",
+    telegram_unavailable: "Подключение Telegram сейчас недоступно.",
+    telegram_already_linked:
+      "Telegram уже подключён. Сначала отключите его, чтобы подключить другой аккаунт.",
     service_unavailable: "Сервис временно недоступен. Попробуйте ещё раз чуть позже.",
     internal_error: "Что-то пошло не так. Попробуйте ещё раз чуть позже.",
     // Not in the catalogue: what the endpoints under /auth answer (a code, no message), and the
@@ -802,6 +808,24 @@
 
   var MESSAGE_STATUSES = { completed: true, in_progress: true, failed: true };
 
+  // The address of a photo that came with a message: this site's own route and nothing else. The server
+  // names it (chat_api._attachment_json); anything that is not exactly that is no photo.
+  var PHOTO_URL = /^\/api\/attachments\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+  function normalizePhoto(list) {
+    if (!Array.isArray(list) || list.length < 1) {
+      return null;
+    }
+    var first = list[0];
+    if (!isObject(first) || typeof first.url !== "string" || !PHOTO_URL.test(first.url)) {
+      return null;
+    }
+    if (first.content_type !== "image/jpeg" && first.content_type !== "image/png" && first.content_type !== "image/webp") {
+      return null;
+    }
+    return { url: first.url };
+  }
+
   function normalizeMessage(item) {
     if (!isObject(item) || !isCount(item.id) || item.id < 1) {
       return null;
@@ -827,6 +851,7 @@
       status: status,
       key: key,
       errorCode: typeof item.error_code === "string" && CODE_PATTERN.test(item.error_code) ? item.error_code : null,
+      photo: normalizePhoto(item.attachments),
     };
   }
 
@@ -2709,6 +2734,7 @@
           id: message.id,
           role: message.role,
           text: message.text,
+          photo: message.photo || null,
           time: formatMoment(message.createdAt, now),
           iso: isoTime(message.createdAt),
           status: message.status,
@@ -2917,6 +2943,406 @@
     };
   }
 
+  // --- Telegram: connecting an account -------------------------------------------------------------------------
+  //
+  // A small controller of its own, beside the conversations and independent of them: it reads whether the bot
+  // exists here and whether this person has linked an account (GET /api/telegram), asks for a pairing code
+  // (POST /api/telegram/link) and unlinks (DELETE /api/telegram/link). The code is shown once, as a link to the
+  // bot and as the command to send by hand, and is kept only in memory until it is used or has expired; while it
+  // is live the status is read every few seconds, so the panel changes by itself once the person has pressed Start
+  // in Telegram. Nothing is stored in the browser. Who is signed in is not its business: the page starts it when it
+  // shows the conversations and stops it when it stops showing them, and a late answer to a stopped panel is ignored
+  // (epoch).
+
+  var TELEGRAM_TEXT = {
+    loading: "Проверяем Telegram…",
+    unlinked:
+      "Подключите Telegram, чтобы писать помощнику с телефона. Разговоры будут общими с сайтом: " +
+      "начатое здесь можно продолжить там и наоборот.",
+    // Always under the panel: what connecting does with what the person writes, and what happens to it.
+    privacy:
+      "После подключения всё, что вы пишете помощнику на сайте, вместе с его ответами дублируется в этот " +
+      "Telegram-чат (отдельно это не отключается: только отключением Telegram). Текст сообщений и фотографии " +
+      "передаются в OpenAI для подготовки ответа. История разговоров хранится 365 дней и затем удаляется; " +
+      "рецепты, сохранённые в избранное, остаются, пока вы сами их не уберёте.",
+    unavailable:
+      "Бот Telegram сейчас не отвечает: подключить его и получать сообщения в Telegram пока нельзя. " +
+      "Сайт работает как обычно; попробуйте позже.",
+    linked: "Telegram подключён",
+    linkedAs: "Подключён: {name}",
+    pairing:
+      "Нажмите «Открыть Telegram» и затем «Запустить» (Start). Если ссылка не открылась, " +
+      "отправьте боту {bot} сообщение: /start {code}. Ссылка действует 10 минут.",
+    pairedNow: "Готово: Telegram подключён.",
+    expired: "Ссылка устарела. Нажмите «Подключить Telegram», чтобы получить новую.",
+    unlinkedNow: "Telegram отключён.",
+    askUnlink: "Отключить Telegram? Помощник перестанет писать вам туда, а бот перестанет отвечать.",
+    failed: "Не удалось получить состояние Telegram.",
+    connect: "Подключить Telegram",
+    open: "Открыть Telegram",
+    disconnect: "Отключить",
+    confirmDisconnect: "Да, отключить",
+    cancel: "Отмена",
+  };
+
+  var TELEGRAM_LINK = /^https:\/\/t\.me\/[A-Za-z][A-Za-z0-9_]{3,31}\?start=[A-Za-z0-9_-]{16,64}$/;
+  var TELEGRAM_CODE = /^[A-Za-z0-9_-]{16,64}$/;
+  var TELEGRAM_POLL_MS = 3000;
+  var TELEGRAM_TIMEOUT_MS = 15000;
+
+  function createTelegramLink(deps) {
+    var nowFn = deps.now || Date.now;
+    var scheduleFn = deps.setTimeout || setTimeout;
+    var cancelFn = deps.clearTimeout || clearTimeout;
+    var AbortCtor = deps.AbortController !== undefined
+      ? deps.AbortController
+      : typeof AbortController !== "undefined"
+        ? AbortController
+        : null;
+    var changed = deps.onChange || function () {};
+    var epoch = 0;
+    var pollTimer = null;
+    var state = blank();
+
+    function blank() {
+      return {
+        phase: "off", // off | loading | unlinked | pairing | linked | error
+        available: true, // false: the server says the bot is not reading Telegram just now
+        bot: null,
+        name: null,
+        link: null,
+        code: null,
+        deadline: null,
+        notice: null,
+        busy: false,
+        confirming: false,
+      };
+    }
+
+    function emit() {
+      changed();
+    }
+
+    function stopPolling() {
+      if (pollTimer !== null) {
+        cancelFn(pollTimer);
+        pollTimer = null;
+      }
+    }
+
+    function parse(text) {
+      try {
+        return { ok: true, value: JSON.parse(text) };
+      } catch (ignored) {
+        return { ok: false, value: null };
+      }
+    }
+
+    // One call: {kind: "ok"|"error"|"network", status, body}.
+    async function call(method, path, json) {
+      var headers = { Accept: "application/json" };
+      var init = { method: method, headers: headers, credentials: "same-origin", cache: "no-store", redirect: "error" };
+      if (json !== undefined) {
+        headers["Content-Type"] = "application/json";
+        init.body = JSON.stringify(json);
+      }
+      var timer = null;
+      if (AbortCtor) {
+        var aborter = new AbortCtor();
+        init.signal = aborter.signal;
+        timer = scheduleFn(function () {
+          aborter.abort();
+        }, TELEGRAM_TIMEOUT_MS);
+      }
+      var response;
+      var text;
+      try {
+        response = await deps.fetch(path, init);
+        text = await response.text();
+      } catch (ignored) {
+        if (timer !== null) {
+          cancelFn(timer);
+        }
+        return { kind: "network", status: 0, body: null };
+      }
+      if (timer !== null) {
+        cancelFn(timer);
+      }
+      var parsed = parse(text);
+      var body = parsed.ok && parsed.value !== null && typeof parsed.value === "object" ? parsed.value : null;
+      return { kind: response.status >= 200 && response.status < 300 ? "ok" : "error", status: response.status, body: body };
+    }
+
+    function readStatus(reply) {
+      // The shape of GET /api/telegram, or null.
+      var body = reply.body;
+      if (reply.kind !== "ok" || body === null || typeof body.enabled !== "boolean" || typeof body.linked !== "boolean") {
+        return null;
+      }
+      var name = null;
+      if (body.linked && body.account && typeof body.account === "object" && typeof body.account.name === "string") {
+        name = body.account.name;
+      }
+      var bot = typeof body.bot_username === "string" ? body.bot_username : null;
+      return { enabled: body.enabled, available: body.available !== false, linked: body.linked, name: name, bot: bot };
+    }
+
+    function applyStatus(status, quiet) {
+      if (!status.enabled) {
+        stopPolling();
+        state = blank();
+        return;
+      }
+      state.bot = status.bot;
+      state.available = status.available;
+      if (status.linked) {
+        var wasPairing = state.phase === "pairing";
+        stopPolling();
+        state.phase = "linked";
+        state.name = status.name;
+        state.link = null;
+        state.code = null;
+        state.deadline = null;
+        state.confirming = false;
+        if (wasPairing) {
+          state.notice = TELEGRAM_TEXT.pairedNow;
+        } else if (!quiet) {
+          state.notice = null;
+        }
+      } else if (state.phase !== "pairing") {
+        state.phase = "unlinked";
+        state.name = null;
+        state.confirming = false;
+        if (!quiet) {
+          state.notice = null;
+        }
+      }
+    }
+
+    function failure(reply, fallback) {
+      if (reply.kind === "network") {
+        return TEXT.network;
+      }
+      var code = reply.body && typeof reply.body.detail === "string" ? reply.body.detail : null;
+      if (code !== null && Object.prototype.hasOwnProperty.call(CODE_MESSAGES, code)) {
+        return CODE_MESSAGES[code];
+      }
+      return fallback;
+    }
+
+    // Reads the status. Called when the conversations are shown, when the page comes back, and by the poll.
+    async function refresh(quiet) {
+      var mine = epoch;
+      if (state.phase === "off" && !quiet) {
+        state.phase = "loading";
+        emit();
+      }
+      var reply = await call("GET", "/api/telegram");
+      if (mine !== epoch) {
+        return;
+      }
+      var status = readStatus(reply);
+      if (status === null) {
+        if (reply.status === 401) {
+          stopPolling();
+          state = blank(); // the conversations deal with the end of a session; this panel simply goes
+        } else if (state.phase === "pairing") {
+          // (a poll that failed: the next one tries again; the code is still good)
+        } else {
+          stopPolling();
+          state.phase = "error";
+          state.notice = failure(reply, TELEGRAM_TEXT.failed);
+          state.busy = false;
+        }
+        emit();
+        return;
+      }
+      applyStatus(status, quiet);
+      emit();
+    }
+
+    function schedulePoll() {
+      stopPolling();
+      var mine = epoch;
+      pollTimer = scheduleFn(async function () {
+        pollTimer = null;
+        if (mine !== epoch || state.phase !== "pairing") {
+          return;
+        }
+        if (state.deadline !== null && nowFn() >= state.deadline) {
+          state.phase = "unlinked";
+          state.link = null;
+          state.code = null;
+          state.deadline = null;
+          state.notice = TELEGRAM_TEXT.expired;
+          emit();
+          return;
+        }
+        await refresh(true);
+        if (mine === epoch && state.phase === "pairing") {
+          schedulePoll();
+        }
+      }, TELEGRAM_POLL_MS);
+    }
+
+    async function connect() {
+      if (state.busy || (state.phase !== "unlinked" && state.phase !== "error")) {
+        return;
+      }
+      if (state.phase === "error") {
+        // ("Повторить" after a failure to read the status: read it again, ask for no code yet.)
+        await refresh(false);
+        return;
+      }
+      var mine = epoch;
+      state.busy = true;
+      state.notice = null;
+      emit();
+      var reply = await call("POST", "/api/telegram/link", {});
+      if (mine !== epoch) {
+        return;
+      }
+      state.busy = false;
+      var body = reply.body;
+      if (
+        reply.kind === "ok" &&
+        body !== null &&
+        typeof body.code === "string" &&
+        TELEGRAM_CODE.test(body.code) &&
+        typeof body.link === "string" &&
+        TELEGRAM_LINK.test(body.link) &&
+        typeof body.expires_in_seconds === "number" &&
+        body.expires_in_seconds > 0
+      ) {
+        state.phase = "pairing";
+        state.code = body.code;
+        state.link = body.link;
+        state.deadline = nowFn() + body.expires_in_seconds * 1000;
+        state.notice = null;
+        schedulePoll();
+        emit();
+        return;
+      }
+      if (reply.body !== null && reply.body.detail === "telegram_already_linked") {
+        await refresh(false);
+        return;
+      }
+      if (reply.status === 401) {
+        state = blank();
+        emit();
+        return;
+      }
+      state.notice = failure(reply, TEXT.unexpected);
+      emit();
+    }
+
+    function askDisconnect() {
+      if (state.phase === "linked" && !state.busy) {
+        state.confirming = true;
+        emit();
+      }
+    }
+
+    function cancelDisconnect() {
+      if (state.confirming) {
+        state.confirming = false;
+        emit();
+      }
+    }
+
+    async function disconnect() {
+      if (state.phase !== "linked" || state.busy || !state.confirming) {
+        return;
+      }
+      var mine = epoch;
+      state.busy = true;
+      emit();
+      var reply = await call("DELETE", "/api/telegram/link");
+      if (mine !== epoch) {
+        return;
+      }
+      state.busy = false;
+      state.confirming = false;
+      if (reply.kind === "ok") {
+        state.phase = "unlinked";
+        state.name = null;
+        state.notice = TELEGRAM_TEXT.unlinkedNow;
+      } else if (reply.status === 401) {
+        state = blank();
+      } else {
+        state.notice = failure(reply, TEXT.unexpected);
+      }
+      emit();
+    }
+
+    // The page shows the conversations: ask what there is to show.
+    function start() {
+      epoch++;
+      stopPolling();
+      state = blank();
+      return refresh(false);
+    }
+
+    // The page stops showing the conversations (signed out, another person, the session ended): nothing of
+    // this person's stays in memory, and answers still on their way change nothing.
+    function stop() {
+      epoch++;
+      stopPolling();
+      state = blank();
+      emit();
+    }
+
+    // The tab is shown again: the person may have pressed Start in Telegram meanwhile.
+    function recheck() {
+      if (state.phase === "off" || state.busy) {
+        return Promise.resolve();
+      }
+      return refresh(state.phase !== "error");
+    }
+
+    function getView() {
+      var linked = state.phase === "linked";
+      var pairing = state.phase === "pairing";
+      var text = "";
+      if (state.phase === "loading") {
+        text = TELEGRAM_TEXT.loading;
+      } else if (state.phase === "unlinked") {
+        text = TELEGRAM_TEXT.unlinked;
+      } else if (pairing) {
+        text = fill(TELEGRAM_TEXT.pairing, { bot: "@" + (state.bot || ""), code: state.code });
+      } else if (linked && state.confirming) {
+        text = TELEGRAM_TEXT.askUnlink;
+      } else if (linked) {
+        text = state.name ? fill(TELEGRAM_TEXT.linkedAs, { name: state.name }) : TELEGRAM_TEXT.linked;
+      }
+      return {
+        visible: state.phase !== "off",
+        phase: state.phase,
+        text: text,
+        notice: state.available ? state.notice : TELEGRAM_TEXT.unavailable,
+        privacy: state.phase === "off" || state.phase === "loading" ? "" : TELEGRAM_TEXT.privacy,
+        link: pairing ? state.link : null,
+        busy: state.busy,
+        canConnect: (state.phase === "unlinked" || state.phase === "error") && !state.busy && state.available,
+        canAskDisconnect: linked && !state.confirming && !state.busy,
+        canConfirmDisconnect: linked && state.confirming && !state.busy,
+        canCancel: linked && state.confirming && !state.busy,
+        retry: state.phase === "error",
+      };
+    }
+
+    return {
+      start: start,
+      stop: stop,
+      recheck: recheck,
+      connect: connect,
+      askDisconnect: askDisconnect,
+      cancelDisconnect: cancelDisconnect,
+      disconnect: disconnect,
+      getView: getView,
+    };
+  }
+
   return {
     MAX_MESSAGE_LENGTH: MAX_MESSAGE_LENGTH,
     PAGE_SIZE: PAGE_SIZE,
@@ -2949,5 +3375,9 @@
     classifyMessageSend: classifyMessageSend,
     createPendingStore: createPendingStore,
     createController: createController,
+    createTelegramLink: createTelegramLink,
+    TELEGRAM_TEXT: TELEGRAM_TEXT,
+    PHOTO_URL: PHOTO_URL,
+    normalizePhoto: normalizePhoto,
   };
 });

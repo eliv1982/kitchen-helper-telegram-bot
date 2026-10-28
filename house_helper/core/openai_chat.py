@@ -29,6 +29,7 @@ produced no visible text at all. That is an empty response, as before, but the l
 why (and how many tokens the reasoning used, which is also logged for every answer).
 """
 
+import base64
 import logging
 import re
 from typing import Any, Optional
@@ -53,6 +54,29 @@ FINISH_REASON_LENGTH = "length"
 # `param`, when they are plain identifiers ("insufficient_quota", "max_tokens"). They are
 # fixed words of the API, not text it echoes; anything else is left out.
 _IDENTIFIER = re.compile(r"[a-z0-9_.\-]{1,64}")
+
+
+def to_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The conversation in the shape the Chat Completions API takes. A message whose content is
+    a string is passed on as it is; one made of parts has its pictures turned into `image_url`
+    parts holding a data URL (the bytes, base64), the only way to give the API a picture that
+    is not on the internet. Anything in a part that is not one of the two kinds is dropped:
+    the parts are made by persistence.conversations, but this is the door to a provider."""
+    converted: list[dict[str, Any]] = []
+    for message in messages:
+        content = message["content"]
+        if isinstance(content, str):
+            converted.append({"role": message["role"], "content": content})
+            continue
+        parts: list[dict[str, Any]] = []
+        for part in content:
+            if part.get("type") == "text":
+                parts.append({"type": "text", "text": part["text"]})
+            elif part.get("type") == "image":
+                url = f"data:{part['content_type']};base64,{base64.b64encode(part['data']).decode('ascii')}"
+                parts.append({"type": "image_url", "image_url": {"url": url}})
+        converted.append({"role": message["role"], "content": parts})
+    return converted
 
 
 class StandaloneOpenAIBackend:
@@ -86,7 +110,7 @@ class StandaloneOpenAIBackend:
 
     async def complete(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         *,
         conversation: ConversationKey,
         context_len: int,
@@ -117,7 +141,10 @@ class StandaloneOpenAIBackend:
         try:
             response = await self._get_client().chat.completions.create(
                 model=settings.model,
-                messages=[{"role": "system", "content": KITCHEN_SYSTEM_PROMPT}, *messages],
+                messages=[
+                    {"role": "system", "content": KITCHEN_SYSTEM_PROMPT},
+                    *to_openai_messages(messages),
+                ],
                 **settings.completion_params(),
             )
         except RateLimitError as exc:

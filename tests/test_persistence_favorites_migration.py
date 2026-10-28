@@ -24,6 +24,7 @@ from house_helper.persistence.database import (
 )
 from tests.persistence_support import CREATED, raw_insert, stored
 from tests.test_persistence_migrations import (
+    FAVORITES,
     HEAD,
     LATER,
     OIDC_STATE,
@@ -36,7 +37,7 @@ from tests.test_persistence_migrations import (
 )
 from tests.test_persistence_schema import TABLES
 
-TABLES_BEFORE_0007 = TABLES - {"favorite_recipes"}
+TABLES_BEFORE_0007 = TABLES - {"favorite_recipes", "telegram_links", "telegram_link_codes", "message_attachments"}
 
 
 @pytest.fixture
@@ -155,8 +156,8 @@ def test_downgrading_the_favorites_drops_only_that_table(tmp_path):
 
 
 def test_the_favorites_revision_renders_as_one_table_and_one_index_in_postgresql_sql():
-    up, down = _offline_sql("up"), _offline_sql("down_from_head")
-    revision = up.split(f"Running upgrade {OIDC_STATE} -> {HEAD}")[1]
+    up, down = _offline_sql("up"), _offline_sql("down_from_favorites")
+    revision = up.split(f"Running upgrade {OIDC_STATE} -> {FAVORITES}")[1].split("-- Running")[0]
 
     statements = [re.sub(r"\s+", " ", part.strip()) for part in revision.split(";")]
     statements = [part for part in statements if part not in ("", "COMMIT")]
@@ -172,7 +173,7 @@ def test_the_favorites_revision_renders_as_one_table_and_one_index_in_postgresql
     assert statements[1] == (
         "CREATE INDEX ix_favorite_recipes_user_id_created_at ON favorite_recipes (user_id, created_at)"
     )
-    assert statements[2].startswith("UPDATE alembic_version SET version_num='" + HEAD + "'")
+    assert statements[2].startswith("UPDATE alembic_version SET version_num='" + FAVORITES + "'")
     assert len(statements) == 3  # nothing else is created, altered, updated or dropped
     assert "ALTER TABLE" not in revision and "DROP" not in revision
     assert "DELETE FROM" not in revision  # (ON DELETE CASCADE is the key's rule, not a data step)

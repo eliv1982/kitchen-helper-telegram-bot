@@ -33,7 +33,9 @@ request with the same idempotency key; the caller then generates the reply with 
 transaction open; complete_turn stores the assistant message and moves to COMPLETED,
 or fail_turn moves to FAILED (failure_kind generation). A FAILED request, and a
 PROCESSING one whose lease has run out (its worker is gone), is claimed again by the
-same key: attempt_count + 1, the earlier attempt's late answer is refused.
+same key: attempt_count + 1, the earlier attempt's late answer is refused. (A caller for
+whom nobody chose to send the message again, a Telegram update that is delivered a second
+time, passes reclaim=False and gets TurnAttempted instead: see begin_turn.)
 
 The lease. A lease is the exclusive right to complete the request until
 lease_expires_at, and it is measured from the instant of the claim: begin_turn reads
@@ -92,12 +94,13 @@ conversation already found through its owner and does not decide ownership.
 import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Callable, Optional, Union
+from typing import Any, Callable, Optional, Union
 from uuid import UUID
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Session as OrmSession
 
+from house_helper.persistence import attachments as att
 from house_helper.persistence.base import RETENTION, utcnow
 from house_helper.persistence.conversations import ConversationNotFound, build_context
 from house_helper.persistence.identifiers import validate_idempotency_key
@@ -220,6 +223,14 @@ class TurnUnusable(Exception):
     cancelled, or holds a reply that was never committed (not produced by this module)."""
 
 
+class TurnAttempted(Exception):
+    """The request of this key was claimed before, so a generation attempt began, it did
+    not complete, and the caller said it must not be claimed again (begin_turn's
+    `reclaim=False`). Whether the provider was asked, and what it would have answered, is
+    not known: all that is recorded is that the attempt began (attempt_count > 0, committed
+    before the provider is called). Nothing is generated and nothing is changed."""
+
+
 class LeaseLost(Exception):
     """The attempt no longer owns its request: another attempt claimed it after the
     lease ran out, or it already ended. The caller's work is discarded; the
@@ -236,7 +247,9 @@ class Claim:
     retry: bool  # an earlier attempt failed or was abandoned
     user_message_id: int
     user_message_created_at: datetime
-    context: list[dict[str, str]]  # what to send to the AI, ending with the user's message
+    # What to send to the AI, ending with the user's message (conversations.build_context says
+    # what a message with a photo looks like).
+    context: list[dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -244,6 +257,7 @@ class StoredMessage:
     id: int
     text: str
     created_at: datetime
+    attachment: Optional[att.AttachmentRef] = None
 
 
 @dataclass(frozen=True)
@@ -316,20 +330,21 @@ def _retire_expired(
     )
 
 
-def _stored(message: Message) -> StoredMessage:
-    return StoredMessage(message.id, message.content, message.created_at)
+def _stored(message: Message, attachment: Optional[att.AttachmentRef] = None) -> StoredMessage:
+    return StoredMessage(message.id, message.content, message.created_at, attachment)
 
 
-def _completed(session: OrmSession, turn: TurnRequest) -> CompletedTurn:
+def _completed(session: OrmSession, turn: TurnRequest, now: datetime) -> CompletedTurn:
     if turn.assistant_message_id is None:
         raise TurnUnusable
     user = session.get(Message, turn.user_message_id)
     assistant = session.get(Message, turn.assistant_message_id)
     payload = turn.result_payload or {}
+    photo = att.refs_for_messages(session, [user.id], now=now).get(user.id)
     return CompletedTurn(
         turn_id=turn.id,
         conversation_id=turn.conversation_id,
-        user_message=_stored(user),
+        user_message=_stored(user, photo),
         assistant_message=_stored(assistant),
         truncated=bool(payload.get("truncated")),
     )
@@ -395,6 +410,8 @@ def begin_turn(
     clock: Callable[[], datetime],
     lease: timedelta,
     max_context_messages: int,
+    attachment_id: Optional[UUID] = None,
+    reclaim: bool = True,
 ) -> Union[Claim, CompletedTurn]:
     """Accept a user's message for answering.
 
@@ -417,6 +434,23 @@ def begin_turn(
     TurnInFlight, TurnSuperseded and TurnUnusable (see their docstrings), ValueError
     for a key or text that is not one. Nothing is written for any of them: the
     caller's transaction rolls back with the exception.
+
+    `attachment_id` names an unattached photo of the user (attachments.store) that the new
+    message takes with it, in this very transaction: attachments.AttachmentUnusable (and
+    nothing stored, the message included) if it is unknown, somebody else's, taken or expired.
+    For a key that has been used before it is a check and not an action: the request already
+    holds its photo, and a key presented with another photo (or one that never had it) is an
+    IdempotencyKeyConflict, as it is for another text. A repeat that names no photo is the
+    same request.
+
+    `reclaim` says whether a key whose earlier attempt did not complete may be claimed again
+    (the website's retry: the person chose to send it again). With reclaim=False (a Telegram
+    update that Telegram delivers a second time: nobody chose anything) a FAILED request, or
+    one whose lease has run out, raises TurnAttempted instead, whatever it failed with: the
+    claim of an attempt is committed before the provider is called, so "attempt_count > 0" is
+    the durable record that the provider may have been asked, and it survives a restart. A
+    COMPLETED request is replayed either way, one with a live lease is TurnInFlight either
+    way, and a request that was never claimed (PENDING, attempt_count 0) is claimed.
     """
     key = validate_idempotency_key(idempotency_key)
     if not isinstance(text, str) or not text:
@@ -431,6 +465,10 @@ def begin_turn(
         _retire_expired(session, conversation_id, now, except_turn=None)
         _refuse_if_busy(session, conversation_id, now, except_turn=None)
         turn, _ = open_turn_request(session, conversation, key, text, now=now)
+        if attachment_id is not None:
+            att.attach(
+                session, user_id, attachment_id, turn.user_message_id, expires_at=turn.expires_at, now=now
+            )
         return _claim(
             session, turn, now=now, lease=lease, max_context_messages=max_context_messages, retry=False
         )
@@ -439,9 +477,13 @@ def begin_turn(
         raise IdempotencyKeyConflict("this idempotency key was used with a different request")
     if existing.expires_at <= now:
         raise TurnUnusable
+    if attachment_id is not None:
+        held = att.refs_for_messages(session, [existing.user_message_id], now=now).get(existing.user_message_id)
+        if held is None or held.id != attachment_id:
+            raise IdempotencyKeyConflict("this idempotency key was used with a different photo")
     status = existing.status
     if status == TurnStatus.COMPLETED.value:
-        return _completed(session, existing)
+        return _completed(session, existing, now)
     if status in (TurnStatus.PROCESSING.value, TurnStatus.COMMITTING.value):
         if existing.lease_expires_at is not None and existing.lease_expires_at > now:
             raise TurnInFlight
@@ -450,6 +492,9 @@ def begin_turn(
             raise TurnUnusable  # a reply is stored and waits for a commit: R5's to finish
     elif status != TurnStatus.PENDING.value:
         raise TurnUnusable  # cancelled
+
+    if not reclaim and existing.attempt_count > 0:
+        raise TurnAttempted
 
     # A retry: of a failure, of an abandoned attempt, or of a request left pending.
     newer = session.scalar(
@@ -535,10 +580,11 @@ def complete_turn(
         .execution_options(synchronize_session=False)
     )
     user = session.get(Message, claim.user_message_id)
+    photo = att.refs_for_messages(session, [user.id], now=now).get(user.id)
     return CompletedTurn(
         turn_id=claim.turn_id,
         conversation_id=claim.conversation_id,
-        user_message=_stored(user),
+        user_message=_stored(user, photo),
         assistant_message=_stored(message),
         truncated=truncated,
     )

@@ -14,6 +14,7 @@ idempotent, and the lifespan calls it (see app.py).
 """
 
 import logging
+import re
 
 ACCESS_LOGGER = "uvicorn.access"
 _PREFIX = "/auth/"
@@ -37,3 +38,44 @@ def install_access_log_redaction() -> None:
     logger = logging.getLogger(ACCESS_LOGGER)
     if not any(isinstance(existing, RedactAuthQuery) for existing in logger.filters):
         logger.addFilter(RedactAuthQuery())
+
+
+# --- the Telegram bot's token -----------------------------------------------------------
+#
+# The Bot API is addressed as https://api.telegram.org/bot<token>/<method>, so the token is
+# in the URL of every request, and httpx writes that URL to the "httpx" logger at INFO for
+# each one. The deployed logging configuration keeps that logger at WARNING, but a level is
+# one setting away from a leak, and "no secret in logs" is not a place for exceptions: the
+# filter replaces the token with a marker in whatever those loggers write. telegram_botapi
+# never puts the URL in an exception or a log line of its own.
+
+HTTP_LOGGERS = ("httpx", "httpcore")
+_BOT_TOKEN_IN_URL = re.compile(r"/(file/)?bot[0-9]{5,16}:[A-Za-z0-9_-]{30,64}(?=[/\s\"'?]|$)")
+
+
+def _hide_token(found: "re.Match[str]") -> str:
+    return "/" + (found.group(1) or "") + "bot[redacted]"
+
+
+def redact_bot_token(text: str) -> str:
+    return _BOT_TOKEN_IN_URL.sub(_hide_token, text)
+
+
+class RedactBotToken(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:  # a record that cannot be formatted is not ours to repair
+            return True
+        redacted = redact_bot_token(message)
+        if redacted != message:
+            record.msg = redacted
+            record.args = ()
+        return True
+
+
+def install_bot_token_redaction() -> None:
+    for name in HTTP_LOGGERS:
+        logger = logging.getLogger(name)
+        if not any(isinstance(existing, RedactBotToken) for existing in logger.filters):
+            logger.addFilter(RedactBotToken())

@@ -39,6 +39,14 @@ Email login (a link mailed over SMTP; needs no Telegram variable):
   HOUSE_HELPER_SMTP_USERNAME          optional, together with the password: the login
   HOUSE_HELPER_SMTP_PASSWORD            to the mail server
 
+The Telegram bot (talking to the assistant from Telegram as the same person who uses the
+website, see telegram_chat.py) is optional and has nothing to do with the sign-in above: it is
+the bot's own token, not the Login Widget's client id. Both variables or neither:
+
+  HOUSE_HELPER_TELEGRAM_BOT_TOKEN     the token @BotFather gave the bot
+  HOUSE_HELPER_TELEGRAM_BOT_USERNAME  its @username (with or without the @), for the link
+                                      https://t.me/<username>?start=<code> that pairs an account
+
 The assistant (the chat's AI provider) is configured by the same variables as the
 Telegram bot's, read through house_helper.core.provider_settings: OPENAI_API_KEY (the
 only required one), OPENAI_MODEL, TEMPERATURE, MAX_TOKENS, OPENAI_TIMEOUT_SECONDS and
@@ -86,6 +94,7 @@ from house_helper.persistence.identifiers import (
     is_printable_ascii,
     normalize_identity,
 )
+from house_helper.web.telegram_botapi import TOKEN_PATTERN
 
 PUBLIC_URL_ENV = "HOUSE_HELPER_PUBLIC_URL"
 TELEGRAM_CLIENT_ID_ENV = "HOUSE_HELPER_TELEGRAM_CLIENT_ID"
@@ -97,6 +106,8 @@ SMTP_SECURITY_ENV = "HOUSE_HELPER_SMTP_SECURITY"
 SMTP_USERNAME_ENV = "HOUSE_HELPER_SMTP_USERNAME"
 SMTP_PASSWORD_ENV = "HOUSE_HELPER_SMTP_PASSWORD"
 EMAIL_FROM_ENV = "HOUSE_HELPER_EMAIL_FROM"
+TELEGRAM_BOT_TOKEN_ENV = "HOUSE_HELPER_TELEGRAM_BOT_TOKEN"
+TELEGRAM_BOT_USERNAME_ENV = "HOUSE_HELPER_TELEGRAM_BOT_USERNAME"
 
 TELEGRAM_CALLBACK_PATH = "/auth/telegram/callback"
 
@@ -242,6 +253,45 @@ class AuthSettings(SessionSettings):
         return ("__Host-" if self.secure_cookies else "") + "hh_login"
 
 
+# A bot's username: 5 to 32 characters, letters, digits and "_", starting with a letter, and
+# ending in "bot" in any case (Telegram's rule for bots).
+_BOT_USERNAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{1,29}[Bb][Oo][Tt]")
+
+
+@dataclass(frozen=True)
+class BotSettings:
+    """The Telegram bot, fully configured. Validated on construction."""
+
+    # repr=False: a settings object ends up in logs and test failure output.
+    token: str = field(repr=False)
+    username: str
+    # How long one getUpdates call may wait for an update (the Bot API's `timeout`).
+    poll_seconds: int = 25
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.token, str) or TOKEN_PATTERN.fullmatch(self.token) is None:
+            raise WebConfigError(f"{TELEGRAM_BOT_TOKEN_ENV} is not a bot token")
+        if (
+            not isinstance(self.username, str)
+            or _BOT_USERNAME.fullmatch(self.username) is None
+            or not 5 <= len(self.username) <= 32
+        ):
+            raise WebConfigError(
+                f"{TELEGRAM_BOT_USERNAME_ENV} must be the bot's username, like house_helper_bot"
+            )
+        if (
+            not isinstance(self.poll_seconds, int)
+            or isinstance(self.poll_seconds, bool)
+            or not 1 <= self.poll_seconds <= 50
+        ):
+            raise WebConfigError("the bot's polling wait must be between 1 and 50 seconds")
+
+    @property
+    def link_base(self) -> str:
+        """Where a pairing link starts: the code is appended as ?start=<code>."""
+        return f"https://t.me/{self.username}"
+
+
 _HOSTNAME_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
 _SMTP_HOST = re.compile(rf"{_HOSTNAME_LABEL}(?:\.{_HOSTNAME_LABEL})*")
 _MAX_SMTP_HOST_LENGTH = 253
@@ -320,6 +370,8 @@ class WebSettings:
     # The assistant. None: not configured, and the chat answers 503. (Its repr hides
     # the key.)
     provider: Optional[ProviderSettings] = None
+    # The Telegram bot. None: not configured, and the website offers no pairing.
+    telegram_bot: Optional[BotSettings] = None
 
     @property
     def session(self) -> Optional[SessionSettings]:
@@ -453,6 +505,25 @@ def load_provider_settings(env: Optional[Mapping[str, str]] = None) -> Optional[
     return settings
 
 
+def load_bot_settings(env: Optional[Mapping[str, str]] = None) -> Optional[BotSettings]:
+    """The bot's settings from `env` (os.environ by default): None when neither of its
+    variables is set, BotSettings when both are, WebConfigError for one without the other or
+    for a value that is not what it names. A value is never quoted in the error."""
+    source = os.environ if env is None else env
+    values = _values(source, (TELEGRAM_BOT_TOKEN_ENV, TELEGRAM_BOT_USERNAME_ENV))
+    if all(value is None for value in values.values()):
+        return None
+    missing = [name for name, value in values.items() if value is None]
+    if missing:
+        raise WebConfigError(
+            "The Telegram bot is only partly configured; also set: " + ", ".join(missing)
+        )
+    return BotSettings(
+        token=values[TELEGRAM_BOT_TOKEN_ENV],
+        username=values[TELEGRAM_BOT_USERNAME_ENV].removeprefix("@"),
+    )
+
+
 def load_web_settings(env: Optional[Mapping[str, str]] = None) -> WebSettings:
     """Settings from `env` (os.environ by default). Raises WebConfigError."""
     source = os.environ if env is None else env
@@ -461,4 +532,5 @@ def load_web_settings(env: Optional[Mapping[str, str]] = None) -> WebSettings:
         auth=load_auth_settings(source),
         email=load_email_settings(source),
         provider=load_provider_settings(source),
+        telegram_bot=load_bot_settings(source),
     )

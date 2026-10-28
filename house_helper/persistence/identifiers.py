@@ -36,6 +36,11 @@ MAX_IDEMPOTENCY_KEY_LENGTH: Final = 128  # the width of turn_requests.idempotenc
 MAX_SUBJECT_LENGTH: Final = 255  # the width of allowlist_entries.subject / identity_links.subject
 MAX_EMAIL_LENGTH: Final = 320  # the width of identity_links.email (a display snapshot)
 
+# A photo kept with a message: the largest size, and the kinds of picture, that are stored. The
+# database holds the same two facts as CHECKs (models.MessageAttachment).
+MAX_ATTACHMENT_BYTES: Final = 5 * 1024 * 1024
+ATTACHMENT_CONTENT_TYPES: Final = ("image/jpeg", "image/png", "image/webp")
+
 # Written out here, not imported from models.py: models.py imports this module.
 PROVIDER_TELEGRAM: Final = "telegram"
 PROVIDER_EMAIL: Final = "email"
@@ -78,6 +83,12 @@ def is_mailable_address(address: object) -> bool:
         and len(found.group(1)) <= MAX_MAILABLE_LOCAL_LENGTH
         and len(found.group(2)) <= MAX_MAILABLE_DOMAIN_LENGTH
     )
+
+
+# The idempotency keys of Telegram turns are "tg-<update id>" (persistence.telegram.update_key).
+# The prefix belongs to the bot: the website refuses a key that starts with it, so that a key made
+# up by a signed-in person can never stand for a Telegram update of somebody else.
+TELEGRAM_UPDATE_KEY_PREFIX = "tg-"
 
 
 def validate_idempotency_key(key: object) -> str:

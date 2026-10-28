@@ -83,6 +83,8 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from house_helper.persistence.base import RETENTION, RETENTION_DAYS, Base, utcnow
 from house_helper.persistence.identifiers import (
+    ATTACHMENT_CONTENT_TYPES,
+    MAX_ATTACHMENT_BYTES,
     MAX_EMAIL_LENGTH,
     MAX_IDEMPOTENCY_KEY_LENGTH,
     MAX_SUBJECT_LENGTH,
@@ -909,6 +911,132 @@ class FavoriteRecipe(Base):
     user: Mapped[User] = relationship(back_populates="favorites")
 
 
+class MessageAttachment(Base):
+    """A photo that belongs to a message of a conversation, kept in the database beside it.
+
+    Why the database. The picture is private conversation data with the retention of the
+    message it came with, and the backup of the database is already the backup of the
+    conversations: stored here, a photo is in every backup, is deleted by the same purge
+    (expires_at, and the foreign key to its message), goes with its user and needs no second
+    place to protect, no path to validate and no file left behind by a failed write. The price
+    is size, and the cap is small on purpose (MAX_ATTACHMENT_BYTES).
+
+    Two stages. An attachment is made first (attachments.store), owned by a user and not yet
+    attached to anything (message_id NULL, expires_at an hour after it was made: an upload that
+    is never sent goes away on its own), and is then attached to the user message of a turn in
+    the very transaction that creates that message (turns.begin_turn), which also gives it the
+    message's deadline. One attachment per message (UNIQUE message_id: NULLs do not collide).
+    The owner is user_id, the user of the session that made it; the message it is attached to is
+    always in a conversation of that same user (attachments.attach checks it under the
+    conversation's lock), and every read goes through user_id.
+
+    content_type is one of ATTACHMENT_CONTENT_TYPES, decided by the bytes (attachments.sniff),
+    never by what the sender called them. size_bytes is length(data), as a CHECK says; sha256 is
+    the digest of data. Neither the sender's file name nor a Telegram file id is stored.
+
+    Retention: expires_at is the message's, so the picture dies with its text; the purge deletes
+    it by expires_at (or created_at beyond the ceiling) before the messages.
+    """
+
+    __tablename__ = "message_attachments"
+    __table_args__ = (
+        sa.UniqueConstraint("message_id"),
+        sa.Index(None, "user_id", "created_at"),
+        sa.Index(None, "expires_at"),
+        sa.CheckConstraint(
+            "content_type IN (" + ", ".join(f"'{kind}'" for kind in ATTACHMENT_CONTENT_TYPES) + ")",
+            name="content_type_valid",
+        ),
+        sa.CheckConstraint(f"size_bytes BETWEEN 1 AND {MAX_ATTACHMENT_BYTES}", name="size_bytes_valid"),
+        sa.CheckConstraint("length(data) = size_bytes", name="data_matches_size"),
+        sa.CheckConstraint("length(sha256) = 64", name="sha256_length"),
+        sa.CheckConstraint("expires_at > created_at", name="expires_after_created"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("users.id", ondelete="CASCADE"))
+    message_id: Mapped[Optional[int]] = mapped_column(
+        _BIGINT_ID, sa.ForeignKey("messages.id", ondelete="CASCADE")
+    )
+    content_type: Mapped[str] = mapped_column(sa.String(32))
+    size_bytes: Mapped[int] = mapped_column(sa.Integer)
+    sha256: Mapped[str] = mapped_column(sa.String(64))
+    data: Mapped[bytes] = mapped_column(sa.LargeBinary)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    expires_at: Mapped[datetime]
+
+
+class TelegramLink(Base):
+    """The Telegram account a user talks to the bot from: the tie between the Bot API's
+    identity and an internal user.
+
+    It is NOT the Telegram sign-in identity. A sign-in is the allowlist entry and identity
+    link of provider 'telegram', whose subject is the `sub` of the OIDC ID token; the bot
+    sees the numeric id of the sender instead, and Telegram's documentation shows the two
+    as different values with no relationship between them. So nothing here is derived from
+    a `sub`: a link comes into being in one way only, a pairing code that a signed-in
+    person asked for on the website and then presented to the bot from the Telegram
+    account being linked (telegram.consume_link_code).
+
+    telegram_user_id is the sender's id, and in a private chat it is also the chat's id
+    (that is what the bot replies to). A group's id is negative and a bot's own id is not
+    a person's, so the CHECK that it is positive is part of "private chats only". One
+    account per person and one person per account: both columns are UNIQUE. Unlinking
+    deletes the row; a revoked or disabled user keeps the row but it is not honoured
+    (telegram.telegram_user_for_chat looks at the user's state on every message).
+
+    display_name is what the account called itself when it was linked (its @username or
+    first name, shortened), kept so that the person can see on the website which account
+    they connected. It is never used to decide anything.
+    """
+
+    __tablename__ = "telegram_links"
+    __table_args__ = (
+        sa.UniqueConstraint("user_id"),
+        sa.UniqueConstraint("telegram_user_id"),
+        sa.CheckConstraint("telegram_user_id > 0", name="telegram_user_id_positive"),
+        _max_length("display_name", 100),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("users.id", ondelete="CASCADE"))
+    telegram_user_id: Mapped[int] = mapped_column(sa.BigInteger().with_variant(sa.Integer(), "sqlite"))
+    display_name: Mapped[Optional[str]] = mapped_column(sa.String(100))
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class TelegramLinkCode(Base):
+    """A one-time pairing code: what a signed-in person asks for on the website and
+    presents to the bot (as the payload of /start) to link their Telegram account.
+
+    code_hash is the SHA-256 hex digest of the secret; the secret is shown once, in the
+    page that asked for it, and never stored. Single use (consumed_at, set by one
+    conditional UPDATE) and short-lived (expires_at, ten minutes). The owner is the user
+    whose session asked for it, taken on the server; the account that presents the code
+    never says who it is, it only proves it can read the page that was shown to the
+    person.
+
+    Once stored, the binding (user, secret, lifetime) does not change: the ORM refuses to
+    rewrite it. Only consumed_at is ever set.
+    """
+
+    __tablename__ = "telegram_link_codes"
+    __table_args__ = (
+        sa.UniqueConstraint("code_hash"),
+        sa.Index(None, "user_id", "created_at"),
+        sa.Index(None, "expires_at"),
+        sa.CheckConstraint("length(code_hash) = 64", name="code_hash_length"),
+        sa.CheckConstraint("expires_at > created_at", name="expires_after_created"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("users.id", ondelete="CASCADE"))
+    code_hash: Mapped[str] = mapped_column(sa.String(64))
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    expires_at: Mapped[datetime]
+    consumed_at: Mapped[Optional[datetime]]
+
+
 # --- the same rules, enforced before the INSERT on the ORM write path -------------
 #
 # The CHECKs above are what holds for any writer. These run first on rows written
@@ -1003,10 +1131,25 @@ def _guard_oidc_state_on_update(mapper: Any, connection: Any, target: Any) -> No
     _forbid_changes(target, "invitation_id")
 
 
+def _guard_attachment_on_update(mapper: Any, connection: Any, target: Any) -> None:
+    _forbid_changes(target, "user_id", "content_type", "size_bytes", "sha256", "data", "created_at")
+
+
+def _guard_telegram_link_on_update(mapper: Any, connection: Any, target: Any) -> None:
+    _forbid_changes(target, "user_id", "telegram_user_id", "created_at")
+
+
+def _guard_telegram_code_on_update(mapper: Any, connection: Any, target: Any) -> None:
+    _forbid_changes(target, "user_id", "code_hash", "created_at", "expires_at")
+
+
 sa.event.listen(Session, "before_update", _guard_session_on_update)
 sa.event.listen(OidcState, "before_update", _guard_oidc_state_on_update)
 sa.event.listen(EmailLoginChallenge, "before_update", _guard_challenge_on_update)
 sa.event.listen(IdentityInvitation, "before_update", _guard_invitation_on_update)
+sa.event.listen(MessageAttachment, "before_update", _guard_attachment_on_update)
+sa.event.listen(TelegramLink, "before_update", _guard_telegram_link_on_update)
+sa.event.listen(TelegramLinkCode, "before_update", _guard_telegram_code_on_update)
 sa.event.listen(Message, "before_insert", _guard_retention_on_insert)
 sa.event.listen(Message, "before_update", _guard_message)
 sa.event.listen(TurnRequest, "before_insert", _guard_turn_request_on_insert)

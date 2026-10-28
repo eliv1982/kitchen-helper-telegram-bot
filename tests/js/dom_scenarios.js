@@ -1288,4 +1288,176 @@ scenario("a_different_person_on_coming_back_never_sees_the_last_ones_recipes", a
   assert.ok(!page.root().includes("Сварите бульон"));
 });
 
+// ============================================================================================
+// The Telegram panel in the sidebar
+// ============================================================================================
+
+const TG_BOT = "house_helper_app_bot";
+const TG_CODE = "k3JmQ0v9aZxP4tR7uYw2LbN6cD8eFgHs";
+const TG_LINK = `https://t.me/${TG_BOT}?start=${TG_CODE}`;
+const tgStatus = (linked, name = "@mama") =>
+  json(200, linked
+    ? { enabled: true, linked: true, bot_username: TG_BOT, account: { name, linked_at: "2026-10-18T12:00:00+00:00" } }
+    : { enabled: true, linked: false, bot_username: TG_BOT });
+
+const withTelegram = (routes) => (env) => {
+  oneConversation()(env);
+  for (const [key, ...responders] of routes) {
+    const [method, route] = key.split(" ");
+    env.net.route(method, route, ...responders);
+  }
+};
+
+scenario("telegram_panel_is_not_drawn_when_the_bot_is_not_here_and_names_no_address", async () => {
+  const page = await open(oneConversation());
+
+  assert.equal(page.visible("telegram"), false);
+  assert.equal(page.el("telegram-open").getAttribute("href"), null, "the shell names no address of its own");
+  assert.ok(page.window.window === page.window);
+});
+
+scenario("telegram_panel_connects_draws_the_link_and_notices_the_pairing", async () => {
+  const page = await open(withTelegram([
+    ["GET /api/telegram", tgStatus(false), tgStatus(false), tgStatus(true)],
+    ["POST /api/telegram/link", json(201, { code: TG_CODE, link: TG_LINK, expires_at: "x", expires_in_seconds: 600 })],
+  ]));
+
+  assert.equal(page.visible("telegram"), true);
+  assert.equal(page.visible("telegram-connect"), true);
+  assert.equal(page.visible("telegram-open"), false);
+  assert.equal(page.visible("telegram-disconnect"), false);
+
+  page.el("telegram-connect").click();
+  await page.settle();
+  assert.equal(page.visible("telegram-open"), true);
+  assert.equal(page.el("telegram-open").getAttribute("href"), TG_LINK);
+  assert.equal(page.el("telegram-open").getAttribute("target"), "_blank");
+  assert.equal(page.el("telegram-open").getAttribute("rel"), "noopener noreferrer");
+  assert.equal(page.visible("telegram-connect"), false);
+  assert.ok(page.el("telegram-text").textContent.includes(`/start ${TG_CODE}`));
+
+  // The only href this script ever writes is the validated link to the bot, on one anchor.
+  const hrefs = page.doc.attributeLog.filter(([, name]) => name === "href");
+  assert.deepEqual(hrefs, [["a", "href", TG_LINK]]);
+
+  await page.env.timers.advance(3000);
+  await page.settle();
+  await page.env.timers.advance(3000);
+  await page.settle();
+  assert.equal(page.visible("telegram-open"), false);
+  assert.equal(page.visible("telegram-disconnect"), true);
+  assert.equal(page.el("telegram-text").textContent, "Подключён: @mama");
+  assert.equal(page.el("telegram-notice").textContent, Logic.TELEGRAM_TEXT.pairedNow);
+  assert.ok(!page.root().includes(TG_CODE), "the code is gone from the page once it is used");
+});
+
+scenario("telegram_panel_explains_the_copy_and_the_data_and_says_when_the_bot_is_down", async () => {
+  const page = await open(withTelegram([["GET /api/telegram", tgStatus(false), json(200, { enabled: true, available: false, linked: false, bot_username: TG_BOT })]]));
+
+  assert.equal(page.visible("telegram-privacy"), true);
+  const privacy = page.el("telegram-privacy").textContent;
+  assert.equal(privacy, Logic.TELEGRAM_TEXT.privacy);
+  assert.ok(privacy.includes("OpenAI") && privacy.includes("365 дней") && privacy.includes("дублируется"));
+  assert.equal(page.visible("telegram-notice"), false);
+  assert.equal(page.visible("telegram-connect"), true);
+
+  page.doc.visibilityState = "visible";
+  page.doc.fire("visibilitychange");
+  await page.settle();
+  assert.equal(page.el("telegram-notice").textContent, Logic.TELEGRAM_TEXT.unavailable);
+  assert.equal(page.visible("telegram-notice"), true);
+  assert.equal(page.visible("telegram-connect"), false, "nothing to press while the bot is down");
+});
+
+scenario("telegram_panel_a_name_is_text_and_never_markup", async () => {
+  const page = await open(withTelegram([["GET /api/telegram", tgStatus(true, HOSTILE)]]));
+
+  assert.equal(page.el("telegram-text").textContent, `Подключён: ${HOSTILE}`);
+  assert.equal(page.doc.root.byTag("img").length, 0);
+  assert.equal(page.doc.root.byTag("script").length, 2);
+  assert.deepEqual(page.doc.attributeLog.filter(([, name]) => name === "href"), []);
+});
+
+scenario("telegram_panel_unlinking_asks_before_it_does_anything", async () => {
+  const page = await open(withTelegram([
+    ["GET /api/telegram", tgStatus(true)],
+    ["DELETE /api/telegram/link", json(200, { linked: false })],
+  ]));
+
+  page.el("telegram-disconnect").click();
+  await page.settle();
+  assert.equal(page.visible("telegram-confirm"), true);
+  assert.equal(page.visible("telegram-cancel"), true);
+  assert.equal(page.visible("telegram-disconnect"), false);
+  assert.equal(page.el("telegram-text").textContent, Logic.TELEGRAM_TEXT.askUnlink);
+  assert.deepEqual(page.env.net.requests("DELETE", "/api/telegram/link"), []);
+
+  page.el("telegram-cancel").click();
+  await page.settle();
+  assert.equal(page.visible("telegram-disconnect"), true);
+
+  page.el("telegram-disconnect").click();
+  await page.settle();
+  page.el("telegram-confirm").click();
+  await page.settle();
+  assert.equal(page.env.net.requests("DELETE", "/api/telegram/link").length, 1);
+  assert.equal(page.visible("telegram-connect"), true);
+  assert.equal(page.el("telegram-notice").textContent, Logic.TELEGRAM_TEXT.unlinkedNow);
+});
+
+scenario("telegram_panel_goes_with_the_session_and_nothing_of_it_stays_for_the_next_person", async () => {
+  const page = await open(withTelegram([["GET /api/telegram", tgStatus(true, "@сестра")]]));
+  assert.ok(page.root().includes("@сестра"));
+
+  page.env.net.route("POST", "/auth/logout", text(204, null));
+  page.el("logout").click();
+  await page.settle();
+  assert.equal(page.visible("telegram"), false);
+  assert.ok(!page.root().includes("@сестра"), "the name does not stay in the page");
+});
+
+scenario("telegram_panel_a_failure_is_said_with_a_retry", async () => {
+  const page = await open(withTelegram([["GET /api/telegram", fail(), tgStatus(false)]]));
+
+  assert.equal(page.visible("telegram"), true);
+  assert.equal(page.el("telegram-notice").textContent, Logic.TEXT.network);
+  assert.equal(page.el("telegram-connect").textContent, Logic.TEXT.retry);
+  page.el("telegram-connect").click();
+  await page.settle();
+  assert.equal(page.el("telegram-connect").textContent, Logic.TELEGRAM_TEXT.connect);
+});
+
+// ============================================================================================
+// A photo in the thread
+// ============================================================================================
+
+const DOM_PHOTO = "/api/attachments/5d6c1f3e-0a9b-4e43-9c2f-7b1a8d3e4f50";
+
+scenario("a_photo_is_drawn_from_this_sites_own_route_and_only_that", async () => {
+  const photo = (url) => [{ id: "5d6c1f3e-0a9b-4e43-9c2f-7b1a8d3e4f50", content_type: "image/jpeg", size: 10, url }];
+  const page = await open(oneConversation([
+    message(3, "user", "Смотрите", { attachments: photo(DOM_PHOTO) }),
+    message(4, "assistant", "Вижу"),
+    message(5, "user", "Подмена", { attachments: photo("https://evil.example/x.png") }),
+  ]));
+
+  const images = page.messages().byTag("img");
+  assert.equal(images.length, 1, "only the address of the server's own route is drawn");
+  assert.equal(images[0].getAttribute("src"), DOM_PHOTO);
+  assert.equal(images[0].getAttribute("alt"), "Фото к сообщению");
+  assert.ok(page.articleTexts().some((t) => t.includes("Подмена")), "the text of the other message is there");
+
+  // The only src this script ever writes is that address, on an image; no other address, on nothing else.
+  const sources = page.doc.attributeLog.filter(([, name]) => name === "src");
+  assert.deepEqual(sources, [["img", "src", DOM_PHOTO]]);
+  assert.ok(!page.doc.attributeLog.some(([, name, value]) => /^(on|style)/i.test(name) || /javascript:|evil/.test(value)));
+});
+
+scenario("no_photo_means_no_image", async () => {
+  const page = await open(oneConversation());
+
+  assert.equal(page.messages().byTag("img").length, 0);
+  assert.deepEqual(page.doc.attributeLog.filter(([, name]) => name === "src"), []);
+});
+
 module.exports = { scenarios, useShell, useNoLoginShell };

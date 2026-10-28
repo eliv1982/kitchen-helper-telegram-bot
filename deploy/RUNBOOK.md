@@ -1,16 +1,19 @@
 # House Helper web application: deployment runbook (R4C-D1)
 
-**Status of this document: the kit was released as repository-only (R4C-D1) and has since been used for the
+**Status of this document (updated 2026-10-28): the kit was released as repository-only (R4C-D1) and was first used for the
 technical deployment of 2026-10-24** (commit `6370bf7`, image `house-helper:6370bf78980e`, database at
-`0006_oidc_state_invitation`; sign-in and OpenAI disabled, no real users; see `docs/STATUS.md`, "Current deployment
-state"). Section 14 (scheduled cleanup, R4C-D2) was added after the kit's release: its code is RELEASED in Git as
-`489ff30` (independent audit passed, owner accepted, CI green). Its systemd timer is installed and active on the VPS;
-its first calendar-triggered execution, on 2026-10-25, was verified and accepted by the owner (owner-reported: it found
-no expired record and deleted nothing). Failure reporting, the encrypted off-host backup and a restore rehearsal are
-separate and not yet completed.
-The repository's schema head has since moved to `0007_favorite_recipes` (History & Favorites, section 9.1): that is code
-released in Git only. The production database stays at `0006_oidc_state_invitation` until an upgrade is run on the VPS with
-the owner's explicit approval.
+`0006_oidc_state_invitation`; at that time sign-in and OpenAI were disabled and there were no real users). **Production now
+runs image `house-helper:66ab4ec32de3` at schema `0007_favorite_recipes` (commit `66ab4ec`, History & Favorites); the owner's
+real Telegram sign-in, a real OpenAI text conversation and the History & Favorites smoke check passed, and the scheduled backup,
+purge and monitoring were accepted by the owner as final** (all REPORTED by the owner on 2026-10-28; this document does not
+record what exactly was installed for them and was not used to check it). Section 14 (scheduled cleanup, R4C-D2) was added
+after the kit's release: its code is RELEASED in Git as `489ff30` (independent audit passed, owner accepted, CI green). Its
+systemd timer is installed and active on the VPS; its first calendar-triggered execution, on 2026-10-25, was verified and
+accepted by the owner (owner-reported: it found no expired record and deleted nothing). The scheduled backup and the
+monitoring are the owner's accepted work of 2026-10-28 (REPORTED); sections 14 and 15 describe procedures, not what runs.
+The repository's schema head is `0009_message_attachments`: `0008_telegram_links` and `0009_message_attachments` (the Telegram
+bot and photos, section 16) are code released in the repository, not deployed and applied to no database. Production stays at
+`0007_favorite_recipes` until an upgrade is run on the VPS with the owner's explicit approval (section 16.2).
 The commands were exercised locally on disposable resources before the deployment (Docker 29.8, Compose 5.6,
 Traefik 3.6.25 on loopback); see section 13 for what that does and does not prove. This
 revision answers an independent audit of the first version (restore while the database is in
@@ -174,6 +177,7 @@ invents one.
 | `HOUSE_HELPER_PUBLIC_URL` | `compose.yaml`, from `HOUSE_HELPER_HOST` | yes | `https://house.elivcloud.org`; redirect URI, cookie attributes, allowed Origin all derive from it |
 | `HOUSE_HELPER_TELEGRAM_CLIENT_ID` / `_CLIENT_SECRET` | env file | for sign-in | both or neither; from @BotFather Login Widget |
 | `HOUSE_HELPER_TELEGRAM_ID_TOKEN_ALG` | env file | no | only if BotFather is not RS256 |
+| `HOUSE_HELPER_TELEGRAM_BOT_TOKEN` / `_BOT_USERNAME` | env file | for the Telegram bot | both or neither (one without the other stops the application at start); the bot's own HTTP API token and @name, NOT the sign-in client id and secret above; exactly one reader of the token and exactly one web instance (section 16.2) |
 | `OPENAI_API_KEY` | env file | for chat | without it a message is answered 503 |
 | `OPENAI_MODEL`, `TEMPERATURE`, `MAX_TOKENS`, `OPENAI_TIMEOUT_SECONDS`, `OPENAI_MAX_RETRIES` | env file | no | defaults `gpt-4.1-mini`, 0.7, 1000, 15, 1 |
 | `OPENAI_REASONING_EFFORT` | env file | for a `gpt-6*` model | unset (the request every earlier model takes: `temperature`, `max_tokens`); `low` for GPT-6 Luna: `reasoning_effort` and `max_completion_tokens` (= `MAX_TOKENS`, reasoning included), no `temperature`; a `gpt-6*` model without it does not start |
@@ -382,8 +386,8 @@ bash deploy/new-env-file.sh "$HOUSE_HELPER_ENV_FILE"   # refuses if it exists; t
 dc config -q && echo "compose file valid"        # prints nothing secret; a missing env file fails here
 dc build                                         # the image, from this checkout
 hhops check-config                               # URL absolute, /data writable by uid 10001
-hhops exec --exclusive -- alembic upgrade head   # 0001 ... 0007_favorite_recipes (the repository head); creates the database
-hhops check-schema                               # "the database schema is at revision 0007_favorite_recipes"
+hhops exec --exclusive -- alembic upgrade head   # 0001 ... 0009_message_attachments (the repository head); creates the database
+hhops check-schema                               # "the database schema is at revision 0009_message_attachments"
 ```
 
 DNS (section 4) must resolve now. BotFather (section 8, step 2) does not need the site to be live,
@@ -556,10 +560,12 @@ Afterwards, by hand: logs, TLS, one real sign-in, one chat message (section 8).
 
 ### 9.1 The next upgrade: `0006_oidc_state_invitation` -> `0007_favorite_recipes` (History & Favorites) **[OWNER]**
 
-**State.** `0007_favorite_recipes` is the schema head of the repository: code released in Git, **not deployed, applied to no
-database, not rehearsed on a copy of the production database.** Production is at `0006_oidc_state_invitation` and stays
-there until this upgrade is run on the VPS with the owner's explicit approval. Nothing in this section has been run on
-the VPS.
+**State (updated 2026-10-28).** This upgrade has been performed: production is at `0007_favorite_recipes` on image
+`house-helper:66ab4ec32de3`, and the History & Favorites production smoke check passed (REPORTED by the owner; this
+document does not record the commands, and it was not rehearsed on a copy of the production database as far as it
+records). The text below is kept as the record of the procedure and of its rollback rules, which apply unchanged to the
+next upgrade, `0007_favorite_recipes` -> `0008_telegram_links` -> `0009_message_attachments` (section 16.2). `0007` is no
+longer the repository's head.
 
 **What the migration does.** It creates one new, empty table, `favorite_recipes`: the answers a person chose to keep (a
 title, the text, the id of the message it was copied from with no foreign key to it, no expiry; `user_id` with
@@ -580,7 +586,7 @@ type `alembic upgrade head` by hand, and do not shorten the backup step: the bac
 - Stop the cleanup timer first and start it afterwards with `HOUSE_HELPER_IMAGE_TAG` in `purge.env` changed to the new tag
   (14.4). `purge-expired` does not know the new table and never touches it (14.1).
 
-**After it** (by hand; none of this has been done): `check-schema` names `0007_favorite_recipes`; `GET /healthz` is 200;
+**After it** (by hand; the owner reports that the smoke check passed): `check-schema` names `0007_favorite_recipes`; `GET /healthz` is 200;
 once sign-in is enabled, the sidebar has two tabs (conversations and favorites), the topbar button on a phone is labelled
 "Menu" (in Russian), and an old conversation is listed by its first words; one answer saved with the button under it appears
 under the favorites tab, opens, and can be removed; a second user sees none of it.
@@ -941,11 +947,13 @@ the row's own creation.
 | OIDC login states (`oidc_states`) | 10 minutes | `expires_at` <= now | pending logins; a consumed state stays until its deadline, so a replay is refused as "used", afterwards as "unknown" |
 | Emailed sign-in links (`email_login_challenges`) | 10 minutes | `expires_at` <= now | live and used-but-unexpired links; the 60-second request cooldown looks only at the last 60 seconds, well inside the 10 minutes |
 | Telegram invitations (`identity_invitations`) | 2 hours | `expires_at` <= now **and** no login state is still bound to it | active, used-but-unexpired and withdrawn-but-unexpired ones. The identity an invitation linked (`allowlist_entries`, `identity_links`) is not an artifact and is never touched |
+| Telegram pairing codes (`telegram_link_codes`) | 10 minutes | `expires_at` <= now | live ones; a used code stays until its own deadline. The link a code made (`telegram_links`) is a person's choice, not an artifact, and is never touched (section 16) |
 | Turn requests (`turn_requests`; `result_payload` is a copy of an answer) | 365 days after creation | `expires_at` <= now **or** `created_at` <= now - 365 x 24 h, and not in flight under a live lease. A request still in flight whose lease is over (its worker is gone) is first set to `cancelled`, then deleted | a request whose lease is still live, and its messages, until the lease ends |
+| Photos that came with messages (`message_attachments`; bytes in the database) | the message's, or 1 hour for an upload that was never sent | the same rule as a message (`expires_at` <= now **or** `created_at` <= now - 365 x 24 h); deleted before the messages so that they are counted | a photo of a message that is still kept (section 16) |
 | Messages (`messages`) | 365 days after creation | the same rule, **and** no request that links the message still exists (the database refuses otherwise) | recent messages of an old conversation; an expired message a request still links waits for the next run (reported as *held back*) |
 | Conversations (`conversations`) | none of their own | no message and no request left **and** no activity for 365 days (`updated_at` and `created_at` both at or before the cutoff) | any conversation with a message; a conversation created minutes ago and still empty |
 
-**Never touched:** `users`, `allowlist_entries`, `identity_links`, `alembic_version`, and every table the command does
+**Never touched:** `users`, `allowlist_entries`, `identity_links`, `telegram_links`, `alembic_version`, and every table the command does
 not name. The favourites and long-term preferences of the product requirements (KHD-05) are independent tables owned by a
 user, and this command, which names its tables one by one, does not know them. The favourites exist since migration `0007`
 (History & Favorites): `favorite_recipes` holds the answers a person chose to keep, copied out of the history, with no
@@ -956,8 +964,9 @@ unnoticed.
 Apart from those saved favourites, which are kept on purpose until their owner removes them (14.7), nothing else in this
 database holds conversation text: a conversation's `title` column is never set (the list shows a title derived on reading
 from the first unexpired message, so it goes with that message), the answer copy in
-`turn_requests` is deleted with its request, and there are no summaries. Outside this database: the Telegram bot's
-history is in that process's memory and is not in the image; whatever OpenAI keeps of the messages it answered is
+`turn_requests` is deleted with its request, and there are no summaries (photos are conversation data and are deleted with
+their message, see the table). Outside this database: the history of the old standalone Telegram bot (`bot.py`) is in that
+process's memory and is not in the image (the bot of section 16 keeps its conversations in this database, like the website); whatever OpenAI keeps of the messages it answered is
 governed by the account's settings there, not by this command.
 
 **The boundary.** The cutoff is `now - 365 x 24 hours`, computed once per run from one UTC clock. A row created at
@@ -2172,3 +2181,235 @@ use Docker, `backup.sh` or `restore`, or print a key, a token, a path of the con
 that, after a pass, do 15.6 and section 10 with the image of the manifest's tag onto a **scratch volume** (never the live one), and
 run the cleanup afterwards (14.6). Record in 15.9: the date, the point's name, its encrypted SHA-256 (the verdict prints it), the
 mode, the machine, and the result. Plaintext existed on that machine for the length of the run: it is unlink, not erasure (15.2).
+
+## 16. The Telegram bot and photos (shared conversations) **[OWNER]**
+
+**State: code only. Nothing in this section has been run on the VPS or against the real Telegram or the real OpenAI.** The code is in
+the repository (released on top of baseline `66ab4ec`, 2026-10-28); the migrations `0008_telegram_links` and
+`0009_message_attachments` are applied to no database. Production (REPORTED by the owner, 2026-10-28) runs image
+`house-helper:66ab4ec32de3` at schema `0007_favorite_recipes`, which contains none of it. The owner approved the design on
+2026-10-28 (`docs/DECISIONS.md`, KHD-35 to KHD-37): in-process long polling for the two-user SQLite alpha with one reader of the token
+and one web instance, mirroring of the website into Telegram on by default once a person has linked their account (no toggle), and no
+web image upload for now. Everything below is the procedure to follow with the owner's explicit approval (KHD-29), and a statement of
+what the tests do and do not show (16.8).
+
+### 16.1 What it is
+
+The bot `@house_helper_app_bot` answers inside the web application's own process (long polling; `house_helper/web/telegram_chat.py`).
+There is no second container, no port, no Traefik label and no webhook. A message to the bot goes through the same turn runner, the same
+database tables, the same limits and the same assistant as a message typed on the page, so one conversation is one thing: started on the
+page it continues in Telegram and the other way round. Once a person has linked their Telegram account, a message typed on the page is
+also copied to their Telegram chat (what they wrote, labelled "from the website", then the answer); there is no switch for this, and it
+ends when they unlink. A message that came from Telegram is never copied back. A photograph sent to the bot is shown to the assistant,
+kept with its message (in the database, so it is in every backup), shown in the page's history, and forgotten with the message (the 365
+days of section 14). Sending a photograph from the page is not built.
+
+Who is answered: only a Telegram account that a signed-in person has linked to their own House Helper account. The person asks the page
+for a pairing code (the Telegram panel in the menu), opens the link it shows (`https://t.me/<bot>?start=<code>`) and presses Start. The code
+is random, lives 10 minutes, works once, and is stored only as a digest. The tie is NOT made from the sign-in identity (Telegram's `sub`
+and the bot's numeric id are different values; nothing compares them). Everybody else gets one fixed notice, at most once in ten minutes,
+and costs no request to the assistant and no row in the database. Private chats only; groups, channels and bots are ignored. Withdrawing a
+person's access (revoking every way they can sign in, or disabling them) ends their Telegram access at their next message.
+
+Signing in with Telegram (OIDC, sections 7 and 8) is a different thing with different credentials (the Login client id and secret) and different
+routes. The bot's listener does not touch it: a refused or blocked bot token leaves sign-in working (a test pins this).
+
+What the people are told, in Russian, and where: the Telegram panel of the page (always visible under its buttons) and the bot's replies to
+`/start`, `/help` and at linking say that what they write on the page is copied to their Telegram chat and how to stop it (unlink), that the
+text of messages and the photographs are passed to OpenAI, that the history is kept 365 days and then deleted, and that recipes saved to
+favorites stay until the person removes them.
+
+### 16.2 Upgrading production: `0007_favorite_recipes` -> `0008_telegram_links` -> `0009_message_attachments` **[OWNER]**
+
+What the migrations do: `0008` creates `telegram_links` and `telegram_link_codes`, `0009` creates `message_attachments`. Three new empty
+tables; no existing table, row or index is changed and no session is revoked. They are applied together by the one `alembic upgrade head`
+that `deploy/upgrade.sh` runs. Nothing migrates at start-up (KHD-09).
+
+Steps, in this order:
+
+1. **Before anything.** The commit that carries the code exists, CI is green on it, and the owner has approved the upgrade. Read the tag of
+   the running image from Docker (section 9), do not take it from a document; it should be `house-helper:66ab4ec32de3`. The newest image also
+   carries the changes of sections 9.1 and 3 (for example `OPENAI_REASONING_EFFORT`): read them first.
+2. **Image and database, with the bot still OFF.** Section 9, unchanged: build the new image from the approved commit, `deploy/upgrade.sh`
+   with a dry run first and `--old-tag` the tag you read, the cleanup timer stopped around it and `HOUSE_HELPER_IMAGE_TAG` in `purge.env`
+   changed to the new tag afterwards (14.4). Leave `HOUSE_HELPER_TELEGRAM_BOT_TOKEN` and `_USERNAME` unset in this step. The log's start line
+   then says `Telegram bot: off`. Check what section 9 and 9.1 check (`check-schema` names `0009_message_attachments`; `GET /healthz` is 200;
+   sign-in, a chat message, history and favorites work). Upgrading and switching the bot on are two separate steps so that a problem is
+   attributable to one of them.
+3. **One reader of the token, one instance.** Telegram allows one `getUpdates` consumer per bot and none while a webhook is set. Make sure
+   nothing else uses the token: no `bot.py` anywhere, no n8n workflow with a Telegram Trigger (those set a webhook), no second copy of
+   the application, and never `up --scale house-helper=2`. The web service is exactly one container with one worker. Check for a webhook
+   without leaving the token in the shell history: `read -rs T; curl -s "https://api.telegram.org/bot$T/getWebhookInfo"; unset T` (the
+   answer must show an empty `url`). The application never sets, reads or deletes a webhook by itself; removing one is a deliberate
+   operator act.
+4. **The token and the name** go into the environment file (section 3), outside the checkout: `HOUSE_HELPER_TELEGRAM_BOT_TOKEN` (the HTTP API
+   token that @BotFather shows for the bot; not the Login Widget's client id and secret) and `HOUSE_HELPER_TELEGRAM_BOT_USERNAME` (the @name without
+   the @). Both or neither: one without the other stops the application at start. The token must reach no ticket, chat or log.
+5. **Tell the two people** what the bot does with their data. The panel and the bot say it in Russian (16.1); say it in person as well:
+   the text of their messages and their photographs go to OpenAI; the history, photos included, is kept 365 days and then deleted;
+   recipes saved to favorites stay until they remove them; what they write on the website is copied to their Telegram chat once they link it.
+6. **Switch the bot on** (16.3) and make the first live check by hand (16.4).
+
+Rollback constraints:
+
+- The new image refuses to start on a database before `0009`, and the old image refuses one at `0009`. The way back from the upgrade is a
+  restore of the pre-upgrade backup with the old image (section 11): everything written after that backup is lost, conversations, photos,
+  links and favorites included. `alembic downgrade 0007_favorite_recipes` removes the Telegram links, the pairing codes and every stored
+  photo and is not a casual step (backup first, web process stopped).
+- Switching the bot off (16.3) is not a schema rollback. The new image still needs `0009`; links and photos stay in the database, and the
+  links work again when the bot is back.
+- A photograph or a link made after the upgrade is in every later backup (photos are rows of the database, so no list of tables names
+  them); a deleted row survives in older backups (KHD-32).
+
+### 16.3 Switching it on
+
+Set the two variables, then `dc up -d --force-recreate house-helper`. Two lines of the log tell you what happened, and the second one is
+the one that matters:
+
+1. The start line says `Telegram bot: on`. That only means the variables are set.
+2. Within about a second the bot must log `The Telegram bot is polling`. That means Telegram answered the first poll with this token. If
+   the log shows `The Telegram bot is blocked` or `its token was refused` instead, the bot is NOT reading anything, whatever the first
+   line says (16.5). The page says so too: the Telegram panel shows that the bot is not answering and offers no connect button, and
+   `GET /api/telegram` returns `"available": false`.
+
+To switch it off again unset both and recreate the container: the links stay in the database and work again when the bot is back. Nothing
+about the bot is needed for the website to run: a refused or blocked token stops only the bot, with a log line that says so, and
+`/healthz` stays what it is (liveness of the process, not of the bot).
+
+### 16.4 The first live check, by hand **[OWNER]**
+
+None of this has been done. Use the owner's own account first, the second person's afterwards.
+
+1. Sign in on the website. The menu shows a Telegram panel; below its buttons it says, in Russian, that the website is copied to Telegram,
+   that text and photos go to OpenAI, that history is kept 365 days and that favorites stay. Press the connect button; open the link (or
+   send `/start <code>` to the bot by hand). The bot confirms; the panel changes to "linked" within a few seconds or on refresh and shows
+   the account's name.
+2. Send a text message to the bot: an answer arrives. Refresh the page: the conversation is the first in the list and holds both messages.
+3. Type a message on the page in that conversation: the answer appears on the page, and the bot sends the copy (what was written, then the answer).
+4. Send a photograph with a caption: an answer arrives; refresh the page: the picture is shown with its message. Open the picture's address in
+   a browser where the other person is signed in: it must be "not found". Send a photograph of an appliance and check that the answer asks for
+   the model or another photo rather than guessing.
+5. From an account that is not linked, write to the bot: one short notice, nothing more, however often you write; the database holds nothing from it.
+6. `/new` starts a new conversation; `/unlink` (or the page) unlinks; after that the bot answers only with the notice and the page no longer
+   copies to Telegram.
+7. Read the log (`dc logs`): it holds fixed words and class names, never a token, a Telegram id, a name, a message or an answer.
+8. Take a backup (section 10) after the first photograph and verify it: the counts it prints include `message_attachments`.
+
+### 16.5 Troubleshooting
+
+| Log line | Meaning |
+|---|---|
+| `The Telegram bot is polling` | the normal start: the first poll was answered |
+| `The Telegram bot is polling again` | polling works again after a failure (an `ERROR` or a warning above it says what the failure was) |
+| `The Telegram bot is blocked: another consumer or a webhook holds its token (category=api:409)` | an `ERROR`, once per run of failures. Nothing is read. Persistent, followed by a warning every 30 s: a webhook is set (`getWebhookInfo`, 16.2 step 3) or a second reader runs. Repeating pairs of `blocked` and `polling again`: another poller is taking turns with this one (a copy of the application, `bot.py`, a tool); find and stop it. The page shows the bot as not answering and issues no pairing code until it works |
+| `Telegram polling failed: category=api:409, trying again in 30 s` | the same condition, repeated; the bot waits 30 s and tries again |
+| `The Telegram bot stopped: its token was refused (api:401)` | wrong or revoked token; fix it and recreate the container; the website is unaffected; the page shows the bot as not answering |
+| `The Telegram bot stopped: polling failed with <ExceptionClass>` | an `ERROR`: the polling loop itself died of a bug (not a Telegram refusal). The bot is dead until the container is restarted; the page shows it as not answering; keep the line and report it |
+| `Telegram polling failed: category=network` / `timeout` / `api:5xx` | the VPS cannot reach `api.telegram.org`, or Telegram is failing; it retries with a growing pause (to 60 s) and the page shows the bot as not answering until a poll works |
+| `Telegram did not take a message: category=api:403` | the person blocked the bot (or never started it); nothing to do, the website is unaffected |
+| `A turn could not be copied to Telegram` | the copy of a website turn failed; the turn itself is stored and shown |
+| `A turn was not copied to Telegram: the chat is no longer the user's` | an `INFO`: the copy waited, and in the meantime the account was unlinked, its user lost access, or the account was linked to somebody else; the copy was dropped on purpose (16.6) |
+| `A queued Telegram message was dropped: its sender has no tie to its user any more` | an `INFO`: the same, for a message from Telegram; nothing was fetched or asked of the assistant for it, or an answer already prepared was kept from the chat (16.6) |
+| `A redelivered Telegram update was not run again: an attempt had begun` | a `WARNING`: Telegram delivered an update again whose first attempt did not complete; the assistant was not asked a second time and the person was told to write the message again (16.6) |
+| `A Telegram update could not be handled: category=...` | a bug or a database failure; the person was told the service is unavailable |
+| `The Telegram bot is overloaded; an update was dropped` | more than 64 updates in hand: someone is flooding the bot |
+
+### 16.6 Limits to know
+
+- What is guaranteed about duplicates and losses, exactly. The guarantee is that **the assistant is not asked twice for one Telegram update**.
+  It is NOT exactly-once delivery of anything that leaves the process, and it is not a promise that every message is answered. Four things
+  are easy to confuse and are different: Telegram delivering the same update again (a duplicate DELIVERY), the assistant being asked again
+  (a duplicate GENERATION, which is what is prevented once an attempt has begun), the same answer appearing twice in the chat (a duplicate
+  MESSAGE, which can happen), and an update that is lost before it was ever recorded (below).
+  - Acknowledgement. Telegram forgets an update when the bot's NEXT `getUpdates` call carries a higher offset, and the bot makes that call
+    as soon as it has handed the updates it fetched to handlers. The offset lives in memory only and has nothing to do with whether the
+    update was answered. So an update that was in hand when the process stopped (killed, or cancelled after the 15-second drain of an
+    orderly stop) is normally NOT delivered again after the restart: it gets no answer, and its message stays in the page's history as one
+    that was not answered. This loss of an acknowledged in-flight message is an accepted alpha residual risk. (An orderly stop does not
+    change it: what is still unfinished after the drain is cancelled, not kept for the restart.)
+  - What is recorded, and when. An update is recorded only when its turn is CLAIMED: the claim (the user's message and its request, key
+    `tg-<update id>`) is committed before the assistant is called, in the claiming user's conversation. An update that is lost before that
+    leaves no record: one that was in hand when the process stopped (above), one that was dropped on the way (an unlinked sender, a message
+    that is too long, a photo that could not be fetched, an account that lost its tie). Such an update is not answered, and if Telegram did
+    bring it again it would be handled as a new message for whoever the account is tied to at that moment.
+  - Redelivery to the same person. An update comes again only when the call that acknowledges it did not reach Telegram. What the bot then
+    does is decided by what the first delivery left in the database: (1) the turn **completed**: the stored answer is sent again (the person
+    may see an answer twice: accepted residual risk, a duplicate message and not a duplicate generation); (2) the attempt is **still running**,
+    its 90-second lease is live: the repeat gets the fixed "still preparing the previous answer" message (`STILL_BUSY`) and nothing new is
+    started; the first attempt may still complete and sends its own answer; (3) an attempt **began and did not complete** (the assistant
+    failed or timed out, the lease ran out, the process was restarted): the assistant is **not asked again**, whatever happened to the first
+    request, and the person gets a fixed message saying the message was not answered and to write it again (the log has a `WARNING`
+    "A redelivered Telegram update was not run again: an attempt had begun"). This survives a restart; what cannot be known is whether the
+    first request reached OpenAI or was billed. (4) no claim was ever made: it is handled as a new message.
+  - Redelivery after the account changed hands (another user's update). The update id belongs to the bot, not to whoever the account is
+    tied to. If an update was claimed for user A, and the account was then unlinked from A and linked to user B, a redelivery of that update
+    is **dropped**, whatever state the first attempt is in (completed, failed, expired or still running): the assistant is not asked, nothing
+    is stored in B's history, A's message, photo and answer are neither read nor sent to B, and A's own rows are untouched. The person at the
+    account gets the fixed "the connection changed, write it again if you still need it" message, which carries nothing of the message (the
+    log has a `WARNING` "A redelivered Telegram update was dropped: it was admitted for another account" when the first look catches it, and
+    the `INFO` line of any dropped message when the claim does). The look is made twice: before
+    anything is fetched, and inside the transaction that claims the turn, so a second owner cannot be admitted even if two claims race. If the
+    account is linked to A again, the rules for the same person apply. This needs no table: the claim's request is the record. It cannot
+    see an update that was never claimed (above).
+  - The website cannot make up a key that stands for somebody's update: an `Idempotency-Key` that starts with `tg-` is refused with 400.
+  - Typing the message again is a new update and runs the assistant again: that is the person's choice. So is the page's "send again" for
+    a failed message, which is unchanged.
+- Who is served is asked again at the moment of serving. A Telegram message is accepted for a sender who is linked to an enrolled user,
+  but it may wait for its turn in the chat. After its turn comes, and before anything is fetched or asked of the assistant, and again inside the
+  transaction that claims the turn, the bot checks that the account is still the enrolled sender of the same user; and immediately
+  before an answer or a copy of a website turn is sent, it checks once more, under a lock that unlinking (the `/unlink` command and the page's
+  button) also takes, so the link cannot be cut between that check and the send. Unlinking removes a link only with a statement that names
+  its account, while it holds that account's lock, and it keeps the lock until its database change has ended (committed or rolled back)
+  even if the request that asked for it is cancelled meanwhile; an unlink that finds no link removes nothing but the pairing codes, so a link
+  made a moment after it looked is never cut. Message and copy that have lost their tie (unlinked,
+  access revoked, the account linked to somebody else) are dropped, never sent to whoever the account belongs to now; the sender gets a fixed
+  notice with nothing of the message in it. The limit: `revoke` and `disable` run in another process and cannot take that lock, so a
+  revocation that lands between the last check and Telegram's accepting the message is not stopped; an answer that is already sent cannot
+  be recalled.
+- Telegram messages of one chat are handled one at a time. A message for a conversation that is still being answered (typed on the page at the
+  same moment) gets "still preparing the previous answer".
+- An album arrives as separate pictures and is answered one picture at a time. A photo sent as a file (a document), a sticker, voice and video
+  are answered with a polite note. A photo may be at most 5 MiB and a JPEG, a PNG or a WebP (told by its first bytes, not by its name or the
+  type Telegram claims); the assistant is shown the newest two photos of a conversation, older ones only as a mention.
+- Photos are stored in the database, so the database and every backup (sections 10 and 15) grow with them; a Telegram photo is usually a few
+  hundred kilobytes. `purge-expired` removes a photo with its message, and an upload that was never sent after an hour (section 14.1).
+- Sending a photo from the page is not built (the owner deferred it); only the display of photos in the history is.
+- One web instance and one reader of the token. More than one needs a webhook or a queue, which is a new decision (KHD-35), not a setting.
+- Mirroring has no switch: unlinking is the only way to stop the copies.
+
+### 16.7 Rollback
+
+Switching the bot off is 16.3 (unset the variables, recreate). Going back to an image older than `0009` is a restore of the pre-upgrade backup
+(section 11); photos, links and everything else written since are lost by it. `alembic downgrade 0007_favorite_recipes` removes the links, the
+codes and the photos deliberately and is not a casual step. The full list of constraints is in 16.2.
+
+### 16.8 What was verified, and what was not
+
+Verified offline in the test suite, with a fake Bot API and a scripted assistant: pairing and its refusals (a code works once, expires, is
+random, stored as a digest), strangers, two-person isolation, the shared conversations in both directions, the copy to Telegram and the
+absence of any copy back, duplicate updates, ordering, photo download, the JPEG/PNG/WebP check by bytes and the 5 MiB limit (before and
+while downloading), storage, display, retrieval by the owner only (another person and a stranger get "not found" and 401), retention and
+clean-up (a photo goes with its message, an unsent upload after an hour), the migrations up and down, the observable start-up and failure
+signal of the poller (the first poll waits for nothing; a refused token or a second consumer or a webhook is an `ERROR` line, a
+"not available" status and no pairing code; recovery is logged and clears the status; no webhook is ever touched), sign-in working while the bot is
+refused or blocked, and the backup, verify, sanitize and restore tools carrying the photos' bytes unchanged (`tests/test_deploy_dbtool_photos.py`).
+After the independent reviews (two rounds; the second round's three reproduced findings are remediated and the final recheck passed, REPORTED by the owner), also
+verified offline, with the interleavings made exact by locks and events and not by sleeping: a message that waited in line is dropped before any
+photo is fetched or the assistant is asked when its user was revoked, unlinked or replaced by another person on the same account; an answer
+prepared for a tie that went away is kept from the chat; a copy of a website turn that waited is dropped, never redirected, when the account changed
+hands; unlinking waits for a send that was already checked; an update delivered again after a timeout, a failure to store the answer, a lease that
+ran out or a restart on the same database does not reach the assistant a second time, a completed one is replayed, and the page's own retry still
+runs a failed message again. Second round: an unlink that found no link cannot cut a link made after it looked (the exact interleaving, with the
+link made and a copy under way in the gap), a tie that changes between the look and the lock is looked up again and removed under its own account's
+lock, a tie that keeps changing is left in place with an error and never removed without its lock; cancelling an unlink (once, repeatedly, or the
+`/unlink` command) does not release the account's lock before the database change has ended, and then the cancellation is delivered, with no
+deadlock and no lock left behind (the unit of work is held on a real worker thread of the real database layer, and `WebDatabase.run_to_completion`
+is tested separately, including a cancel scope that stays cancelled); an update that was admitted for one user and is delivered again after the
+account was unlinked and linked to another is dropped in every state of the first attempt (completed, failed, in flight with a live or expired
+lease), with a photo update neither fetched nor stored again, after a restart on the same database, when the look before the claim is blind (the
+claim alone refuses), and when two claims for the same update race (the second waits for the first and is refused); the same user linked again
+still gets the replay or the refusal of the same-user rules; the website refuses the bot's key prefix.
+NOT done: PostgreSQL (the share lock that keeps an unlink away from a claim is reasoned and checked only as generated SQL), a redelivery by the real Telegram (no test shows what the real service redelivers after a crash or a network failure of the acknowledging call), a
+single message through the real Telegram, a real photo through the real OpenAI model (whether `gpt-6-luna` accepts the image
+parts of this request as built is unverified), a real phone or browser, Docker with the new image, the upgrade on a copy of the production
+database, PostgreSQL, and Python 3.10 at run time on the development machine (CI covers it).

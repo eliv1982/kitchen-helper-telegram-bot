@@ -180,6 +180,17 @@ _SHELL = """\
         <button id="favorites-retry" class="btn btn-quiet btn-block" type="button" hidden>Обновить избранное</button>
         <ul id="favorite-list" class="conv-list"></ul>
       </div>
+      <section id="telegram" class="telegram" aria-labelledby="telegram-title" hidden>
+        <h2 id="telegram-title" class="telegram-title">Telegram</h2>
+        <p id="telegram-text" class="hint" role="status"></p>
+        <p id="telegram-notice" class="notice" role="status" hidden></p>
+        <p id="telegram-privacy" class="hint"></p>
+        <a id="telegram-open" class="btn btn-primary btn-block" target="_blank" rel="noopener noreferrer" hidden>Открыть Telegram</a>
+        <button id="telegram-connect" class="btn btn-secondary btn-block" type="button" hidden>Подключить Telegram</button>
+        <button id="telegram-disconnect" class="btn btn-quiet btn-block" type="button" hidden>Отключить</button>
+        <button id="telegram-confirm" class="btn btn-danger btn-block" type="button" hidden>Да, отключить</button>
+        <button id="telegram-cancel" class="btn btn-quiet btn-block" type="button" hidden>Отмена</button>
+      </section>
     </nav>
     <div id="backdrop" class="backdrop" hidden></div>
     <main id="chat" class="chat" aria-labelledby="chat-title" hidden>

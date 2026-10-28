@@ -64,7 +64,7 @@ def test_the_telegram_provider_layer_uses_the_shared_prompt():
 
 def test_the_prompt_is_russian_and_bounded():
     assert PROMPT == PROMPT.strip()
-    assert 500 < len(PROMPT) < 3500  # it is sent with every request: it costs tokens
+    assert 500 < len(PROMPT) < 4200  # it is sent with every request: it costs tokens (4200: the photo section)
     assert "по-русски" in PROMPT
     cyrillic = sum("а" <= c.lower() <= "я" or c.lower() == "ё" for c in PROMPT)
     assert cyrillic > 0.7 * sum(c.isalpha() for c in PROMPT)
@@ -134,9 +134,29 @@ def test_the_prompt_does_not_route_to_domains_that_do_not_exist():
 
 
 def test_the_prompt_does_not_promise_what_the_chat_cannot_do():
+    # (A photo can be attached since the Telegram bot and the photo storage: the prompt says how to treat
+    # one, below. A voice message, a reminder, a favorite and a saved preference still do not exist for the
+    # assistant to offer.)
     lowered = PROMPT.lower()
-    for word in ("картинк", "фото", "голос", "напомин", "избранн", "сохран"):
+    for word in ("голос", "напомин", "избранн", "сохран"):
         assert word not in lowered, word
+
+
+@pytest.mark.parametrize(
+    ("scenario", "clause"),
+    [
+        ("a photo is described by what is visible", "Опирайся только на то, что видно"),
+        ("food on a photo is the basis for options", "Продукты на фото — основа для вариантов блюд"),
+        ("unclear is called unclear", "нечёткое или нечитаемое назови нечётким"),
+        ("appliances: only the obvious and safe", "только очевидное и безопасное"),
+        ("appliances: no guessing the model, fault or inside", "Не угадывай модель, причину поломки и устройство внутри"),
+        ("appliances: no repairs, bypassing, gas or electrics", "не советуй разбирать, чинить, обходить защиту, трогать газ и электрику"),
+        ("when unsure: the model, the manual or another photo", "попроси модель прибора, инструкцию или ещё одно фото"),
+        ("a risk goes to a repairer", "посоветуй мастера"),
+    ],
+)
+def test_the_prompt_tells_how_to_treat_a_photo(scenario, clause):
+    assert clause in PROMPT, scenario
 
 
 # --- Telegram is unchanged ---------------------------------------------------------------------------------

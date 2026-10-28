@@ -15,7 +15,8 @@ UUID is the same 404 "conversation_not_found" for every route: nothing tells the
 which of them it was.
 
 Sending a message (POST .../messages). The header `Idempotency-Key` (1 to 128 printable
-ASCII characters, chosen by the client, one per message) is required, and the body is
+ASCII characters, chosen by the client, one per message; not starting with "tg-", which is
+the Telegram bot's: 400 invalid_idempotency_key) is required, and the body is
 {"text": "..."}:
 
   201  the message was answered:
@@ -69,10 +70,10 @@ from sqlalchemy.exc import SQLAlchemyError
 from starlette.requests import ClientDisconnect
 
 from house_helper.core.limits import MAX_INPUT_LENGTH
-from house_helper.persistence import conversations
+from house_helper.persistence import attachments, conversations
 from house_helper.persistence.authn import AuthenticatedSession
 from house_helper.persistence.conversations import ConversationNotFound, MessageView
-from house_helper.persistence.identifiers import validate_idempotency_key
+from house_helper.persistence.identifiers import TELEGRAM_UPDATE_KEY_PREFIX, validate_idempotency_key
 from house_helper.web.auth import AuthService, get_auth_service, require_user
 from house_helper.web.database import DatabaseClosed, WebDatabase
 from house_helper.web.dependencies import get_database
@@ -252,15 +253,22 @@ def _idempotency_key(request: Request) -> str:
     try:
         if len(values) != 1:
             raise ValueError("repeated header")
-        return validate_idempotency_key(values[0])
+        key = validate_idempotency_key(values[0])
+        if key.startswith(TELEGRAM_UPDATE_KEY_PREFIX):
+            # Reserved for the Telegram bot's turns ("tg-<update id>"): a key made up here could
+            # otherwise stand for somebody else's update (persistence.telegram, "the identity of
+            # an update"). The page's own keys are "web-..." and are not touched.
+            raise ValueError("a key of the Telegram bot")
+        return key
     except ValueError:
         raise ApiError("invalid_idempotency_key") from None
 
 
-def _message_text(document: dict) -> str:
-    if set(document) != {"text"} or not isinstance(document["text"], str):
-        raise ApiError("invalid_request", category="UnexpectedFields")
-    text = document["text"].strip()
+def clean_message_text(raw: str) -> str:
+    """A message as it is stored: trimmed, and ApiError if it is empty, has a character that
+    cannot be stored, or is longer than MAX_INPUT_LENGTH. The same rule for every channel
+    (the website's, and the Telegram bot's, which calls this too)."""
+    text = raw.strip()
     if not text:
         raise ApiError("empty_message")
     if _UNSTORABLE_TEXT.search(text) is not None:
@@ -268,6 +276,12 @@ def _message_text(document: dict) -> str:
     if len(text) > MAX_INPUT_LENGTH:
         raise ApiError("message_too_long", max_length=MAX_INPUT_LENGTH)
     return text
+
+
+def _message_text(document: dict) -> str:
+    if set(document) != {"text"} or not isinstance(document["text"], str):
+        raise ApiError("invalid_request", category="UnexpectedFields")
+    return clean_message_text(document["text"])
 
 
 # --- writing a response --------------------------------------------------------------
@@ -298,20 +312,35 @@ def _message_json(view: MessageView) -> dict[str, Any]:
         body["idempotency_key"] = view.idempotency_key
     if view.error_code is not None:
         body["error_code"] = view.error_code
+    if view.attachment is not None:
+        body["attachments"] = [_attachment_json(view.attachment)]
     return body
+
+
+def _attachment_json(ref: attachments.AttachmentRef) -> dict[str, Any]:
+    """A photo as the history names it: where to fetch it, never its bytes."""
+    return {
+        "id": str(ref.id),
+        "content_type": ref.content_type,
+        "size": ref.size_bytes,
+        "url": f"/api/attachments/{ref.id}",
+    }
 
 
 def _turn_json(result: TurnResult) -> dict[str, Any]:
     done = result.completed
+    user_message: dict[str, Any] = {
+        "id": done.user_message.id,
+        "role": "user",
+        "text": done.user_message.text,
+        "created_at": _timestamp(done.user_message.created_at),
+        "status": conversations.MESSAGE_COMPLETED,
+    }
+    if done.user_message.attachment is not None:
+        user_message["attachments"] = [_attachment_json(done.user_message.attachment)]
     return {
         "conversation_id": str(done.conversation_id),
-        "user_message": {
-            "id": done.user_message.id,
-            "role": "user",
-            "text": done.user_message.text,
-            "created_at": _timestamp(done.user_message.created_at),
-            "status": conversations.MESSAGE_COMPLETED,
-        },
+        "user_message": user_message,
         "assistant_message": {
             "id": done.assistant_message.id,
             "role": "assistant",
@@ -325,6 +354,38 @@ def _turn_json(result: TurnResult) -> dict[str, Any]:
 
 
 # --- the routes ----------------------------------------------------------------------
+
+
+@router.get("/attachments/{attachment_id}")
+async def get_attachment(
+    request: Request,
+    attachment_id: str,
+    current: AuthenticatedSession = Depends(authenticated),
+    database: WebDatabase = Depends(get_database),
+) -> Response:
+    """A photo of the signed-in person, as the bytes it was stored with. A photo that does not
+    exist, is somebody else's, has expired or whose id is not even a UUID is the same 404.
+    The answer is `no-store` (the chat API's rule), cannot be sniffed into anything else and,
+    if a browser ever rendered it as a document, runs nothing."""
+    if _UUID.fullmatch(attachment_id) is None:
+        raise ApiError("attachment_not_found")
+    wanted = UUID(attachment_id)
+    now = request.app.state.clock()
+    found = await database.run(
+        lambda session: attachments.get_for_user(session, current.user_id, wanted, now=now)
+    )
+    if found is None:
+        raise ApiError("attachment_not_found")
+    return Response(
+        found.data,
+        media_type=found.content_type,
+        headers={
+            "Content-Disposition": "inline",
+            "Content-Security-Policy": "default-src 'none'; sandbox",
+            "Cross-Origin-Resource-Policy": "same-origin",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @router.post("/conversations")
