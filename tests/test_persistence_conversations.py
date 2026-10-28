@@ -137,7 +137,7 @@ def test_conversations_are_listed_newest_activity_first_with_a_total_order(facto
     ]
     tied = [run(factory, lambda db: cv.create_conversation(db, user_id, now=NOW)).id for _ in range(3)]
 
-    page = run(factory, lambda db: cv.list_conversations(db, user_id, limit=50))
+    page = run(factory, lambda db: cv.list_conversations(db, user_id, now=NOW, limit=50))
 
     listed = [c.id for c in page.conversations]
     assert listed[:3] == [ids[2], ids[1], ids[0]]
@@ -149,8 +149,8 @@ def test_the_list_is_bounded_and_says_when_there_is_more(factory, user_id):
     for n in range(5):
         run(factory, lambda db, n=n: cv.create_conversation(db, user_id, now=NOW + timedelta(seconds=n)))
 
-    three = run(factory, lambda db: cv.list_conversations(db, user_id, limit=3))
-    five = run(factory, lambda db: cv.list_conversations(db, user_id, limit=5))
+    three = run(factory, lambda db: cv.list_conversations(db, user_id, now=NOW, limit=3))
+    five = run(factory, lambda db: cv.list_conversations(db, user_id, now=NOW, limit=5))
 
     assert (len(three.conversations), three.has_more) == (3, True)
     assert (len(five.conversations), five.has_more) == (5, False)
@@ -160,8 +160,8 @@ def test_the_list_is_bounded_and_says_when_there_is_more(factory, user_id):
 def test_only_the_owners_conversations_are_listed_or_owned(factory, user_id, other_user_id, conversation_id):
     theirs = run(factory, lambda db: cv.create_conversation(db, other_user_id, now=NOW)).id
 
-    mine_listed = run(factory, lambda db: cv.list_conversations(db, user_id, limit=50))
-    theirs_listed = run(factory, lambda db: cv.list_conversations(db, other_user_id, limit=50))
+    mine_listed = run(factory, lambda db: cv.list_conversations(db, user_id, now=NOW, limit=50))
+    theirs_listed = run(factory, lambda db: cv.list_conversations(db, other_user_id, now=NOW, limit=50))
 
     assert [c.id for c in mine_listed.conversations] == [conversation_id]
     assert [c.id for c in theirs_listed.conversations] == [theirs]
@@ -250,7 +250,7 @@ def test_reading_issues_no_write_and_leaves_the_activity_time_alone(engine, fact
     sa.event.listen(engine, "before_cursor_execute", lambda c, cur, st, p, ctx, m: seen.append(st.lstrip().split(None, 1)[0].upper()))
 
     history(factory, user_id, conversation_id, now=NOW + timedelta(days=3))
-    run(factory, lambda db: cv.list_conversations(db, user_id, limit=10))
+    run(factory, lambda db: cv.list_conversations(db, user_id, now=NOW, limit=10))
     context(factory, conversation_id, 2, now=NOW + timedelta(days=3))
 
     assert set(seen) <= {"BEGIN", "SELECT", "PRAGMA"}

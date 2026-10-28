@@ -16,8 +16,15 @@ repository's rule for SQLite's deferred BEGIN (see persistence.database).
 Retention. A message is "there" only while its expires_at is in the future: every read
 below takes `now` from the caller (the application's clock) and leaves an expired
 message out, whether or not a purge job has deleted it yet. The conversation itself has
-no deadline and no title is ever set here: a title would be a copy of something the user
-said that nothing could expire.
+no deadline and no title is ever stored here: a title would be a copy of something the
+user said that nothing could expire.
+
+Titles. What the list shows as a conversation's name is made when it is read, from the
+first user message that has not expired (conversation_title): the person's own first
+words, shortened. It lives exactly as long as that message does. When the message
+expires, the next one names the conversation; when none is left the title is None and
+the page falls back to the date. (A title stored in conversations.title, if there ever
+is one, wins.)
 
 Nothing here commits; the caller owns the transaction (web.database.WebDatabase.run).
 Results are plain values, not ORM objects, so they can leave the worker thread.
@@ -42,6 +49,27 @@ from house_helper.persistence.models import (
 
 class ConversationNotFound(Exception):
     """No such conversation for this user (unknown, somebody else's: not told apart)."""
+
+
+# The longest name a conversation gets from its first message, in characters (code
+# points), before the ellipsis. The page applies the same rule to a conversation it has
+# just made (chat-logic.js, deriveTitle); tests/test_web_ui_logic.py compares the two.
+TITLE_LENGTH = 60
+TITLE_ELLIPSIS = "…"
+
+
+def conversation_title(text: Optional[str]) -> Optional[str]:
+    """The name for a conversation whose first message is `text`: its words on one line
+    (every run of whitespace is one space), cut at TITLE_LENGTH characters with an
+    ellipsis when longer. None when there is nothing to name it by."""
+    if not text:
+        return None
+    line = " ".join(text.split())
+    if not line:
+        return None
+    if len(line) <= TITLE_LENGTH:
+        return line
+    return line[:TITLE_LENGTH].rstrip() + TITLE_ELLIPSIS
 
 
 @dataclass(frozen=True)
@@ -97,21 +125,41 @@ def create_conversation(session: OrmSession, user_id: UUID, *, now: datetime) ->
     return _summary(conversation)
 
 
-def list_conversations(session: OrmSession, user_id: UUID, *, limit: int) -> ConversationPage:
+def list_conversations(
+    session: OrmSession, user_id: UUID, *, now: datetime, limit: int
+) -> ConversationPage:
     """The user's conversations, most recently active first (ties by id, so the order
-    is total), at most `limit` of them."""
-    rows = session.scalars(
-        sa.select(Conversation)
+    is total), at most `limit` of them, each named (see "Titles", above) by its first
+    user message that has not expired at `now`."""
+    first_question = (
+        sa.select(Message.content)
+        .where(
+            Message.conversation_id == Conversation.id,
+            Message.role == MessageRole.USER.value,
+            Message.expires_at > now,
+        )
+        .order_by(Message.id)
+        .limit(1)
+        .correlate(Conversation)
+        .scalar_subquery()
+    )
+    rows = session.execute(
+        sa.select(Conversation, first_question)
         .where(Conversation.user_id == user_id)
         .order_by(Conversation.updated_at.desc(), Conversation.id.desc())
         .limit(limit + 1)
     ).all()
-    return ConversationPage([_summary(row) for row in rows[:limit]], has_more=len(rows) > limit)
+    return ConversationPage(
+        [_summary(row[0], row[1]) for row in rows[:limit]], has_more=len(rows) > limit
+    )
 
 
-def _summary(conversation: Conversation) -> ConversationSummary:
+def _summary(conversation: Conversation, first_question: Optional[str] = None) -> ConversationSummary:
     return ConversationSummary(
-        conversation.id, conversation.title, conversation.created_at, conversation.updated_at
+        conversation.id,
+        conversation.title or conversation_title(first_question),
+        conversation.created_at,
+        conversation.updated_at,
     )
 
 

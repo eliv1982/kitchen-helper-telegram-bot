@@ -7,8 +7,8 @@
 | KHD-01 | Kitchen Helper prioritizes a real cooking Web MVP for the owner's mother, not a generic household platform. | ACCEPTED — Stage 2A summary |
 | KHD-02 | All end-user UI, messages, recipe text and errors are in Russian. | ACCEPTED — Stage 2A summary |
 | KHD-03 | Three equally important chat intents: ingredients, specific dish, free inspiration. | ACCEPTED — Stage 2A summary |
-| KHD-04 | Multiple user conversations, durable history, device sync; each message expires after 365 days. | ACCEPTED product requirement; not implemented as Web product. *[Updated 2026-10-24: the 365-day physical deletion is RELEASED as code in R4C-D2 (KHD-30); its systemd timer is installed on the technical deployment, and the first scheduled run is not yet verified.]* *[Updated 2026-10-25: the first scheduled run was verified and accepted; it found nothing expired.]* |
-| KHD-05 | Saved recipes and long-term preferences are separate from history and survive history cleanup. | ACCEPTED product requirement; not fully implemented |
+| KHD-04 | Multiple user conversations, durable history, device sync; each message expires after 365 days. | ACCEPTED product requirement; not implemented as Web product. *[Updated 2026-10-24: the 365-day physical deletion is RELEASED as code in R4C-D2 (KHD-30); its systemd timer is installed on the technical deployment, and the first scheduled run is not yet verified.]* *[Updated 2026-10-25: the first scheduled run was verified and accepted; it found nothing expired.]* *[Updated 2026-10-27: the Web product part is released as code — history persists and conversations are listed under titles derived on reading (KHD-34); not deployed.]* |
+| KHD-05 | Saved recipes and long-term preferences are separate from history and survive history cleanup. | ACCEPTED product requirement; not fully implemented. *[Updated 2026-10-27: saved recipes are released as code (table `favorite_recipes`, migration `0007_favorite_recipes`, KHD-34), not deployed; long-term preferences are not built.]* |
 | KHD-06 | Preference extraction distinguishes explicit preferences, justified hypotheses and one-off wishes; user corrections take precedence. | ACCEPTED product requirement; not implemented |
 | KHD-07 | Shared User with independently approved Telegram OIDC and passwordless email identities; closed allowlist. No automatic merging. | ACCEPTED; backend pieces RELEASED |
 | KHD-08 | Modular Python monolith; Telegram and FastAPI processes share transport-neutral core. | ACCEPTED architecture |
@@ -109,6 +109,21 @@ This records an **owner decision given in Task A1 (2026-10-25)**, with a conflic
 - **Found with the real binary (rclone 1.75.2):** `copyto --immutable` and `moveto --immutable` replace an existing different object; the tool now also passes `--ignore-existing` (RUNBOOK 15.12.6). Yandex Disk itself was never exercised.
 - **Two gaps the last review found, closed in the repository:** (1) a foreign `.partial` created after the first listing (during the rename or the retention) was in no listing the run read, so a run that committed its point could end with exit 0; every run that commits now ends with a **closing listing**, taken last of all, and exit 6 follows from it (a closing listing that cannot be taken is also 6, never 0; no `.partial` is deleted; RUNBOOK 15.1). It is an observation at one moment, not a guarantee against a writer that comes later. (2) The operator's manual quarantine renamed onto a fixed `.quarantined` destination, which the real 1.75.2 replaces; RUNBOOK 15.11 now stops the timer, takes an exact inspected name, a unique checked destination, `--ignore-existing --error-on-no-transfer` and a listing of both names afterwards, and sends an ambiguous result to the owner instead of a retry (run against the real binary on its `local` backend, not against Yandex Disk, and not claimed atomic).
 - **Not decided here:** the date the exception must end by; the monitoring/alerting (assigned elsewhere; interfaces preserved in RUNBOOK 15.12.10); the live restore rehearsal from a real point; the activation itself.
+
+## Accepted product direction — History & Favorites (2026-10-27)
+
+These decisions record what the owner ACCEPTED with the History & Favorites implementation (REPORTED by the owner, 2026-10-27). They describe **released code that is not deployed**: migration `0007_favorite_recipes` is applied to no database and production stays at `0006_oidc_state_invitation` (`docs/STATUS.md`). They refine KHD-04 and KHD-05; they replace nothing.
+
+| ID | Decision | Status |
+|---|---|---|
+| **KHD-34** | (1) A conversation's title is **derived on reading** from its first unexpired user message (60 code points, then "…"); no title is stored, so the title expires with its message and retention (KHD-30) is unchanged. (2) Favorites are **independent of conversation retention**: a favorite is a copy of the answer, with no foreign key to the history and no expiry, and `purge-expired` does not know the table. (3) At most **100 favorites per user**. (4) **Any assistant response** can be saved, not only a detected recipe; the text is copied from the database, never taken from the request. (5) The topbar toggle is labelled "Меню". No further product change was approved. | ACCEPTED — owner, 2026-10-27; code RELEASED, not deployed |
+
+### Why / alternatives / boundaries
+
+- **Derived, not stored, titles:** a stored title would be a second copy of conversation text that the purge would have to know about; deriving it on reading keeps the 365-day promise exactly as it was.
+- **Favorites outside the 365 days:** the point of KHD-05 is that a saved recipe survives history cleanup. The cost is that the promise "everything is deleted after a year" no longer covers it; what the users are told about retention has to say so (`deploy/RUNBOOK.md` 14.7), and a saved recipe is in every backup taken after the upgrade.
+- **The limit of 100:** everything else expires, favorites do not, so they need their own bound.
+- **Not decided here:** the upgrade of the production database (an owner-approved step under `deploy/RUNBOOK.md` section 9, see 9.1); automatic extraction of preferences, search, renaming and folders for favorites; what the users are told about retention.
 
 ## Change discipline
 

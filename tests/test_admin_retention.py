@@ -41,6 +41,7 @@ from house_helper.persistence.database import (
     create_session_factory,
 )
 from tests.admin_support import db_path, db_url, migrated_template, snapshot  # noqa: F401  (fixtures)
+from tests.persistence_support import stored
 from tests.retention_support import (
     CUTOFF,
     MICROSECOND,
@@ -717,6 +718,35 @@ def test_favourites_and_preferences_survive_the_deletion_of_the_history_they_cam
     integrity(db_url)
 
 
+def test_a_real_favorite_survives_the_expiry_and_purge_of_its_answer_its_conversation_and_its_own_age(db_url):
+    gone, kept = seeded(db_url, seed_history)
+    owner_id = read(db_url, "SELECT user_id FROM conversations ORDER BY created_at LIMIT 1")[0][0]
+    expired = gone["messages"][0]
+    saved_at = NOW - 2 * RETENTION  # kept for more than a year: its own age is no reason to delete it
+    engine = create_db_engine(db_url)
+    try:
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "INSERT INTO favorite_recipes (id, user_id, title, content, source_message_id, created_at) "
+                "VALUES (?, ?, 'Борщ', 'Борщ: свёкла, капуста, говядина.', ?, ?)",
+                (uuid.uuid4().hex, owner_id, expired.id, stored(saved_at)),
+            )
+    finally:
+        engine.dispose()
+    before = dump(db_url)["favorite_recipes"]
+    assert len(before) == 1
+
+    preview = purge(db_url, dry_run=True)
+    real = purge(db_url)
+
+    assert "favorite_recipes" not in preview.deleted and "favorite_recipes" not in real.deleted
+    assert real.deleted["messages"] > 0  # the purge did run over the answer the favorite was copied from
+    check(db_url, gone, kept)
+    assert expired.id not in present(db_url, "messages")  # the source is gone; the favorite is not
+    assert dump(db_url)["favorite_recipes"] == before
+    integrity(db_url)
+
+
 def test_the_batch_statements_take_row_locks_only_where_the_database_has_them():
     from sqlalchemy.dialects import postgresql, sqlite
 
@@ -744,6 +774,7 @@ def test_every_table_of_the_schema_has_a_retention_decision():
         "users": "the person; deleting one is not retention",
         "allowlist_entries": "who may sign in (also the record that an identity was revoked)",
         "identity_links": "the Telegram or email identity of a user",
+        "favorite_recipes": "answers a person chose to keep: copies with no deadline and no link to the history",
     }
     assert set(Base.metadata.tables) == purged | set(kept), (
         "a table was added or removed: decide its retention (RUNBOOK section 14.1)"
@@ -755,7 +786,7 @@ def test_the_purge_names_exactly_the_tables_it_may_delete_from():
                                retention._invitations, retention._requests, retention._messages,
                                retention._conversations)}
     assert tables == {c.value for c in Category}
-    untouchable = {"users", "allowlist_entries", "identity_links", "alembic_version"}
+    untouchable = {"users", "allowlist_entries", "identity_links", "favorite_recipes", "alembic_version"}
     assert not tables & untouchable
 
 

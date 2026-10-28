@@ -6,6 +6,7 @@
  *   whitespace        every code point that trimLikeServer strips from the ends of a text
  *   count             countCodePoints of each text
  *   prepare           prepareMessage of each text: {ok, reason, text}
+ *   title             deriveTitle of each text: the name the page gives a conversation
  *   texts             the page's own words and constants
  */
 
@@ -40,6 +41,9 @@ process.stdin.on("end", () => {
           return { ok: result.ok, reason: result.reason || null, text: result.ok ? result.text : null };
         }),
       };
+      break;
+    case "title":
+      answer = { titles: request.texts.map((text) => Logic.deriveTitle(text)) };
       break;
     case "texts":
       answer = { TEXT: Logic.TEXT, CODE_MESSAGES: Logic.CODE_MESSAGES, MAX: Logic.MAX_MESSAGE_LENGTH, PAGE_SIZE: Logic.PAGE_SIZE };

@@ -44,10 +44,20 @@
     sidebar: byId("sidebar"),
     backdrop: byId("backdrop"),
     logout: byId("logout"),
+    tabChats: byId("tab-chats"),
+    tabFavorites: byId("tab-favorites"),
+    panelChats: byId("panel-chats"),
+    panelFavorites: byId("panel-favorites"),
     newConversation: byId("new-conversation"),
     listStatus: byId("list-status"),
     listRetry: byId("list-retry"),
     list: byId("conversation-list"),
+    favoritesStatus: byId("favorites-status"),
+    favoritesRetry: byId("favorites-retry"),
+    favoriteList: byId("favorite-list"),
+    recipe: byId("recipe"),
+    recipeTitle: byId("recipe-title"),
+    recipeBody: byId("recipe-body"),
     banner: byId("banner"),
     bannerText: byId("banner-text"),
     bannerClose: byId("banner-close"),
@@ -210,7 +220,16 @@
       drawScreens(data);
     });
     if (view.screen === "app") {
+      region("section", view.section, drawSection);
       region("list", view.list, drawList);
+      region("favoriteList", { status: view.favorites.status, error: view.favorites.error, items: view.favorites.items }, drawFavoriteList);
+      // (The state of the list matters to the pane only while no recipe is open: it then says what to do.)
+      var open = view.favorites.current !== null;
+      region(
+        "recipe",
+        { current: view.favorites.current, status: open ? null : view.favorites.status, count: open ? null : view.favorites.items.length },
+        drawRecipe
+      );
       region("title", view.chatTitle, function (title) {
         els.chatTitle.textContent = title;
       });
@@ -219,6 +238,26 @@
         drawThread(thread, view.currentId);
       });
       region("composer", view.composer, drawComposer);
+      applyWantedFocus();
+    }
+  }
+
+  // What the person's last action wants focused once the page has been drawn: "recipe" (the title of the
+  // recipe pane, which is hidden until it is drawn), "keep" (the safe answer of the question "remove it?"),
+  // "remove" (the button that asked the question). The nodes are made by the drawing. It is asked of one
+  // drawing only: if what it wanted is not there, nothing is focused, and nothing is focused later.
+  var wantFocus = null;
+  var focusNodes = {};
+
+  function applyWantedFocus() {
+    var wanted = wantFocus;
+    wantFocus = null;
+    if (wanted === "recipe") {
+      if (!els.recipe.hidden) {
+        els.recipeTitle.focus();
+      }
+    } else if (wanted !== null && focusNodes[wanted]) {
+      focusNodes[wanted].focus();
     }
   }
 
@@ -227,6 +266,7 @@
 
   function drawScreens(data) {
     var screen = data.screen;
+    drawn.section = null; // (the part in front is drawn again after every change of screen)
     var waiting = Object.prototype.hasOwnProperty.call(WAITING, screen);
     var apart = screen === "unavailable" || screen === "unverified";
     els.gate.hidden = screen === "app";
@@ -282,6 +322,16 @@
         drawn.thread = drawn.list = drawn.banner = drawn.composer = drawn.title = null;
         clear(els.messages);
         clear(els.list);
+        clear(els.favoriteList);
+        clear(els.recipeBody);
+        drawn.favoriteList = drawn.recipe = null;
+        els.recipe.hidden = true;
+        els.recipeTitle.textContent = "";
+        els.favoritesStatus.textContent = "";
+        els.favoritesRetry.hidden = true;
+        lastRecipeId = null;
+        wantFocus = null;
+        focusNodes = {};
         els.input.value = "";
         autosize();
         els.chatTitle.textContent = "";
@@ -365,6 +415,189 @@
     });
   }
 
+  // The favorites ------------------------------------------------------------------------------------------
+
+  // Which part is in front: the conversations (the chat) or the favorites (the recipe).
+  function drawSection(section) {
+    var favorites = section === "favorites";
+    els.tabChats.setAttribute("aria-pressed", favorites ? "false" : "true");
+    els.tabFavorites.setAttribute("aria-pressed", favorites ? "true" : "false");
+    els.panelChats.hidden = favorites;
+    els.panelFavorites.hidden = !favorites;
+    els.chat.hidden = favorites;
+    els.recipe.hidden = !favorites;
+  }
+
+  function drawFavoriteList(list) {
+    var status = "";
+    els.favoritesRetry.hidden = true;
+    if (list.status === "loading" && list.items.length === 0) {
+      status = Logic.TEXT.favoritesLoading;
+    } else if (list.status === "error") {
+      status = list.error ? list.error.text : Logic.TEXT.favoritesFailed;
+      els.favoritesRetry.hidden = false;
+    } else if (list.status === "ready" && list.items.length === 0) {
+      status = Logic.TEXT.favoritesEmpty;
+    }
+    els.favoritesStatus.textContent = status;
+    clear(els.favoriteList);
+    list.items.forEach(function (item) {
+      var button = h("button", { class: "conv-item", type: "button", "aria-current": item.current ? "true" : false }, [
+        h("span", { class: "conv-label", text: item.title }),
+        h("span", { class: "conv-meta", text: item.meta }),
+      ]);
+      button.addEventListener("click", function () {
+        openFavorite(item.id);
+      });
+      els.favoriteList.appendChild(h("li", null, [button]));
+    });
+  }
+
+  var lastRecipeId = null;
+
+  function drawRecipe(data) {
+    focusNodes = {};
+    var box = els.recipeBody;
+    var current = data.current;
+    var scrolled = current && lastRecipeId === current.id ? box.scrollTop : 0;
+    clear(box);
+    if (current === null) {
+      lastRecipeId = null;
+      els.recipeTitle.textContent = Logic.TEXT.favoritesTab;
+      var empty = h("div", { class: "empty" }, [
+        h("p", { class: "lead", text: data.status === "ready" && data.count === 0 ? Logic.TEXT.favoritesEmpty : Logic.TEXT.favoritesPick }),
+      ]);
+      if (data.count > 0) {
+        var choose = action("Выбрать рецепт", "btn-primary only-narrow", function () {
+          setDrawer(true, false);
+        });
+        empty.appendChild(choose);
+      }
+      box.appendChild(empty);
+      return;
+    }
+    lastRecipeId = current.id;
+    els.recipeTitle.textContent = current.title || "Рецепт";
+    if (current.status === "loading") {
+      box.appendChild(
+        h("p", { class: "loading" }, [h("span", { class: "spinner", "aria-hidden": "true" }), document.createTextNode(Logic.TEXT.recipeLoading)])
+      );
+    } else if (current.status === "error" || current.status === "gone") {
+      var problem = h("div", { class: "empty" }, [
+        h("p", { class: "notice notice-error", text: current.error ? current.error.text : Logic.TEXT.recipeFailed }),
+        current.error && current.error.correlationId
+          ? h("p", { class: "hint", text: Logic.TEXT.correlation.replace("{id}", current.error.correlationId) })
+          : null,
+      ]);
+      if (current.status === "error") {
+        problem.appendChild(
+          action(Logic.TEXT.retry, "btn-primary", function () {
+            controller.reloadRecipe();
+          })
+        );
+      }
+      box.appendChild(problem);
+      alertText(current.error ? current.error.text : "");
+    } else {
+      if (current.meta) {
+        box.appendChild(h("p", { class: "hint recipe-meta", text: current.meta }));
+      }
+      var text = textBlocks(current.text);
+      text.className += " recipe-text";
+      box.appendChild(text);
+      box.appendChild(removalControls(current));
+    }
+    box.scrollTop = scrolled;
+  }
+
+  // "Убрать из избранного", and after it the question, which is answered before anything is removed.
+  function removalControls(current) {
+    var removing = current.removing;
+    var row = h("div", { class: "recipe-actions" });
+    if (removing === null) {
+      var remove = action(Logic.TEXT.removeAction, "btn-quiet", function () {
+        wantFocus = "keep";
+        controller.askRemoveFavorite(current.id);
+      });
+      focusNodes.remove = remove;
+      row.appendChild(remove);
+      return row;
+    }
+    if (removing.phase === "removing") {
+      row.appendChild(
+        h("p", { class: "loading" }, [h("span", { class: "spinner", "aria-hidden": "true" }), document.createTextNode(Logic.TEXT.removing)])
+      );
+      return row;
+    }
+    var question = h("div", { class: "confirm", role: "group", "aria-label": Logic.TEXT.removeAsk });
+    question.appendChild(h("p", { class: "confirm-text", text: removing.error ? removing.error.text : Logic.TEXT.removeAsk }));
+    if (removing.error && removing.error.correlationId) {
+      question.appendChild(h("p", { class: "hint", text: Logic.TEXT.correlation.replace("{id}", removing.error.correlationId) }));
+    }
+    var buttons = h("div", { class: "msg-actions" });
+    buttons.appendChild(
+      action(removing.error ? Logic.TEXT.retry : Logic.TEXT.removeConfirm, "btn-danger", function () {
+        controller.removeFavorite();
+      })
+    );
+    var keep = action(Logic.TEXT.removeKeep, "btn-quiet", function () {
+      wantFocus = "remove";
+      controller.cancelRemoveFavorite();
+    });
+    focusNodes.keep = keep;
+    buttons.appendChild(keep);
+    question.appendChild(buttons);
+    row.appendChild(question);
+    if (removing.error) {
+      alertText(removing.error.text);
+    }
+    return row;
+  }
+
+  function openFavorite(id) {
+    setDrawer(false, false);
+    wantFocus = "recipe";
+    controller.openFavorite(id);
+  }
+
+  // Under an answer of the assistant: keep it, or (when it is kept) say so and open it.
+  function favoriteActions(mark, messageId, conversationId) {
+    var row = h("div", { class: "msg-actions msg-favorite" });
+    if (mark.state === "saved") {
+      row.appendChild(h("span", { class: "fav-mark", text: Logic.TEXT.favoriteKept }));
+      row.appendChild(
+        action(Logic.TEXT.favoriteOpen, "btn-quiet", function () {
+          openFavorite(mark.id);
+        }, "Открыть сохранённый рецепт")
+      );
+      return row;
+    }
+    if (mark.state === "saving") {
+      row.appendChild(
+        h("p", { class: "msg-note" }, [h("span", { class: "spinner", "aria-hidden": "true" }), h("span", { text: Logic.TEXT.favoriteKeeping })])
+      );
+      return row;
+    }
+    if (mark.state === "error") {
+      row.appendChild(h("p", { class: "msg-note msg-note-error", text: mark.error.text }));
+    }
+    row.appendChild(
+      action(Logic.TEXT.favoriteKeep, "btn-quiet", function () {
+        controller.keepFavorite(conversationId, messageId).then(function (result) {
+          if (result && !result.ok && result.reason !== "busy" && result.reason !== "stale") {
+            var failed = lastView && lastView.thread.items.filter(function (item) {
+              return item.type === "message" && item.id === messageId && item.favorite && item.favorite.error;
+            })[0];
+            if (failed) {
+              alertText(failed.favorite.error.text);
+            }
+          }
+        });
+      }, "Сохранить этот ответ в избранное")
+    );
+    return row;
+  }
+
   // The messages ------------------------------------------------------------------------------------------
 
   // Paragraphs by blank lines; single line breaks stay (white-space: pre-wrap in the style). The
@@ -381,8 +614,8 @@
     return wrapper;
   }
 
-  function action(label, className, handler) {
-    var button = h("button", { class: "btn " + className, type: "button", text: label });
+  function action(label, className, handler, description) {
+    var button = h("button", { class: "btn " + className, type: "button", text: label, "aria-label": description || false });
     button.addEventListener("click", handler);
     return button;
   }
@@ -415,6 +648,9 @@
           })
         );
         node.appendChild(row);
+      }
+      if (item.favorite) {
+        node.appendChild(favoriteActions(item.favorite, item.id, conversationId));
       }
       return node;
     }
@@ -698,7 +934,7 @@
     els.backdrop.hidden = !isOpen;
     els.chat.inert = isOpen;
     if (isOpen) {
-      els.newConversation.focus();
+      (els.tabFavorites.getAttribute("aria-pressed") === "true" ? els.tabFavorites : els.tabChats).focus();
     } else if (restoreFocus) {
       els.drawerToggle.focus();
     }
@@ -734,6 +970,15 @@
   });
   els.listRetry.addEventListener("click", function () {
     controller.reloadList();
+  });
+  els.tabChats.addEventListener("click", function () {
+    controller.showSection("chats");
+  });
+  els.tabFavorites.addEventListener("click", function () {
+    controller.showSection("favorites");
+  });
+  els.favoritesRetry.addEventListener("click", function () {
+    controller.reloadFavorites();
   });
   els.bannerClose.addEventListener("click", function () {
     controller.dismissBanner();

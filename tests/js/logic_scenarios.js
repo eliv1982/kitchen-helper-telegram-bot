@@ -62,6 +62,7 @@ scenario("boot_opens_the_most_recent_conversation", async () => {
   assert.deepEqual(env.net.log.map((r) => `${r.method} ${r.url}`), [
     "GET /auth/me",
     "GET /api/conversations?limit=50",
+    "GET /api/favorites",
     `GET /api/conversations/${CONV_B}/messages?limit=50`,
   ]);
   assert.equal(view.list.items.length, 2);
@@ -2196,7 +2197,7 @@ scenario("a_different_person_on_coming_back_never_sees_the_last_ones_conversatio
   const since = env.net.log.slice(aboutAnna);
   assert.deepEqual(since.filter((r) => r.url.includes(CONV_A)), []);
   assert.deepEqual(since.map((r) => `${r.method} ${r.url.split("?")[0]}`), [
-    "GET /auth/me", "GET /auth/me", "GET /api/conversations", `GET /api/conversations/${CONV_B}/messages`,
+    "GET /auth/me", "GET /auth/me", "GET /api/conversations", "GET /api/favorites", `GET /api/conversations/${CONV_B}/messages`,
   ]);
 });
 
@@ -2780,6 +2781,618 @@ scenario("when_the_browser_will_not_keep_the_record_the_page_does_not_promise_re
   await (await kept.ctl.send("Вопрос")).done;
   await kept.settle();
   assert.equal(pendingItem(kept).warning, "");
+});
+
+// ============================================================================================
+// Names of conversations: the first message, as the server names them
+// ============================================================================================
+
+const FIRST_QUESTION = "Что приготовить из курицы и риса?";
+
+async function startedConversation(question, answerText = "Запеките.") {
+  const env = makeEnv().signedIn([]);
+  await env.boot();
+  env.net.route("POST", "/api/conversations", json(201, conversation(CONV_C, 60)));
+  env.net.route("POST", `/api/conversations/${CONV_C}/messages`, turnBody(CONV_C, 1, question, 2, answerText));
+  await (await env.ctl.send(question)).done;
+  await env.settle();
+  return env;
+}
+
+scenario("a_conversation_made_in_the_page_is_named_by_its_first_message", async () => {
+  const env = await startedConversation(FIRST_QUESTION);
+
+  const view = env.view();
+  assert.equal(view.list.items[0].label, FIRST_QUESTION);
+  assert.equal(view.chatTitle, FIRST_QUESTION);
+  assert.equal(env.ctl._state().list.items[0].title, FIRST_QUESTION);
+});
+
+scenario("the_second_message_does_not_rename_the_conversation", async () => {
+  const env = await startedConversation(FIRST_QUESTION);
+  env.net.route("POST", `/api/conversations/${CONV_C}/messages`, turnBody(CONV_C, 3, "А без духовки?", 4, "На плите."));
+
+  await (await env.ctl.send("А без духовки?")).done;
+  await env.settle();
+
+  assert.equal(env.view().list.items[0].label, FIRST_QUESTION);
+});
+
+scenario("a_long_or_untidy_first_message_is_named_on_one_line_and_cut_like_the_servers", async () => {
+  const long = "Подскажите, пожалуйста, как приготовить домашнюю лапшу для куриного супа без яиц и муки высшего сорта";
+  const env = await startedConversation("  " + long + "\n\n  ещё\tстрока ");
+
+  const label = env.view().list.items[0].label;
+  assert.equal(label, Logic.deriveTitle(long));
+  assert.ok(label.endsWith("…"), label);
+  assert.equal(Array.from(label).length, Logic.TITLE_LENGTH + 1);
+  assert.ok(!/[\n\t]/.test(label));
+});
+
+scenario("a_name_the_server_gave_is_kept_when_the_conversation_is_continued", async () => {
+  const env = makeEnv().signedIn([conversation(CONV_A, 0, "Борщ по-домашнему")], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Борщ по-домашнему"), message(2, "assistant", "Варите.")]),
+  });
+  await env.boot();
+  env.net.route("POST", URL_A, turnBody(CONV_A, 3, "Сколько солить?", 4, "Две чайные ложки."));
+
+  await (await env.ctl.send("Сколько солить?")).done;
+  await env.settle();
+
+  assert.equal(env.view().list.items[0].label, "Борщ по-домашнему");
+});
+
+scenario("a_conversation_without_a_name_is_named_when_its_first_message_is_known_and_not_before", async () => {
+  // Nothing in it yet: the first exchange names it.
+  const empty = makeEnv().signedIn([conversation(CONV_A, 0)], { [CONV_A]: historyBody(CONV_A, []) });
+  await empty.boot();
+  empty.net.route("POST", URL_A, turnBody(CONV_A, 1, FIRST_QUESTION, 2, "Запеките."));
+  await (await empty.ctl.send(FIRST_QUESTION)).done;
+  await empty.settle();
+  assert.equal(empty.view().list.items[0].label, FIRST_QUESTION);
+
+  // Older messages are still unread: the first message is not known, and a newer one must not name it.
+  const longer = makeEnv().signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [message(7, "user", "Вопрос"), message(8, "assistant", "Ответ")], { hasMore: true, nextBefore: 7 }),
+  });
+  await longer.boot();
+  longer.net.route("POST", URL_A, turnBody(CONV_A, 9, "Новое", 10, "Ответ."));
+  await (await longer.ctl.send("Новое")).done;
+  await longer.settle();
+  assert.equal(longer.ctl._state().list.items[0].title, null);
+  assert.ok(longer.view().list.items[0].label.startsWith("Разговор от "), "the date, as before");
+});
+
+scenario("the_title_rule_is_the_same_for_every_kind_of_whitespace_and_every_length", async () => {
+  const cases = [
+    ["", null],
+    [" \n\t ", null],
+    ["Борщ", "Борщ"],
+    ["  Борщ   с\t\tфасолью\n", "Борщ с фасолью"],
+    ["a b c　d", "a b c d"],
+    ["x".repeat(60), "x".repeat(60)],
+    ["x".repeat(61), "x".repeat(60) + "…"],
+    ["😀".repeat(60), "😀".repeat(60)],
+    ["😀".repeat(61), "😀".repeat(60) + "…"],
+    ["слово ".repeat(40), ("слово ".repeat(40)).slice(0, 60).replace(/ +$/, "") + "…"],
+  ];
+  for (const [input, expected] of cases) {
+    assert.equal(Logic.deriveTitle(input), expected, JSON.stringify(input.slice(0, 20)));
+  }
+  assert.equal(Logic.deriveTitle(undefined), null);
+  assert.equal(Logic.deriveTitle(5), null);
+});
+
+// ============================================================================================
+// Favorites
+// ============================================================================================
+
+const RECIPE_TEXT = "Борщ\n\nПорции: 4.\n1. Сварите бульон.";
+const F1 = H.favorite(H.FAV_1, 2, "Борщ классический", 0);
+const F2 = H.favorite(H.FAV_2, 12, "Плов с курицей", 30);
+const FAVORITES_URL = "/api/favorites";
+const FAV_URL_1 = `/api/favorites/${H.FAV_1}`;
+const FAV_URL_2 = `/api/favorites/${H.FAV_2}`;
+
+// A signed-in person with the conversation of withConversation() and these favorites.
+async function withFavorites(items = [F1, F2], options = {}) {
+  const env = makeEnv(options).signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Старый вопрос"), message(2, "assistant", "Старый ответ")]),
+  });
+  env.net.route("GET", FAVORITES_URL, H.favoritesBody(items));
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(F1, RECIPE_TEXT));
+  env.net.route("GET", FAV_URL_2, H.favoriteDetail(F2, "Плов: рис, курица."));
+  await env.boot();
+  return env;
+}
+
+const answerMark = (env) => timeline(env).find((i) => i.role === "assistant").favorite;
+
+scenario("the_favorites_are_read_once_at_the_start_and_mark_the_answers_that_are_kept", async () => {
+  const env = await withFavorites([F1]);
+
+  assert.equal(gets(env, FAVORITES_URL), 1);
+  const view = env.view();
+  assert.equal(view.section, "chats");
+  assert.deepEqual([view.favorites.status, view.favorites.items.map((i) => i.title)], ["ready", ["Борщ классический"]]);
+  assert.deepEqual(answerMark(env), { state: "saved", id: H.FAV_1, error: null });
+  const user = timeline(env).find((i) => i.role === "user");
+  assert.equal("favorite" in user, false, "only the assistant's answers can be kept");
+});
+
+scenario("an_answer_that_is_not_kept_is_marked_so", async () => {
+  const env = await withFavorites([F2]); // (kept: another answer)
+
+  assert.deepEqual(answerMark(env), { state: "none", id: null, error: null });
+});
+
+scenario("when_the_favorites_cannot_be_read_the_conversations_work_and_the_list_can_be_read_again", async () => {
+  const env = makeEnv().signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Старый вопрос"), message(2, "assistant", "Старый ответ")]),
+  });
+  env.net.route("GET", FAVORITES_URL, fail(), H.favoritesBody([F1]));
+  let view = await env.boot();
+
+  assert.deepEqual([view.favorites.status, view.favorites.error.text], ["error", Logic.TEXT.network]);
+  assert.equal(view.composer.locked, false);
+  assert.deepEqual(view.thread.items.map((i) => i.text), ["Старый вопрос", "Старый ответ"]);
+
+  await env.ctl.reloadFavorites();
+  await env.settle();
+  assert.deepEqual([env.view().favorites.status, env.view().favorites.items.length], ["ready", 1]);
+});
+
+scenario("a_favorites_list_that_is_not_the_servers_is_an_error_not_an_empty_list", async () => {
+  for (const answer of [json(200, { favorites: [{ id: "x" }] }), json(200, { nothing: 1 }), text(502, "<html>"), json(500, { detail: "internal_error" })]) {
+    const env = makeEnv().signedIn([]);
+    env.net.route("GET", FAVORITES_URL, answer);
+    const view = await env.boot();
+
+    assert.equal(view.favorites.status, "error");
+    assert.deepEqual(view.favorites.items, []);
+  }
+});
+
+scenario("keeping_an_answer_sends_the_conversation_and_the_message_and_nothing_else", async () => {
+  const env = await withFavorites([]);
+  env.net.route("POST", FAVORITES_URL, H.keptBody(F1));
+
+  const result = await env.ctl.keepFavorite(CONV_A, 2);
+  await env.settle();
+
+  assert.deepEqual(result, { ok: true, reason: "created" });
+  const [request] = env.net.requests("POST", FAVORITES_URL);
+  assert.deepEqual(request.body, { conversation_id: CONV_A, message_id: 2 });
+  assert.equal(request.init.credentials, "same-origin");
+  assert.equal(request.init.cache, "no-store");
+  assert.equal(request.headers["idempotency-key"], undefined, "keeping an answer is idempotent by itself");
+  assert.deepEqual(answerMark(env), { state: "saved", id: H.FAV_1, error: null });
+  assert.deepEqual(env.view().favorites.items.map((i) => i.id), [H.FAV_1]);
+  assert.ok(env.announced.includes(Logic.TEXT.favoriteKeptAnnounce));
+});
+
+scenario("while_an_answer_is_being_kept_it_says_so_and_asking_again_sends_nothing", async () => {
+  const env = await withFavorites([]);
+  const gate = deferred();
+  env.net.route("POST", FAVORITES_URL, async () => {
+    await gate.promise;
+    return H.keptBody(F1);
+  });
+
+  const first = env.ctl.keepFavorite(CONV_A, 2);
+  await flush();
+  assert.deepEqual(answerMark(env), { state: "saving", id: null, error: null });
+  assert.deepEqual(await env.ctl.keepFavorite(CONV_A, 2), { ok: false, reason: "busy" });
+  gate.resolve();
+  await first;
+  await env.settle();
+
+  assert.equal(env.net.requests("POST", FAVORITES_URL).length, 1);
+  assert.equal(answerMark(env).state, "saved");
+});
+
+scenario("an_answer_that_is_already_kept_is_not_sent_again", async () => {
+  const env = await withFavorites([F1]);
+
+  assert.deepEqual(await env.ctl.keepFavorite(CONV_A, 2), { ok: true, reason: "already" });
+  assert.equal(env.net.requests("POST", FAVORITES_URL).length, 0);
+});
+
+scenario("a_keep_whose_outcome_is_unclear_can_simply_be_asked_again", async () => {
+  const env = await withFavorites([]);
+  env.net.route("POST", FAVORITES_URL, fail(), apiError(503, "service_unavailable", { retryable: true }), H.keptBody(F1, false));
+
+  assert.deepEqual(await env.ctl.keepFavorite(CONV_A, 2), { ok: false, reason: "uncertain" });
+  assert.deepEqual(answerMark(env), { state: "error", id: null, error: { text: Logic.TEXT.network, correlationId: null } });
+  assert.equal((await env.ctl.keepFavorite(CONV_A, 2)).ok, false);
+  assert.equal(answerMark(env).state, "error");
+  assert.equal(answerMark(env).error.correlationId !== null, true, "the number of the request is kept for a report");
+
+  assert.deepEqual(await env.ctl.keepFavorite(CONV_A, 2), { ok: true, reason: "already" }); // 200: it was kept after all
+  assert.equal(answerMark(env).state, "saved");
+  assert.equal(env.net.requests("POST", FAVORITES_URL).length, 3);
+});
+
+scenario("a_refusal_is_shown_in_the_servers_words_and_a_stranger_answer_is_not_a_success", async () => {
+  const cases = [
+    [apiError(409, "favorites_full"), Logic.CODE_MESSAGES.favorites_full],
+    [apiError(404, "message_not_found"), Logic.CODE_MESSAGES.message_not_found],
+    [apiError(404, "conversation_not_found"), Logic.CODE_MESSAGES.conversation_not_found],
+    [json(201, { id: "no-uuid" }), Logic.TEXT.unexpected],
+    [text(200, "<html>proxy</html>"), Logic.TEXT.unexpected],
+  ];
+  for (const [answer, words] of cases) {
+    const env = await withFavorites([]);
+    env.net.route("POST", FAVORITES_URL, answer);
+
+    const result = await env.ctl.keepFavorite(CONV_A, 2);
+
+    assert.equal(result.ok, false);
+    assert.equal(answerMark(env).state, "error");
+    assert.equal(answerMark(env).error.text, words);
+    assert.deepEqual(env.view().favorites.items, [], "nothing is shown as kept that is not");
+  }
+});
+
+scenario("keeping_ends_the_session_when_the_server_says_401", async () => {
+  const env = await withFavorites([]);
+  env.net.route("POST", FAVORITES_URL, notAuthenticated());
+
+  await env.ctl.keepFavorite(CONV_A, 2);
+  await env.settle();
+
+  const view = env.view();
+  assert.equal(view.screen, "login");
+  assert.deepEqual(view.favorites.items, []);
+  assert.equal(view.currentId, null);
+});
+
+scenario("only_a_conversation_and_a_message_that_can_be_named_are_sent", async () => {
+  const env = await withFavorites([]);
+
+  for (const [conversationId, messageId] of [["x", 2], [CONV_A, 0], [CONV_A, -1], [CONV_A, 1.5], [CONV_A, "2"], [null, 2], [CONV_A, undefined]]) {
+    assert.deepEqual(await env.ctl.keepFavorite(conversationId, messageId), { ok: false, reason: "invalid" });
+  }
+  assert.equal(env.net.requests("POST", FAVORITES_URL).length, 0);
+});
+
+scenario("the_favorites_section_lists_newest_first_and_a_recipe_is_opened_by_asking_the_server", async () => {
+  const env = await withFavorites([F2, F1]);
+
+  env.ctl.showSection("favorites");
+  await env.settle();
+  let view = env.view();
+  assert.equal(view.section, "favorites");
+  assert.deepEqual(view.favorites.items.map((i) => i.title), ["Плов с курицей", "Борщ классический"]);
+  assert.ok(view.favorites.items[0].meta.startsWith("Сохранено: "), view.favorites.items[0].meta);
+  assert.equal(view.favorites.current, null);
+
+  await env.ctl.openFavorite(H.FAV_1);
+  await env.settle();
+
+  view = env.view();
+  assert.equal(view.section, "favorites");
+  assert.deepEqual(
+    [view.favorites.current.id, view.favorites.current.status, view.favorites.current.title, view.favorites.current.text],
+    [H.FAV_1, "ready", "Борщ классический", RECIPE_TEXT]
+  );
+  assert.deepEqual(view.favorites.items.map((i) => i.current), [false, true]);
+  assert.equal(gets(env, FAV_URL_1), 1);
+  assert.equal(gets(env, FAVORITES_URL), 1, "the list was read at the start and not again");
+});
+
+scenario("a_recipe_that_is_loading_is_shown_with_its_title_from_the_list", async () => {
+  const env = await withFavorites([F1]);
+  const gate = deferred();
+  env.net.route("GET", FAV_URL_1, async () => {
+    await gate.promise;
+    return H.favoriteDetail(F1, RECIPE_TEXT);
+  });
+
+  const opening = env.ctl.openFavorite(H.FAV_1);
+  await flush();
+  assert.deepEqual(
+    [env.view().favorites.current.status, env.view().favorites.current.title, env.view().favorites.current.text],
+    ["loading", "Борщ классический", ""]
+  );
+  gate.resolve();
+  await opening;
+  assert.equal(env.view().favorites.current.status, "ready");
+});
+
+scenario("a_recipe_that_cannot_be_opened_offers_to_try_again", async () => {
+  const env = await withFavorites([F1]);
+  env.net.route("GET", FAV_URL_1, fail(), H.favoriteDetail(F1, RECIPE_TEXT));
+
+  await env.ctl.openFavorite(H.FAV_1);
+  assert.deepEqual([env.view().favorites.current.status, env.view().favorites.current.error.text], ["error", Logic.TEXT.network]);
+
+  await env.ctl.reloadRecipe();
+  assert.deepEqual([env.view().favorites.current.status, env.view().favorites.current.text], ["ready", RECIPE_TEXT]);
+});
+
+scenario("a_recipe_removed_elsewhere_is_said_to_be_gone_and_leaves_the_list", async () => {
+  const env = await withFavorites([F1, F2]);
+  env.net.route("GET", FAV_URL_1, apiError(404, "favorite_not_found"));
+
+  await env.ctl.openFavorite(H.FAV_1);
+
+  const view = env.view();
+  assert.deepEqual([view.favorites.current.status, view.favorites.current.error.text], ["gone", Logic.TEXT.recipeGone]);
+  assert.deepEqual(view.favorites.items.map((i) => i.id), [H.FAV_2]);
+});
+
+scenario("a_late_answer_about_a_recipe_that_is_no_longer_the_open_one_changes_nothing", async () => {
+  const env = await withFavorites([F1, F2]);
+  const slow = deferred();
+  env.net.route("GET", FAV_URL_1, async () => {
+    await slow.promise;
+    return H.favoriteDetail(F1, RECIPE_TEXT);
+  });
+
+  const first = env.ctl.openFavorite(H.FAV_1);
+  await flush();
+  await env.ctl.openFavorite(H.FAV_2);
+  slow.resolve();
+  await first;
+  await env.settle();
+
+  const current = env.view().favorites.current;
+  assert.deepEqual([current.id, current.status, current.text], [H.FAV_2, "ready", "Плов: рис, курица."]);
+});
+
+scenario("an_answer_for_another_recipe_is_not_taken_for_the_one_asked_for", async () => {
+  const env = await withFavorites([F1, F2]);
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(F2, "Чужой текст")); // the server named another one
+
+  await env.ctl.openFavorite(H.FAV_1);
+
+  assert.equal(env.view().favorites.current.status, "error");
+  assert.equal(env.view().favorites.current.text, "");
+});
+
+scenario("only_a_favorite_id_that_can_be_one_is_asked_for", async () => {
+  const env = await withFavorites([F1]);
+
+  for (const id of ["x", "../../auth/me", "", null, undefined, 5, `${H.FAV_1}/../x`]) {
+    await env.ctl.openFavorite(id);
+  }
+
+  assert.equal(env.net.log.filter((r) => /^\/api\/favorites\/.+/.test(r.url)).length, 0);
+  assert.equal(env.view().section, "chats");
+});
+
+scenario("opening_a_conversation_brings_the_conversations_forward_again", async () => {
+  const env = await withFavorites([F1]);
+  await env.ctl.openFavorite(H.FAV_1);
+  assert.equal(env.view().section, "favorites");
+
+  await env.ctl.selectConversation(CONV_A);
+  assert.equal(env.view().section, "chats");
+  await env.ctl.openFavorite(H.FAV_1);
+  await env.ctl.startDraft();
+  assert.equal(env.view().section, "chats");
+  env.ctl.showSection("favorites");
+  assert.equal(env.view().section, "favorites");
+  env.ctl.showSection("nonsense");
+  assert.equal(env.view().section, "favorites");
+});
+
+scenario("the_favorites_section_reads_the_list_when_the_first_read_failed", async () => {
+  const env = makeEnv().signedIn([]);
+  env.net.route("GET", FAVORITES_URL, fail(), H.favoritesBody([F1]));
+  await env.boot();
+  assert.equal(env.view().favorites.status, "error");
+
+  env.ctl.showSection("favorites");
+  await env.settle();
+
+  assert.deepEqual([env.view().favorites.status, env.view().favorites.items.length], ["ready", 1]);
+  assert.equal(gets(env, FAVORITES_URL), 2);
+});
+
+scenario("removing_asks_first_and_changes_nothing_until_it_is_confirmed", async () => {
+  const env = await withFavorites([F1, F2]);
+  await env.ctl.openFavorite(H.FAV_1);
+
+  env.ctl.askRemoveFavorite(H.FAV_1);
+  assert.deepEqual(env.view().favorites.current.removing, { phase: "asking", error: null });
+  env.ctl.cancelRemoveFavorite();
+  assert.equal(env.view().favorites.current.removing, null);
+  env.ctl.askRemoveFavorite(H.FAV_2); // not the recipe that is open
+  assert.equal(env.view().favorites.current.removing, null);
+  assert.deepEqual(await env.ctl.removeFavorite(), { ok: false, reason: "not_asked" });
+
+  assert.equal(env.net.requests("DELETE", /.*/).length, 0);
+  assert.deepEqual(env.view().favorites.items.map((i) => i.id), [H.FAV_1, H.FAV_2]);
+});
+
+scenario("a_confirmed_removal_deletes_that_recipe_only", async () => {
+  const env = await withFavorites([F1, F2]);
+  env.net.route("DELETE", FAV_URL_1, H.removedBody());
+  await env.ctl.openFavorite(H.FAV_1);
+
+  env.ctl.askRemoveFavorite(H.FAV_1);
+  const result = await env.ctl.removeFavorite();
+  await env.settle();
+
+  assert.deepEqual(result, { ok: true });
+  const [request] = env.net.requests("DELETE", /.*/);
+  assert.equal(request.url, FAV_URL_1);
+  assert.equal(request.body, undefined, "nothing but the address says what to remove");
+  assert.equal(request.init.credentials, "same-origin");
+  const view = env.view();
+  assert.deepEqual(view.favorites.items.map((i) => i.id), [H.FAV_2]);
+  assert.equal(view.favorites.current, null);
+  assert.deepEqual(answerMark(env), { state: "none", id: null, error: null }, "the answer can be kept again");
+  assert.ok(env.announced.includes(Logic.TEXT.removed));
+});
+
+scenario("a_removal_that_failed_keeps_the_recipe_and_may_be_repeated", async () => {
+  const env = await withFavorites([F1]);
+  env.net.route("DELETE", FAV_URL_1, apiError(503, "service_unavailable", { retryable: true }), H.removedBody());
+  await env.ctl.openFavorite(H.FAV_1);
+  env.ctl.askRemoveFavorite(H.FAV_1);
+
+  assert.deepEqual(await env.ctl.removeFavorite(), { ok: false, reason: "failed" });
+  let current = env.view().favorites.current;
+  assert.equal(current.removing.phase, "error");
+  assert.equal(current.removing.error.text, Logic.CODE_MESSAGES.service_unavailable);
+  assert.equal(current.status, "ready");
+  assert.deepEqual(env.view().favorites.items.map((i) => i.id), [H.FAV_1]);
+
+  assert.deepEqual(await env.ctl.removeFavorite(), { ok: true });
+  assert.equal(env.view().favorites.current, null);
+  assert.deepEqual(env.view().favorites.items, []);
+});
+
+scenario("removing_what_is_already_gone_is_the_outcome_that_was_wanted", async () => {
+  const env = await withFavorites([F1]);
+  env.net.route("DELETE", FAV_URL_1, apiError(404, "favorite_not_found"));
+  await env.ctl.openFavorite(H.FAV_1);
+  env.ctl.askRemoveFavorite(H.FAV_1);
+
+  assert.deepEqual(await env.ctl.removeFavorite(), { ok: true });
+  assert.deepEqual(env.view().favorites.items, []);
+});
+
+scenario("a_removal_is_not_sent_twice_while_it_is_under_way", async () => {
+  const env = await withFavorites([F1]);
+  const gate = deferred();
+  env.net.route("DELETE", FAV_URL_1, async () => {
+    await gate.promise;
+    return H.removedBody();
+  });
+  await env.ctl.openFavorite(H.FAV_1);
+  env.ctl.askRemoveFavorite(H.FAV_1);
+
+  const first = env.ctl.removeFavorite();
+  await flush();
+  assert.equal(env.view().favorites.current.removing.phase, "removing");
+  assert.deepEqual(await env.ctl.removeFavorite(), { ok: false, reason: "not_asked" });
+  env.ctl.cancelRemoveFavorite();
+  assert.equal(env.view().favorites.current.removing.phase, "removing", "it cannot be called back");
+  gate.resolve();
+  await first;
+
+  assert.equal(env.net.requests("DELETE", /.*/).length, 1);
+});
+
+scenario("opening_another_recipe_drops_the_question_about_the_first", async () => {
+  const env = await withFavorites([F1, F2]);
+  await env.ctl.openFavorite(H.FAV_1);
+  env.ctl.askRemoveFavorite(H.FAV_1);
+
+  await env.ctl.openFavorite(H.FAV_2);
+
+  assert.equal(env.view().favorites.current.removing, null);
+  assert.deepEqual(await env.ctl.removeFavorite(), { ok: false, reason: "not_asked" });
+  assert.equal(env.net.requests("DELETE", /.*/).length, 0);
+});
+
+scenario("a_401_on_any_favorites_call_ends_the_session_and_drops_every_favorite", async () => {
+  for (const [route, act] of [
+    [["GET", FAV_URL_1], (env) => env.ctl.openFavorite(H.FAV_1)],
+    [["DELETE", FAV_URL_1], async (env) => {
+      await env.ctl.openFavorite(H.FAV_1);
+      env.ctl.askRemoveFavorite(H.FAV_1);
+      await env.ctl.removeFavorite();
+    }],
+  ]) {
+    const env = await withFavorites([F1]);
+    env.net.route(route[0], route[1], notAuthenticated());
+
+    await act(env);
+    await env.settle();
+
+    const view = env.view();
+    assert.equal(view.screen, "login");
+    assert.deepEqual(view.favorites.items, []);
+    assert.equal(view.favorites.current, null);
+  }
+});
+
+scenario("leaving_drops_the_favorites_with_everything_else_and_a_new_person_starts_with_none_of_them", async () => {
+  const env = await withFavorites([F1]);
+  await env.ctl.openFavorite(H.FAV_1);
+  env.net.route("POST", "/auth/logout", { kind: "empty", status: 204 });
+
+  await env.ctl.logout();
+
+  assert.equal(env.view().screen, "login");
+  const state = env.ctl._state();
+  assert.deepEqual([state.section, state.favorites.items, state.favorites.currentId, state.favorites.detail], ["chats", [], null, null]);
+  assert.ok(!JSON.stringify(state).includes("Борщ"), "no word of a recipe is left in memory");
+});
+
+scenario("nothing_of_the_favorites_is_in_view_while_the_page_asks_who_is_signed_in", async () => {
+  const env = await withFavorites([F1]);
+  await env.ctl.openFavorite(H.FAV_1);
+  const gate = deferred();
+  env.net.route("GET", "/auth/me", async () => {
+    await gate.promise;
+    return me();
+  });
+
+  env.ctl.recheck();
+  const held = env.view();
+  assert.equal(held.screen, "verifying");
+  assert.deepEqual([held.section, held.favorites.items, held.favorites.current], ["chats", [], null]);
+  assert.ok(!JSON.stringify(held).includes("Борщ"));
+  assert.deepEqual(await env.ctl.keepFavorite(CONV_A, 2), { ok: false, reason: "not_ready" });
+  assert.equal(await env.ctl.openFavorite(H.FAV_2), undefined);
+  gate.resolve();
+  await env.settle();
+
+  const back = env.view();
+  assert.equal(back.screen, "app");
+  assert.deepEqual([back.section, back.favorites.current.id, back.favorites.items.length], ["favorites", H.FAV_1, 1]);
+});
+
+scenario("a_different_person_never_sees_the_last_persons_favorites", async () => {
+  const env = await withFavorites([F1]);
+  await env.ctl.openFavorite(H.FAV_1);
+  env.net.route("GET", "/auth/me", me(86400, USER_B));
+  env.net.route("GET", FAVORITES_URL, H.favoritesBody([F2]));
+
+  env.ctl.recheck();
+  await env.settle();
+
+  const view = env.view();
+  assert.equal(view.screen, "app");
+  assert.equal(view.section, "chats");
+  assert.deepEqual(view.favorites.items.map((i) => i.title), ["Плов с курицей"]);
+  assert.equal(view.favorites.current, null);
+  assert.ok(!JSON.stringify(view).includes("Борщ"));
+});
+
+scenario("favorites_are_never_written_to_the_browsers_storage", async () => {
+  const env = await withFavorites([F1]);
+  env.net.route("POST", FAVORITES_URL, H.keptBody(F2));
+  await env.ctl.openFavorite(H.FAV_1);
+  await env.ctl.keepFavorite(CONV_A, 12);
+  await env.settle();
+
+  assert.deepEqual(env.storage.data, {});
+});
+
+scenario("every_favorites_call_is_made_with_the_session_cookie_only_and_names_no_user", async () => {
+  const env = await withFavorites([F1]);
+  env.net.route("POST", FAVORITES_URL, H.keptBody(F2));
+  env.net.route("DELETE", FAV_URL_1, H.removedBody());
+  await env.ctl.openFavorite(H.FAV_1);
+  await env.ctl.keepFavorite(CONV_A, 12);
+  env.ctl.askRemoveFavorite(H.FAV_1);
+  await env.ctl.removeFavorite();
+
+  const asked = env.net.log.filter((r) => r.url.startsWith(FAVORITES_URL));
+  assert.deepEqual(asked.map((r) => r.method), ["GET", "GET", "POST", "DELETE"]);
+  for (const request of asked) {
+    assert.equal(request.init.credentials, "same-origin");
+    assert.equal(request.init.redirect, "error");
+    assert.deepEqual(Object.keys(request.headers).sort(), request.body === undefined ? ["accept"] : ["accept", "content-type"]);
+    assert.ok(!JSON.stringify(request).includes(USER_A));
+  }
 });
 
 module.exports = scenarios;

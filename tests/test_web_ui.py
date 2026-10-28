@@ -605,7 +605,8 @@ async def test_the_journey_of_the_page_create_send_list_read(tmp_path):
     body = sent.json()
     assert set(body) == {"conversation_id", "user_message", "assistant_message", "truncated", "replayed"}
     assert body["replayed"] is False and body["truncated"] is False and body["conversation_id"] == conversation
-    assert listing.json()["conversations"][0]["id"] == conversation and listing.json()["conversations"][0]["title"] is None
+    assert listing.json()["conversations"][0]["id"] == conversation
+    assert listing.json()["conversations"][0]["title"] == "Как варить борщ?"  # named by its first message, on reading
     page = history.json()
     assert page["conversation_id"] == conversation and page["has_more"] is False and page["next_before"] is None
     assert [(m["role"], m["text"], m["status"]) for m in page["messages"]] == [

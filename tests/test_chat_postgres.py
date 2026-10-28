@@ -419,7 +419,7 @@ def test_a_reader_is_not_held_up_by_a_writer_that_has_not_committed(factory, use
         writer.execute(sa.update(Conversation).where(Conversation.id == conversation_id).values(updated_at=NOW))
         # the row is locked by an open transaction: reads go on
         page = run(factory, lambda db: cv.list_messages(db, user_id, conversation_id, now=NOW, limit=5))
-        listed = run(factory, lambda db: cv.list_conversations(db, user_id, limit=5))
+        listed = run(factory, lambda db: cv.list_conversations(db, user_id, now=NOW, limit=5))
         assert len(page.messages) == 1 and len(listed.conversations) == 1
     finally:
         writer.rollback()

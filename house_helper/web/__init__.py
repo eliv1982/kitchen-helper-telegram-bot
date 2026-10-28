@@ -27,6 +27,10 @@ of its errors (stable codes, Russian messages, server-made correlation ids). The
 comes from the same settings as the Telegram bot's, minus its token (settings.py), and
 is built when the application starts but connects only on the first message.
 
+The favorites API (favorites_api.py) is the second: the answers a person chose to keep, copied
+out of their conversations so that they outlive the history (persistence.favorites). It shares
+the chat API's route class, so its errors and headers are the same.
+
 The page (ui.py and static/) is the people's side of both: the shell at "/" and the
 script, style and logic under /static. It is public and holds no data of anyone's; it
 asks /auth/me who is signed in and calls the routes above with the visitor's own cookie.

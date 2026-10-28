@@ -70,7 +70,8 @@ PROVENANCE = "0002_session_provenance"
 CHALLENGES = "0003_email_login_challenges"
 EMAIL_CASE = "0004_email_identity_case"
 INVITATIONS = "0005_identity_invitations"
-HEAD = "0006_oidc_state_invitation"
+OIDC_STATE = "0006_oidc_state_invitation"
+HEAD = "0007_favorite_recipes"
 REPO_ROOT = Path(house_helper.persistence.__file__).resolve().parents[2]
 
 
@@ -99,13 +100,15 @@ def test_the_history_is_one_line_with_one_head():
     assert script.get_heads() == [HEAD]
     assert [revision.revision for revision in script.walk_revisions()] == [
         HEAD,
+        OIDC_STATE,
         INVITATIONS,
         EMAIL_CASE,
         CHALLENGES,
         PROVENANCE,
         INITIAL,
     ]
-    assert script.get_revision(HEAD).down_revision == INVITATIONS
+    assert script.get_revision(HEAD).down_revision == OIDC_STATE
+    assert script.get_revision(OIDC_STATE).down_revision == INVITATIONS
     assert script.get_revision(INVITATIONS).down_revision == EMAIL_CASE
     assert script.get_revision(EMAIL_CASE).down_revision == CHALLENGES
     assert script.get_revision(CHALLENGES).down_revision == PROVENANCE
@@ -472,7 +475,7 @@ def test_downgrading_the_provenance_keeps_every_row_and_the_old_schema(tmp_path)
 # their provenance stay live, identity links stay, and the new table starts empty.
 # (These stop at 0003: 0004, which follows it, revokes the email identities; see below.)
 
-ALL_TABLES_BEFORE_0003 = TABLES - {"email_login_challenges", "identity_invitations"}
+ALL_TABLES_BEFORE_0003 = TABLES - {"email_login_challenges", "identity_invitations", "favorite_recipes"}
 
 
 def _r3b1_database(engine):
@@ -876,7 +879,7 @@ def test_downgrading_is_refused_while_an_address_with_a_capital_in_its_local_par
 # every old table stays byte for byte, nobody is signed out, no migration-time data step
 # exists. No limit on the number of users enters the schema.
 
-TABLES_BEFORE_0005 = TABLES - {"identity_invitations"}
+TABLES_BEFORE_0005 = TABLES - {"identity_invitations", "favorite_recipes"}
 
 
 def _r3b3_database(engine) -> dict:
@@ -903,7 +906,7 @@ def test_the_invitation_migration_adds_one_empty_table_and_changes_nothing_else(
     upgrade_database(empty_engine, INVITATIONS)
 
     assert _version(empty_engine) == [INVITATIONS]
-    assert _tables(empty_engine) == TABLES | {"alembic_version"}
+    assert _tables(empty_engine) == TABLES - {"favorite_recipes"} | {"alembic_version"}
     assert _snapshot_before_0005(empty_engine) == before  # every row of every old table
     with empty_engine.connect() as connection:
         assert connection.exec_driver_sql("SELECT count(*) FROM identity_invitations").scalar() == 0
@@ -999,7 +1002,7 @@ def test_the_one_outstanding_rule_is_the_same_partial_index_in_the_migrated_and_
 # finishes as before (NULL is an ordinary login), nobody is signed out, no invitation is
 # touched. The way back deletes the logins bound to an invitation and nothing else.
 
-TABLES_BEFORE_0006_WITH_ROWS = TABLES - {"oidc_states"}
+TABLES_BEFORE_0006_WITH_ROWS = TABLES - {"oidc_states", "favorite_recipes"}
 
 
 def _r4c_database(engine) -> dict:
@@ -1187,8 +1190,10 @@ def _offline_sql(direction: str) -> str:
         command.downgrade(config, f"{EMAIL_CASE}:{CHALLENGES}", sql=True)
     elif direction == "down_from_invitations":
         command.downgrade(config, f"{INVITATIONS}:{EMAIL_CASE}", sql=True)
+    elif direction == "down_from_oidc_state":
+        command.downgrade(config, f"{OIDC_STATE}:{INVITATIONS}", sql=True)
     elif direction == "down_from_head":
-        command.downgrade(config, f"{HEAD}:{INVITATIONS}", sql=True)
+        command.downgrade(config, f"{HEAD}:{OIDC_STATE}", sql=True)
     else:
         command.downgrade(config, f"{HEAD}:base", sql=True)
     return config.output_buffer.getvalue()
@@ -1214,7 +1219,7 @@ def test_the_upgrade_renders_as_postgresql_sql():
     assert "%" not in sql  # a doubled percent sign would make the offline SQL unrunnable
     assert f"INSERT INTO alembic_version (version_num) VALUES ('{INITIAL}')" in sql
     assert f"UPDATE alembic_version SET version_num='{HEAD}'" in sql
-    assert sql.count("CREATE INDEX") == 16 and sql.count("CREATE UNIQUE INDEX") == 2
+    assert sql.count("CREATE INDEX") == 17 and sql.count("CREATE UNIQUE INDEX") == 2
 
 
 def test_the_downgrade_renders_as_postgresql_sql():
@@ -1322,8 +1327,8 @@ def test_the_invitation_revision_renders_as_one_table_and_its_indexes():
 
 
 def test_the_oidc_state_revision_renders_as_three_alters_and_the_way_back_as_a_delete_and_three_drops():
-    up, down = _offline_sql("up"), _offline_sql("down_from_head")
-    revision = up.split(f"Running upgrade {INVITATIONS} -> {HEAD}")[1]
+    up, down = _offline_sql("up"), _offline_sql("down_from_oidc_state")
+    revision = up.split(f"Running upgrade {INVITATIONS} -> {OIDC_STATE}")[1].split("-- Running upgrade")[0]
 
     statements = [re.sub(r"\s+", " ", part.strip()) for part in revision.split(";")]
     statements = [part for part in statements if part not in ("", "COMMIT")]
@@ -1333,7 +1338,7 @@ def test_the_oidc_state_revision_renders_as_three_alters_and_the_way_back_as_a_d
         "FOREIGN KEY(invitation_id) REFERENCES identity_invitations (id) ON DELETE CASCADE"
     )
     assert statements[2] == "CREATE INDEX ix_oidc_states_invitation_id ON oidc_states (invitation_id)"
-    assert statements[3].startswith("UPDATE alembic_version SET version_num='" + HEAD + "'")
+    assert statements[3].startswith("UPDATE alembic_version SET version_num='" + OIDC_STATE + "'")
     assert len(statements) == 4  # nothing else is created, altered, updated or dropped
     assert "NOT NULL" not in statements[0]  # a nullable column: no existing row is rewritten
     assert "UPDATE oidc_states" not in revision and "DELETE FROM" not in revision
@@ -1415,7 +1420,7 @@ def test_the_migration_and_the_models_build_the_same_schema_in_postgresql_sql():
 
 def test_the_migration_and_the_models_create_the_same_indexes_in_postgresql_sql():
     assert _indexes_in(_offline_sql("up")) == _indexes_in(_models_as_postgresql())
-    assert len(_indexes_in(_models_as_postgresql())) == 18  # 16 plain, 2 unique
+    assert len(_indexes_in(_models_as_postgresql())) == 19  # 17 plain, 2 unique
 
 
 def test_the_postgresql_comparison_does_see_a_difference(monkeypatch):

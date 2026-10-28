@@ -159,16 +159,27 @@ _SHELL = """\
 
 <div id="screen-app" class="app" data-drawer="closed" hidden>
   <header class="topbar">
-    <button id="drawer-toggle" class="btn btn-onblue drawer-toggle" type="button" aria-controls="sidebar" aria-expanded="false"><span class="burger" aria-hidden="true"></span>Разговоры</button>
+    <button id="drawer-toggle" class="btn btn-onblue drawer-toggle" type="button" aria-controls="sidebar" aria-expanded="false"><span class="burger" aria-hidden="true"></span>Меню</button>
     <p class="brand">House Helper</p>
     <button id="logout" class="btn btn-onblue" type="button">Выйти</button>
   </header>
   <div class="workspace">
-    <nav id="sidebar" class="sidebar" aria-label="Разговоры">
-      <button id="new-conversation" class="btn btn-secondary btn-block" type="button">Новый разговор</button>
-      <p id="list-status" class="hint" role="status"></p>
-      <button id="list-retry" class="btn btn-quiet btn-block" type="button" hidden>Обновить список</button>
-      <ul id="conversation-list" class="conv-list"></ul>
+    <nav id="sidebar" class="sidebar" aria-label="Разговоры и избранное">
+      <div class="tabs" role="group" aria-label="Раздел">
+        <button id="tab-chats" class="tab" type="button" aria-pressed="true">Разговоры</button>
+        <button id="tab-favorites" class="tab" type="button" aria-pressed="false">Избранное</button>
+      </div>
+      <div id="panel-chats">
+        <button id="new-conversation" class="btn btn-secondary btn-block" type="button">Новый разговор</button>
+        <p id="list-status" class="hint" role="status"></p>
+        <button id="list-retry" class="btn btn-quiet btn-block" type="button" hidden>Обновить список</button>
+        <ul id="conversation-list" class="conv-list"></ul>
+      </div>
+      <div id="panel-favorites" hidden>
+        <p id="favorites-status" class="hint" role="status"></p>
+        <button id="favorites-retry" class="btn btn-quiet btn-block" type="button" hidden>Обновить избранное</button>
+        <ul id="favorite-list" class="conv-list"></ul>
+      </div>
     </nav>
     <div id="backdrop" class="backdrop" hidden></div>
     <main id="chat" class="chat" aria-labelledby="chat-title" hidden>
@@ -190,6 +201,10 @@ _SHELL = """\
         <p class="composer-meta"><span><span id="composer-hint" class="hint"></span> <span class="hint hint-keys">Ctrl+Enter — отправить</span></span><span id="counter" class="hint counter" aria-hidden="true"></span></p>
       </form>
     </main>
+    <section id="recipe" class="chat recipe" aria-labelledby="recipe-title" hidden>
+      <h1 id="recipe-title" class="chat-title" tabindex="-1"></h1>
+      <div id="recipe-body" class="recipe-body" tabindex="0"></div>
+    </section>
   </div>
 </div>
 

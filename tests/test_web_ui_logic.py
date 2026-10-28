@@ -175,6 +175,45 @@ def test_the_client_accepts_and_refuses_exactly_what_the_server_does():
     assert kinds == {"ok", "empty_message", "invalid_message_text", "message_too_long"}, "the texts cover every verdict"
 
 
+def _titled_texts() -> list[str]:
+    """Texts as they are STORED (the server's verdict "ok", already trimmed) plus the shapes that
+    matter for a name: every kind of whitespace inside, astral characters at the cut, lengths
+    around the limit."""
+    stored = [text for verdict, text in map(_server_verdict, _generated_texts()) if verdict == "ok"]
+    generator = random.Random(20261027)
+    spaces = [chr(code) for code in range(0x110000) if chr(code).isspace()]
+    pieces = ["слово", "а", "борщ", "🍲", "😀😀", "x" * 7, "é", "́"]
+    for _ in range(1500):
+        text = ""
+        for _ in range(generator.randint(1, 30)):
+            text += generator.choice(pieces) + "".join(
+                generator.choice(spaces) for _ in range(generator.randint(0, 3))
+            )
+        stored.append(text)  # (the rule is the same for any text; the server only ever gets the storable ones)
+    for length in (58, 59, 60, 61, 62):
+        for filler in ("x", "я", "😀", "x ", " я"):
+            stored.append(("a" + filler * length)[: length + 1].strip() or "a")
+            stored.append("x" * (length - 1) + " " + "y" * 5)
+    return stored
+
+
+def test_the_page_names_a_conversation_exactly_as_the_server_does():
+    from house_helper.persistence.conversations import TITLE_LENGTH, conversation_title
+
+    texts = _titled_texts()
+
+    titles = _crosscheck("title", texts=texts)["titles"]
+
+    assert len(texts) >= 1000
+    expected = [conversation_title(text) for text in texts]
+    assert titles == expected
+    assert any(title and title.endswith("…") for title in titles), "the texts reach the cut"
+    assert any(title and len(title) == TITLE_LENGTH for title in titles), "and stop exactly at the limit"
+    # ... and what is not a name is not one on either side
+    blanks = ["", " ", "\n\t ", "\u3000", "\u0085\u001f"]
+    assert _crosscheck("title", texts=blanks)["titles"] == [conversation_title(text) for text in blanks] == [None] * 5
+
+
 def test_the_pages_limits_are_the_servers():
     facts = _crosscheck("texts")
 

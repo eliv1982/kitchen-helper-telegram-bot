@@ -8,6 +8,9 @@ state"). Section 14 (scheduled cleanup, R4C-D2) was added after the kit's releas
 its first calendar-triggered execution, on 2026-10-25, was verified and accepted by the owner (owner-reported: it found
 no expired record and deleted nothing). Failure reporting, the encrypted off-host backup and a restore rehearsal are
 separate and not yet completed.
+The repository's schema head has since moved to `0007_favorite_recipes` (History & Favorites, section 9.1): that is code
+released in Git only. The production database stays at `0006_oidc_state_invitation` until an upgrade is run on the VPS with
+the owner's explicit approval.
 The commands were exercised locally on disposable resources before the deployment (Docker 29.8, Compose 5.6,
 Traefik 3.6.25 on loopback); see section 13 for what that does and does not prove. This
 revision answers an independent audit of the first version (restore while the database is in
@@ -379,8 +382,8 @@ bash deploy/new-env-file.sh "$HOUSE_HELPER_ENV_FILE"   # refuses if it exists; t
 dc config -q && echo "compose file valid"        # prints nothing secret; a missing env file fails here
 dc build                                         # the image, from this checkout
 hhops check-config                               # URL absolute, /data writable by uid 10001
-hhops exec --exclusive -- alembic upgrade head   # 0001 ... 0006_oidc_state_invitation; creates the database
-hhops check-schema                               # "the database schema is at revision 0006_oidc_state_invitation"
+hhops exec --exclusive -- alembic upgrade head   # 0001 ... 0007_favorite_recipes (the repository head); creates the database
+hhops check-schema                               # "the database schema is at revision 0007_favorite_recipes"
 ```
 
 DNS (section 4) must resolve now. BotFather (section 8, step 2) does not need the site to be live,
@@ -551,6 +554,47 @@ file, its `.sha256` and the old image stay until the new version has been accept
 
 Afterwards, by hand: logs, TLS, one real sign-in, one chat message (section 8).
 
+### 9.1 The next upgrade: `0006_oidc_state_invitation` -> `0007_favorite_recipes` (History & Favorites) **[OWNER]**
+
+**State.** `0007_favorite_recipes` is the schema head of the repository: code released in Git, **not deployed, applied to no
+database, not rehearsed on a copy of the production database.** Production is at `0006_oidc_state_invitation` and stays
+there until this upgrade is run on the VPS with the owner's explicit approval. Nothing in this section has been run on
+the VPS.
+
+**What the migration does.** It creates one new, empty table, `favorite_recipes`: the answers a person chose to keep (a
+title, the text, the id of the message it was copied from with no foreign key to it, no expiry; `user_id` with
+`ON DELETE CASCADE`). It changes no existing table, row or index and revokes no session or invitation. Nothing migrates at
+start-up (KHD-09): the new image refuses to start against a `0006` database (`schema_not_head`, section 11), so the
+migration comes first.
+
+**The procedure is the one above, unchanged.** Use `deploy/upgrade.sh` as section 9 describes, a dry run first. Do not
+type `alembic upgrade head` by hand, and do not shorten the backup step: the backup is made by the **old** image from a
+`0006` database, which is what `--require-head` expects. In addition:
+
+- Read the tag of the running image from Docker (the second command of section 9) and pass that as `--old-tag`. Do not take
+  it from a document: the tag recorded in `docs/STATUS.md` is the last *verified* production deployment, and a newer one
+  may have been made since.
+- Build the new image from the approved commit, which contains migration `0007`. If that image is also the first one built
+  after earlier commits, read what else it brings (for example the environment variables in section 3) before the
+  upgrade; this migration needs no new variable.
+- Stop the cleanup timer first and start it afterwards with `HOUSE_HELPER_IMAGE_TAG` in `purge.env` changed to the new tag
+  (14.4). `purge-expired` does not know the new table and never touches it (14.1).
+
+**After it** (by hand; none of this has been done): `check-schema` names `0007_favorite_recipes`; `GET /healthz` is 200;
+once sign-in is enabled, the sidebar has two tabs (conversations and favorites), the topbar button on a phone is labelled
+"Menu" (in Russian), and an old conversation is listed by its first words; one answer saved with the button under it appears
+under the favorites tab, opens, and can be removed; a second user sees none of it.
+
+**Rollback.** As section 11 says for every migration: restore the pre-upgrade backup with the old image. The old image
+refuses to start against a `0007` database (it is ahead), so a bad release after this upgrade is a restore, not a change
+of tag. Recipes saved after the backup are lost by a restore, and `alembic downgrade 0006_oidc_state_invitation` drops the
+whole table with every saved recipe, so neither is a casual step.
+
+**Not shown yet.** The migration runs up, down and up again on SQLite in the tests, and the opt-in PostgreSQL tests were
+updated for it, but they were not run. Not exercised: the image built with `0007`, `deploy/upgrade.sh` against a `0006`
+database, and real PostgreSQL. If the owner wants more assurance, the upgrade can be rehearsed first on a restored copy of
+a backup in a disposable volume (section 10).
+
 ## 10. Backup and restore
 
 **What a backup is.** The database runs in WAL mode: committed data lives in the file *and* its
@@ -716,7 +760,8 @@ A raw copy of the live database file, without its `-wal`, is the same case: it c
 
 ## 11. Rollback and recovery
 
-`alembic downgrade` is **not** a rollback. Downgrading `0006` deletes in-flight invitation-bound
+`alembic downgrade` is **not** a rollback. Downgrading `0007` drops the table `favorite_recipes` with every recipe
+the users saved; downgrading `0006` deletes in-flight invitation-bound
 logins; downgrading `0005` drops the invitations table and everything in it; a downgrade also
 cannot restore data a newer version changed or removed. The rollback is **the saved database plus
 the application version that wrote it**. In the table, `OLD` is the tag of that version:
@@ -901,12 +946,16 @@ the row's own creation.
 | Conversations (`conversations`) | none of their own | no message and no request left **and** no activity for 365 days (`updated_at` and `created_at` both at or before the cutoff) | any conversation with a message; a conversation created minutes ago and still empty |
 
 **Never touched:** `users`, `allowlist_entries`, `identity_links`, `alembic_version`, and every table the command does
-not name. The favourites and long-term preferences of the product requirements (KHD-05) are **not in the schema
-yet**; when they arrive they are independent tables owned by a user, and this command, which names its tables one by
-one, will not know them. A test with such tables shows them untouched when the history they came from is deleted. The
-converse is guarded too: a test fails when a table appears in the schema that the cleanup does not name and the test does
-not list as kept, so that a future table holding conversation text cannot escape the 365 days unnoticed.
-Nothing else in this database holds conversation text: a conversation's `title` is never set, the answer copy in
+not name. The favourites and long-term preferences of the product requirements (KHD-05) are independent tables owned by a
+user, and this command, which names its tables one by one, does not know them. The favourites exist since migration `0007`
+(History & Favorites): `favorite_recipes` holds the answers a person chose to keep, copied out of the history, with no
+deadline and no key to the history, and a test with a real favourite shows it untouched when the history it came from is
+deleted. The long-term preferences are **not in the schema yet**. The converse is guarded too: a test fails when a table appears in the schema that the cleanup does
+not name and the test does not list as kept, so that a future table holding conversation text cannot escape the 365 days
+unnoticed.
+Apart from those saved favourites, which are kept on purpose until their owner removes them (14.7), nothing else in this
+database holds conversation text: a conversation's `title` column is never set (the list shows a title derived on reading
+from the first unexpired message, so it goes with that message), the answer copy in
 `turn_requests` is deleted with its request, and there are no summaries. Outside this database: the Telegram bot's
 history is in that process's memory and is not in the image; whatever OpenAI keeps of the messages it answered is
 governed by the account's settings there, not by this command.
@@ -1127,6 +1176,11 @@ does with the space is its own:
 **Backups.** A deleted row survives in every older backup. The backup retention, the off-host target and encryption are
 **undecided (section 10, section 12); R4C-D2 invents no policy for them**, and until the owner decides, the 365-day promise
 holds for the live database only. This is a blocker before real data, as section 12 says.
+
+**Favourites are outside the 365 days.** A saved recipe (`favorite_recipes`, once migration `0007` is applied) is a copy that
+the person chose to keep: this cleanup does not delete it and no deadline applies. It goes when its owner removes it, or with
+the user row (`ON DELETE CASCADE`), and it is in every backup taken after the upgrade. Each user can keep at most 100. What
+the users are told about retention has to say so.
 
 ### 14.8 Checking it by hand
 

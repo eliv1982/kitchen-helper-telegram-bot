@@ -604,7 +604,7 @@ scenario("the_drawer_opens_and_closes_on_a_narrow_screen_and_does_nothing_on_a_w
   toggle.click();
   assert.deepEqual([app.getAttribute("data-drawer"), toggle.getAttribute("aria-expanded"), narrow.el("backdrop").hidden, narrow.el("chat").inert],
     ["open", "true", false, true]);
-  assert.equal(narrow.doc.activeElement, narrow.el("new-conversation"));
+  assert.equal(narrow.doc.activeElement, narrow.el("tab-chats"), "the drawer opens on the part that is in front");
   narrow.doc.fire("keydown", { key: "Escape" });
   assert.deepEqual([app.getAttribute("data-drawer"), toggle.getAttribute("aria-expanded"), narrow.el("backdrop").hidden, narrow.el("chat").inert],
     ["closed", "false", true, false]);
@@ -953,7 +953,7 @@ scenario("the_script_never_sets_a_handler_a_style_a_link_or_an_address_on_anythi
   for (const name of names) {
     assert.ok(!/^on/i.test(name) && !["style", "href", "src", "srcdoc", "action", "formaction", "target"].includes(name), name);
   }
-  assert.deepEqual([...names].sort().filter((n) => !["aria-busy", "aria-current", "aria-disabled", "aria-hidden", "aria-invalid", "aria-expanded", "data-drawer", "data-id", "datetime", "type"].includes(n)), []);
+  assert.deepEqual([...names].sort().filter((n) => !["aria-busy", "aria-current", "aria-disabled", "aria-hidden", "aria-invalid", "aria-expanded", "aria-label", "aria-pressed", "data-drawer", "data-id", "datetime", "role", "type"].includes(n)), []);
   assert.deepEqual(page.doc.root.byTag("script").length, 2);
 });
 
@@ -974,6 +974,24 @@ scenario("the_view_has_everything_the_page_reads", async () => {
   for (const name of used("thread")) assert.ok(name in view.thread, "thread." + name);
   for (const name of used("composer")) assert.ok(name in view.composer, "composer." + name);
   for (const name of used("list")) assert.ok(name in view.list, "list." + name);
+
+  // The favorites: the list beside the chat, the recipe in front, the question "remove it?", the mark under an answer.
+  const keptEnv = H.makeEnv().signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "а"), message(2, "assistant", "б")]),
+  });
+  keptEnv.net.route("GET", "/api/favorites", H.favoritesBody([KEPT]));
+  keptEnv.net.route("GET", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(KEPT, FAV_RECIPE));
+  await keptEnv.boot();
+  await keptEnv.ctl.openFavorite(H.FAV_1);
+  keptEnv.ctl.askRemoveFavorite(H.FAV_1);
+  const kept = keptEnv.view();
+  for (const name of used("favorites")) assert.ok(name in kept.favorites, "favorites." + name);
+  for (const name of used("current")) assert.ok(name in kept.favorites.current, "current." + name);
+  for (const name of used("removing")) assert.ok(name in kept.favorites.current.removing, "removing." + name);
+  const markKeys = Object.keys(kept.thread.items.find((i) => i.role === "assistant").favorite);
+  for (const name of used("mark")) assert.ok(markKeys.includes(name), "mark." + name);
+  const favoriteKeys = Object.keys(kept.favorites.items[0]);
+  for (const name of ["id", "title", "meta", "current"]) assert.ok(favoriteKeys.includes(name), "favorite item has " + name);
   for (const name of used("banner")) assert.ok(["kind", "text", "correlationId"].includes(name), "banner." + name);
   for (const name of used("notice")) assert.ok(["kind", "text"].includes(name), "notice." + name);
 
@@ -988,8 +1006,9 @@ scenario("the_view_has_everything_the_page_reads", async () => {
   await (await failedEnv.ctl.send("в")).done;
   collect(failedEnv.view().thread.items);
   const listKeys = new Set(Object.keys(view.list.items[0]));
+  const favoriteItemKeys = new Set(Object.keys(kept.favorites.items[0]));
   for (const name of used("item")) {
-    assert.ok(itemKeys.has(name) || listKeys.has(name), "item." + name);
+    assert.ok(itemKeys.has(name) || listKeys.has(name) || favoriteItemKeys.has(name), "item." + name);
   }
   for (const name of ["id", "label", "meta", "current"]) assert.ok(listKeys.has(name), name);
   for (const name of ["type", "id", "role", "text", "time", "iso", "status", "note", "canRetry", "phase", "correlationId", "actions", "busy"]) {
@@ -1001,6 +1020,272 @@ scenario("the_view_has_everything_the_page_reads", async () => {
   assert.ok(controllerMethods.size >= 12);
   for (const name of controllerMethods) assert.equal(typeof probe.ctl[name], "function", "controller." + name);
   for (const name of used("Logic")) assert.ok(name in Logic, "Logic." + name);
+});
+
+// ============================================================================================
+// Favorites
+// ============================================================================================
+
+const FAV_RECIPE = "Борщ классический\n\nПорции: 4.\n1. Сварите бульон.";
+const KEPT = H.favorite(H.FAV_1, 2, "Борщ классический", 0);
+const OTHER_KEPT = H.favorite(H.FAV_2, 12, "Плов с курицей", 30);
+
+// One conversation (an answer with id 2), and these favorites on the server.
+const withFavorites = (items = [KEPT, OTHER_KEPT], recipes = {}) => (env) => {
+  oneConversation()(env);
+  env.net.route("GET", "/api/favorites", H.favoritesBody(items));
+  env.net.route("GET", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(KEPT, recipes[H.FAV_1] || FAV_RECIPE));
+  env.net.route("GET", `/api/favorites/${H.FAV_2}`, H.favoriteDetail(OTHER_KEPT, recipes[H.FAV_2] || "Плов: рис, курица."));
+};
+
+scenario("the_tabs_swap_the_conversations_for_the_favorites_and_back", async () => {
+  const page = await open(withFavorites());
+  const state = () => ["panel-chats", "panel-favorites", "chat", "recipe"].map(page.visible);
+  const pressed = () => [page.el("tab-chats").getAttribute("aria-pressed"), page.el("tab-favorites").getAttribute("aria-pressed")];
+
+  assert.deepEqual(state(), [true, false, true, false]);
+  assert.deepEqual(pressed(), ["true", "false"]);
+
+  page.el("tab-favorites").click();
+  await page.settle();
+  assert.deepEqual(state(), [false, true, false, true]);
+  assert.deepEqual(pressed(), ["false", "true"]);
+  assert.deepEqual(
+    page.el("favorite-list").byTag("button").map((b) => b.byClass("conv-label")[0].textContent),
+    ["Борщ классический", "Плов с курицей"]
+  );
+  assert.equal(page.el("recipe-title").textContent, "Избранное");
+  assert.ok(page.el("recipe-body").textContent.includes(Logic.TEXT.favoritesPick));
+
+  page.el("tab-chats").click();
+  await page.settle();
+  assert.deepEqual(state(), [true, false, true, false]);
+  assert.deepEqual(pressed(), ["true", "false"]);
+});
+
+scenario("an_empty_list_of_favorites_says_what_to_do", async () => {
+  const page = await open(withFavorites([]));
+
+  page.el("tab-favorites").click();
+  await page.settle();
+
+  assert.equal(page.el("favorites-status").textContent, Logic.TEXT.favoritesEmpty);
+  assert.equal(page.el("favorite-list").childNodes.length, 0);
+  assert.ok(page.el("recipe-body").textContent.includes(Logic.TEXT.favoritesEmpty));
+});
+
+scenario("a_favorite_that_cannot_be_listed_offers_to_try_again", async () => {
+  const page = await open((env) => {
+    withFavorites([KEPT])(env);
+    env.net.route("GET", "/api/favorites", fail(), fail(), H.favoritesBody([KEPT])); // (the start, the tab, the button)
+  });
+
+  page.el("tab-favorites").click();
+  await page.settle();
+  assert.equal(page.el("favorites-status").textContent, Logic.TEXT.network);
+  assert.equal(page.visible("favorites-retry"), true);
+
+  page.el("favorites-retry").click();
+  await page.settle();
+  assert.equal(page.visible("favorites-retry"), false);
+  assert.equal(page.el("favorite-list").byTag("button").length, 1);
+});
+
+scenario("an_answer_is_kept_from_the_chat_and_then_says_so_and_opens_the_recipe", async () => {
+  const page = await open(withFavorites([]));
+  page.env.net.route("POST", "/api/favorites", H.keptBody(KEPT));
+  const article = () => page.articles()[1];
+  assert.deepEqual(article().buttons("В избранное").length, 1);
+  assert.equal(page.articles()[0].buttons("В избранное").length, 0, "only the assistant's answers");
+
+  article().buttons("В избранное")[0].click();
+  await page.settle();
+
+  assert.equal(article().buttons("В избранное").length, 0);
+  assert.ok(article().textContent.includes(Logic.TEXT.favoriteKept));
+  assert.deepEqual(page.env.net.requests("POST", "/api/favorites")[0].body, { conversation_id: CONV_A, message_id: 2 });
+
+  page.env.net.route("GET", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(KEPT, FAV_RECIPE));
+  article().buttons("Открыть")[0].click();
+  await page.settle();
+  assert.deepEqual(["chat", "recipe"].map(page.visible), [false, true]);
+  assert.equal(page.el("recipe-title").textContent, "Борщ классический");
+  assert.ok(page.el("recipe-body").textContent.includes("1. Сварите бульон."));
+  assert.equal(page.doc.activeElement, page.el("recipe-title"));
+});
+
+scenario("a_failed_keep_says_so_under_the_answer_and_the_button_is_still_there", async () => {
+  const page = await open(withFavorites([]));
+  page.env.net.route("POST", "/api/favorites", apiError(409, "favorites_full"), H.keptBody(KEPT));
+  const article = () => page.articles()[1];
+
+  article().buttons("В избранное")[0].click();
+  await page.settle();
+
+  assert.ok(article().textContent.includes(Logic.CODE_MESSAGES.favorites_full));
+  assert.equal(article().buttons("В избранное").length, 1);
+  article().buttons("В избранное")[0].click();
+  await page.settle();
+  assert.ok(article().textContent.includes(Logic.TEXT.favoriteKept));
+  assert.ok(!article().textContent.includes(Logic.CODE_MESSAGES.favorites_full));
+});
+
+scenario("the_text_of_a_recipe_stays_text_whatever_it_contains", async () => {
+  const page = await open(withFavorites([KEPT], { [H.FAV_1]: HOSTILE }));
+
+  page.el("tab-favorites").click();
+  page.el("favorite-list").byTag("button")[0].click();
+  await page.settle();
+
+  const body = page.el("recipe-body");
+  assert.ok(body.textContent.includes("<script>alert(2)</script>"));
+  assert.deepEqual(["img", "script", "svg", "a", "iframe"].map((tag) => body.byTag(tag).length), [0, 0, 0, 0, 0]);
+  assert.equal(page.doc.root.byTag("script").length, 2, "only the page's own two scripts");
+});
+
+scenario("a_recipe_is_chosen_from_the_list_and_on_a_narrow_screen_the_drawer_closes", async () => {
+  const page = await open(withFavorites(), { narrow: true });
+  page.el("drawer-toggle").click();
+  page.el("tab-favorites").click();
+  await page.settle();
+  assert.equal(page.el("screen-app").getAttribute("data-drawer"), "open");
+
+  page.el("favorite-list").byTag("button")[1].click();
+  await page.settle();
+
+  assert.equal(page.el("screen-app").getAttribute("data-drawer"), "closed");
+  assert.equal(page.el("recipe-title").textContent, "Плов с курицей");
+  assert.equal(page.doc.activeElement, page.el("recipe-title"));
+  assert.equal(page.el("favorite-list").byTag("button")[1].getAttribute("aria-current"), "true");
+});
+
+scenario("a_recipe_that_fails_to_open_offers_to_try_again", async () => {
+  const page = await open((env) => {
+    withFavorites([KEPT])(env);
+    env.net.route("GET", `/api/favorites/${H.FAV_1}`, fail(), H.favoriteDetail(KEPT, FAV_RECIPE));
+  });
+
+  page.el("tab-favorites").click();
+  page.el("favorite-list").byTag("button")[0].click();
+  await page.settle();
+  assert.ok(page.el("recipe-body").textContent.includes(Logic.TEXT.network));
+
+  page.el("recipe-body").buttons("Повторить")[0].click();
+  await page.settle();
+  assert.ok(page.el("recipe-body").textContent.includes("1. Сварите бульон."));
+});
+
+scenario("removing_a_recipe_asks_first_and_the_safe_answer_is_the_one_in_focus", async () => {
+  const page = await open(withFavorites());
+  page.env.net.route("DELETE", `/api/favorites/${H.FAV_1}`, H.removedBody());
+  page.el("tab-favorites").click();
+  page.el("favorite-list").byTag("button")[0].click();
+  await page.settle();
+  const body = page.el("recipe-body");
+
+  body.buttons("Убрать из избранного")[0].click();
+  await page.settle();
+  assert.ok(body.textContent.includes(Logic.TEXT.removeAsk));
+  assert.deepEqual(body.byClass("confirm")[0].byTag("button").map((b) => b.textContent), ["Убрать", "Оставить"]);
+  assert.equal(page.doc.activeElement.textContent, "Оставить");
+  assert.equal(page.env.net.requests("DELETE", /.*/).length, 0, "asking removes nothing");
+
+  body.buttons("Оставить")[0].click();
+  await page.settle();
+  assert.ok(!body.textContent.includes(Logic.TEXT.removeAsk));
+  assert.equal(page.doc.activeElement.textContent, "Убрать из избранного");
+  assert.equal(page.env.net.requests("DELETE", /.*/).length, 0);
+
+  body.buttons("Убрать из избранного")[0].click();
+  await page.settle();
+  body.buttons("Убрать")[0].click();
+  await page.settle();
+
+  assert.equal(page.env.net.requests("DELETE", /.*/).length, 1);
+  assert.deepEqual(page.el("favorite-list").byTag("button").map((b) => b.textContent.includes("Плов")), [true]);
+  assert.ok(page.el("recipe-body").textContent.includes(Logic.TEXT.favoritesPick));
+  await page.env.timers.advance(100); // (a spoken line is set a moment after it is asked for)
+  assert.equal(page.el("announcer").textContent, Logic.TEXT.removed);
+});
+
+scenario("a_removal_that_fails_says_so_and_can_be_repeated_or_called_off", async () => {
+  const page = await open(withFavorites([KEPT]));
+  page.env.net.route("DELETE", `/api/favorites/${H.FAV_1}`, apiError(503, "service_unavailable", { retryable: true }), H.removedBody());
+  page.el("tab-favorites").click();
+  page.el("favorite-list").byTag("button")[0].click();
+  await page.settle();
+  const body = page.el("recipe-body");
+
+  body.buttons("Убрать из избранного")[0].click();
+  await page.settle();
+  body.buttons("Убрать")[0].click();
+  await page.settle();
+  assert.ok(body.textContent.includes(Logic.CODE_MESSAGES.service_unavailable));
+  assert.equal(page.el("favorite-list").byTag("button").length, 1, "still there");
+
+  body.buttons("Повторить")[0].click();
+  await page.settle();
+  assert.equal(page.el("favorite-list").byTag("button").length, 0);
+});
+
+scenario("nothing_of_the_favorites_stays_on_the_page_after_signing_out", async () => {
+  const page = await open(withFavorites());
+  page.el("tab-favorites").click();
+  page.el("favorite-list").byTag("button")[0].click();
+  await page.settle();
+  assert.ok(page.root().includes("Сварите бульон"));
+
+  page.env.net.route("POST", "/auth/logout", text(204, null));
+  page.el("logout").click();
+  await page.settle();
+
+  assert.equal(page.visible("screen-login"), true);
+  for (const words of ["Сварите бульон", "Борщ классический", "Плов с курицей", Logic.TEXT.favoritesEmpty]) {
+    assert.ok(!page.root().includes(words), words);
+  }
+  assert.equal(page.el("favorite-list").childNodes.length, 0);
+  assert.equal(page.el("recipe-body").childNodes.length, 0);
+  assert.equal(page.el("recipe-title").textContent, "");
+  assert.equal(page.visible("recipe"), false);
+});
+
+scenario("while_the_page_asks_who_is_signed_in_no_recipe_is_in_it_and_the_same_person_gets_it_back", async () => {
+  const page = await open(withFavorites());
+  page.el("tab-favorites").click();
+  page.el("favorite-list").byTag("button")[0].click();
+  await page.settle();
+  const wait = paused();
+  page.env.net.route("GET", "/auth/me", wait.answer(me()));
+
+  await comesBack(page);
+  await flush();
+  assert.equal(page.visible("screen-app"), false);
+  for (const words of ["Сварите бульон", "Борщ классический", "Плов с курицей"]) {
+    assert.ok(!page.root().includes(words), "in the page while asking: " + words);
+  }
+  wait.gate.resolve();
+  await page.settle();
+
+  assert.equal(page.visible("screen-app"), true);
+  assert.deepEqual(["chat", "recipe"].map(page.visible), [false, true]);
+  assert.ok(page.el("recipe-body").textContent.includes("Сварите бульон"));
+});
+
+scenario("a_different_person_on_coming_back_never_sees_the_last_ones_recipes", async () => {
+  const page = await open(withFavorites());
+  page.el("tab-favorites").click();
+  page.el("favorite-list").byTag("button")[0].click();
+  await page.settle();
+  page.env.net.route("GET", "/auth/me", me(86400, H.USER_B));
+  page.env.net.route("GET", "/api/favorites", H.favoritesBody([]));
+
+  await comesBack(page);
+  await page.settle();
+
+  assert.equal(page.visible("screen-app"), true);
+  assert.deepEqual(["panel-chats", "chat", "recipe"].map(page.visible), [true, true, false]);
+  assert.ok(!page.root().includes("Борщ классический"));
+  assert.ok(!page.root().includes("Сварите бульон"));
 });
 
 module.exports = { scenarios, useShell, useNoLoginShell };

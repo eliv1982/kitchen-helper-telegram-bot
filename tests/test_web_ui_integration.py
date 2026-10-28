@@ -215,6 +215,12 @@ EXPECTED = {
         Counter({"пока выхожу": 1}), (1, 1)
     ),
     "a_sign_out_whose_request_was_lost_is_repeated_and_ends_the_session": (Counter({"пока не вышла": 1}), (1, 1)),
+    "a_long_first_message_is_named_the_same_by_the_page_and_by_the_server": (
+        Counter({"Подскажите,   пожалуйста,\nкак приготовить домашнюю лапшу 🍜 для куриного супа без яиц и без муки высшего сорта": 1}),
+        (1, 1),
+    ),
+    "favorites_are_kept_reopened_after_a_reload_and_removed": (Counter({"Как варить борщ?": 1}), (1, 1)),
+    "favorites_belong_to_the_person_who_kept_them": (Counter({"секрет рецепт Анны": 1}), (1, 1)),
 }
 
 # The database after a journey, for the ones about signing out: whose session is revoked and whose is not.

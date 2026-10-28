@@ -21,9 +21,10 @@ Two kinds of rows are deleted, for real (a DELETE, not a filter on reads):
     too. A long-lived conversation keeps its recent messages: rows are judged one by one.
 
 Never touched: users, allowlist entries, identity links, anything alembic owns, and any
-table that is not named here (the favourites and long-term preferences of the product
-requirements are not in this schema yet; when they arrive they are independent tables and
-this module will not know them). A new table is therefore safe by default.
+table that is not named here (the favourites are one: favorite_recipes holds copies of answers
+that a person chose to keep, with no deadline and no key to the history, and this module does not
+know it; the long-term preferences of the product requirements are not in this schema yet, and
+when they arrive they will be independent tables too). A new table is therefore safe by default.
 
 Order, which is what the foreign keys demand: sessions, login states, emailed links,
 invitations (after the states bound to them), turn requests, messages, conversations. A

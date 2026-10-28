@@ -1035,18 +1035,20 @@ async def test_there_are_no_other_routes(tmp_path, path):
 
 @pytest.mark.asyncio
 async def test_no_recipe_preference_user_or_other_conversation_route_exists(tmp_path):
-    # The conversations of the web chat (R4A) are served at /api/conversations and
-    # nowhere else; test_web_chat_api.py pins that API. Nothing else of a user's data
-    # (recipes, preferences, profile, users) has a route yet.
+    # The conversations of the web chat (R4A) are served at /api/conversations and the
+    # recipes a person kept at /api/favorites, nowhere else; test_web_chat_api.py and
+    # test_web_favorites.py pin those APIs. Nothing else of a user's data (preferences,
+    # profile, users) has a route yet.
     async with auth_app(tmp_path) as h:
         await signed_in(h)
         paths = [
             "/conversations", "/recipes", "/preferences", "/api/me",
             "/users", "/api/users", "/chat", "/api/chat", "/api/v1/conversations",
-            "/api/recipes", "/api/preferences", "/api/favorites",
+            "/api/recipes", "/api/preferences", "/favorites", "/api/v1/favorites",
         ]  # fmt: skip
         statuses = {path: (await h.client.get(path)).status_code for path in paths}
         chat_api = (await h.client.get("/api/conversations")).status_code
+        favorites_api = (await h.client.get("/api/favorites")).status_code
 
     assert set(statuses.values()) == {404}
-    assert chat_api == 200
+    assert chat_api == favorites_api == 200

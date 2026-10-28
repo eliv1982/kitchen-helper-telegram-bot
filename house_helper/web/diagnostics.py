@@ -76,6 +76,11 @@ CATALOGUE: dict[str, ErrorSpec] = {
     # Who and what
     "not_authenticated": _spec(401, "Войдите в аккаунт, чтобы продолжить."),
     "conversation_not_found": _spec(404, "Разговор не найден."),
+    "message_not_found": _spec(404, "Этот ответ не найден: возможно, он уже удалён."),
+    "favorite_not_found": _spec(404, "Этого рецепта нет в избранном."),
+    "favorites_full": _spec(
+        409, "В избранном набралось максимальное число рецептов. Уберите ненужные, чтобы добавить новый."
+    ),
     # Idempotency and concurrency
     "idempotency_key_reused": _spec(
         409, "Этот ключ запроса уже использован для другого сообщения. Отправьте сообщение заново."

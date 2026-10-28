@@ -3,7 +3,8 @@
 Four routes, all under /api, all answering JSON:
 
   POST /api/conversations                       a new, empty conversation (body: {})
-  GET  /api/conversations                       the user's conversations, newest activity first
+  GET  /api/conversations                       the user's conversations, newest activity first,
+                                                each named by its first unexpired message
   GET  /api/conversations/{id}/messages         the history (?limit=1..100, ?before=<message id>)
   POST /api/conversations/{id}/messages         send a message, get the assistant's answer
 
@@ -350,8 +351,9 @@ async def list_conversations(
     limit = _query_number(
         request, "limit", default=DEFAULT_LIST_LIMIT, low=1, high=MAX_LIST_LIMIT
     )
+    now = request.app.state.clock()
     page = await database.run(
-        lambda session: conversations.list_conversations(session, current.user_id, limit=limit)
+        lambda session: conversations.list_conversations(session, current.user_id, now=now, limit=limit)
     )
     return JSONResponse(
         {

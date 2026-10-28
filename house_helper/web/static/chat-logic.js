@@ -69,6 +69,14 @@
  *    removed when it is read, not just ignored, and is never shown to, or counted for, the
  *    person who is signed in. If the browser will not keep it, the page says so. Never a
  *    cookie, a token or a history.
+ *  - Favorites (answers of the assistant that the person kept) are the server's: the page holds
+ *    the list in memory, opens a recipe by asking for it, and keeps nothing of them in the
+ *    browser. Keeping an answer names a conversation and a message and nothing else (the server
+ *    copies the text); the server keeps one favorite per answer, so a save whose outcome is not
+ *    known may simply be asked again, and so may a removal (a second one finds nothing, which is
+ *    the outcome that was wanted). Everything of the favorites is dropped with the rest when the
+ *    session ends, at "Выйти" and for another person, and is held back with the rest while it is
+ *    asked who is signed in.
  */
 (function (root, factory) {
   "use strict";
@@ -189,6 +197,31 @@
     correlation: "Номер обращения: {id}",
     emptyThread:
       "Спросите, что приготовить из имеющихся продуктов, или как приготовить блюдо.",
+    // The favorites: the recipes the person kept.
+    chatsTab: "Разговоры",
+    favoritesTab: "Избранное",
+    favoritesLoading: "Загружаем избранное…",
+    favoritesFailed: "Не удалось загрузить избранное.",
+    favoritesEmpty:
+      "В избранном пока ничего нет. Под ответом помощника нажмите «В избранное», чтобы сохранить рецепт.",
+    favoritesPick: "Выберите рецепт в списке.",
+    favoriteKeep: "В избранное",
+    favoriteKeeping: "Сохраняем…",
+    favoriteKept: "Сохранено в избранном",
+    favoriteOpen: "Открыть",
+    favoriteKeptAnnounce: "Рецепт сохранён в избранное.",
+    favoriteKeepFailed: "Не удалось сохранить в избранное. Попробуйте ещё раз.",
+    recipeLoading: "Загружаем рецепт…",
+    recipeFailed: "Не удалось открыть рецепт.",
+    recipeGone: "Этого рецепта больше нет в избранном.",
+    removeAction: "Убрать из избранного",
+    removeAsk: "Убрать этот рецепт из избранного?",
+    removeConfirm: "Убрать",
+    removeKeep: "Оставить",
+    removing: "Убираем…",
+    removeFailed: "Не удалось убрать рецепт. Попробуйте ещё раз.",
+    removed: "Рецепт убран из избранного.",
+    savedOn: "Сохранено: {when}",
   };
 
   // What the server says for each of its error codes (house_helper/web/diagnostics.py).
@@ -211,6 +244,9 @@
     invalid_query: "Параметры запроса указаны неверно.",
     not_authenticated: "Войдите в аккаунт, чтобы продолжить.",
     conversation_not_found: "Разговор не найден.",
+    message_not_found: "Этот ответ не найден: возможно, он уже удалён.",
+    favorite_not_found: "Этого рецепта нет в избранном.",
+    favorites_full: "В избранном набралось максимальное число рецептов. Уберите ненужные, чтобы добавить новый.",
     idempotency_key_reused: "Этот ключ запроса уже использован для другого сообщения. Отправьте сообщение заново.",
     conversation_busy: "В этом разговоре ещё готовится предыдущий ответ. Подождите немного и повторите.",
     turn_in_progress: "Ответ на это сообщение ещё готовится. Подождите немного.",
@@ -308,6 +344,32 @@
 
   function hasUnstorableCharacters(text) {
     return CONTROL_CHARACTER.test(text) || hasLoneSurrogate(text);
+  }
+
+  // The name of a conversation, from its first message: the same rule as the server's
+  // (persistence.conversations.conversation_title), which names every conversation the list
+  // brings; this is for a conversation made in this page, until the list is read again. The words
+  // on one line (every run of whitespace is one space), cut at 60 characters (code points) with
+  // an ellipsis when longer. tests/test_web_ui_logic.py compares it with the server's over a
+  // fixed set of texts.
+  var TITLE_LENGTH = 60;
+  var SPACE_RUN = new RegExp("[" + SPACE_CLASS + "]+");
+
+  function deriveTitle(text) {
+    if (typeof text !== "string") {
+      return null;
+    }
+    var line = text.split(SPACE_RUN).filter(function (word) {
+      return word !== "";
+    }).join(" ");
+    if (line === "") {
+      return null;
+    }
+    var points = Array.from(line);
+    if (points.length <= TITLE_LENGTH) {
+      return line;
+    }
+    return points.slice(0, TITLE_LENGTH).join("").replace(/ +$/, "") + "…";
   }
 
   // The checks the server makes, in its order (chat_api._message_text): trimmed, not empty,
@@ -561,8 +623,9 @@
     return { type: "unavailable", text: unavailableText(response, null), correlationId: null };
   }
 
-  // The reads of the chat API (the list, the history).
-  function classifyRead(response) {
+  // The reads of the chat API (the list, the history) and of the favorites. `missing` is the code of the
+  // application's 404 that means "that one is not there" ("conversation_not_found" unless said otherwise).
+  function classifyRead(response, missing) {
     if (response.kind === "network") {
       return { type: "unavailable", text: unavailableText(response, null), correlationId: null };
     }
@@ -570,7 +633,7 @@
       return { type: "auth" };
     }
     var error = readApiError(response);
-    if (response.status === 404 && error && error.code === "conversation_not_found") {
+    if (response.status === 404 && error && error.code === (missing || "conversation_not_found")) {
       return { type: "not_found" };
     }
     if (response.status === 200 && response.jsonOk && isObject(response.json)) {
@@ -639,6 +702,102 @@
       items.push(conversation);
     }
     return { items: items, hasMore: body.has_more };
+  }
+
+  // --- favorites: what the server says about the recipes a person kept ---------------------------------
+
+  // {id, title, message_id, created_at} -> {id, title, messageId, createdAt}
+  function normalizeFavorite(item) {
+    if (
+      !isObject(item) ||
+      typeof item.id !== "string" ||
+      !UUID_PATTERN.test(item.id) ||
+      typeof item.title !== "string" ||
+      item.title === "" ||
+      !isCount(item.message_id) ||
+      item.message_id < 1
+    ) {
+      return null;
+    }
+    return {
+      id: item.id.toLowerCase(),
+      title: item.title,
+      messageId: item.message_id,
+      createdAt: parseTimestamp(item.created_at),
+    };
+  }
+
+  function normalizeFavoriteList(body) {
+    if (!isObject(body) || !Array.isArray(body.favorites)) {
+      return null;
+    }
+    var items = [];
+    for (var i = 0; i < body.favorites.length; i++) {
+      var item = normalizeFavorite(body.favorites[i]);
+      if (item === null) {
+        return null;
+      }
+      items.push(item);
+    }
+    return items;
+  }
+
+  // The recipe itself: the summary and the text, for the very favorite that was asked for.
+  function normalizeFavoriteDetail(body, id) {
+    var item = normalizeFavorite(body);
+    if (item === null || item.id !== id || typeof body.text !== "string" || body.text === "") {
+      return null;
+    }
+    item.text = body.text;
+    return item;
+  }
+
+  // The answer to POST /api/favorites, as what the page must do next:
+  //   kept       201 (kept now) or 200 (it already was): the favorite
+  //   auth       401: the session is gone
+  //   rejected   the application refused it for a reason of the request (a 4xx): `text` is its words
+  //   uncertain  no answer, a body that is not the application's, any 5xx: the outcome is not known.
+  //              Keeping an answer is idempotent on the server, so the person may simply ask again.
+  function classifyFavoriteKeep(response) {
+    if (response.kind === "network") {
+      return { type: "uncertain", text: unavailableText(response, null) };
+    }
+    if (response.status === 401) {
+      return { type: "auth" };
+    }
+    if ((response.status === 201 || response.status === 200) && response.jsonOk) {
+      var favorite = normalizeFavorite(response.json);
+      if (favorite !== null) {
+        return { type: "kept", favorite: favorite, created: response.status === 201 };
+      }
+      return { type: "uncertain", text: TEXT.unexpected };
+    }
+    var error = readApiError(response);
+    if (error && response.status >= 400 && response.status < 500) {
+      return { type: "rejected", text: error.message || TEXT.favoriteKeepFailed, correlationId: error.correlationId };
+    }
+    return { type: "uncertain", text: unavailableText(response, error), correlationId: error ? error.correlationId : null };
+  }
+
+  // The answer to DELETE /api/favorites/{id}:
+  //   removed    204, or 404 favorite_not_found: it is not in the favorites any more, which is what was asked for
+  //   auth       401
+  //   failed     anything else: it may still be there
+  function classifyFavoriteRemove(response) {
+    if (response.kind === "network") {
+      return { type: "failed", text: unavailableText(response, null) };
+    }
+    if (response.status === 401) {
+      return { type: "auth" };
+    }
+    if (response.status === 204) {
+      return { type: "removed" };
+    }
+    var error = readApiError(response);
+    if (response.status === 404 && error && error.code === "favorite_not_found") {
+      return { type: "removed" };
+    }
+    return { type: "failed", text: unavailableText(response, error), correlationId: error ? error.correlationId : null };
   }
 
   var MESSAGE_STATUSES = { completed: true, in_progress: true, failed: true };
@@ -942,9 +1101,19 @@
     var expiredRecords = 0; // stored records found too old when the page was opened
     var state = freshState("loading");
 
+    // What the page knows of the favorites. `items` newest first; `currentId` is the recipe that is open
+    // (section "favorites") and `detail` its state; `saving` is per message id (a save that is under
+    // way or failed); `removing` is the question "remove it?" and its outcome, for one recipe.
+    function freshFavorites() {
+      return { status: "idle", error: null, items: [], currentId: null, detail: null, saving: {}, removing: null };
+    }
+
     function freshState(screen) {
       return {
         screen: screen,
+        // Which part of the app is in front: the conversations or the favorites.
+        section: "chats",
+        favorites: freshFavorites(),
         // While set, the signed-in page is held back: nothing of the conversations is in the view and
         // nothing is asked for them, until /auth/me has said who is signed in. { phase: "checking" } while
         // the question is out; { phase: "unavailable", failure } when it could not be answered.
@@ -1261,6 +1430,9 @@
           track(reconcile(id));
         }
       });
+      if (state.favorites.status === "idle") {
+        track(loadFavorites()); // (asked for while it was held back)
+      }
       var open = state.currentId === null ? null : state.threads[state.currentId];
       if (open && !open.synced) {
         track(loadLatest(open.id)); // (opened, or being opened, while it was held back)
@@ -1359,6 +1531,7 @@
       if (mine !== epoch) {
         return;
       }
+      track(loadFavorites()); // (beside the conversation: a slow or failed list does not hold it up)
       var first = chooseInitialConversation();
       if (first !== null) {
         await selectConversation(first);
@@ -1442,6 +1615,7 @@
       if (state.screen !== "app" || state.creating) {
         return;
       }
+      state.section = "chats";
       state.currentId = id;
       state.banner = null;
       state.composerError = null;
@@ -1760,6 +1934,19 @@
       if (!known) {
         state.list.items.unshift({ id: id, title: null, createdAt: turn.user.createdAt, updatedAt: turn.assistant.createdAt });
       }
+      // A conversation that has no name yet is named by its first message, as the server will name it
+      // when the list is read again. Only when the first message is known to be in memory: not when an
+      // older page is still to be read.
+      state.list.items.forEach(function (item) {
+        if (item.id === id && !item.title && !thread.hasMore) {
+          for (var i = 0; i < thread.messages.length; i++) {
+            if (thread.messages[i].role === "user") {
+              item.title = deriveTitle(thread.messages[i].text);
+              return;
+            }
+          }
+        }
+      });
     }
 
     // Read the history to see what the server has of an unresolved turn. Read-only: it
@@ -1986,6 +2173,240 @@
       removePending(id);
       emit();
       return text;
+    }
+
+    // --- the favorites ---------------------------------------------------------------------------------
+
+    function favoriteOfMessage(messageId) {
+      var items = state.favorites.items;
+      for (var i = 0; i < items.length; i++) {
+        if (items[i].messageId === messageId) {
+          return items[i];
+        }
+      }
+      return null;
+    }
+
+    // The newest first; one favorite per answer and per id.
+    function putFavorite(favorite) {
+      var others = state.favorites.items.filter(function (item) {
+        return item.id !== favorite.id && item.messageId !== favorite.messageId;
+      });
+      state.favorites.items = [favorite].concat(others);
+    }
+
+    function dropFavorite(id) {
+      state.favorites.items = state.favorites.items.filter(function (item) {
+        return item.id !== id;
+      });
+    }
+
+    async function loadFavorites() {
+      if (state.screen !== "app" || state.gate || state.favorites.status === "loading") {
+        return false;
+      }
+      var mine = epoch;
+      state.favorites.status = "loading";
+      state.favorites.error = null;
+      emit();
+      var response = await http("GET", "/api/favorites", { timeoutMs: READ_TIMEOUT_MS });
+      if (mine !== epoch) {
+        return false;
+      }
+      var favorites = state.favorites;
+      var found = classifyRead(response, "favorite_not_found");
+      if (found.type === "ok") {
+        var items = normalizeFavoriteList(found.body);
+        if (items !== null) {
+          favorites.items = items;
+          favorites.status = "ready";
+          emit();
+          return true;
+        }
+        found = { type: "unavailable", text: TEXT.unexpected, correlationId: null };
+      }
+      if (found.type === "auth") {
+        handleAuthLost();
+        return false;
+      }
+      favorites.status = "error";
+      favorites.error = { text: found.text || TEXT.favoritesFailed, correlationId: found.correlationId || null };
+      emit();
+      return false;
+    }
+
+    // Which part of the app is in front. The list of the favorites is read when it is first wanted
+    // (and again when the last read failed).
+    function showSection(name) {
+      if (state.screen !== "app" || state.gate || (name !== "chats" && name !== "favorites")) {
+        return;
+      }
+      state.section = name;
+      emit();
+      if (name === "favorites" && (state.favorites.status === "idle" || state.favorites.status === "error")) {
+        track(loadFavorites());
+      }
+    }
+
+    async function openFavorite(rawId) {
+      var id = typeof rawId === "string" ? rawId.toLowerCase() : "";
+      if (state.screen !== "app" || state.gate || !UUID_PATTERN.test(id)) {
+        return;
+      }
+      var mine = epoch;
+      var favorites = state.favorites;
+      state.section = "favorites";
+      favorites.currentId = id;
+      favorites.removing = null; // a question about another recipe is over
+      favorites.detail = { id: id, status: "loading", item: null, error: null };
+      emit();
+      var response = await http("GET", "/api/favorites/" + id, { timeoutMs: READ_TIMEOUT_MS });
+      if (mine !== epoch || state.favorites.currentId !== id) {
+        return; // the session ended, or another recipe was asked for meanwhile
+      }
+      var detail = state.favorites.detail;
+      var found = classifyRead(response, "favorite_not_found");
+      if (found.type === "ok") {
+        var item = normalizeFavoriteDetail(found.body, id);
+        if (item !== null) {
+          detail.status = "ready";
+          detail.item = item;
+          detail.error = null;
+          emit();
+          return;
+        }
+        found = { type: "unavailable", text: TEXT.unexpected, correlationId: null };
+      }
+      if (found.type === "auth") {
+        handleAuthLost();
+        return;
+      }
+      if (found.type === "not_found") {
+        dropFavorite(id); // (removed in another window)
+        detail.status = "gone";
+        detail.error = { text: TEXT.recipeGone, correlationId: null };
+        emit();
+        return;
+      }
+      detail.status = "error";
+      detail.error = { text: found.text || TEXT.recipeFailed, correlationId: found.correlationId || null };
+      emit();
+    }
+
+    function reloadRecipe() {
+      var id = state.favorites.currentId;
+      return id === null ? Promise.resolve() : openFavorite(id);
+    }
+
+    // Keep an answer of the assistant. The server copies the text from the answer it finds under this
+    // conversation and message, and keeps one favorite per answer: asking again (after an unclear
+    // outcome, or from another window) is harmless.
+    async function keepFavorite(conversationId, messageId) {
+      if (state.screen !== "app" || state.gate) {
+        return { ok: false, reason: "not_ready" };
+      }
+      if (typeof conversationId !== "string" || !UUID_PATTERN.test(conversationId) || !isCount(messageId) || messageId < 1) {
+        return { ok: false, reason: "invalid" };
+      }
+      var favorites = state.favorites;
+      if (favoriteOfMessage(messageId) !== null) {
+        return { ok: true, reason: "already" };
+      }
+      var asked = favorites.saving[messageId];
+      if (asked && asked.phase === "saving") {
+        return { ok: false, reason: "busy" };
+      }
+      var mine = epoch;
+      favorites.saving[messageId] = { phase: "saving", error: null };
+      emit();
+      var response = await http("POST", "/api/favorites", {
+        json: { conversation_id: conversationId, message_id: messageId },
+        timeoutMs: READ_TIMEOUT_MS,
+      });
+      if (mine !== epoch) {
+        return { ok: false, reason: "stale" };
+      }
+      favorites = state.favorites;
+      var outcome = classifyFavoriteKeep(response);
+      if (outcome.type === "auth") {
+        handleAuthLost();
+        return { ok: false, reason: "auth" };
+      }
+      if (outcome.type === "kept") {
+        delete favorites.saving[messageId];
+        putFavorite(outcome.favorite);
+        announce(TEXT.favoriteKeptAnnounce);
+        emit();
+        return { ok: true, reason: outcome.created ? "created" : "already" };
+      }
+      favorites.saving[messageId] = {
+        phase: "error",
+        error: { text: outcome.text || TEXT.favoriteKeepFailed, correlationId: outcome.correlationId || null },
+      };
+      emit();
+      return { ok: false, reason: outcome.type };
+    }
+
+    // Removing is asked first, for the recipe that is open, and done only on the second click.
+    function askRemoveFavorite(id) {
+      var favorites = state.favorites;
+      if (state.screen !== "app" || state.gate || favorites.currentId !== id || !favorites.detail || favorites.detail.status !== "ready") {
+        return;
+      }
+      if (favorites.removing && favorites.removing.phase === "removing") {
+        return;
+      }
+      favorites.removing = { id: id, phase: "asking", error: null };
+      emit();
+    }
+
+    function cancelRemoveFavorite() {
+      var removing = state.favorites.removing;
+      if (removing && removing.phase !== "removing") {
+        state.favorites.removing = null;
+        emit();
+      }
+    }
+
+    async function removeFavorite() {
+      var asked = state.favorites.removing;
+      if (state.screen !== "app" || state.gate || !asked || asked.phase === "removing") {
+        return { ok: false, reason: "not_asked" };
+      }
+      var mine = epoch;
+      var id = asked.id;
+      asked.phase = "removing";
+      asked.error = null;
+      emit();
+      var response = await http("DELETE", "/api/favorites/" + id, { timeoutMs: READ_TIMEOUT_MS });
+      if (mine !== epoch) {
+        return { ok: false, reason: "stale" };
+      }
+      var favorites = state.favorites;
+      var outcome = classifyFavoriteRemove(response);
+      if (outcome.type === "auth") {
+        handleAuthLost();
+        return { ok: false, reason: "auth" };
+      }
+      if (outcome.type === "removed") {
+        dropFavorite(id);
+        if (favorites.currentId === id) {
+          favorites.currentId = null;
+          favorites.detail = null;
+        }
+        if (favorites.removing === asked) {
+          favorites.removing = null;
+        }
+        announce(TEXT.removed);
+        emit();
+        return { ok: true };
+      }
+      if (favorites.removing === asked) {
+        asked.phase = "error";
+        asked.error = { text: outcome.text || TEXT.removeFailed, correlationId: outcome.correlationId || null };
+        emit();
+      }
+      return { ok: false, reason: "failed" };
     }
 
     // --- everything else ------------------------------------------------------------------------------
@@ -2221,6 +2642,53 @@
       return typeof time === "number" ? new Date(time).toISOString() : "";
     }
 
+    // Whether an answer is kept: {state: "none" | "saving" | "saved" | "error", id (of the favorite), error}.
+    // (When the list of the favorites has not been read, an answer shows as "none": keeping it again is harmless.)
+    function favoriteMark(messageId) {
+      var kept = favoriteOfMessage(messageId);
+      if (kept !== null) {
+        return { state: "saved", id: kept.id, error: null };
+      }
+      var saving = state.favorites.saving[messageId];
+      if (saving) {
+        return saving.phase === "saving"
+          ? { state: "saving", id: null, error: null }
+          : { state: "error", id: null, error: saving.error };
+      }
+      return { state: "none", id: null, error: null };
+    }
+
+    // The favorites as the page draws them: the list (for the side), and the recipe that is open.
+    function favoritesView(now) {
+      var favorites = state.favorites;
+      var items = favorites.items.map(function (item) {
+        return {
+          id: item.id,
+          title: item.title,
+          meta: item.createdAt === null ? "" : fill(TEXT.savedOn, { when: formatMoment(item.createdAt, now) }),
+          current: item.id === favorites.currentId,
+        };
+      });
+      var current = null;
+      var detail = favorites.detail;
+      if (favorites.currentId !== null && detail && detail.id === favorites.currentId) {
+        var listed = items.filter(function (item) {
+          return item.id === detail.id;
+        })[0];
+        var removing = favorites.removing && favorites.removing.id === detail.id ? favorites.removing : null;
+        current = {
+          id: detail.id,
+          status: detail.status,
+          title: detail.item ? detail.item.title : listed ? listed.title : "",
+          text: detail.item ? detail.item.text : "",
+          meta: detail.item && detail.item.createdAt !== null ? fill(TEXT.savedOn, { when: formatMoment(detail.item.createdAt, now) }) : "",
+          error: detail.error,
+          removing: removing ? { phase: removing.phase, error: removing.error } : null,
+        };
+      }
+      return { status: favorites.status, error: favorites.error, items: items, current: current };
+    }
+
     function buildTimeline(thread, turn, now) {
       var items = [];
       var messages = thread ? thread.messages : [];
@@ -2248,6 +2716,9 @@
           correlationId: null,
           canRetry: false,
         };
+        if (message.role === "assistant") {
+          item.favorite = favoriteMark(message.id);
+        }
         if (message.role === "user" && message.status === "in_progress") {
           item.note = TEXT.preparing;
         } else if (message.role === "user" && message.status === "failed") {
@@ -2275,6 +2746,8 @@
         notice: null,
         failure: checking ? null : state.gate.failure,
         banner: null,
+        section: "chats",
+        favorites: { status: "idle", error: null, items: [], current: null },
         currentId: null,
         busy: false,
         maxLength: maxLength,
@@ -2307,6 +2780,8 @@
         notice: state.notice,
         failure: state.failure,
         banner: state.banner,
+        section: state.section,
+        favorites: favoritesView(now),
         currentId: state.currentId,
         busy: false,
         maxLength: maxLength,
@@ -2409,6 +2884,24 @@
       clearComposerError: clearComposerError,
       reloadList: reloadList,
       reloadThread: reloadThread,
+      showSection: showSection,
+      openFavorite: function (id) {
+        return track(openFavorite(id));
+      },
+      reloadFavorites: function () {
+        return track(loadFavorites());
+      },
+      reloadRecipe: function () {
+        return track(reloadRecipe());
+      },
+      keepFavorite: function (conversationId, messageId) {
+        return track(keepFavorite(conversationId, messageId));
+      },
+      askRemoveFavorite: askRemoveFavorite,
+      cancelRemoveFavorite: cancelRemoveFavorite,
+      removeFavorite: function () {
+        return track(removeFavorite());
+      },
       recheck: recheck,
       recover: recover,
       checkSession: checkSession,
@@ -2439,6 +2932,12 @@
     parseTimestamp: parseTimestamp,
     formatMoment: formatMoment,
     conversationLabel: conversationLabel,
+    deriveTitle: deriveTitle,
+    TITLE_LENGTH: TITLE_LENGTH,
+    normalizeFavorite: normalizeFavorite,
+    normalizeFavoriteList: normalizeFavoriteList,
+    classifyFavoriteKeep: classifyFavoriteKeep,
+    classifyFavoriteRemove: classifyFavoriteRemove,
     normalizeMessage: normalizeMessage,
     normalizeMessagePage: normalizeMessagePage,
     normalizeConversationList: normalizeConversationList,

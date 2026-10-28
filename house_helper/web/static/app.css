@@ -157,6 +157,15 @@ h1:focus {
   background: var(--pale);
 }
 
+.btn-danger {
+  background: var(--red);
+  color: var(--on-color);
+}
+
+.btn-danger:hover {
+  background: var(--red-dark);
+}
+
 .btn-onblue {
   background: transparent;
   border-color: var(--on-color);
@@ -425,6 +434,35 @@ textarea[aria-invalid="true"] {
   font-weight: 400;
 }
 
+/* The two parts of the sidebar: the conversations and the favorites. */
+.tabs {
+  display: flex;
+  gap: 0.4rem;
+  margin-bottom: 0.9rem;
+}
+
+.tab {
+  flex: 1;
+  min-height: 2.75rem;
+  padding: 0.5rem 0.6rem;
+  border: 2px solid var(--blue);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--blue);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.tab:hover {
+  background: var(--pale-strong);
+}
+
+.tab[aria-pressed="true"] {
+  background: var(--blue);
+  color: var(--on-color);
+}
+
 .backdrop {
   display: none;
 }
@@ -579,6 +617,65 @@ textarea[aria-invalid="true"] {
   margin-top: 0.7rem;
 }
 
+/* --- under an answer, and the recipe ------------------------------------------------------ */
+
+.msg-favorite {
+  align-items: center;
+  margin-top: 0.5rem;
+}
+
+.msg-favorite .msg-note {
+  margin: 0;
+}
+
+.fav-mark {
+  color: var(--green-dark);
+  font-weight: 600;
+}
+
+.recipe-body {
+  flex: 1;
+  min-height: 0;
+  padding: 1rem;
+  overflow-y: auto;
+}
+
+.recipe-meta {
+  max-width: 46rem;
+  margin-bottom: 0.75rem;
+}
+
+.recipe-text {
+  max-width: 46rem;
+  padding: 0.9rem 1rem;
+  border: 1px solid var(--line);
+  border-left: 5px solid var(--green);
+  border-radius: var(--radius);
+  background: var(--surface);
+  overflow-wrap: anywhere;
+}
+
+.recipe-actions {
+  max-width: 46rem;
+  margin-top: 1.1rem;
+}
+
+.confirm {
+  padding: 0.8rem 0.95rem;
+  border: 2px solid var(--red);
+  border-radius: var(--radius);
+  background: var(--red-pale);
+  color: var(--red-dark);
+}
+
+.confirm-text {
+  font-weight: 600;
+}
+
+.only-narrow {
+  display: none;
+}
+
 /* --- the composer ---------------------------------------------------------------------- */
 
 .composer {
@@ -625,6 +722,10 @@ textarea[aria-invalid="true"] {
 
 @media (max-width: 52rem) {
   .drawer-toggle {
+    display: inline-flex;
+  }
+
+  .only-narrow {
     display: inline-flex;
   }
 

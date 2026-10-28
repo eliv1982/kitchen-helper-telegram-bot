@@ -25,7 +25,7 @@ DEPLOY = REPO_ROOT / "deploy"
 DBTOOL_PATH = DEPLOY / "ops" / "dbtool.py"
 URL_ENV = "HOUSE_HELPER_DATABASE_URL"
 STAGING_ENV = "HOUSE_HELPER_STAGING_DIR"
-HEAD = "0006_oidc_state_invitation"
+HEAD = "0007_favorite_recipes"
 BEHIND = "0005_identity_invitations"
 
 posix_only = pytest.mark.skipif(os.name == "nt", reason="POSIX file locks and file modes")

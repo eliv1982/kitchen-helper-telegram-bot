@@ -135,10 +135,11 @@ journeys.first_conversation = async ({ base, cookie }) => {
 
   assert.deepEqual(p.texts(), ["Как варить борщ?", "Ответ на: Как варить борщ?"]);
   assert.equal(view.list.items.length, 1);
-  assert.match(view.list.items[0].label, /^Разговор от \d{1,2} [а-я]+, \d\d:\d\d$/);
+  assert.equal(view.list.items[0].label, "Как варить борщ?", "named by its first message");
   assert.equal(view.currentId, view.list.items[0].id);
   assert.deepEqual(p.net.log.map((r) => `${r.method} ${r.url.replace(/[0-9a-f-]{36}/, "<id>")}`), [
-    "GET /auth/me", "GET /api/conversations?limit=50", "POST /api/conversations", "POST /api/conversations/<id>/messages",
+    "GET /auth/me", "GET /api/conversations?limit=50", "GET /api/favorites", "POST /api/conversations",
+    "POST /api/conversations/<id>/messages",
   ]);
   assert.ok(p.net.log.every((r) => r.status === null || r.status < 300), JSON.stringify(p.net.log));
   return { conversation: view.currentId };
@@ -156,6 +157,8 @@ journeys.reload_restores_the_history_and_the_list = async ({ base, cookie }) => 
   assert.equal(view.currentId, first.view().currentId);
   assert.deepEqual(reloaded.texts(), ["Первый вопрос", "Ответ на: Первый вопрос", "Второй вопрос", "Ответ на: Второй вопрос"]);
   assert.equal(view.list.items.length, 1);
+  assert.equal(view.list.items[0].label, "Первый вопрос", "the server names it by its first message, not the second");
+  assert.equal(first.view().list.items[0].label, "Первый вопрос");
   assert.ok(reloaded.items().every((item) => item.time && item.iso), "every message has a time");
   assert.equal(reloaded.posts().length, 0, "reading sends nothing");
   assert.equal(view.composer.locked, false);
@@ -514,6 +517,99 @@ journeys.a_sign_out_whose_request_was_lost_is_repeated_and_ends_the_session = as
   assert.deepEqual(logouts(p).map((r) => r.status), [null, 204]);
   assert.equal((await p.net.raw("GET", "/auth/me")).status, 401);
   assert.deepEqual([p.view().screen, p.view().notice.text], ["login", Logic.TEXT.loggedOut]);
+};
+
+
+// --- history titles and favorites ---------------------------------------------------------------------------
+
+const assistantOf = (p) => p.items().find((item) => item.role === "assistant");
+
+journeys.a_long_first_message_is_named_the_same_by_the_page_and_by_the_server = async ({ base, cookie }) => {
+  const question = "  Подскажите,   пожалуйста,\nкак приготовить домашнюю лапшу 🍜 для куриного супа без яиц и без муки высшего сорта  ";
+  const first = page(base, cookie);
+  await first.boot();
+  await (await first.ctl.send(question)).done;
+  const named = first.view().list.items[0].label;
+
+  const reloaded = page(base, cookie); // the name now comes from the server's own rule
+  const view = await reloaded.boot();
+
+  assert.equal(view.list.items.length, 1);
+  assert.equal(view.list.items[0].label, named);
+  assert.equal(view.chatTitle, named);
+  assert.equal(named, Logic.deriveTitle(question));
+  assert.ok(named.endsWith("…") && !/[\n\t]/.test(named) && Array.from(named).length === Logic.TITLE_LENGTH + 1, named);
+};
+
+journeys.favorites_are_kept_reopened_after_a_reload_and_removed = async ({ base, cookie }) => {
+  const first = page(base, cookie);
+  await first.boot();
+  await (await first.ctl.send("Как варить борщ?")).done;
+  const conversation = first.view().currentId;
+  const answer = assistantOf(first);
+  assert.equal(answer.favorite.state, "none");
+
+  assert.deepEqual(await first.ctl.keepFavorite(conversation, answer.id), { ok: true, reason: "created" });
+  assert.equal(assistantOf(first).favorite.state, "saved");
+
+  const second = page(base, cookie); // a new tab: nothing in memory
+  let view = await second.boot();
+  assert.deepEqual([view.favorites.status, view.favorites.items.length], ["ready", 1]);
+  assert.equal(view.favorites.items[0].title, "Ответ на: Как варить борщ?");
+  assert.equal(assistantOf(second).favorite.state, "saved", "the answer is marked from the first read");
+  const id = view.favorites.items[0].id;
+  assert.equal(assistantOf(second).favorite.id, id);
+
+  await second.ctl.openFavorite(id);
+  await second.ctl.idle();
+  view = second.view();
+  assert.deepEqual([view.section, view.favorites.current.status, view.favorites.current.text], ["favorites", "ready", "Ответ на: Как варить борщ?"]);
+
+  // The server keeps one favorite per answer: asking again, outside the page's own check, is the same one.
+  const again = await second.net.raw("POST", "/api/favorites", { conversation_id: conversation, message_id: answer.id });
+  assert.deepEqual([again.status, again.json.created, again.json.id], [200, false, id]);
+
+  second.ctl.askRemoveFavorite(id);
+  assert.deepEqual(await second.ctl.removeFavorite(), { ok: true });
+  assert.deepEqual(second.view().favorites.items, []);
+
+  const third = page(base, cookie);
+  view = await third.boot();
+  assert.deepEqual([view.favorites.status, view.favorites.items.length], ["ready", 0]);
+  assert.equal(assistantOf(third).favorite.state, "none");
+  assert.deepEqual(third.texts(), ["Как варить борщ?", "Ответ на: Как варить борщ?"], "the conversation is as it was");
+  const gone = await third.net.raw("DELETE", "/api/favorites/" + id);
+  assert.equal(gone.status, 404);
+  assert.equal(gone.json.detail, "favorite_not_found");
+  return { favorite: id };
+};
+
+journeys.favorites_belong_to_the_person_who_kept_them = async ({ base, cookie, other }) => {
+  const anna = page(base, cookie);
+  await anna.boot();
+  await (await anna.ctl.send("секрет рецепт Анны")).done;
+  const conversation = anna.view().currentId;
+  const answer = assistantOf(anna);
+  await anna.ctl.keepFavorite(conversation, answer.id);
+  const id = anna.view().favorites.items[0].id;
+
+  const boris = page(base, other); // his own browser
+  const view = await boris.boot();
+  assert.deepEqual([view.favorites.status, view.favorites.items], ["ready", []]);
+  assert.equal(view.list.items.length, 0);
+  assert.equal((await boris.net.raw("GET", "/api/favorites/" + id)).status, 404);
+  assert.equal((await boris.net.raw("DELETE", "/api/favorites/" + id)).status, 404);
+  assert.equal((await boris.net.raw("GET", "/api/conversations/" + conversation + "/messages")).status, 404);
+  const stolen = await boris.net.raw("POST", "/api/favorites", { conversation_id: conversation, message_id: answer.id });
+  assert.deepEqual([stolen.status, stolen.json.detail], [404, "conversation_not_found"]);
+  await boris.ctl.openFavorite(id); // the page itself, asked for her recipe by id
+  await boris.ctl.idle();
+  assert.equal(boris.view().favorites.current.status, "gone");
+  assert.ok(!JSON.stringify([boris.view(), boris.ctl._state()]).includes("секрет рецепт"));
+
+  const again = page(base, cookie);
+  const back = await again.boot();
+  assert.deepEqual(back.favorites.items.map((item) => item.id), [id], "nothing of hers was taken or removed");
 };
 
 // --- run -------------------------------------------------------------------------------------------------------

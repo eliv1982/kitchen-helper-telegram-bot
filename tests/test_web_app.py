@@ -120,13 +120,14 @@ def test_creating_the_application_touches_neither_the_database_nor_the_disk(tmp_
 def test_the_application_exposes_health_sign_in_chat_the_page_and_nothing_else(tmp_path):
     # The sign-in routes (R3A Telegram, R3B-2 email, R4C-Auth A3 Telegram invitation: the
     # page, its start and the page after it, none of which serves a person's data), the chat API (R4A: the
-    # conversations and their messages) and the page (R4B: the shell at "/" and its few
-    # static files) are the only additions to /healthz: no recipe, preference or other
-    # user-data route may exist, and not even the interactive API pages FastAPI would
-    # add by default. A route added later has to change this list on purpose, and a
-    # route that serves a person's data has to use auth.require_user (the chat routes
-    # do: see test_web_chat_api.py, which asks each of them without a session; the page
-    # holds no data of anyone's: see test_web_ui.py).
+    # conversations and their messages), the favorites API (the answers a person chose to
+    # keep) and the page (R4B: the shell at "/" and its few static files) are the only
+    # additions to /healthz: no preference or other user-data route may exist, and not even
+    # the interactive API pages FastAPI would add by default. A route added later has to
+    # change this list on purpose, and a route that serves a person's data has to use
+    # auth.require_user (the chat and favorites routes do: see test_web_chat_api.py and
+    # test_web_favorites.py, which ask each of them without a session; the page holds no
+    # data of anyone's: see test_web_ui.py).
     app = create_app(settings_for(tmp_path / "routes.db"))
 
     # openapi() is the public listing (app.routes holds FastAPI internals); the
@@ -145,6 +146,8 @@ def test_the_application_exposes_health_sign_in_chat_the_page_and_nothing_else(t
         "/auth/invite/done": ["get"],
         "/api/conversations": ["get", "post"],
         "/api/conversations/{conversation_id}/messages": ["get", "post"],
+        "/api/favorites": ["get", "post"],
+        "/api/favorites/{favorite_id}": ["delete", "get"],
         "/": ["get"],
         "/static/{name}": ["get"],
     }
@@ -402,7 +405,7 @@ async def test_starting_and_stopping_leaves_a_migrated_database_as_it_was(tmp_pa
     upgrade_database(engine)
     engine.dispose()
     before = _snapshot(target)
-    assert before[1] == [("0006_oidc_state_invitation",)]
+    assert before[1] == [("0007_favorite_recipes",)]
 
     async with serving(create_app(settings_for(target))) as client:
         await client.get("/healthz")

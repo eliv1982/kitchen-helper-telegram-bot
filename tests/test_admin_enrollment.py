@@ -1137,8 +1137,8 @@ def test_two_enrolled_users_have_independent_conversations(capsys, db_url):
         with factory() as db:
             who = {name: authenticate(db, issued.token, now=LATER).user_id for name, issued in sessions.items()}
             assert who == {"first": first[0], "second": second[0]} and first[0] != second[0]
-            assert [c.id for c in cv.list_conversations(db, first[0], limit=10).conversations] == [chats["first"]]
-            assert [c.id for c in cv.list_conversations(db, second[0], limit=10).conversations] == [chats["second"]]
+            assert [c.id for c in cv.list_conversations(db, first[0], now=LATER, limit=10).conversations] == [chats["first"]]
+            assert [c.id for c in cv.list_conversations(db, second[0], now=LATER, limit=10).conversations] == [chats["second"]]
             assert cv.owns_conversation(db, first[0], chats["first"])
             assert not cv.owns_conversation(db, first[0], chats["second"])  # not the other's, not told apart
             assert not cv.owns_conversation(db, second[0], chats["first"])

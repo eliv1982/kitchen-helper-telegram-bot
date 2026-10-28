@@ -13,6 +13,9 @@ const Logic = require(path.join(__dirname, "..", "..", "house_helper", "web", "s
 const CONV_A = "11111111-1111-4111-8111-111111111111";
 const CONV_B = "22222222-2222-4222-8222-222222222222";
 const CONV_C = "33333333-3333-4333-8333-333333333333";
+const FAV_1 = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1";
+const FAV_2 = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2";
+const FAV_3 = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3";
 const START = Date.UTC(2026, 9, 18, 12, 0, 0);
 
 async function flush(rounds = 25) {
@@ -201,6 +204,8 @@ function respond(responder, signal) {
       });
     case "text":
       return new Response(responder.body, { status: responder.status, headers: responder.headers });
+    case "empty":
+      return new Response(null, { status: responder.status });
     case "fail":
       throw new TypeError("Failed to fetch");
     case "dropBody":
@@ -236,6 +241,22 @@ function conversation(id, minutes = 0, title = null) {
 }
 
 const listBody = (conversations, hasMore = false) => json(200, { conversations, has_more: hasMore });
+
+// The favorites, in the shapes of the real API (tests/test_web_favorites.py checks those).
+function favorite(id, messageId, title, minutes = 0) {
+  const at = new Date(START - 86400_000 + minutes * 60_000).toISOString().replace("Z", "+00:00");
+  return { id, title, message_id: messageId, created_at: at };
+}
+
+const favoritesBody = (favorites) => json(200, { favorites });
+
+function favoriteDetail(item, textValue) {
+  return json(200, { ...item, text: textValue });
+}
+
+// 201 (kept now) or 200 (it already was)
+const keptBody = (item, created = true) => json(created ? 201 : 200, { ...item, created });
+const removedBody = () => ({ kind: "empty", status: 204 });
 
 function message(id, role, textValue, extra = {}) {
   return { id, role, text: textValue, created_at: iso(id), status: "completed", ...extra };
@@ -302,6 +323,8 @@ function makeEnv(options = {}) {
   const net = new Net();
   const storage = options.storage || new Storage();
   const crypto = options.crypto === undefined ? fakeCrypto() : options.crypto;
+  // Whoever signs in has no favorites unless a scenario says so (a later route is asked first).
+  net.route("GET", "/api/favorites", favoritesBody([]));
   const changes = { count: 0 };
   const announced = [];
   const controller = Logic.createController({
@@ -366,6 +389,9 @@ module.exports = {
   CONV_A,
   CONV_B,
   CONV_C,
+  FAV_1,
+  FAV_2,
+  FAV_3,
   START,
   flush,
   Timers,
@@ -380,6 +406,11 @@ module.exports = {
   iso,
   conversation,
   listBody,
+  favorite,
+  favoritesBody,
+  favoriteDetail,
+  keptBody,
+  removedBody,
   message,
   historyBody,
   turnBody,

@@ -30,6 +30,9 @@ created and read, and a message is answered 503. `chat_backend` replaces the bac
 in tests. On the way out the runner is stopped first (it lets running turns finish,
 then cancels what is left), then the backend's client is closed, then the database.
 
+The favorites API (favorites_api.py) is always routed as well: it needs no assistant, only the
+database and a signed-in user.
+
 The page (ui.py) is always served too: `GET /` and the few files under /static. It is
 public and static -- it holds nothing of anyone's, and every byte of user data it shows
 comes from the /auth and /api routes it calls with the visitor's own cookie -- and it
@@ -49,7 +52,7 @@ from house_helper.core.backend import ChatBackend
 from house_helper.core.openai_chat import StandaloneOpenAIBackend
 from house_helper.persistence.base import utcnow
 from house_helper.persistence.database import create_db_engine
-from house_helper.web import auth, chat_api, email_auth, health, invite_auth, ui
+from house_helper.web import auth, chat_api, email_auth, favorites_api, health, invite_auth, ui
 from house_helper.web.auth import AuthService
 from house_helper.web.database import WebDatabase
 from house_helper.web.email_auth import EmailLoginService
@@ -171,5 +174,6 @@ def create_app(
     app.include_router(email_auth.router)
     app.include_router(invite_auth.router)
     app.include_router(chat_api.router)
+    app.include_router(favorites_api.router)
     app.include_router(ui.router)
     return app

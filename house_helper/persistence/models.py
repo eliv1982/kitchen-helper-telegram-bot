@@ -224,6 +224,9 @@ class User(Base):
     conversations: Mapped[list["Conversation"]] = relationship(
         back_populates="user", cascade="save-update, merge", passive_deletes="all"
     )
+    favorites: Mapped[list["FavoriteRecipe"]] = relationship(
+        back_populates="user", cascade="save-update, merge", passive_deletes="all"
+    )
 
 
 class AllowlistEntry(Base):
@@ -859,6 +862,51 @@ class TurnRequest(Base):
         foreign_keys=[assistant_message_id],
         viewonly=True,
     )
+
+
+class FavoriteRecipe(Base):
+    """An assistant answer that a user chose to keep, copied out of its conversation.
+
+    The copy is the point. A message is history and expires with it (RETENTION_DAYS, then
+    the purge deletes it, and a conversation left empty with it); a favorite is something
+    the person decided to keep, so it has no deadline and no link to the conversation it
+    came from: content is the exact text of the assistant's answer as it was stored, and
+    nothing here points at a conversation or a message by a foreign key. It therefore
+    survives the expiry of the answer, the purge of the conversation and the deletion of
+    both. Only deleting the user deletes it (user_id, ON DELETE CASCADE), and the person
+    removing it (favorites.remove). The purge does not know this table and never touches it.
+
+    title is a short label made from the first line of the answer when it was saved
+    (favorites.favorite_title); the content is never parsed or rewritten.
+
+    source_message_id is the id of the message it was copied from, a plain number kept
+    for two things: saving the same answer twice is one favorite (UNIQUE with user_id),
+    and the page can mark the answers of an open conversation that are already saved.
+    Message ids come from a sequence that never reuses a number (messages.id), so the
+    number cannot come to mean another message after the purge deleted the first.
+
+    The owner is always the user of the session that saved it, never something the
+    request says; every function in favorites.py takes it and finds a row only through it.
+    """
+
+    __tablename__ = "favorite_recipes"
+    __table_args__ = (
+        sa.UniqueConstraint("user_id", "source_message_id"),
+        # The user's list, newest first (and the foreign key's cascade).
+        sa.Index(None, "user_id", "created_at"),
+        _max_length("title", 200),
+        sa.CheckConstraint("length(title) >= 1", name="title_not_empty"),
+        sa.CheckConstraint("length(content) >= 1", name="content_not_empty"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("users.id", ondelete="CASCADE"))
+    title: Mapped[str] = mapped_column(sa.String(200))
+    content: Mapped[str] = mapped_column(sa.Text)
+    source_message_id: Mapped[int] = mapped_column(_BIGINT_ID)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+    user: Mapped[User] = relationship(back_populates="favorites")
 
 
 # --- the same rules, enforced before the INSERT on the ORM write path -------------

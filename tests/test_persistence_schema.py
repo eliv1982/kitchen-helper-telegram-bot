@@ -23,6 +23,7 @@ TABLES = {
     "oidc_states",
     "email_login_challenges",
     "identity_invitations",
+    "favorite_recipes",
     "conversations",
     "messages",
     "turn_requests",
@@ -31,7 +32,7 @@ TABLES = {
 POSTGRESQL_IDENTIFIER_LIMIT = 63
 
 
-def test_the_schema_has_exactly_the_ten_tables():
+def test_the_schema_has_exactly_the_eleven_tables():
     assert set(Base.metadata.tables) == TABLES
 
 
