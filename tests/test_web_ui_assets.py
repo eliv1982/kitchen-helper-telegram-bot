@@ -153,6 +153,8 @@ def test_the_viewport_allows_zoom_and_the_markup_asks_for_no_fixed_sizes():
 
     assert "width=device-width" in viewport and "initial-scale=1" in viewport
     assert "user-scalable" not in viewport and "maximum-scale" not in viewport
+    # An on-screen keyboard shrinks the page (the header and the composer stay in view above it) instead of covering it.
+    assert "interactive-widget=resizes-content" in viewport
     assert 'style="' not in html
 
 
@@ -251,6 +253,7 @@ def test_touch_targets_are_at_least_44_css_pixels():
         height = rules[selector]["min-height"]
         assert height.endswith("rem") and float(height[:-3]) * root_size >= 44, selector
     assert float(rules[".conv-item"]["min-height"][:-3]) * root_size >= 44
+    assert float(rules[".telegram-more summary"]["min-height"][:-3]) * root_size >= 44
     assert float(rules[".btn"]["min-width"][:-3]) * root_size >= 44
 
 
@@ -275,3 +278,59 @@ def test_the_icon_is_a_plain_image_with_no_script_or_reference():
 
     assert icon.lstrip().startswith("<svg") and "<script" not in icon and "onload" not in icon
     assert "href" not in icon and "xlink" not in icon and "<image" not in icon and "<foreignObject" not in icon.lower()
+
+
+# --- the layout: what keeps the page from scrolling, and where the parts of the side column stay ------------------------
+
+
+def test_the_page_cannot_be_made_taller_than_the_window_by_what_is_in_the_messages():
+    rules = _merged_rules()
+
+    # Each message holds a visually-hidden "who wrote this" label, which is positioned (out of the flow).
+    assert rules[".visually-hidden"]["position"] == "absolute !important"
+    # With no positioned box above it, the containing block of such a label is the page, and the label, at its
+    # place in a long conversation, stretched the page by the length of the whole list (found in a real browser:
+    # a blank page below the application). The scrolled list is therefore the containing block of its labels...
+    assert rules[".messages"]["position"] == "relative" and rules[".messages"]["overflow-y"] == "auto"
+    # ...and the application, exactly as tall as the window, holds whatever else sticks out.
+    assert rules[".app"]["position"] == "relative" and rules[".app"]["overflow"] == "clip"
+    assert rules[".app"]["height"] == "100dvh"
+
+
+def test_the_side_column_keeps_its_top_and_its_foot_and_scrolls_the_list_between_them():
+    rules = _merged_rules()
+
+    assert rules[".sidebar"]["display"] == "flex" and rules[".sidebar"]["flex-direction"] == "column"
+    assert rules[".conv-list"]["overflow-y"] == "auto" and rules[".conv-list"]["min-height"] == "0"
+    assert rules[".telegram"]["flex"] == "none" and rules[".tabs"]["flex"] == "none"
+    html = ui.render_shell(telegram=True, email=True)
+    # The tabs, the button for a new conversation and the list are in this order, and Telegram comes after them.
+    order = [html.index(marker) for marker in ('id="tab-chats"', 'id="new-conversation"', 'id="conversation-list"', 'id="telegram"')]
+    assert order == sorted(order)
+
+
+def test_the_long_telegram_text_is_in_a_details_and_what_matters_at_a_glance_is_not():
+    html = ui.render_shell(telegram=True, email=True)
+    block = re.search(r'<details id="telegram-more"([^>]*)>(.*?)</details>', html, re.S)
+
+    assert block is not None
+    # The shell does not decide whether it is open: the script does, by the state of the account (below).
+    assert not re.search(r"\bopen\b", block.group(1))
+    assert re.search(r"<summary>[^<]+</summary>", block.group(2))
+    assert 'id="telegram-privacy"' in block.group(2)
+    for glance in ("telegram-title", "telegram-text", "telegram-notice", "telegram-connect", "telegram-disconnect", "telegram-confirm"):
+        assert f'id="{glance}"' in html and f'id="{glance}"' not in block.group(2), glance
+    # The script shows the expander only when the logic has something to put in it, and empties and closes it with the panel.
+    assert "els.telegramMore.hidden = !panel.privacy" in APP
+    assert "els.telegramMore.open = false" in APP
+
+
+def test_the_long_telegram_text_is_open_until_the_account_is_linked_and_the_readers_choice_is_left_alone():
+    # Open by default unless the panel says "linked"; set only when that default changes, so a redraw of the
+    # panel (a code, a poll, the question about disconnecting) does not undo what the reader opened or closed.
+    assert 'var openByDefault = panel.phase !== "linked";' in APP
+    assert "if (openByDefault !== explanationOpen) {" in APP
+    assert "els.telegramMore.open = openByDefault;" in APP
+    assert "explanationOpen = null;" in APP
+    # The text itself is the same as before: it is not shortened, nor made a separate consent.
+    assert "Что происходит с данными" in ui.render_shell(telegram=True, email=True)

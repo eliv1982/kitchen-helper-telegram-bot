@@ -117,7 +117,7 @@ _SHELL = """\
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="robots" content="noindex">
 <meta name="color-scheme" content="light">
 <meta name="theme-color" content="#1c3f94">
@@ -169,27 +169,32 @@ _SHELL = """\
         <button id="tab-chats" class="tab" type="button" aria-pressed="true">Разговоры</button>
         <button id="tab-favorites" class="tab" type="button" aria-pressed="false">Избранное</button>
       </div>
-      <div id="panel-chats">
+      <div id="panel-chats" class="panel">
         <button id="new-conversation" class="btn btn-secondary btn-block" type="button">Новый разговор</button>
         <p id="list-status" class="hint" role="status"></p>
         <button id="list-retry" class="btn btn-quiet btn-block" type="button" hidden>Обновить список</button>
         <ul id="conversation-list" class="conv-list"></ul>
       </div>
-      <div id="panel-favorites" hidden>
+      <div id="panel-favorites" class="panel" hidden>
         <p id="favorites-status" class="hint" role="status"></p>
         <button id="favorites-retry" class="btn btn-quiet btn-block" type="button" hidden>Обновить избранное</button>
         <ul id="favorite-list" class="conv-list"></ul>
       </div>
       <section id="telegram" class="telegram" aria-labelledby="telegram-title" hidden>
         <h2 id="telegram-title" class="telegram-title">Telegram</h2>
-        <p id="telegram-text" class="hint" role="status"></p>
+        <p id="telegram-text" class="telegram-text" role="status"></p>
         <p id="telegram-notice" class="notice" role="status" hidden></p>
-        <p id="telegram-privacy" class="hint"></p>
-        <a id="telegram-open" class="btn btn-primary btn-block" target="_blank" rel="noopener noreferrer" hidden>Открыть Telegram</a>
-        <button id="telegram-connect" class="btn btn-secondary btn-block" type="button" hidden>Подключить Telegram</button>
-        <button id="telegram-disconnect" class="btn btn-quiet btn-block" type="button" hidden>Отключить</button>
-        <button id="telegram-confirm" class="btn btn-danger btn-block" type="button" hidden>Да, отключить</button>
-        <button id="telegram-cancel" class="btn btn-quiet btn-block" type="button" hidden>Отмена</button>
+        <div class="telegram-actions">
+          <a id="telegram-open" class="btn btn-primary" target="_blank" rel="noopener noreferrer" hidden>Открыть Telegram</a>
+          <button id="telegram-connect" class="btn btn-secondary" type="button" hidden>Подключить Telegram</button>
+          <button id="telegram-disconnect" class="btn btn-quiet" type="button" hidden>Отключить</button>
+          <button id="telegram-confirm" class="btn btn-danger" type="button" hidden>Да, отключить</button>
+          <button id="telegram-cancel" class="btn btn-quiet" type="button" hidden>Отмена</button>
+        </div>
+        <details id="telegram-more" class="telegram-more" hidden>
+          <summary>Что происходит с данными</summary>
+          <p id="telegram-privacy" class="hint"></p>
+        </details>
       </section>
     </nav>
     <div id="backdrop" class="backdrop" hidden></div>

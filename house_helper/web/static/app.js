@@ -58,6 +58,7 @@
     telegram: byId("telegram"),
     telegramText: byId("telegram-text"),
     telegramNotice: byId("telegram-notice"),
+    telegramMore: byId("telegram-more"),
     telegramPrivacy: byId("telegram-privacy"),
     telegramOpen: byId("telegram-open"),
     telegramConnect: byId("telegram-connect"),
@@ -280,6 +281,10 @@
     }
   }
 
+  // Whether the explanation of the data was last made open (true) or closed (false) by default, null while
+  // the panel is not shown.
+  var explanationOpen = null;
+
   // (`panel`, not `view`: that name is the conversations' view, whose fields tests check by name.)
   function drawTelegram(panel) {
     if (panel === null || !panel.visible) {
@@ -288,6 +293,9 @@
       els.telegramText.textContent = "";
       els.telegramNotice.textContent = "";
       els.telegramPrivacy.textContent = "";
+      els.telegramMore.hidden = true;
+      els.telegramMore.open = false;
+      explanationOpen = null;
       els.telegramOpen.removeAttribute("href");
       els.telegramOpen.hidden = true;
       return;
@@ -296,7 +304,17 @@
     els.telegramText.textContent = panel.text;
     els.telegramNotice.hidden = !panel.notice;
     els.telegramNotice.textContent = panel.notice || "";
+    // What connecting does with the person's words and photographs is kept in a <details> (it is long): it is
+    // there whenever the logic has something to say about it. It is open for as long as the account is not
+    // linked (that is when it is read, before pressing "connect") and closed once it is; the default is
+    // set when that changes, so what the reader opens or closes themselves is left as it is.
     els.telegramPrivacy.textContent = panel.privacy;
+    els.telegramMore.hidden = !panel.privacy;
+    var openByDefault = panel.phase !== "linked";
+    if (openByDefault !== explanationOpen) {
+      els.telegramMore.open = openByDefault;
+      explanationOpen = openByDefault;
+    }
     // The one address this script ever sets on an element: the link to the bot that the server made, which
     // the logic has checked against a strict pattern (https://t.me/<bot>?start=<code>) before it gets here.
     els.telegramOpen.hidden = !panel.link;
@@ -716,7 +734,10 @@
     if (item.photo) {
       // The photo that came with the message. Its address is this site's own route, which the logic checked
       // against a strict pattern (Logic.PHOTO_URL); the server serves it to its owner only.
-      node.appendChild(h("img", { class: "msg-photo", src: item.photo.url, alt: "Фото к сообщению", loading: "lazy" }));
+      var photo = h("img", { class: "msg-photo", src: item.photo.url, alt: "Фото к сообщению", loading: "lazy" });
+      photo.addEventListener("load", keepEnd);
+      photo.addEventListener("error", keepEnd);
+      node.appendChild(photo);
     }
     node.appendChild(textBlocks(item.text));
     node.appendChild(meta);
@@ -791,6 +812,19 @@
     var box = els.messages;
     return box.scrollHeight - box.scrollTop - box.clientHeight < 96;
   }
+
+  // A photograph has no height until it has loaded, so a thread that was scrolled to its newest message when
+  // it was drawn is longer by the photographs a moment later, and the newest message is out of sight. While the
+  // reader has not scrolled away from the end, the thread follows it.
+  var followEnd = false;
+  function keepEnd() {
+    if (followEnd) {
+      els.messages.scrollTop = els.messages.scrollHeight;
+    }
+  }
+  els.messages.addEventListener("scroll", function () {
+    followEnd = nearBottom();
+  });
 
   var SUGGESTIONS = [
     "Что приготовить из курицы и риса?",
@@ -915,6 +949,7 @@
     } else {
       box.scrollTop = previousTop;
     }
+    followEnd = nearBottom();
     lastThread = { id: conversationId, first: firstId, last: lastKey };
   }
 

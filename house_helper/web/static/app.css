@@ -34,6 +34,11 @@
 
   --radius: 0.75rem;
   --shadow: 0 1px 3px rgba(22, 32, 51, 0.12);
+
+  /* The readable column of the conversation and the recipe. On a wide window the sides are left empty
+     (the percentage is the pane's own width); on a narrow one the side is 1rem. */
+  --column: 48rem;
+  --gutter: max(1rem, calc((100% - var(--column)) / 2));
 }
 
 *,
@@ -321,11 +326,19 @@ textarea[aria-invalid="true"] {
 
 /* --- the application ------------------------------------------------------------------ */
 
+/* The application is exactly as tall as the window and never makes the page scroll: its panes scroll
+   inside it. It is also the containing block of everything positioned inside it, and it clips what
+   sticks out (`clip` rather than `hidden`: a clipped box cannot be scrolled at all, not even by a
+   script), so a positioned child -- the visually-hidden "who wrote this" labels of the messages,
+   say -- cannot stretch the page below the window. */
 .app {
+  position: relative;
   display: flex;
   flex-direction: column;
   height: 100vh;
   height: 100dvh;
+  overflow: hidden;
+  overflow: clip;
 }
 
 .topbar {
@@ -378,7 +391,13 @@ textarea[aria-invalid="true"] {
   min-height: 0;
 }
 
+/* The side column is laid out top to bottom: the two tabs and (under "Разговоры") the button for a new
+   conversation stay where they are, the list under them is what scrolls, and the Telegram panel stays
+   at the foot, small. The column itself scrolls only when the window is too short for all of that. */
 .sidebar {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
   padding: 1rem;
   overflow-y: auto;
   background: var(--pale);
@@ -387,6 +406,18 @@ textarea[aria-invalid="true"] {
 
 .sidebar .hint {
   margin-top: 0.6rem;
+}
+
+/* (An empty status line stays in the page, for a screen reader's sake, but takes no room.) */
+.sidebar .hint:empty {
+  margin: 0;
+}
+
+.panel {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 12rem;
 }
 
 .msg-photo {
@@ -398,30 +429,77 @@ textarea[aria-invalid="true"] {
   background: var(--pale);
 }
 
+/* Telegram: the title, one line of status, the buttons that fit the state, and the long explanation
+   (what is copied, what OpenAI receives, how long it is kept) in a <details>: open while the account is
+   not linked, closed once it is, and one tap on its title either way. */
 .telegram {
-  margin-top: 1.25rem;
-  padding-top: 1rem;
+  flex: none;
+  margin-top: 0.75rem;
+  padding-top: 0.6rem;
   border-top: 1px solid var(--line);
 }
 
 .telegram-title {
-  margin: 0 0 0.25rem;
+  margin: 0;
   font-size: 1rem;
   color: var(--text);
 }
 
-.telegram .btn,
-.telegram .notice {
-  margin-top: 0.6rem;
+.telegram-text {
+  margin: 0.1rem 0 0;
+  font-size: 0.95rem;
 }
 
+.telegram .notice {
+  margin: 0.5rem 0 0;
+}
+
+/* One button fills the row; two (the question "Отключить?") share it if both labels fit, and are
+   one above the other if not. */
+.telegram-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.telegram-actions .btn {
+  flex: 1 1 auto;
+}
+
+.telegram-more {
+  margin-top: 0.25rem;
+}
+
+.telegram-more summary {
+  min-height: 2.75rem;
+  padding: 0.6rem 0;
+  color: var(--blue);
+  font-weight: 600;
+  list-style-position: inside;
+  cursor: pointer;
+}
+
+.telegram-more .hint {
+  margin: 0 0 0.5rem;
+}
+
+/* The list is the part of the side column that scrolls. The padding and the negative margin keep the
+   focus ring of the first and last items from being cut off by the edge of the scrolled box. */
 .conv-list {
   display: flex;
+  flex: 1 1 0;
   flex-direction: column;
   gap: 0.45rem;
-  margin: 0.75rem 0 0;
-  padding: 0;
+  min-height: 0;
+  margin: 0.4rem -0.4rem 0;
+  padding: 0.4rem;
+  overflow-y: auto;
   list-style: none;
+}
+
+.conv-list > li {
+  flex: none;
 }
 
 .conv-item {
@@ -463,6 +541,7 @@ textarea[aria-invalid="true"] {
 /* The two parts of the sidebar: the conversations and the favorites. */
 .tabs {
   display: flex;
+  flex: none;
   gap: 0.4rem;
   margin-bottom: 0.9rem;
 }
@@ -502,7 +581,8 @@ textarea[aria-invalid="true"] {
 
 .chat-title {
   margin: 0;
-  padding: 0.7rem 1rem;
+  padding: 0.7rem var(--gutter);
+  overflow-wrap: anywhere;
   border-bottom: 1px solid var(--line);
   background: var(--surface);
   font-size: 1.05rem;
@@ -512,7 +592,7 @@ textarea[aria-invalid="true"] {
   display: flex;
   align-items: center;
   gap: 0.75rem;
-  padding: 0.6rem 1rem;
+  padding: 0.6rem var(--gutter);
   background: var(--pale);
   border-bottom: 1px solid var(--pale-strong);
 }
@@ -528,13 +608,17 @@ textarea[aria-invalid="true"] {
   border-bottom-color: var(--red);
 }
 
+/* `position: relative`: the visually-hidden labels in the messages are positioned, and their
+   containing block must be this scrolled box -- otherwise it is the page, and each label, at its
+   place in the long list, makes the page that tall. */
 .messages {
+  position: relative;
   display: flex;
   flex: 1;
   flex-direction: column;
   gap: 0.9rem;
   min-height: 0;
-  padding: 1rem;
+  padding: 1rem var(--gutter);
   overflow-y: auto;
 }
 
@@ -662,7 +746,7 @@ textarea[aria-invalid="true"] {
 .recipe-body {
   flex: 1;
   min-height: 0;
-  padding: 1rem;
+  padding: 1rem var(--gutter);
   overflow-y: auto;
 }
 
@@ -705,7 +789,7 @@ textarea[aria-invalid="true"] {
 /* --- the composer ---------------------------------------------------------------------- */
 
 .composer {
-  padding: 0.75rem 1rem;
+  padding: 0.75rem var(--gutter);
   padding-bottom: calc(0.75rem + env(safe-area-inset-bottom, 0px));
   border-top: 1px solid var(--line);
   background: var(--surface);

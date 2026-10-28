@@ -105,6 +105,16 @@ class FakeElement extends FakeNode {
     else this.attrs.delete("hidden");
   }
 
+  // (`open` of a <details>, as a property that is the attribute: what the reader's click on the summary changes too.)
+  get open() {
+    return this.attrs.has("open");
+  }
+
+  set open(value) {
+    if (value) this.attrs.set("open", "");
+    else this.attrs.delete("open");
+  }
+
   get textContent() {
     return this.childNodes.map((child) => child.textContent).join("");
   }

@@ -1369,6 +1369,137 @@ scenario("telegram_panel_explains_the_copy_and_the_data_and_says_when_the_bot_is
   assert.equal(page.visible("telegram-connect"), false, "nothing to press while the bot is down");
 });
 
+scenario("telegram_panel_keeps_the_long_explanation_in_a_details_that_is_there_only_with_something_to_say", async () => {
+  const gate = deferred();
+  const page = await open(withTelegram([["GET /api/telegram", async () => {
+    await gate.promise;
+    return tgStatus(true);
+  }]]));
+
+  // While the state is being read there is nothing to explain yet: no empty expander.
+  assert.equal(page.visible("telegram"), true);
+  assert.equal(page.visible("telegram-more"), false);
+
+  gate.resolve();
+  await page.settle();
+  const more = page.el("telegram-more");
+  assert.equal(page.visible("telegram-more"), true);
+  assert.equal(page.el("telegram-privacy").closest("details"), more, "the explanation is inside it");
+  assert.equal(page.el("telegram-privacy").textContent, Logic.TELEGRAM_TEXT.privacy, "the whole text, not a shortened one");
+  assert.ok(more.textContent.includes("Что происходит с данными"), "the summary says what is inside");
+  // What the person needs at a glance is outside it.
+  assert.equal(page.el("telegram-text").closest("details"), null);
+  assert.equal(page.el("telegram-disconnect").closest("details"), null);
+  assert.equal(page.el("telegram-text").textContent, Logic.TELEGRAM_TEXT.linkedAs.replace("{name}", "@mama"));
+});
+
+scenario("telegram_panel_explanation_is_open_while_the_account_is_not_linked_and_closed_once_it_is", async () => {
+  const page = await open(withTelegram([
+    ["GET /api/telegram", tgStatus(false), tgStatus(false), tgStatus(true)],
+    ["POST /api/telegram/link", json(201, { code: TG_CODE, link: TG_LINK, expires_at: "x", expires_in_seconds: 600 })],
+    ["DELETE /api/telegram/link", json(200, { linked: false })],
+  ]));
+  const more = page.el("telegram-more");
+
+  // Not linked: the whole text is on the page without a tap, with the button that connects.
+  assert.equal(page.visible("telegram-more"), true);
+  assert.equal(more.getAttribute("open"), "", "open while the account is not linked");
+  assert.equal(page.visible("telegram-connect"), true);
+  assert.equal(page.el("telegram-privacy").textContent, Logic.TELEGRAM_TEXT.privacy);
+
+  // Waiting for the person to press Start in Telegram is still "not linked".
+  page.el("telegram-connect").click();
+  await page.settle();
+  assert.equal(page.visible("telegram-open"), true);
+  assert.equal(more.open, true);
+  await page.env.timers.advance(3000);
+  await page.settle();
+  assert.equal(more.open, true);
+
+  // Linked: closed by default, but still there with its title and the whole text.
+  await page.env.timers.advance(3000);
+  await page.settle();
+  assert.equal(page.visible("telegram-disconnect"), true);
+  assert.equal(more.open, false);
+  assert.equal(page.visible("telegram-more"), true, "reachable at all times");
+  assert.equal(page.el("telegram-privacy").textContent, Logic.TELEGRAM_TEXT.privacy);
+
+  // Asking about disconnecting does not change it; being unlinked again opens it again.
+  page.el("telegram-disconnect").click();
+  await page.settle();
+  assert.equal(more.open, false);
+  page.el("telegram-confirm").click();
+  await page.settle();
+  assert.equal(page.visible("telegram-connect"), true);
+  assert.equal(more.open, true);
+});
+
+scenario("telegram_panel_leaves_the_readers_own_choice_of_the_explanation_alone", async () => {
+  const page = await open(withTelegram([
+    ["GET /api/telegram", tgStatus(false), tgStatus(false), tgStatus(true)],
+    ["POST /api/telegram/link", json(201, { code: TG_CODE, link: TG_LINK, expires_at: "x", expires_in_seconds: 600 })],
+  ]));
+  const more = page.el("telegram-more");
+
+  // Not linked: the reader closes it; the panel changing (the code, the polls) does not open it again.
+  assert.equal(more.open, true);
+  more.open = false;
+  page.el("telegram-connect").click();
+  await page.settle();
+  assert.equal(page.visible("telegram-open"), true);
+  assert.equal(more.open, false);
+  await page.env.timers.advance(3000);
+  await page.settle();
+  assert.equal(more.open, false);
+
+  // Linked: closed by default; the reader opens it; asking and cancelling leave it open.
+  await page.env.timers.advance(3000);
+  await page.settle();
+  assert.equal(page.visible("telegram-disconnect"), true);
+  assert.equal(more.open, false);
+  more.open = true;
+  page.el("telegram-disconnect").click();
+  await page.settle();
+  assert.equal(page.visible("telegram-confirm"), true);
+  assert.equal(more.open, true);
+  page.el("telegram-cancel").click();
+  await page.settle();
+  assert.equal(page.visible("telegram-disconnect"), true);
+  assert.equal(more.open, true);
+});
+
+scenario("telegram_panel_explanation_is_open_when_the_state_could_not_be_read_and_closes_when_linked", async () => {
+  const page = await open(withTelegram([["GET /api/telegram", fail(), tgStatus(true)]]));
+  const more = page.el("telegram-more");
+
+  // The state is not known: nothing says the account is linked, so the explanation is there.
+  assert.equal(page.el("telegram-connect").textContent, Logic.TEXT.retry);
+  assert.equal(page.visible("telegram-more"), true);
+  assert.equal(more.open, true);
+
+  page.el("telegram-connect").click();
+  await page.settle();
+  assert.equal(page.visible("telegram-disconnect"), true);
+  assert.equal(more.open, false);
+});
+
+scenario("telegram_panel_explanation_is_open_again_for_the_next_person_who_is_not_linked", async () => {
+  const page = await open(withTelegram([["GET /api/telegram", tgStatus(false), tgStatus(false)]]));
+  const more = page.el("telegram-more");
+  assert.equal(more.open, true);
+
+  // Another person comes to the same tab; what the first one did with the panel is not carried over.
+  more.open = false;
+  page.env.net.route("GET", "/auth/me", me(86400, H.USER_B));
+  page.env.net.route("GET", "/api/favorites", H.favoritesBody([]));
+  await comesBack(page);
+  await page.settle();
+
+  assert.equal(page.visible("telegram-more"), true);
+  assert.equal(page.visible("telegram-connect"), true);
+  assert.equal(more.open, true, "open for a person whose account is not linked, as it is for anyone");
+});
+
 scenario("telegram_panel_a_name_is_text_and_never_markup", async () => {
   const page = await open(withTelegram([["GET /api/telegram", tgStatus(true, HOSTILE)]]));
 
@@ -1413,6 +1544,8 @@ scenario("telegram_panel_goes_with_the_session_and_nothing_of_it_stays_for_the_n
   page.el("logout").click();
   await page.settle();
   assert.equal(page.visible("telegram"), false);
+  assert.equal(page.visible("telegram-more"), false);
+  assert.equal(page.el("telegram-more").open, false);
   assert.ok(!page.root().includes("@сестра"), "the name does not stay in the page");
 });
 
@@ -1451,6 +1584,30 @@ scenario("a_photo_is_drawn_from_this_sites_own_route_and_only_that", async () =>
   const sources = page.doc.attributeLog.filter(([, name]) => name === "src");
   assert.deepEqual(sources, [["img", "src", DOM_PHOTO]]);
   assert.ok(!page.doc.attributeLog.some(([, name, value]) => /^(on|style)/i.test(name) || /javascript:|evil/.test(value)));
+});
+
+scenario("a_photo_that_loads_late_keeps_the_newest_message_in_view_unless_the_reader_has_scrolled_away", async () => {
+  const photo = [{ id: "5d6c1f3e-0a9b-4e43-9c2f-7b1a8d3e4f50", content_type: "image/jpeg", size: 10, url: DOM_PHOTO }];
+  const page = await open(oneConversation([message(3, "user", "Смотрите", { attachments: photo }), message(4, "assistant", "Вижу")]));
+  const box = page.messages();
+  let height = 400;
+  Object.defineProperty(box, "scrollHeight", { get: () => height });
+  box.clientHeight = 300;
+  const image = box.byTag("img")[0];
+
+  // Drawn at the end of the thread (400 - 100 - 300 = 0 below the view); the photograph then gets its height.
+  box.scrollTop = 100;
+  box.fire("scroll");
+  height = 800;
+  image.fire("load");
+  assert.equal(box.scrollTop, 800, "the end of the thread is brought back into view");
+
+  // The reader has gone up to look at something: a photograph that loads now does not take them away.
+  box.scrollTop = 100;
+  box.fire("scroll");
+  height = 1000;
+  image.fire("error");
+  assert.equal(box.scrollTop, 100);
 });
 
 scenario("no_photo_means_no_image", async () => {
