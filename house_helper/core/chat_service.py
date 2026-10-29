@@ -47,6 +47,7 @@ from house_helper.core.backend import (
 )
 from house_helper.core.identity import ConversationKey
 from house_helper.core.limits import MAX_INPUT_LENGTH
+from house_helper.core.orthography import replace_yo
 from house_helper.core.outcomes import ChatOutcome, OutcomeStatus
 
 logger = logging.getLogger(__name__)
@@ -197,7 +198,9 @@ class Turn:
                             conversation=key,
                             context_len=ctx_len,
                         )
-                    reply = backend_reply.text
+                    # The assistant's own words, spelled by the product's rule; the
+                    # user's message was added to the history above exactly as given.
+                    reply = replace_yo(backend_reply.text)
                 except BaseException:
                     context_manager.remove_last_message(key)
                     raise

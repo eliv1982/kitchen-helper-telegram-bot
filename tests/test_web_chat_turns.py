@@ -511,7 +511,7 @@ async def test_a_complete_answer_is_not_marked(tmp_path):
         sent = await chat.send(conversation, "привет", "k")
 
         assert sent.json()["truncated"] is False
-        assert sent.json()["assistant_message"]["text"] == "Всё."
+        assert sent.json()["assistant_message"]["text"] == "Все."  # the provider's "Всё.", spelled without "ё"
 
 
 # --- a client that goes away ----------------------------------------------------------------------------

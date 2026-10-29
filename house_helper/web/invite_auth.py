@@ -55,16 +55,16 @@ _PRIVATE_HEADERS = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer
 # The user-facing texts of the JSON endpoint. Fixed: nothing from the request is echoed into them.
 _MESSAGE_INVALID_REQUEST = "Запрос не удалось разобрать."
 _MESSAGE_INVALID_INVITATION = (
-    "Приглашение недействительно, уже использовано или его срок истёк. Попросите выдать новое."
+    "Приглашение недействительно, уже использовано или его срок истек. Попросите выдать новое."
 )
 _MESSAGE_OTHER_USER = (
-    "В этом браузере уже выполнен вход в другую учётную запись. Выйдите из неё и откройте "
+    "В этом браузере уже выполнен вход в другую учетную запись. Выйдите из нее и откройте "
     "ссылку-приглашение снова."
 )
-_MESSAGE_FORBIDDEN = "Запрос отклонён: он пришёл не с нашего сайта."
+_MESSAGE_FORBIDDEN = "Запрос отклонен: он пришел не с нашего сайта."
 _MESSAGE_NOT_CONFIGURED = "Вход через Telegram сейчас не настроен. Обратитесь к тому, кто прислал приглашение."
-_MESSAGE_UNAVAILABLE = "Сервис временно недоступен. Попробуйте ещё раз чуть позже."
-_MESSAGE_ERROR = "Что-то пошло не так. Попробуйте ещё раз чуть позже."
+_MESSAGE_UNAVAILABLE = "Сервис временно недоступен. Попробуйте еще раз чуть позже."
+_MESSAGE_ERROR = "Что-то пошло не так. Попробуйте еще раз чуть позже."
 
 router = APIRouter(prefix="/auth/invite")
 

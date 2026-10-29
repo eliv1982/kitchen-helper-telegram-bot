@@ -166,7 +166,7 @@ async def test_unlinking_ends_the_link_and_the_bot_stops_answering(tmp_path):
     assert second.status_code == 200  # idempotent
     assert status["linked"] is False
     assert answered == 1 and t.chat.backend.calls == 1  # the second message cost nothing
-    assert "только для подключённых" in t.bot.texts(MOTHER)[-1]
+    assert "только для подключенных" in t.bot.texts(MOTHER)[-1]
 
 
 async def test_after_unlinking_the_same_person_can_pair_another_account(tmp_path):

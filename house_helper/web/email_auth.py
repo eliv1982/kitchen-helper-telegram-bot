@@ -93,15 +93,15 @@ _PRIVATE_HEADERS = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer
 # echoed into them.
 _MESSAGE_INVALID_EMAIL = "Введите корректный адрес электронной почты."
 _MESSAGE_INVALID_REQUEST = "Запрос не удалось разобрать."
-_MESSAGE_FORBIDDEN = "Запрос отклонён: он пришёл не с нашего сайта."
-_MESSAGE_UNAVAILABLE = "Сервис временно недоступен. Попробуйте ещё раз чуть позже."
-_MESSAGE_ERROR = "Что-то пошло не так. Попробуйте ещё раз чуть позже."
+_MESSAGE_FORBIDDEN = "Запрос отклонен: он пришел не с нашего сайта."
+_MESSAGE_UNAVAILABLE = "Сервис временно недоступен. Попробуйте еще раз чуть позже."
+_MESSAGE_ERROR = "Что-то пошло не так. Попробуйте еще раз чуть позже."
 
 
 def _request_accepted_message(settings: EmailSettings) -> str:
     minutes = max(1, math.ceil(settings.link_lifetime.total_seconds() / 60))
     return (
-        "Если этот адрес есть в списке разрешённых, мы отправили на него письмо со ссылкой "
+        "Если этот адрес есть в списке разрешенных, мы отправили на него письмо со ссылкой "
         f"для входа. Ссылка действует {minutes_in_russian(minutes)}. Если письма нет, проверьте "
         "папку «Спам» или подождите немного и запросите ссылку снова."
     )

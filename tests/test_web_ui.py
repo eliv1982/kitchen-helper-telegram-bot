@@ -555,7 +555,7 @@ async def test_the_email_request_keeps_the_local_part_and_answers_every_address_
     assert [r.status_code for r in (known, lowered, stranger)] == [202, 202, 202]
     assert known.json() == lowered.json() == stranger.json()  # nothing tells the allowlist apart
     assert known.json()["detail"] == "link_requested"
-    assert "в списке разрешённых" in known.json()["message"] and "Если" in known.json()["message"]  # neutral wording
+    assert "в списке разрешенных" in known.json()["message"] and "Если" in known.json()["message"]  # neutral wording
     assert [m.to for m in mailer.sent] == ["Cook@example.com"]  # only the exact local part was admitted
     for response in (known, lowered, stranger):
         assert "x-correlation-id" not in response.headers and "correlation_id" not in response.json()

@@ -79,7 +79,7 @@ async def test_an_allowlisted_address_is_mailed_a_link(tmp_path):
         assert response.status_code == 202
         body = response.json()
         assert body["detail"] == "link_requested"
-        assert "Если этот адрес есть в списке разрешённых" in body["message"]
+        assert "Если этот адрес есть в списке разрешенных" in body["message"]
         assert "Ссылка действует 10 минут" in body["message"]
         (mail,) = h.mailer.sent
         assert mail.to == ADDRESS and mail.subject == "Вход в House Helper"

@@ -130,7 +130,7 @@ _SHELL = """\
 <div id="alerter" class="visually-hidden" role="alert" aria-atomic="true"></div>
 <noscript>
   <div class="card card-center"><h1>House Helper</h1>
-  <p>Для работы помощника нужен включённый JavaScript. Включите его в настройках браузера и обновите страницу.</p></div>
+  <p>Для работы помощника нужен включенный JavaScript. Включите его в настройках браузера и обновите страницу.</p></div>
 </noscript>
 
 <main id="gate" class="gate">

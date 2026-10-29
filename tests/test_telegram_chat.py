@@ -141,7 +141,7 @@ async def test_what_the_bot_says_about_the_copy_the_processing_and_the_retention
 
     assert "OpenAI" in text and "фотографии" in text  # messages and photos go to OpenAI
     assert "365 дней" in text and "удаляется" in text  # the history expires
-    assert "в избранное" in text and "пока вы сами их не уберёте" in text  # favorites stay until removed
+    assert "в избранное" in text and "пока вы сами их не уберете" in text  # favorites stay until removed
 
 
 @pytest.mark.parametrize(

@@ -55,7 +55,7 @@ async def cmd_start(message: Message) -> None:
         "Привет! Я Kitchen Helper — помогу придумать простое блюдо из того, "
         "что есть дома.\n\n"
         "Напиши, какие продукты у тебя есть, и я предложу варианты.\n\n"
-        "Обрати внимание: текст твоих сообщений передаётся во внешний сервис "
+        "Обрати внимание: текст твоих сообщений передается во внешний сервис "
         "OpenAI для обработки и генерации ответа.\n\n"
         "Команды:\n"
         "/reset — очистить историю диалога\n"
@@ -115,7 +115,7 @@ async def handle_text(message: Message, bot: Bot) -> None:
             await message.answer(messages_ru.render(outcome))
         except (TelegramNetworkError, TelegramAPIError) as exc:
             logger.error("Telegram error for user_id=%s: %s", user_id, exc)
-            await message.answer("Не удалось отправить ответ. Попробуй ещё раз.")
+            await message.answer("Не удалось отправить ответ. Попробуй еще раз.")
 
 
 async def main() -> None:

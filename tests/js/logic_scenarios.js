@@ -1216,7 +1216,7 @@ scenario("a_restored_turn_opens_its_conversation_and_shows_its_exact_text", asyn
   assert.equal(view.currentId, CONV_A, "not the newest conversation: the one with the unresolved message");
   const item = pendingItem(env);
   assert.deepEqual([item.phase, item.text, item.note], ["uncertain", "Незаконченный вопрос", Logic.TEXT.uncertainRestored]);
-  assert.equal(view.list.items.find((i) => i.id === CONV_A).meta, "ждёт решения");
+  assert.equal(view.list.items.find((i) => i.id === CONV_A).meta, "ждет решения");
 
   env.net.route("POST", URL_A, turnBody(CONV_A, 3, "Незаконченный вопрос", 4, "Ответ", true));
   await env.ctl.retry(CONV_A);
@@ -1493,7 +1493,7 @@ scenario("looking_stops_when_the_person_leaves_the_conversation", async () => {
 // Email sign-in
 // ============================================================================================
 
-const SENT = json(202, { detail: "link_requested", message: "Если этот адрес есть в списке разрешённых, мы отправили письмо." });
+const SENT = json(202, { detail: "link_requested", message: "Если этот адрес есть в списке разрешенных, мы отправили письмо." });
 
 scenario("the_email_address_is_trimmed_and_nothing_else_the_local_part_keeps_its_case", async () => {
   const env = makeEnv();
@@ -1505,7 +1505,7 @@ scenario("the_email_address_is_trimmed_and_nothing_else_the_local_part_keeps_its
   assert.deepEqual(request.body, { email: "Cook@Example.COM" });
   assert.equal(request.headers["content-type"], "application/json");
   assert.equal(request.init.credentials, "same-origin");
-  assert.equal(result.text, "Если этот адрес есть в списке разрешённых, мы отправили письмо.");
+  assert.equal(result.text, "Если этот адрес есть в списке разрешенных, мы отправили письмо.");
 });
 
 scenario("the_email_answer_is_the_same_for_every_address", async () => {
@@ -1535,10 +1535,10 @@ scenario("email_failures_are_plain_and_never_carry_a_correlation_id", async () =
   const answers = [
     json(400, { detail: "invalid_email", message: "Введите корректный адрес электронной почты." }),
     json(400, { detail: "invalid_request", message: "Запрос не удалось разобрать." }),
-    json(403, { detail: "forbidden_origin", message: "Запрос отклонён: он пришёл не с нашего сайта." }),
+    json(403, { detail: "forbidden_origin", message: "Запрос отклонен: он пришел не с нашего сайта." }),
     json(503, { detail: "login_unavailable" }),
-    json(503, { detail: "temporarily_unavailable", message: "Сервис временно недоступен. Попробуйте ещё раз чуть позже." }),
-    json(500, { detail: "server_error", message: "Что-то пошло не так. Попробуйте ещё раз чуть позже." }),
+    json(503, { detail: "temporarily_unavailable", message: "Сервис временно недоступен. Попробуйте еще раз чуть позже." }),
+    json(500, { detail: "server_error", message: "Что-то пошло не так. Попробуйте еще раз чуть позже." }),
     text(502, "<html>Bad Gateway</html>"),
     text(200, "<html>portal</html>"),
     fail(),
@@ -3474,7 +3474,7 @@ scenario("telegram_panel_always_says_what_is_copied_where_it_is_processed_and_ho
     assert.ok(privacy.includes("OpenAI"), "messages and photos go to OpenAI");
     assert.ok(privacy.includes("фотографии"));
     assert.ok(privacy.includes("365 дней"), "history expires");
-    assert.ok(privacy.includes("в избранное") && privacy.includes("пока вы сами их не уберёте"), "favorites do not");
+    assert.ok(privacy.includes("в избранное") && privacy.includes("пока вы сами их не уберете"), "favorites do not");
   }
 });
 
@@ -3495,7 +3495,7 @@ scenario("telegram_panel_says_when_the_bot_is_not_answering_and_offers_nothing_i
   const linked = telegramPanel({ "GET /api/telegram": [status(true, down)] });
   await linked.panel.start();
   view = linked.view();
-  assert.equal(view.text, "Подключён: @mama", "an account that is linked stays linked");
+  assert.equal(view.text, "Подключен: @mama", "an account that is linked stays linked");
   assert.equal(view.notice, Logic.TELEGRAM_TEXT.unavailable, "but is not shown as working");
   assert.equal(view.canAskDisconnect, true, "and can still be unlinked");
 
@@ -3592,7 +3592,7 @@ scenario("telegram_panel_linked_shows_the_account_and_unlinking_asks_first", asy
   await t.panel.start();
   let view = t.view();
   assert.equal(view.phase, "linked");
-  assert.equal(view.text, "Подключён: @mama");
+  assert.equal(view.text, "Подключен: @mama");
   assert.equal(view.canAskDisconnect, true);
   await t.panel.disconnect(); // without asking: nothing happens
   assert.deepEqual(t.net.requests("DELETE", "/api/telegram/link"), []);
@@ -3739,7 +3739,7 @@ scenario("telegram_panel_text_is_russian_and_holds_only_what_the_server_said", a
   }
   const t = telegramPanel({ "GET /api/telegram": [json(200, { enabled: true, linked: true, bot_username: BOT, account: { name: "<img src=x onerror=alert(1)>" } })] });
   await t.panel.start();
-  assert.equal(t.view().text, "Подключён: <img src=x onerror=alert(1)>", "the name is data: the page draws it as text");
+  assert.equal(t.view().text, "Подключен: <img src=x onerror=alert(1)>", "the name is data: the page draws it as text");
 });
 
 scenario("telegram_panel_refreshes_when_the_page_comes_back_and_never_when_nothing_is_shown", async () => {

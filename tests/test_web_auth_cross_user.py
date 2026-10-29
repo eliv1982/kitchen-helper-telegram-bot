@@ -75,7 +75,7 @@ def assert_conflict(response) -> None:
     assert response.headers["cache-control"] == "no-store"
     assert response.headers["referrer-policy"] in ("no-referrer", "same-origin")
     assert f'data-code="{CODE}"' in response.text
-    assert "учётную запись" in response.text and "выйдите" in response.text
+    assert "учетную запись" in response.text and "выйдите" in response.text
     assert "script" not in response.text.lower()
     cookies = response.headers.get_list("set-cookie")
     assert not any(cookie.startswith(f"{SESSION_COOKIE}=") for cookie in cookies), cookies

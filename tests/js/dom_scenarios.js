@@ -889,7 +889,7 @@ scenario("the_email_form_sends_the_address_as_typed_and_shows_the_neutral_answer
     env.net.route("GET", "/auth/me", notAuthenticated());
     env.net.route("POST", "/auth/email/request", async () => {
       await gate.promise;
-      return json(202, { detail: "link_requested", message: "Если этот адрес есть в списке разрешённых, мы отправили письмо." });
+      return json(202, { detail: "link_requested", message: "Если этот адрес есть в списке разрешенных, мы отправили письмо." });
     });
   });
 
@@ -905,10 +905,10 @@ scenario("the_email_form_sends_the_address_as_typed_and_shows_the_neutral_answer
   const requests = page.env.net.requests("POST", "/auth/email/request");
   assert.equal(requests.length, 1);
   assert.deepEqual(requests[0].body, { email: "Cook@Example.COM" });
-  assert.equal(page.el("email-result").textContent, "Если этот адрес есть в списке разрешённых, мы отправили письмо.");
+  assert.equal(page.el("email-result").textContent, "Если этот адрес есть в списке разрешенных, мы отправили письмо.");
   assert.ok(page.el("email-result").className.includes("notice-ok"));
   assert.equal(page.el("email-submit").getAttribute("aria-disabled"), "false");
-  assert.equal(page.el("email-submit").textContent, "Отправить ссылку ещё раз");
+  assert.equal(page.el("email-submit").textContent, "Отправить ссылку еще раз");
 });
 
 scenario("a_bad_address_is_refused_on_the_page_and_a_failure_is_plain", async () => {
@@ -1346,7 +1346,7 @@ scenario("telegram_panel_connects_draws_the_link_and_notices_the_pairing", async
   await page.settle();
   assert.equal(page.visible("telegram-open"), false);
   assert.equal(page.visible("telegram-disconnect"), true);
-  assert.equal(page.el("telegram-text").textContent, "Подключён: @mama");
+  assert.equal(page.el("telegram-text").textContent, "Подключен: @mama");
   assert.equal(page.el("telegram-notice").textContent, Logic.TELEGRAM_TEXT.pairedNow);
   assert.ok(!page.root().includes(TG_CODE), "the code is gone from the page once it is used");
 });
@@ -1503,7 +1503,7 @@ scenario("telegram_panel_explanation_is_open_again_for_the_next_person_who_is_no
 scenario("telegram_panel_a_name_is_text_and_never_markup", async () => {
   const page = await open(withTelegram([["GET /api/telegram", tgStatus(true, HOSTILE)]]));
 
-  assert.equal(page.el("telegram-text").textContent, `Подключён: ${HOSTILE}`);
+  assert.equal(page.el("telegram-text").textContent, `Подключен: ${HOSTILE}`);
   assert.equal(page.doc.root.byTag("img").length, 0);
   assert.equal(page.doc.root.byTag("script").length, 2);
   assert.deepEqual(page.doc.attributeLog.filter(([, name]) => name === "href"), []);

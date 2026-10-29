@@ -485,7 +485,7 @@ async def test_a_browser_signed_in_as_another_user_cannot_start_and_stays_signed
         response = await start(h.client, mother.code)  # her link, opened in his browser
 
         assert response.status_code == 409 and response.json()["detail"] == "signed_in_as_another_user"
-        assert "учётную запись" in response.json()["message"]
+        assert "учетную запись" in response.json()["message"]
         assert "set-cookie" not in response.headers
         assert len(states(h)) == 1  # only the owner's own, from before
         assert is_unused(h, mother)

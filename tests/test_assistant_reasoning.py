@@ -418,15 +418,18 @@ async def test_a_question_reaches_the_model_in_the_reasoning_shape_and_the_answe
 
         reply = await chat.send(conversation, question, "k-1")
 
+        # What the model said, spelled without "ё" (the product's rule, tests/test_orthography.py);
+        # the one change made to it: not trimmed, not marked.
+        spelled = answer.replace("ё", "е").replace("Ё", "Е")
         assert reply.status_code == 201
-        assert reply.json()["assistant_message"]["text"] == answer  # unchanged, not trimmed or marked
+        assert reply.json()["assistant_message"]["text"] == spelled
         assert cyrillic_share(reply.json()["assistant_message"]["text"]) > 0.8
         (call,) = sdk[0].calls
         assert call["messages"][0] == {"role": "system", "content": KITCHEN_SYSTEM_PROMPT}
         assert call["messages"][-1] == {"role": "user", "content": question}
         assert call["reasoning_effort"] == "low" and call["max_completion_tokens"] == 6000
         assert not {"temperature", "max_tokens", "tools"} & set(call)
-        assert [m.content for m in chat.messages(conversation)] == [question, answer]
+        assert [m.content for m in chat.messages(conversation)] == [question, spelled]
 
 
 @pytest.mark.asyncio

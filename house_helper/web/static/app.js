@@ -669,7 +669,7 @@
       row.appendChild(
         action(Logic.TEXT.favoriteOpen, "btn-quiet", function () {
           openFavorite(mark.id);
-        }, "Открыть сохранённый рецепт")
+        }, "Открыть сохраненный рецепт")
       );
       return row;
     }
@@ -959,7 +959,7 @@
     els.input.readOnly = composer.locked;
     els.send.setAttribute("aria-disabled", composer.locked ? "true" : "false");
     els.send.className = "btn btn-primary btn-send" + (composer.locked ? " is-disabled" : "");
-    els.send.textContent = composer.creating ? "Создаём разговор…" : "Отправить";
+    els.send.textContent = composer.creating ? "Создаем разговор…" : "Отправить";
     els.composerHint.textContent = composer.hint || "";
     els.composerError.hidden = !composer.error;
     els.composerError.textContent = composer.error || "";
@@ -1152,7 +1152,7 @@
           els.emailResult.className = "notice " + (result.ok ? "notice-ok" : "notice-error");
           els.emailResult.textContent = result.text;
           if (result.ok) {
-            els.emailSubmit.textContent = "Отправить ссылку ещё раз";
+            els.emailSubmit.textContent = "Отправить ссылку еще раз";
           } else if (result.kind === "invalid") {
             els.emailInput.focus();
           }

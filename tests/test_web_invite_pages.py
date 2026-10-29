@@ -403,7 +403,7 @@ def test_the_page_follows_only_an_address_at_telegram(address):
 @needs_node
 @pytest.mark.parametrize("code", [400, 403])
 def test_a_refusal_is_final_the_message_is_shown_and_the_code_is_forgotten(code):
-    message = "Приглашение недействительно, уже использовано или его срок истёк. Попросите выдать новое."
+    message = "Приглашение недействительно, уже использовано или его срок истек. Попросите выдать новое."
     result = run_script(
         fragment="#" + CODE,
         steps=["click", "click"],
@@ -454,7 +454,7 @@ def test_a_lost_connection_is_said_in_russian_and_may_be_retried():
 def test_an_answer_that_is_not_ours_gets_a_fixed_russian_sentence(answer):
     result = run_script(fragment="#" + CODE, steps=["click"], answers=[answer])
 
-    assert result["end"]["text"] == "Не получилось начать вход. Попробуйте ещё раз чуть позже."
+    assert result["end"]["text"] == "Не получилось начать вход. Попробуйте еще раз чуть позже."
 
 
 @needs_node
@@ -470,7 +470,7 @@ def test_coming_back_from_telegram_by_the_back_button_lets_the_person_start_agai
 
     assert result["frames"]["after_pageshow-plain"]["disabled"] is True  # a plain show changes nothing
     assert result["frames"]["after_pageshow"]["disabled"] is False  # a page restored from the cache does
-    assert "не завершён" in result["frames"]["after_pageshow"]["text"]
+    assert "не завершен" in result["frames"]["after_pageshow"]["text"]
     assert len(fetches(result)) == 2
 
 

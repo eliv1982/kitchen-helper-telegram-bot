@@ -259,7 +259,7 @@ async def test_an_unexpected_error_is_a_catalogue_error_with_no_traceback_anywhe
         body = error_of(response)
         assert body == {
             "detail": "internal_error",
-            "message": "Что-то пошло не так. Попробуйте ещё раз чуть позже.",
+            "message": "Что-то пошло не так. Попробуйте еще раз чуть позже.",
             "retryable": True,
             "correlation_id": response.headers["x-correlation-id"],
         }

@@ -111,6 +111,7 @@ from house_helper.core.backend import (
 )
 from house_helper.core.identity import ConversationKey
 from house_helper.core.limits import MAX_HISTORY_MESSAGES
+from house_helper.core.orthography import replace_yo
 from house_helper.core.outcomes import OutcomeStatus
 from house_helper.persistence import attachments, turns
 from house_helper.persistence.conversations import ConversationNotFound
@@ -586,7 +587,10 @@ class WebTurnRunner:
         except Exception as exc:  # the backend's own bug, not the provider's failure
             raise ApiError("internal_error", category=type(exc).__name__) from None
 
-        text = clean_reply(reply.text)
+        # The assistant's own words, spelled by the product's rule (house_helper.core.orthography).
+        # Applied here, as the answer is produced, and nowhere on the way out: what is stored
+        # (the person's messages, and the answers stored before this) is shown as it was entered.
+        text = replace_yo(clean_reply(reply.text))
         if not text.strip():
             raise ApiError(
                 _OUTCOME_CODES[OutcomeStatus.EMPTY_RESPONSE], category="EmptyAfterCleaning"
