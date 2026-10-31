@@ -1,8 +1,8 @@
-# Kitchen Helper — Documentation index
+# House Helper — Documentation index
 
-**Updated:** 2026-10-18
+**Updated:** 2026-10-31
 
-**Baseline release:** R3B-2 (`6e2b432d460bfca18ed7d697bb8c05490fcc7512`) — **REPORTED from release handoff; confirm against Git before making changes.** R3B-3 Admin Bootstrap is ACCEPTED and counts as released only after GitHub CI confirms it; see [`STATUS.md`](STATUS.md).
+**Baseline:** production image `house-helper:3d09d45f6318` (commit `3d09d45f6318dc8e0a007c9b71738a6be65b5a3c`) at schema `0009_message_attachments`; the owner **ACCEPTED the Functional Alpha on 2026-10-31** (REPORTED; production facts independently verified by Cursor on 2026-10-31). See [`STATUS.md`](STATUS.md) for the release ledger and the current deployment state.
 
 ## Purpose and reading order
 
@@ -10,7 +10,8 @@
 2. [`architecture/ARCHITECTURE_BASELINE.md`](architecture/ARCHITECTURE_BASELINE.md) — summary of Stage 2B architecture and security invariants, not a substitute for the original full design.
 3. [`DECISIONS.md`](DECISIONS.md) — recorded product/architecture decisions and deferred questions.
 4. [`STATUS.md`](STATUS.md) — dated release snapshot, outstanding gates and proposed next work.
-5. Repository root `README.md` — setup, commands, configuration and currently implemented functionality.
+5. [`product/BACKLOG.md`](product/BACKLOG.md) — the authoritative post-alpha feature backlog: IDs, priorities, acceptance scope, dependencies and implementation state.
+6. Repository root `README.md` — setup, commands, configuration and currently implemented functionality.
 
 **Source provenance:** These documents were prepared from `Kitchen_Helper_HANDOFF_2026-10-18.md` supplied by the project owner. The original approved Stage 2A (25 detailed acceptance criteria) and Stage 2B full design were not available at the time of preparation. If originals already exist in the repository or another authoritative location, link to or import **them**, preserving their content; reconcile any difference with the owner rather than silently overwriting.
 

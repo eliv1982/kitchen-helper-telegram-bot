@@ -1,6 +1,6 @@
-# Kitchen Helper — Product baseline (Stage 2A summary)
+# House Helper (Kitchen domain) — Product baseline (Stage 2A summary)
 
-**Source:** owner handoff dated 2026-10-18, summarizing approved Stage 2A dated 2026-10-16.
+**Source:** owner handoff dated 2026-10-18, summarizing approved Stage 2A dated 2026-10-16. The product is now named **House Helper**; **Kitchen** is its first domain. The historical name "Kitchen Helper" in the source is preserved.
 
 **Authority level:** summary of an accepted specification; **not the original 25 acceptance criteria**. Obtain the original before changing scope or making claims about exact AC wording.
 
@@ -40,7 +40,11 @@ Meal planning calendar, automatic grocery shopping, calorie counting, generalize
 
 ## Product vs implementation
 
-As of the **R3B-2 release report**, the backend persistence/FastAPI foundation, Telegram OIDC and passwordless email authentication were released in Git. There is **no user-facing Web Chat API, cooking Web UI, voice UI, favorites UI or preferences UI**. Production deployment and first real-user validation have not occurred. Do not present this requirements table as a list of delivered features.
+**Current state (2026-10-31): the owner ACCEPTED the Functional Alpha on 2026-10-31 (REPORTED; production facts independently verified by Cursor).** The accepted alpha covers a two-user Kitchen deployment: successful account isolation, Telegram authentication, cooking workflows, history, favorites and cross-device synchronization. Production runs image `house-helper:3d09d45f6318` at schema `0009_message_attachments`; Telegram sign-in and the in-process Telegram bot are enabled, and email sign-in is disabled.
+
+This table remains the list of **product commitments**, not a claim that every row is delivered. Still not delivered or not part of the accepted alpha: voice STT/TTS and per-step reading; the automatic extraction and user management of long-term preferences; equipment-aware cooking; family recipe digitization; Web photo upload. Passwordless email authentication exists in code but its operational activation (real SMTP/TLS/SPF/DKIM/DMARC) is deferred. The post-alpha proposals and their acceptance scope are in [`BACKLOG.md`](BACKLOG.md); do not present them as implemented.
+
+**Historical implementation state:** as of the R3B-2 release report (2026-10-20), the backend persistence/FastAPI foundation, Telegram OIDC and passwordless email authentication were released in Git, and no user-facing Web Chat API, cooking Web UI, voice UI, favorites UI or preferences UI existed. That state is superseded by the deployed Functional Alpha above.
 
 ## Unresolved documentation requirement
 

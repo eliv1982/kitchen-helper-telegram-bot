@@ -1,13 +1,13 @@
-# Kitchen Helper — Architecture baseline (Stage 2B summary)
+# House Helper (Kitchen domain) — Architecture baseline (Stage 2B summary)
 
-**Source:** project owner handoff dated 2026-10-18.
+**Source:** project owner handoff dated 2026-10-18. The product is now named **House Helper**; **Kitchen** is its first domain. The historical name "Kitchen Helper" is preserved in the source.
 
 **Authority level:** architecture **summary**, not a verbatim copy of the full accepted Stage 2B design. Verify concrete behavior in code/migrations.
 
 ## Overall design
 
 - Modular **Python monolith**, not microservices.
-- Telegram bot and FastAPI Web run as distinct processes; reusable transport-agnostic application logic lives in `house_helper/core`.
+- The original standalone Telegram bot (`bot.py`) and the FastAPI Web run as distinct processes. **The Telegram bot that shares conversations with the Web is different:** it runs **inside the single Web process** (in-process long polling, plain `httpx`), so a Telegram message and a page message use the same turn runner and tables. This is accepted for the two-user SQLite alpha (KHD-35) and requires exactly one Web instance and exactly one `getUpdates` consumer. Sign-in through Telegram (OIDC) is independent of that listener. Reusable transport-agnostic application logic lives in `house_helper/core`.
 - Shared Core must not import Telegram, FastAPI or provider configuration just by being imported.
 - Storage: SQLite with SQLAlchemy and Alembic; PostgreSQL may follow later.
 - Production DB configured explicitly via `HOUSE_HELPER_DATABASE_URL`; **never run migrations automatically during Web startup**.
@@ -20,7 +20,7 @@
 - Never infer Telegram `sub` from a username or numeric user ID. Never merge accounts simply because an email matches.
 - `user_id` is not `conversation_id`. `ConversationKey("web", conversation_id)` identifies a single dialog, not an account.
 - Server checks owner authorization on every operation that reads or changes a user-owned resource.
-- Do not automatically unify Telegram and Web conversation histories merely because logins share one User.
+- Do not automatically unify Telegram and Web conversation histories merely because logins share one User. A person's own Web and Telegram conversations become **one store only after an explicit Telegram pairing** (KHD-35, KHD-36); nobody's conversations are unified with anyone else's, and an unlinked Telegram account is answered with one fixed notice and stores nothing.
 - Durable history and LLM context are different abstractions. LLM context is bounded to 20 messages and must respect resets, deletions and retention.
 
 ## Reported implemented foundation
@@ -30,7 +30,13 @@
 - **R3A**: Telegram OIDC Authorization Code Flow + PKCE, state/nonce, ID-token verification, approved allowlist, hashed server sessions, HttpOnly cookie.
 - **R3B-1**: session identity provenance, revoke per identity, migration `0002`; old sessions without provenance fail closed.
 - **R3B-2**: passwordless email flow with atomic single-use 10-minute challenge; migration `0003`/`0004`; authorized email case-sensitive local part, case-insensitive domain; provider isolation. No automated User creation, merging or transfer.
-- **R3B-3 (ACCEPTED, release pending GitHub CI; no new migration)**: operator-run CLI `python -m house_helper.admin provision-email` in `house_helper/admin/`, imported by neither the Web app nor the Telegram bot. It creates the single first `User` plus an approved email allowlist entry in one transaction, or re-approves an explicitly confirmed revoked email; it refuses when a user already exists, creates no Telegram identity, merges nothing and never runs migrations (target database only via `HOUSE_HELPER_DATABASE_URL`; schema must already be at `head`). It is not a Web Chat, Telegram-linking or domain feature. Contract: root `README.md`, section "Первый пользователь".
+- **R3B-3 (RELEASED, `8934536`; no new migration)**: operator-run CLI `python -m house_helper.admin provision-email` in `house_helper/admin/`, imported by neither the Web app nor the Telegram bot. It creates the single first `User` plus an approved email allowlist entry in one transaction, or re-approves an explicitly confirmed revoked email; it refuses when a user already exists, creates no Telegram identity, merges nothing and never runs migrations (target database only via `HOUSE_HELPER_DATABASE_URL`; schema must already be at `head`). It is not a Web Chat, Telegram-linking or domain feature. Contract: root `README.md`, section "Первый пользователь".
+- **R4A**: an authenticated, persistent Web Chat API on top of the persistence and identity foundation: conversation creation/listing, history, and turns under an idempotency key with a lease-fenced lifecycle.
+- **R4B**: a Russian-language responsive browser UI served by the Web app itself (plain HTML/CSS/JavaScript, strict CSP, no build step), backed by the R4A API.
+- **R4C-Auth A2/A3**: operator enrollment through two-hour, single-use, revocable Telegram invitations; the invitation is claimed through a verified Telegram OIDC login whose `sub` is bound to the invited user in one atomic transaction. Two users remain independent.
+- **R4C-D1/D2**: a hardened Docker/Compose deployment kit (Traefik, explicit migrations, startup schema guard, backup/verify/restore, fail-closed upgrade) and an operator `purge-expired` command with opt-in systemd scheduling.
+- **R4C live deployment**: production is a single Web container behind the existing Traefik with SQLite on a persistent volume. Production schema is `0009_message_attachments` (the repository head is the same revision), and the owner accepted the Functional Alpha on 2026-10-31 (`docs/STATUS.md`).
+- **In-process Telegram bot and photos** (KHD-35 to KHD-38): long polling inside the Web process; Web/Telegram conversations share one store after an explicit pairing; Web turns are mirrored to Telegram; photos are stored in the database, shown to the model and in Web history, served only to their owner, and expire with their message.
 
 ## Security invariants
 
@@ -41,11 +47,11 @@
 - Revocation must use supported application transaction/API paths; a re-allow must not reactivate revoked sessions.
 - Public Web ingress needs auth request rate limits and timing-enumeration mitigation; forward headers must be trusted only behind configured proxy.
 - Never log URL query parameters containing Telegram callback `code`/`state` at upstream/proxy/APM layers. Never log plaintext tokens/SMTP secrets or enable unsafe SQL echo.
-- Real provider logins, browser E2E, HTTPS proxy/cookie behavior, SMTP deliverability and backups/migrations require separate verification.
+- Real Telegram login for two users, HTTPS serving and `/healthz` are verified in the accepted alpha. Real SMTP delivery, cross-browser E2E beyond the alpha's use, an isolated off-host restore rehearsal, and live backup/alerting behavior still require separate verification.
 
 ## Deployment caution
 
-Release to Git, local offline tests, real-provider authentication and live deployment are **different states**. The last reported Git release was R3B-2, but migrations `0002`–`0004` were **not applied to existing or production databases** according to the handoff. Before a real deployment: stop service, backup the correct DB, explicitly upgrade migration revision, verify integrity including SQLite `foreign_key_check`, restart, reauthenticate and independently reverify legacy emails before allowing them.
+Release to Git, local offline tests, real-provider authentication and live deployment are **different states**. **Current state (2026-10-31):** production runs image `house-helper:3d09d45f6318` at schema `0009_message_attachments`; Telegram sign-in and the in-process Telegram bot are enabled; email sign-in is disabled; the owner accepted the Functional Alpha on 2026-10-31 (REPORTED; production facts independently verified by Cursor). Migrations are still explicit operator steps: before any upgrade, stop the service, take and verify a backup, run the migration revision explicitly, check integrity including SQLite `foreign_key_check`, restart, and reauthenticate. `deploy/RUNBOOK.md` section 9 is the procedure; it stays in force for every later migration. PostgreSQL is supported by code and opt-in tests but is not the deployed database.
 
 
 ## Accepted direction after Stage 2B: multi-domain House Helper (2026-10-18)

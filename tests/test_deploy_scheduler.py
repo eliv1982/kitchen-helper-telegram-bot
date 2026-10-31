@@ -35,6 +35,10 @@ from tests.test_deploy_kit import (
 )
 
 STATUS = REPO_ROOT / "docs" / "STATUS.md"
+# One place for the documented production facts: the three documents must agree with these.
+PRODUCTION_IMAGE = "house-helper:3d09d45f6318"
+PRODUCTION_TAG = "3d09d45f6318"
+PRODUCTION_SCHEMA = "0009_message_attachments"
 UNITS = DEPLOY / "systemd"
 SERVICE = UNITS / "house-helper-purge.service"
 TIMER = UNITS / "house-helper-purge.timer"
@@ -354,11 +358,12 @@ def test_the_checklist_ticks_the_timer_for_the_first_run_and_keeps_the_separate_
         assert one(still_open)
 
 
-# --- the documented state, as the documents give it on 2026-10-25 ----------------------------------------
-# Five things that must not be confused: the technical deployment is done; the retention timer is installed
-# and active and its first calendar-triggered run was verified and accepted (it deleted nothing); the offsite
-# backup and the reporting of failures are separate and still pending; the Functional Alpha has not started. When
-# one of them changes, the documents change with it and so do these checks (the helper they share is in test_deploy_kit.py).
+# --- the documented state, as the documents give it after the accepted Functional Alpha (2026-10-31) -----
+# Five things that must not be confused: the production instance is live and accepted as the two-user Functional
+# Alpha; the retention timer is installed and active and its first calendar-triggered run was verified and accepted
+# (it deleted nothing); the offsite backup and the reporting of failures are separate pending work; email sign-in is
+# disabled. When one of them changes, the documents change with it and so do these checks (the helper they share is
+# in test_deploy_kit.py).
 
 
 def current_state() -> tuple:
@@ -379,31 +384,33 @@ def readme_row(name: str) -> str:
     return next(flat(line) for line in read(REPO_ROOT / "README.md").splitlines() if line.startswith(f"| {name} |"))
 
 
-def test_the_documented_state_keeps_deployment_cleanup_pending_work_and_functional_alpha_apart():
+def test_the_documented_state_keeps_production_cleanup_pending_work_and_the_accepted_alpha_apart():
     introduction, rows = current_state()
     header = flat(read(RUNBOOK).split("\n## ", 1)[0])
-    # 1. The technical deployment of 2026-10-24 is the history of the kit; what runs now (REPORTED by the owner on
-    # 2026-10-28) is image 66ab4ec32de3 at schema 0007, and every document that gives the state says the same. It is
-    # the owner's own use and not a beta, not a public demo and not a Functional Alpha.
+    # 1. Production is the accepted two-user Functional Alpha: every document that gives the state names the same
+    # image and schema, and the image tag is the first twelve characters of the commit STATUS.md names.
     assert "technical deployment" in header
     assert re.search(r"technical instance of House Helper is live", introduction)
-    assert re.search(r"not a functional alpha", introduction, re.I)
+    assert re.search(r"Functional Alpha", introduction) and re.search(r"ACCEPTED", introduction)
+    assert re.search(r"closed two-user alpha", introduction)  # still not a public demo or public sign-up
     for where, text in (
         ("RUNBOOK status paragraph", header),
         ("STATUS.md, Image", rows["Image"]),
         ("README, Deployed version", readme_row("Deployed version")),
     ):
-        assert "house-helper:66ab4ec32de3" in text and "REPORTED" in text.replace("reported", "REPORTED"), where
+        assert PRODUCTION_IMAGE in text and "REPORTED" in text.replace("reported", "REPORTED"), where
+    assert PRODUCTION_TAG in rows["Deployed commit"]
+    assert "3d09d45f6318dc8e0a007c9b71738a6be65b5a3c" in rows["Deployed commit"]
     for where, text in (
         ("RUNBOOK status paragraph", header),
         ("STATUS.md, Database", rows["Database"]),
         ("README, Database", readme_row("Database")),
     ):
-        assert "`0007_favorite_recipes`" in text, where
-    assert "0009_message_attachments" in header and "not deployed and applied to no database" in header  # the repository is ahead of production
-    assert re.search(r"owner is enrolled and has signed in", rows["Users"])
-    assert re.search(r"second person, and of any other, is not recorded", rows["Users"])  # nothing is claimed beyond the owner
-    assert re.search(r"real Telegram OIDC login PASSED", rows["Sign-in and AI"]) and re.search(r"Email login is \*\*disabled", rows["Sign-in and AI"])
+        assert PRODUCTION_SCHEMA in text, where
+    assert "Telegram bot" in header and re.search(r"bot are enabled|bot is enabled", header)
+    assert re.search(r"two users", rows["Users"], re.I) and re.search(r"account isolation", rows["Users"], re.I)
+    assert re.search(r"Telegram sign-in is enabled", rows["Sign-in and AI"])
+    assert re.search(r"Email login is \*\*disabled", rows["Sign-in and AI"])
     # 2. The retention timer is installed and active; its first calendar-triggered run was verified and accepted,
     # and it deleted nothing. Every document that gives the state says the same.
     for where, text in (
@@ -421,8 +428,8 @@ def test_the_documented_state_keeps_deployment_cleanup_pending_work_and_function
     assert "FINAL ACCEPT" in backups and "REPORTED" in backups and "does not record what exactly is installed" in backups
     assert re.search(r"History, state of 2026-10-25.*not installed or activated on the VPS", backups) and "pending" in backups
     assert re.search(r"final acceptance", readme_row("Backups and monitoring"), re.I)
-    assert "the owner's accepted work of 2026-10-28 (REPORTED)" in header and "describe procedures, not what runs" in header
-    assert re.search(r"of the items below, the owner's real Telegram sign-in and a real OpenAI text conversation are done", introduction)
-    # 4. The Functional Alpha is not declared started or accepted, and nothing here says otherwise.
-    assert re.search(r"not declared started or accepted", rows["Functional Alpha"], re.I)
-    assert re.search(r"not a first-user beta and not a Functional Alpha", introduction)
+    assert "accepted by the owner as final on 2026-10-28" in header and "describe procedures" in header
+    assert re.search(r"both users' real Telegram sign-in", introduction)
+    # 4. The Functional Alpha is ACCEPTED on 2026-10-31, and nothing here says otherwise.
+    assert re.search(r"ACCEPTED by the owner on 2026-10-31", rows["Functional Alpha"])
+    assert "cross-device" in rows["Functional Alpha"]

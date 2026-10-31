@@ -1,19 +1,21 @@
 # House Helper web application: deployment runbook (R4C-D1)
 
-**Status of this document (updated 2026-10-28): the kit was released as repository-only (R4C-D1) and was first used for the
+**Status of this document (updated 2026-10-31): the kit was released as repository-only (R4C-D1) and was first used for the
 technical deployment of 2026-10-24** (commit `6370bf7`, image `house-helper:6370bf78980e`, database at
 `0006_oidc_state_invitation`; at that time sign-in and OpenAI were disabled and there were no real users). **Production now
-runs image `house-helper:66ab4ec32de3` at schema `0007_favorite_recipes` (commit `66ab4ec`, History & Favorites); the owner's
-real Telegram sign-in, a real OpenAI text conversation and the History & Favorites smoke check passed, and the scheduled backup,
-purge and monitoring were accepted by the owner as final** (all REPORTED by the owner on 2026-10-28; this document does not
-record what exactly was installed for them and was not used to check it). Section 14 (scheduled cleanup, R4C-D2) was added
-after the kit's release: its code is RELEASED in Git as `489ff30` (independent audit passed, owner accepted, CI green). Its
-systemd timer is installed and active on the VPS; its first calendar-triggered execution, on 2026-10-25, was verified and
-accepted by the owner (owner-reported: it found no expired record and deleted nothing). The scheduled backup and the
-monitoring are the owner's accepted work of 2026-10-28 (REPORTED); sections 14 and 15 describe procedures, not what runs.
-The repository's schema head is `0009_message_attachments`: `0008_telegram_links` and `0009_message_attachments` (the Telegram
-bot and photos, section 16) are code released in the repository, not deployed and applied to no database. Production stays at
-`0007_favorite_recipes` until an upgrade is run on the VPS with the owner's explicit approval (section 16.2).
+runs image `house-helper:3d09d45f6318` at schema `0009_message_attachments` (commit `3d09d45`, Russian user-facing text
+normalization; it includes the Telegram bot and photos and the Web layout fix). Telegram sign-in and the in-process Telegram
+bot are enabled, email sign-in is disabled, and the instance is healthy (`GET /healthz` returns 200). The owner ACCEPTED the
+Functional Alpha on 2026-10-31: two-user account isolation, Telegram authentication, cooking workflows, history, favorites and
+cross-device synchronization** (REPORTED by the owner; production facts independently verified by Cursor on 2026-10-31; this
+document does not record the commands and was not used to check the instance). The scheduled backup, purge and monitoring were
+accepted by the owner as final on 2026-10-28 (REPORTED); the document does not record what exactly was installed for them.
+Section 14 (scheduled cleanup, R4C-D2) was added after the kit's release: its code is RELEASED in Git as `489ff30`
+(independent audit passed, owner accepted, CI green). Its systemd timer is installed and active on the VPS, and its first
+calendar-triggered execution, on 2026-10-25, was verified and accepted by the owner (owner-reported: it found no expired record
+and deleted nothing). Section 16 (the Telegram bot and photos) records a procedure that has since been performed: production
+is at `0009_message_attachments` and the bot is enabled. Sections 14, 15 and 16 still describe procedures and rollback rules,
+not a promise about the host's exact configuration.
 The commands were exercised locally on disposable resources before the deployment (Docker 29.8, Compose 5.6,
 Traefik 3.6.25 on loopback); see section 13 for what that does and does not prove. This
 revision answers an independent audit of the first version (restore while the database is in
@@ -560,12 +562,12 @@ Afterwards, by hand: logs, TLS, one real sign-in, one chat message (section 8).
 
 ### 9.1 The next upgrade: `0006_oidc_state_invitation` -> `0007_favorite_recipes` (History & Favorites) **[OWNER]**
 
-**State (updated 2026-10-28).** This upgrade has been performed: production is at `0007_favorite_recipes` on image
+**State (updated 2026-10-31).** This upgrade has been performed: production reached `0007_favorite_recipes` on image
 `house-helper:66ab4ec32de3`, and the History & Favorites production smoke check passed (REPORTED by the owner; this
 document does not record the commands, and it was not rehearsed on a copy of the production database as far as it
-records). The text below is kept as the record of the procedure and of its rollback rules, which apply unchanged to the
-next upgrade, `0007_favorite_recipes` -> `0008_telegram_links` -> `0009_message_attachments` (section 16.2). `0007` is no
-longer the repository's head.
+records). The `0007` -> `0008` -> `0009` upgrade of section 16.2 has since been performed too (REPORTED, 2026-10-31):
+production now runs `0009_message_attachments`, and the owner accepted the Functional Alpha on 2026-10-31. The text below is
+kept as the record of the procedure and of its rollback rules, which apply unchanged to the next upgrade.
 
 **What the migration does.** It creates one new, empty table, `favorite_recipes`: the answers a person chose to keep (a
 title, the text, the id of the message it was copied from with no foreign key to it, no expiry; `user_id` with
@@ -2184,14 +2186,15 @@ mode, the machine, and the result. Plaintext existed on that machine for the len
 
 ## 16. The Telegram bot and photos (shared conversations) **[OWNER]**
 
-**State: code only. Nothing in this section has been run on the VPS or against the real Telegram or the real OpenAI.** The code is in
-the repository (released on top of baseline `66ab4ec`, 2026-10-28); the migrations `0008_telegram_links` and
-`0009_message_attachments` are applied to no database. Production (REPORTED by the owner, 2026-10-28) runs image
-`house-helper:66ab4ec32de3` at schema `0007_favorite_recipes`, which contains none of it. The owner approved the design on
-2026-10-28 (`docs/DECISIONS.md`, KHD-35 to KHD-37): in-process long polling for the two-user SQLite alpha with one reader of the token
-and one web instance, mirroring of the website into Telegram on by default once a person has linked their account (no toggle), and no
-web image upload for now. Everything below is the procedure to follow with the owner's explicit approval (KHD-29), and a statement of
-what the tests do and do not show (16.8).
+**State (updated 2026-10-31): this procedure has been performed.** The code is in the repository (released on top of baseline
+`66ab4ec`, 2026-10-28), the migrations `0008_telegram_links` and `0009_message_attachments` were applied in the controlled
+upgrade, and production runs image `house-helper:3d09d45f6318` at schema `0009_message_attachments` with the Telegram bot
+enabled (REPORTED by the owner; production facts independently verified by Cursor on 2026-10-31). The owner accepted the
+Functional Alpha on 2026-10-31, which records real Telegram use by two users. The owner approved the design on 2026-10-28
+(`docs/DECISIONS.md`, KHD-35 to KHD-37): in-process long polling for the two-user SQLite alpha with one reader of the token and
+one web instance, mirroring of the website into Telegram on by default once a person has linked their account (no toggle), and
+no web image upload for now. Everything below remains the procedure and the rollback rules to follow for any later change, with
+the owner's explicit approval (KHD-29), and a statement of what the tests do and do not show (16.8).
 
 ### 16.1 What it is
 
@@ -2228,7 +2231,8 @@ that `deploy/upgrade.sh` runs. Nothing migrates at start-up (KHD-09).
 Steps, in this order:
 
 1. **Before anything.** The commit that carries the code exists, CI is green on it, and the owner has approved the upgrade. Read the tag of
-   the running image from Docker (section 9), do not take it from a document; it should be `house-helper:66ab4ec32de3`. The newest image also
+   the running image from Docker (section 9), do not take it from a document (at the time of this recorded upgrade it was
+   `house-helper:66ab4ec32de3`; production now runs `house-helper:3d09d45f6318`). The newest image also
    carries the changes of sections 9.1 and 3 (for example `OPENAI_REASONING_EFFORT`): read them first.
 2. **Image and database, with the bot still OFF.** Section 9, unchanged: build the new image from the approved commit, `deploy/upgrade.sh`
    with a dry run first and `--old-tag` the tag you read, the cleanup timer stopped around it and `HOUSE_HELPER_IMAGE_TAG` in `purge.env`
