@@ -102,17 +102,22 @@ def test_the_user_id_is_kept_to_tell_whose_page_it_is_and_is_never_sent():
     assert code.count("user_id") == code[me_start:me_end].count("user_id") > 0
     # ...the page keeps the id (the principal, and the owner written in each record of an unresolved message)
     # only to know whose page and whose record it is. It is sent nowhere: no request line mentions it, the
-    # bodies are the message text, nothing, the conversation and message of an answer to keep, and the e-mail
-    # address, and the one header is the idempotency key.
+    # bodies are the message text, nothing, the conversation, message and optional recipe position of an
+    # answer to keep, the editable fields of a favorite, and the e-mail address, and the one header is the
+    # idempotency key.
     for line in code.splitlines():
         if re.search(r"http\(|json:|headers|\.body|Idempotency", line):
             assert not re.search(r"principal|userId|owner|user_id", line), line
     assert re.findall(r"json:\s*(\{[^}]*\})", code) == [
         "{ text: turn.text }",
         "{}",
-        "{ conversation_id: conversationId, message_id: messageId }",
         "{ email: checked.address }",
     ]
+    # The keep body names the answer (and, when a recipe is kept on its own, its position);
+    # the edit body is built by editBody from the kind's editable fields. Neither can carry an owner.
+    assert "var body = { conversation_id: conversationId, message_id: messageId };" in code
+    assert "body.recipe_index = recipeIndex;" in code
+    assert "function editBody(draft, kind, version)" in code
     assert "Idempotency-Key" in code and code.count('"Idempotency-Key"') == 1
 
 

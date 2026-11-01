@@ -99,6 +99,16 @@
   var STORAGE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
   var STORAGE_MAX_RECORDS = 8;
   var MAX_USER_ID_LENGTH = 64; // the server's are UUIDs (36); this only bounds what is stored
+  var MAX_RECIPES_PER_MESSAGE = 5; // the server's MAX_RECIPES_PER_REPLY (protocol position limit)
+  var MAX_EDIT_INGREDIENTS = 100; // the protocol's MAX_INGREDIENTS
+  var MAX_EDIT_STEPS = 50; // the protocol's MAX_STEPS
+  var MAX_EDIT_TITLE = 200; // the protocol's MAX_TITLE_LENGTH
+  var MAX_EDIT_SERVINGS = 100; // the protocol's MAX_SERVINGS_LENGTH
+  var MAX_EDIT_INGREDIENT_NAME = 200; // the protocol's MAX_INGREDIENT_NAME_LENGTH
+  var MAX_EDIT_AMOUNT = 100; // the protocol's MAX_AMOUNT_LENGTH
+  var MAX_EDIT_STEP = 1000; // the protocol's MAX_STEP_LENGTH
+  var MAX_EDIT_TEXT = 100000; // the server's MAX_FAVORITE_TEXT_LENGTH
+  var MAX_EDIT_NOTES = 2000; // the server's MAX_FAVORITE_NOTES_LENGTH
   var MAX_AUTO_ATTEMPTS = 24; // waiting for a busy conversation, at 5 s each: about two minutes
   var DEFAULT_RETRY_MS = 5000;
   var MIN_RETRY_MS = 1000;
@@ -222,6 +232,57 @@
     removeFailed: "Не удалось убрать рецепт. Попробуйте еще раз.",
     removed: "Рецепт убран из избранного.",
     savedOn: "Сохранено: {when}",
+    // One answer may hold several recipes; each is kept separately.
+    saveRecipeNamed: "Сохранить «{title}»",
+    recipeSaving: "Сохраняем…",
+    recipeSaved: "В избранном",
+    recipeSaveFailed: "Не удалось сохранить рецепт. Попробуйте еще раз.",
+    openRecipe: "Открыть",
+    // The card and its editing.
+    servings: "Порции",
+    ingredients: "Ингредиенты",
+    steps: "Приготовление",
+    notes: "Мои заметки",
+    editAction: "Редактировать",
+    editTitleLabel: "Название",
+    editServingsLabel: "Порции",
+    editTextLabel: "Текст рецепта",
+    editNotesLabel: "Мои заметки",
+    editIngredientName: "Название ингредиента",
+    editIngredientAmount: "Количество",
+    editAddIngredient: "Добавить ингредиент",
+    editRemoveIngredient: "Удалить ингредиент",
+    editStep: "Шаг",
+    editAddStep: "Добавить шаг",
+    editRemoveStep: "Удалить шаг",
+    editMoveUp: "Выше",
+    editMoveDown: "Ниже",
+    editSave: "Сохранить",
+    editCancel: "Отмена",
+    editSaving: "Сохраняем изменения…",
+    editSaved: "Изменения сохранены.",
+    editFailed: "Не удалось сохранить изменения. Попробуйте еще раз.",
+    editTitleRequired: "Введите название рецепта.",
+    editTitleTooLong: "Название слишком длинное (максимум 200 символов).",
+    editTextRequired: "Введите текст рецепта.",
+    editTextTooLong: "Текст рецепта слишком длинный (максимум 100000 символов).",
+    editIngredientsRequired: "Добавьте хотя бы один ингредиент.",
+    editTooManyIngredients: "Слишком много ингредиентов (максимум 100).",
+    editIngredientIncomplete: "У каждого ингредиента должны быть название и количество.",
+    editIngredientNameTooLong: "Название ингредиента слишком длинное (максимум 200 символов).",
+    editIngredientAmountTooLong: "Количество слишком длинное (максимум 100 символов).",
+    editServingsTooLong: "Порции указаны слишком длинно (максимум 100 символов).",
+    editStepsRequired: "Добавьте хотя бы один шаг приготовления.",
+    editTooManySteps: "Слишком много шагов (максимум 50).",
+    editStepEmpty: "Шаг не должен быть пустым.",
+    editStepTooLong: "Шаг слишком длинный (максимум 1000 символов).",
+    editNotesTooLong: "Заметки слишком длинные (максимум 2000 символов).",
+    editTooLong: "Одно из полей слишком длинное.",
+    editConflict:
+      "Рецепт изменился в другом месте. Загрузите новую версию или сохраните свои изменения поверх нее.",
+    editReload: "Загрузить заново",
+    editOverwrite: "Сохранить поверх",
+    editUnsaved: "В рецепте есть несохраненные изменения. Уйти без сохранения?",
   };
 
   // What the server says for each of its error codes (house_helper/web/diagnostics.py).
@@ -714,7 +775,9 @@
 
   // --- favorites: what the server says about the recipes a person kept ---------------------------------
 
-  // {id, title, message_id, created_at} -> {id, title, messageId, createdAt}
+  // {id, title, message_id, created_at, kind, recipe_index, version} ->
+  // {id, title, messageId, createdAt, kind, recipeIndex, version}.
+  // A body from an older server (no kind) is a text favorite, as it always was.
   function normalizeFavorite(item) {
     if (
       !isObject(item) ||
@@ -727,11 +790,26 @@
     ) {
       return null;
     }
+    var kind = item.kind === undefined ? "text" : item.kind;
+    if (kind !== "text" && kind !== "structured") {
+      return null;
+    }
+    var recipeIndex = -1;
+    if (kind === "structured") {
+      if (!isCount(item.recipe_index) || item.recipe_index < 0 || item.recipe_index >= MAX_RECIPES_PER_MESSAGE) {
+        return null;
+      }
+      recipeIndex = item.recipe_index;
+    }
+    var version = isCount(item.version) && item.version >= 1 ? item.version : 1;
     return {
       id: item.id.toLowerCase(),
       title: item.title,
       messageId: item.message_id,
       createdAt: parseTimestamp(item.created_at),
+      kind: kind,
+      recipeIndex: recipeIndex,
+      version: version,
     };
   }
 
@@ -750,13 +828,70 @@
     return items;
   }
 
+  function normalizeIngredients(value) {
+    if (!Array.isArray(value) || value.length < 1 || value.length > MAX_EDIT_INGREDIENTS) {
+      return null;
+    }
+    var items = [];
+    for (var i = 0; i < value.length; i++) {
+      var item = value[i];
+      if (
+        !isObject(item) ||
+        typeof item.name !== "string" ||
+        item.name === "" ||
+        typeof item.amount !== "string" ||
+        item.amount === ""
+      ) {
+        return null;
+      }
+      items.push({ name: item.name, amount: item.amount });
+    }
+    return items;
+  }
+
+  function normalizeSteps(value) {
+    if (!Array.isArray(value) || value.length < 1 || value.length > MAX_EDIT_STEPS) {
+      return null;
+    }
+    var items = [];
+    for (var i = 0; i < value.length; i++) {
+      if (typeof value[i] !== "string" || value[i] === "") {
+        return null;
+      }
+      items.push(value[i]);
+    }
+    return items;
+  }
+
   // The recipe itself: the summary and the text, for the very favorite that was asked for.
+  // A structured favorite also carries its fields: the card draws those, not the text.
   function normalizeFavoriteDetail(body, id) {
     var item = normalizeFavorite(body);
     if (item === null || item.id !== id || typeof body.text !== "string" || body.text === "") {
       return null;
     }
+    var notes = body.notes === undefined || body.notes === null ? "" : body.notes;
+    if (typeof notes !== "string") {
+      return null;
+    }
     item.text = body.text;
+    item.notes = notes;
+    item.updatedAt = parseTimestamp(body.updated_at);
+    if (item.kind === "structured") {
+      var servings = body.servings === undefined || body.servings === null ? "" : body.servings;
+      var ingredients = normalizeIngredients(body.ingredients);
+      var steps = normalizeSteps(body.steps);
+      if (typeof servings !== "string" || ingredients === null || steps === null) {
+        return null;
+      }
+      item.servings = servings;
+      item.ingredients = ingredients;
+      item.steps = steps;
+    } else {
+      item.servings = "";
+      item.ingredients = [];
+      item.steps = [];
+    }
     return item;
   }
 
@@ -787,6 +922,50 @@
     return { type: "uncertain", text: unavailableText(response, error), correlationId: error ? error.correlationId : null };
   }
 
+  // The answer to PATCH /api/favorites/{id}, as what the editor must do next:
+  //   saved     200: the recipe as it now is (with its new version)
+  //   auth      401: the session is gone
+  //   gone      404 favorite_not_found: it was removed somewhere else
+  //   conflict  409 favorite_conflict: the recipe changed since expected_version; the draft stays
+  //   rejected  another 4xx: the application refused the edit; the draft stays
+  //   uncertain no answer, a body that is not the application's, any 5xx: the edit MAY have
+  //             been stored (a lost acknowledgement is a 503); the draft stays, and asking
+  //             again with the same expected_version either succeeds or reports a conflict.
+  function classifyFavoriteEdit(response, id) {
+    if (response.kind === "network") {
+      return { type: "uncertain", text: unavailableText(response, null) };
+    }
+    if (response.status === 401) {
+      return { type: "auth" };
+    }
+    if (response.status === 200 && response.jsonOk) {
+      var item = normalizeFavoriteDetail(response.json, id);
+      if (item !== null) {
+        return { type: "saved", item: item };
+      }
+      return { type: "uncertain", text: TEXT.unexpected };
+    }
+    var error = readApiError(response);
+    if (response.status === 404 && error && error.code === "favorite_not_found") {
+      return { type: "gone" };
+    }
+    if (response.status === 409 && error && error.code === "favorite_conflict") {
+      return { type: "conflict", text: TEXT.editConflict, correlationId: error.correlationId };
+    }
+    if (error && response.status >= 400 && response.status < 500) {
+      return {
+        type: "rejected",
+        text: error.message || TEXT.editFailed,
+        correlationId: error.correlationId,
+      };
+    }
+    return {
+      type: "uncertain",
+      text: unavailableText(response, error),
+      correlationId: error ? error.correlationId : null,
+    };
+  }
+
   // The answer to DELETE /api/favorites/{id}:
   //   removed    204, or 404 favorite_not_found: it is not in the favorites any more, which is what was asked for
   //   auth       401
@@ -813,6 +992,37 @@
   // The address of a photo that came with a message: this site's own route and nothing else. The server
   // names it (chat_api._attachment_json); anything that is not exactly that is no photo.
   var PHOTO_URL = /^\/api\/attachments\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+  // The structured recipes of one answer, as the server names them: a position and a
+  // title, nothing fabricated. A malformed entry is dropped rather than allowed to spoil
+  // the whole message; positions are unique and in order.
+  function normalizeRecipes(value) {
+    if (!Array.isArray(value)) {
+      return [];
+    }
+    var seen = {};
+    var items = [];
+    for (var i = 0; i < value.length; i++) {
+      var item = value[i];
+      if (
+        !isObject(item) ||
+        !isCount(item.position) ||
+        item.position < 0 ||
+        item.position >= MAX_RECIPES_PER_MESSAGE ||
+        typeof item.title !== "string" ||
+        item.title === "" ||
+        seen[item.position] === true
+      ) {
+        continue;
+      }
+      seen[item.position] = true;
+      items.push({ position: item.position, title: item.title });
+    }
+    items.sort(function (left, right) {
+      return left.position - right.position;
+    });
+    return items;
+  }
 
   function normalizePhoto(list) {
     if (!Array.isArray(list) || list.length < 1) {
@@ -854,6 +1064,7 @@
       key: key,
       errorCode: typeof item.error_code === "string" && CODE_PATTERN.test(item.error_code) ? item.error_code : null,
       photo: normalizePhoto(item.attachments),
+      recipes: item.role === "assistant" ? normalizeRecipes(item.recipes) : [],
     };
   }
 
@@ -1110,6 +1321,10 @@
       : typeof AbortController === "function" ? AbortController : null;
     var cryptoApi = deps.crypto || null;
     var maxLength = deps.maxLength || MAX_MESSAGE_LENGTH;
+    // The server's feature switch (the shell's data-structured-recipes): with it off the
+    // page offers no per-recipe Save control, even for an answer that still has stored
+    // recipes from before it was switched off.
+    var structuredRecipes = deps.structuredRecipes === true;
     var store = createPendingStore(deps.storage || null, nowFn);
 
     var epoch = 0; // bumped when the session ends: answers that arrive after it are ignored
@@ -1129,10 +1344,21 @@
     var state = freshState("loading");
 
     // What the page knows of the favorites. `items` newest first; `currentId` is the recipe that is open
-    // (section "favorites") and `detail` its state; `saving` is per message id (a save that is under
-    // way or failed); `removing` is the question "remove it?" and its outcome, for one recipe.
+    // (section "favorites") and `detail` its state; `saving` is per message id for a whole answer, or
+    // per "message:position" for one structured recipe (a save that is under way or failed); `removing`
+    // is the question "remove it?" and its outcome, for one recipe; `editor` is the draft being edited,
+    // if any. The editor is memory only and survives a list refresh.
     function freshFavorites() {
-      return { status: "idle", error: null, items: [], currentId: null, detail: null, saving: {}, removing: null };
+      return {
+        status: "idle",
+        error: null,
+        items: [],
+        currentId: null,
+        detail: null,
+        saving: {},
+        removing: null,
+        editor: null,
+      };
     }
 
     function freshState(screen) {
@@ -2204,22 +2430,59 @@
 
     // --- the favorites ---------------------------------------------------------------------------------
 
+    // The whole-answer favorite of an answer, if it has one. A structured favorite of the
+    // same answer is a different thing and is not it.
     function favoriteOfMessage(messageId) {
       var items = state.favorites.items;
       for (var i = 0; i < items.length; i++) {
-        if (items[i].messageId === messageId) {
+        if (items[i].kind === "text" && items[i].messageId === messageId) {
           return items[i];
         }
       }
       return null;
     }
 
-    // The newest first; one favorite per answer and per id.
+    function structuredFavoriteOf(messageId, position) {
+      var items = state.favorites.items;
+      for (var i = 0; i < items.length; i++) {
+        if (
+          items[i].kind === "structured" &&
+          items[i].messageId === messageId &&
+          items[i].recipeIndex === position
+        ) {
+          return items[i];
+        }
+      }
+      return null;
+    }
+
+    // The newest first; one favorite per id, and one per (answer, kind, position).
+    function sameFavorite(left, right) {
+      return (
+        left.id === right.id ||
+        (left.messageId === right.messageId &&
+          left.kind === right.kind &&
+          left.recipeIndex === right.recipeIndex)
+      );
+    }
+
     function putFavorite(favorite) {
       var others = state.favorites.items.filter(function (item) {
-        return item.id !== favorite.id && item.messageId !== favorite.messageId;
+        return !sameFavorite(item, favorite);
       });
       state.favorites.items = [favorite].concat(others);
+    }
+
+    // An edit changed the summary the list shows; keep its place (an edit is not news).
+    function replaceFavoriteSummary(favorite) {
+      var items = state.favorites.items;
+      for (var i = 0; i < items.length; i++) {
+        if (items[i].id === favorite.id) {
+          items[i] = favorite;
+          return;
+        }
+      }
+      items.unshift(favorite);
     }
 
     function dropFavorite(id) {
@@ -2247,6 +2510,21 @@
         if (items !== null) {
           favorites.items = items;
           favorites.status = "ready";
+          // The list is the server's answer: a recipe that is no longer in it was removed
+          // somewhere else. Say so for the open card, unless a draft is being edited (it
+          // is kept; saving will report the truth of the version).
+          if (
+            favorites.editor === null &&
+            favorites.currentId !== null &&
+            favorites.detail !== null &&
+            favorites.detail.status === "ready" &&
+            !items.some(function (item) {
+              return item.id === favorites.currentId;
+            })
+          ) {
+            favorites.detail.status = "gone";
+            favorites.detail.error = { text: TEXT.recipeGone, correlationId: null };
+          }
           emit();
           return true;
         }
@@ -2262,16 +2540,73 @@
       return false;
     }
 
-    // Which part of the app is in front. The list of the favorites is read when it is first wanted
-    // (and again when the last read failed).
+    // The open card read again in the background, without putting it into "loading": a
+    // recipe changed on another device shows its current fields when the person returns
+    // to Favorites. A draft is never touched, and a failed refresh changes nothing (the
+    // next edit will report the conflict).
+    async function refreshOpenFavorite() {
+      var favorites = state.favorites;
+      var id = favorites.currentId;
+      if (
+        id === null ||
+        favorites.editor !== null ||
+        favorites.detail === null ||
+        favorites.detail.status !== "ready"
+      ) {
+        return false;
+      }
+      var mine = epoch;
+      var response = await http("GET", "/api/favorites/" + id, { timeoutMs: READ_TIMEOUT_MS });
+      if (
+        mine !== epoch ||
+        state.favorites.currentId !== id ||
+        state.favorites.editor !== null ||
+        state.favorites.detail === null ||
+        state.favorites.detail.id !== id
+      ) {
+        return false;
+      }
+      var detail = state.favorites.detail;
+      var found = classifyRead(response, "favorite_not_found");
+      if (found.type === "ok") {
+        var item = normalizeFavoriteDetail(found.body, id);
+        if (item !== null) {
+          detail.status = "ready";
+          detail.item = item;
+          detail.error = null;
+          replaceFavoriteSummary(summaryOf(item));
+          emit();
+          return true;
+        }
+        return false;
+      }
+      if (found.type === "auth") {
+        handleAuthLost();
+        return false;
+      }
+      if (found.type === "not_found") {
+        dropFavorite(id);
+        detail.status = "gone";
+        detail.item = null;
+        detail.error = { text: TEXT.recipeGone, correlationId: null };
+        emit();
+        return false;
+      }
+      return false; // a failed background read is not an error shown over a readable card
+    }
+
+    // Which part of the app is in front. The list of the favorites (and the open card, when
+    // there is one) is read whenever the person returns to it, so a recipe kept or changed
+    // in another tab or on another device shows up.
     function showSection(name) {
       if (state.screen !== "app" || state.gate || (name !== "chats" && name !== "favorites")) {
         return;
       }
       state.section = name;
       emit();
-      if (name === "favorites" && (state.favorites.status === "idle" || state.favorites.status === "error")) {
+      if (name === "favorites" && state.favorites.status !== "loading") {
         track(loadFavorites());
+        track(refreshOpenFavorite());
       }
     }
 
@@ -2285,6 +2620,7 @@
       state.section = "favorites";
       favorites.currentId = id;
       favorites.removing = null; // a question about another recipe is over
+      favorites.editor = null; // (the page asked before discarding a draft; see app.js)
       favorites.detail = { id: id, status: "loading", item: null, error: null };
       emit();
       var response = await http("GET", "/api/favorites/" + id, { timeoutMs: READ_TIMEOUT_MS });
@@ -2325,29 +2661,39 @@
       return id === null ? Promise.resolve() : openFavorite(id);
     }
 
-    // Keep an answer of the assistant. The server copies the text from the answer it finds under this
-    // conversation and message, and keeps one favorite per answer: asking again (after an unclear
+    // Keep an answer of the assistant, or (with a position) one of its structured recipes.
+    // The server copies from the answer it finds under this conversation and message, and
+    // keeps one favorite per answer, and one per recipe: asking again (after an unclear
     // outcome, or from another window) is harmless.
-    async function keepFavorite(conversationId, messageId) {
+    async function keepFavorite(conversationId, messageId, recipeIndex) {
       if (state.screen !== "app" || state.gate) {
         return { ok: false, reason: "not_ready" };
       }
       if (typeof conversationId !== "string" || !UUID_PATTERN.test(conversationId) || !isCount(messageId) || messageId < 1) {
         return { ok: false, reason: "invalid" };
       }
+      var structured = recipeIndex !== undefined && recipeIndex !== null;
+      if (structured && (!isCount(recipeIndex) || recipeIndex < 0 || recipeIndex >= MAX_RECIPES_PER_MESSAGE)) {
+        return { ok: false, reason: "invalid" };
+      }
       var favorites = state.favorites;
-      if (favoriteOfMessage(messageId) !== null) {
+      var key = structured ? messageId + ":" + recipeIndex : String(messageId);
+      if (structured ? structuredFavoriteOf(messageId, recipeIndex) !== null : favoriteOfMessage(messageId) !== null) {
         return { ok: true, reason: "already" };
       }
-      var asked = favorites.saving[messageId];
+      var asked = favorites.saving[key];
       if (asked && asked.phase === "saving") {
         return { ok: false, reason: "busy" };
       }
       var mine = epoch;
-      favorites.saving[messageId] = { phase: "saving", error: null };
+      favorites.saving[key] = { phase: "saving", error: null };
       emit();
+      var body = { conversation_id: conversationId, message_id: messageId };
+      if (structured) {
+        body.recipe_index = recipeIndex;
+      }
       var response = await http("POST", "/api/favorites", {
-        json: { conversation_id: conversationId, message_id: messageId },
+        json: body,
         timeoutMs: READ_TIMEOUT_MS,
       });
       if (mine !== epoch) {
@@ -2360,18 +2706,426 @@
         return { ok: false, reason: "auth" };
       }
       if (outcome.type === "kept") {
-        delete favorites.saving[messageId];
+        delete favorites.saving[key];
         putFavorite(outcome.favorite);
         announce(TEXT.favoriteKeptAnnounce);
         emit();
         return { ok: true, reason: outcome.created ? "created" : "already" };
       }
-      favorites.saving[messageId] = {
+      favorites.saving[key] = {
         phase: "error",
-        error: { text: outcome.text || TEXT.favoriteKeepFailed, correlationId: outcome.correlationId || null },
+        error: {
+          text: outcome.text || (structured ? TEXT.recipeSaveFailed : TEXT.favoriteKeepFailed),
+          correlationId: outcome.correlationId || null,
+        },
       };
       emit();
       return { ok: false, reason: outcome.type };
+    }
+
+    // --- editing a recipe: the server stores it, no model is called ---------------------------
+
+    function draftOf(item) {
+      return {
+        title: item.title,
+        text: item.kind === "text" ? item.text : "",
+        notes: item.notes || "",
+        servings: item.servings || "",
+        ingredients: item.kind === "structured"
+          ? item.ingredients.map(function (ingredient) {
+              return { name: ingredient.name, amount: ingredient.amount };
+            })
+          : [],
+        steps: item.kind === "structured" ? item.steps.slice() : [],
+      };
+    }
+
+    // The draft as the editor holds it, every field exactly as it was written. Nothing is
+    // shortened or dropped here: a field over the server's bound is reported when the person
+    // asks to save (draftProblem), and the whole draft stays as it is until then. Fields the
+    // caller did not name fall back to the draft it had; nothing is invented for a text
+    // favorite (its structured fields stay empty).
+    function draftFrom(raw, fallback) {
+      raw = isObject(raw) ? raw : {};
+      fallback = fallback || {};
+      function text(name) {
+        var value = typeof raw[name] === "string" ? raw[name] : fallback[name];
+        return typeof value === "string" ? value : "";
+      }
+      var ingredients = Array.isArray(raw.ingredients) ? raw.ingredients : fallback.ingredients || [];
+      var steps = Array.isArray(raw.steps) ? raw.steps : fallback.steps || [];
+      var draft = {
+        title: text("title"),
+        text: text("text"),
+        notes: text("notes"),
+        servings: text("servings"),
+        ingredients: [],
+        steps: [],
+      };
+      for (var i = 0; i < ingredients.length; i++) {
+        var ingredient = isObject(ingredients[i]) ? ingredients[i] : {};
+        draft.ingredients.push({
+          name: typeof ingredient.name === "string" ? ingredient.name : "",
+          amount: typeof ingredient.amount === "string" ? ingredient.amount : "",
+        });
+      }
+      for (var j = 0; j < steps.length; j++) {
+        draft.steps.push(typeof steps[j] === "string" ? steps[j] : "");
+      }
+      return draft;
+    }
+
+    // The first thing that would make the server refuse the edit, in the page's words. Lengths
+    // are counted in Unicode code points (as Python's len() does), never in JavaScript's
+    // UTF-16 .length, so a field of emoji is judged by the same number as on the server.
+    function draftProblem(draft, kind) {
+      var title = draft.title.trim();
+      if (!title) {
+        return TEXT.editTitleRequired;
+      }
+      if (countCodePoints(title) > MAX_EDIT_TITLE) {
+        return TEXT.editTitleTooLong;
+      }
+      if (countCodePoints(draft.notes) > MAX_EDIT_NOTES) {
+        return TEXT.editNotesTooLong;
+      }
+      if (kind === "text") {
+        if (!draft.text.trim()) {
+          return TEXT.editTextRequired;
+        }
+        if (countCodePoints(draft.text) > MAX_EDIT_TEXT) {
+          return TEXT.editTextTooLong;
+        }
+        return null;
+      }
+      if (countCodePoints(draft.servings.trim()) > MAX_EDIT_SERVINGS) {
+        return TEXT.editServingsTooLong;
+      }
+      if (draft.ingredients.length === 0) {
+        return TEXT.editIngredientsRequired;
+      }
+      if (draft.ingredients.length > MAX_EDIT_INGREDIENTS) {
+        return TEXT.editTooManyIngredients;
+      }
+      for (var i = 0; i < draft.ingredients.length; i++) {
+        var name = draft.ingredients[i].name.trim();
+        var amount = draft.ingredients[i].amount.trim();
+        if (!name || !amount) {
+          return TEXT.editIngredientIncomplete;
+        }
+        if (countCodePoints(name) > MAX_EDIT_INGREDIENT_NAME) {
+          return TEXT.editIngredientNameTooLong;
+        }
+        if (countCodePoints(amount) > MAX_EDIT_AMOUNT) {
+          return TEXT.editIngredientAmountTooLong;
+        }
+      }
+      if (draft.steps.length === 0) {
+        return TEXT.editStepsRequired;
+      }
+      if (draft.steps.length > MAX_EDIT_STEPS) {
+        return TEXT.editTooManySteps;
+      }
+      for (var j = 0; j < draft.steps.length; j++) {
+        var step = draft.steps[j].trim();
+        if (!step) {
+          return TEXT.editStepEmpty;
+        }
+        if (countCodePoints(step) > MAX_EDIT_STEP) {
+          return TEXT.editStepTooLong;
+        }
+      }
+      // The protocol bounds one recipe block (the fields as JSON) at 20,000 characters;
+      // the server would refuse a larger edit with a less specific message.
+      var block = JSON.stringify({
+        title: draft.title.trim(),
+        servings: draft.servings.trim() ? draft.servings.trim() : null,
+        ingredients: draft.ingredients.map(function (ingredient) {
+          return { name: ingredient.name.trim(), amount: ingredient.amount.trim() };
+        }),
+        steps: draft.steps.map(function (step) {
+          return step.trim();
+        }),
+      });
+      if (countCodePoints(block) > 20000) {
+        return TEXT.editTooLong;
+      }
+      return null;
+    }
+
+    // What PATCH names: the version the draft started from and every editable field of the
+    // kind. A blank optional note or servings phrase is null, as the protocol's shape has
+    // it; the text of a text favorite and the notes are stored as written.
+    function editBody(draft, kind, version) {
+      var body = {
+        expected_version: version,
+        title: draft.title.trim(),
+        notes: draft.notes.trim() ? draft.notes : null,
+      };
+      if (kind === "text") {
+        body.text = draft.text;
+        return body;
+      }
+      body.servings = draft.servings.trim() ? draft.servings.trim() : null;
+      body.ingredients = draft.ingredients.map(function (ingredient) {
+        return { name: ingredient.name.trim(), amount: ingredient.amount.trim() };
+      });
+      body.steps = draft.steps.map(function (step) {
+        return step.trim();
+      });
+      return body;
+    }
+
+    function currentDetailItem() {
+      var favorites = state.favorites;
+      var detail = favorites.detail;
+      if (
+        favorites.currentId !== null &&
+        detail !== null &&
+        detail.status === "ready" &&
+        detail.item !== null &&
+        detail.item.id === favorites.currentId
+      ) {
+        return detail.item;
+      }
+      return null;
+    }
+
+    function beginEditFavorite() {
+      var item = currentDetailItem();
+      if (state.screen !== "app" || state.gate || item === null) {
+        return false;
+      }
+      if (state.favorites.editor !== null) {
+        return false;
+      }
+      state.favorites.editor = {
+        id: item.id,
+        phase: "editing",
+        draft: draftOf(item),
+        error: null,
+      };
+      emit();
+      return true;
+    }
+
+    // The draft lives here, in memory, not in the page's inputs: the page hands over
+    // every change as it happens (a keystroke included), and a drawing made later --
+    // after a session recheck, a return to the tab, an online event or any other
+    // refresh -- is made from this draft, so an unsaved edit is never rebuilt from an
+    // older one. It redraws nothing (the person may be typing) and sends nothing.
+    function syncFavoriteDraft(rawDraft) {
+      var editor = state.favorites.editor;
+      if (editor === null || editor.phase === "saving") {
+        return false;
+      }
+      editor.draft = draftFrom(rawDraft, editor.draft);
+      return true;
+    }
+
+    // Every change of the form (a row added, removed or moved; the draft before a save)
+    // passes through here; it redraws, which a keystroke must not.
+    function updateFavoriteDraft(rawDraft) {
+      if (!syncFavoriteDraft(rawDraft)) {
+        return false;
+      }
+      emit();
+      return true;
+    }
+
+    function cancelEditFavorite() {
+      if (state.favorites.editor === null) {
+        return false;
+      }
+      state.favorites.editor = null;
+      emit();
+      return true;
+    }
+
+    function summaryOf(item) {
+      return {
+        id: item.id,
+        title: item.title,
+        messageId: item.messageId,
+        createdAt: item.createdAt,
+        kind: item.kind,
+        recipeIndex: item.recipeIndex,
+        version: item.version,
+      };
+    }
+
+    function finishEdit(item, outcome, draft, editor) {
+      var favorites = state.favorites;
+      if (favorites.editor !== editor) {
+        return { ok: false, reason: "stale" };
+      }
+      if (outcome.type === "auth") {
+        handleAuthLost();
+        return { ok: false, reason: "auth" };
+      }
+      if (outcome.type === "saved") {
+        var updated = outcome.item;
+        favorites.editor = null;
+        if (favorites.detail && favorites.detail.id === updated.id) {
+          favorites.detail.status = "ready";
+          favorites.detail.item = updated;
+          favorites.detail.error = null;
+        }
+        replaceFavoriteSummary(summaryOf(updated));
+        announce(TEXT.editSaved);
+        emit();
+        return { ok: true };
+      }
+      if (outcome.type === "gone") {
+        dropFavorite(item.id);
+        favorites.editor = null;
+        if (favorites.currentId === item.id) {
+          favorites.detail = {
+            id: item.id,
+            status: "gone",
+            item: null,
+            error: { text: TEXT.recipeGone, correlationId: null },
+          };
+        }
+        announce(TEXT.recipeGone);
+        emit();
+        return { ok: false, reason: "gone" };
+      }
+      if (outcome.type === "conflict") {
+        editor.phase = "conflict";
+        editor.draft = draft;
+        editor.error = { text: TEXT.editConflict, correlationId: outcome.correlationId || null };
+        emit();
+        return { ok: false, reason: "conflict" };
+      }
+      editor.phase = "editing";
+      editor.draft = draft;
+      editor.error = {
+        text: outcome.text || TEXT.editFailed,
+        correlationId: outcome.correlationId || null,
+      };
+      emit();
+      return { ok: false, reason: outcome.type };
+    }
+
+    async function saveFavoriteEdit(rawDraft) {
+      var favorites = state.favorites;
+      var editor = favorites.editor;
+      var item = currentDetailItem();
+      if (
+        state.screen !== "app" ||
+        state.gate ||
+        editor === null ||
+        item === null ||
+        editor.id !== item.id ||
+        editor.phase === "saving"
+      ) {
+        return { ok: false, reason: "not_ready" };
+      }
+      var draft = draftFrom(rawDraft, editor.draft);
+      editor.draft = draft;
+      var problem = draftProblem(draft, item.kind);
+      if (problem !== null) {
+        editor.phase = "editing";
+        editor.error = { text: problem, correlationId: null };
+        emit();
+        return { ok: false, reason: "invalid" };
+      }
+      var mine = epoch;
+      editor.phase = "saving";
+      editor.error = null;
+      emit();
+      var response = await http("PATCH", "/api/favorites/" + item.id, {
+        json: editBody(draft, item.kind, item.version),
+        timeoutMs: READ_TIMEOUT_MS,
+      });
+      if (mine !== epoch) {
+        return { ok: false, reason: "stale" };
+      }
+      return finishEdit(item, classifyFavoriteEdit(response, item.id), draft, editor);
+    }
+
+    // "Загрузить заново": the draft is given up and the last stored version is read.
+    function reloadFavoriteAfterConflict() {
+      var editor = state.favorites.editor;
+      if (editor === null) {
+        return Promise.resolve(false);
+      }
+      var id = editor.id;
+      state.favorites.editor = null;
+      emit();
+      return openFavorite(id);
+    }
+
+    // "Сохранить поверх": the person has explicitly chosen to overwrite. The last stored
+    // version is read first, so the PATCH names the version that is current now; if it
+    // changed again in between, the server answers 409 and the choice is shown again.
+    async function overwriteFavorite(rawDraft) {
+      var favorites = state.favorites;
+      var editor = favorites.editor;
+      var item = currentDetailItem();
+      if (
+        state.screen !== "app" ||
+        state.gate ||
+        editor === null ||
+        item === null ||
+        editor.id !== item.id ||
+        editor.phase !== "conflict"
+      ) {
+        return { ok: false, reason: "not_ready" };
+      }
+      var mine = epoch;
+      // The conflict view is editable too: the fields as they are in the page are the
+      // draft that will overwrite, not the copy made when the conflict was reported.
+      var draft = draftFrom(rawDraft, editor.draft);
+      editor.draft = draft;
+      // An over-limit field is refused here as it is on a plain save: the whole draft stays
+      // on the page, in the conflict view, and nothing is sent.
+      var problem = draftProblem(draft, item.kind);
+      if (problem !== null) {
+        editor.phase = "conflict";
+        editor.error = { text: problem, correlationId: null };
+        emit();
+        return { ok: false, reason: "invalid" };
+      }
+      var response = await http("GET", "/api/favorites/" + item.id, { timeoutMs: READ_TIMEOUT_MS });
+      if (mine !== epoch || state.favorites.editor !== editor) {
+        return { ok: false, reason: "stale" };
+      }
+      var found = classifyRead(response, "favorite_not_found");
+      if (found.type === "auth") {
+        handleAuthLost();
+        return { ok: false, reason: "auth" };
+      }
+      if (found.type === "not_found") {
+        return finishEdit(item, { type: "gone" }, draft, editor);
+      }
+      var latest = found.type === "ok" ? normalizeFavoriteDetail(found.body, item.id) : null;
+      if (latest === null) {
+        editor.phase = "conflict";
+        editor.error = {
+          text: found.type === "ok" ? TEXT.unexpected : found.text || TEXT.editFailed,
+          correlationId: found.correlationId || null,
+        };
+        emit();
+        return { ok: false, reason: found.type === "ok" ? "unexpected" : found.type };
+      }
+      editor.draft = draft;
+      editor.phase = "saving";
+      editor.error = null;
+      emit();
+      var response2 = await http("PATCH", "/api/favorites/" + item.id, {
+        json: editBody(draft, latest.kind, latest.version),
+        timeoutMs: READ_TIMEOUT_MS,
+      });
+      if (mine !== epoch) {
+        return { ok: false, reason: "stale" };
+      }
+      return finishEdit(latest, classifyFavoriteEdit(response2, item.id), draft, editor);
+    }
+
+    function hasUnsavedChanges() {
+      return state.favorites.editor !== null;
     }
 
     // Removing is asked first, for the recipe that is open, and done only on the second click.
@@ -2420,6 +3174,9 @@
         if (favorites.currentId === id) {
           favorites.currentId = null;
           favorites.detail = null;
+        }
+        if (favorites.editor !== null && favorites.editor.id === id) {
+          favorites.editor = null;
         }
         if (favorites.removing === asked) {
           favorites.removing = null;
@@ -2676,7 +3433,23 @@
       if (kept !== null) {
         return { state: "saved", id: kept.id, error: null };
       }
-      var saving = state.favorites.saving[messageId];
+      var saving = state.favorites.saving[String(messageId)];
+      if (saving) {
+        return saving.phase === "saving"
+          ? { state: "saving", id: null, error: null }
+          : { state: "error", id: null, error: saving.error };
+      }
+      return { state: "none", id: null, error: null };
+    }
+
+    // The same, for one structured recipe of an answer: each has its own save, its own
+    // state and its own favorite, and one being under way or failed does not touch another.
+    function recipeMark(messageId, position) {
+      var kept = structuredFavoriteOf(messageId, position);
+      if (kept !== null) {
+        return { state: "saved", id: kept.id, error: null };
+      }
+      var saving = state.favorites.saving[messageId + ":" + position];
       if (saving) {
         return saving.phase === "saving"
           ? { state: "saving", id: null, error: null }
@@ -2703,6 +3476,7 @@
           return item.id === detail.id;
         })[0];
         var removing = favorites.removing && favorites.removing.id === detail.id ? favorites.removing : null;
+        var editor = favorites.editor && favorites.editor.id === detail.id ? favorites.editor : null;
         current = {
           id: detail.id,
           status: detail.status,
@@ -2711,6 +3485,29 @@
           meta: detail.item && detail.item.createdAt !== null ? fill(TEXT.savedOn, { when: formatMoment(detail.item.createdAt, now) }) : "",
           error: detail.error,
           removing: removing ? { phase: removing.phase, error: removing.error } : null,
+          kind: detail.item ? detail.item.kind : "text",
+          version: detail.item ? detail.item.version : null,
+          notes: detail.item ? detail.item.notes : "",
+          servings: detail.item ? detail.item.servings : "",
+          ingredients: detail.item ? detail.item.ingredients : [],
+          steps: detail.item ? detail.item.steps : [],
+          updatedAt: detail.item ? detail.item.updatedAt : null,
+          editor: editor
+            ? {
+                phase: editor.phase,
+                error: editor.error,
+                draft: {
+                  title: editor.draft.title,
+                  text: editor.draft.text,
+                  notes: editor.draft.notes,
+                  servings: editor.draft.servings,
+                  ingredients: editor.draft.ingredients.map(function (ingredient) {
+                    return { name: ingredient.name, amount: ingredient.amount };
+                  }),
+                  steps: editor.draft.steps.slice(),
+                },
+              }
+            : null,
         };
       }
       return { status: favorites.status, error: favorites.error, items: items, current: current };
@@ -2745,7 +3542,22 @@
           canRetry: false,
         };
         if (message.role === "assistant") {
-          item.favorite = favoriteMark(message.id);
+          var recipes = structuredRecipes ? message.recipes : [];
+          item.recipes = recipes.map(function (recipe) {
+            var mark = recipeMark(message.id, recipe.position);
+            return {
+              position: recipe.position,
+              title: recipe.title,
+              state: mark.state,
+              favoriteId: mark.id,
+              error: mark.error,
+            };
+          });
+          // With the feature on, only an answer that carries validated recipes has Save
+          // controls -- one per recipe -- and an ordinary answer has none at all: the
+          // legacy whole-answer button is not a fallback for it. With the feature off
+          // nothing changes: every answer keeps the legacy whole-answer control.
+          item.favorite = structuredRecipes ? null : favoriteMark(message.id);
         }
         if (message.role === "user" && message.status === "in_progress") {
           item.note = TEXT.preparing;
@@ -2917,14 +3729,29 @@
         return track(openFavorite(id));
       },
       reloadFavorites: function () {
+        track(refreshOpenFavorite());
         return track(loadFavorites());
       },
       reloadRecipe: function () {
         return track(reloadRecipe());
       },
-      keepFavorite: function (conversationId, messageId) {
-        return track(keepFavorite(conversationId, messageId));
+      keepFavorite: function (conversationId, messageId, recipeIndex) {
+        return track(keepFavorite(conversationId, messageId, recipeIndex));
       },
+      beginEditFavorite: beginEditFavorite,
+      syncFavoriteDraft: syncFavoriteDraft,
+      updateFavoriteDraft: updateFavoriteDraft,
+      cancelEditFavorite: cancelEditFavorite,
+      saveFavoriteEdit: function (draft) {
+        return track(saveFavoriteEdit(draft));
+      },
+      reloadFavoriteAfterConflict: function () {
+        return track(reloadFavoriteAfterConflict());
+      },
+      overwriteFavorite: function (draft) {
+        return track(overwriteFavorite(draft));
+      },
+      hasUnsavedChanges: hasUnsavedChanges,
       askRemoveFavorite: askRemoveFavorite,
       cancelRemoveFavorite: cancelRemoveFavorite,
       removeFavorite: function () {

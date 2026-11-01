@@ -440,6 +440,7 @@ async def auth_app(
     provider: Optional[Any] = None,
     bot_settings: Optional[Any] = None,
     bot_transport: Optional[Any] = None,
+    structured_recipes: bool = False,
     **options: Any,
 ):
     """The application with Telegram login on, started, and a client for it.
@@ -447,7 +448,9 @@ async def auth_app(
     `chat_backend` answers chat messages (None: the chat is not configured, unless
     `provider` -- a ProviderSettings -- is given, which makes the application build the
     real OpenAI backend from it). `bot_settings` (a BotSettings) switches the Telegram bot on,
-    with `bot_transport` standing in for the network to the Bot API."""
+    with `bot_transport` standing in for the network to the Bot API. `structured_recipes`
+    switches the recipe protocol on for the backend the application builds and for the
+    shell the page reads."""
     url = sqlite_url(tmp_path / "auth.db")
     engine = create_db_engine(url)
     upgrade_database(engine)
@@ -457,7 +460,13 @@ async def auth_app(
     settings = auth_settings(origin, **options)
     telegram = FakeTelegram(clock, settings)
     app = create_app(
-        WebSettings(database_url=url, auth=settings, provider=provider, telegram_bot=bot_settings),
+        WebSettings(
+            database_url=url,
+            auth=settings,
+            provider=provider,
+            telegram_bot=bot_settings,
+            structured_recipes=structured_recipes,
+        ),
         provider_transport=telegram.transport(),
         clock=clock,
         chat_backend=chat_backend,

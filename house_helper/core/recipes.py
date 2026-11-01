@@ -288,10 +288,12 @@ def validate_recipe(
     This is the protocol's acceptance rule as a public function, for the places that
     store or edit a recipe after it was parsed: a structured recipe of a message, and
     a favourite made from one. It checks the field types, the lengths, the control
-    characters, the protocol markers and the per-block size exactly as _recipe_from_json
-    does, and returns the validated Recipe. It does NOT spell the text (replace_yo):
-    parsed answers were already spelled when they were stored, and an edit is kept as
-    it was entered. ValueError for anything the protocol would not have accepted.
+    characters, the protocol markers and the per-block size, and returns the validated
+    Recipe. The size is measured on the compact wire form, so a recipe the parser
+    accepted from a block within MAX_RECIPE_BLOCK_LENGTH is never refused here for a
+    longer spelling of the same fields. It does NOT spell the text (replace_yo): parsed
+    answers were already spelled when they were stored, and an edit is kept as it was
+    entered. ValueError for anything the protocol would not have accepted.
 
     `index` is the position the recipe holds among the accepted recipes of its answer.
     `ingredients` is a list or tuple of Ingredient objects or of objects with exactly
@@ -338,6 +340,11 @@ def validate_recipe(
         ingredients=tuple(checked_ingredients),
         steps=checked_steps,
     )
+    # The size is measured on the compact wire form, the minimal JSON that carries these
+    # fields. A block the parser accepted is at most MAX_RECIPE_BLOCK_LENGTH characters on
+    # the wire (whitespace and escapes make it longer, never shorter), so a recipe that
+    # came from parse_reply is never refused here for being "too large" merely because
+    # this check spelled the same fields with pretty separators.
     block = json.dumps(
         {
             "title": recipe.title,
@@ -349,6 +356,7 @@ def validate_recipe(
             "steps": list(recipe.steps),
         },
         ensure_ascii=False,
+        separators=(",", ":"),
     )
     if len(block) > MAX_RECIPE_BLOCK_LENGTH:
         raise ValueError("the recipe is too large")

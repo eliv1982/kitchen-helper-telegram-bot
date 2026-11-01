@@ -100,7 +100,9 @@ from uuid import UUID
 import sqlalchemy as sa
 from sqlalchemy.orm import Session as OrmSession
 
+from house_helper.core.recipes import Recipe
 from house_helper.persistence import attachments as att
+from house_helper.persistence import message_recipes
 from house_helper.persistence.base import RETENTION, utcnow
 from house_helper.persistence.conversations import ConversationNotFound, build_context
 from house_helper.persistence.identifiers import validate_idempotency_key
@@ -267,6 +269,10 @@ class CompletedTurn:
     user_message: StoredMessage
     assistant_message: StoredMessage
     truncated: bool
+    # The answer's validated structured recipes, in answer order (empty when it carried
+    # none). They belong to assistant_message and are stored in the transaction that
+    # stored it; a replay reads them back, so it never regenerates them.
+    recipes: tuple[message_recipes.StoredRecipe, ...] = ()
 
 
 def _lock_conversation(session: OrmSession, user_id: UUID, conversation_id: UUID) -> Conversation:
@@ -347,6 +353,7 @@ def _completed(session: OrmSession, turn: TurnRequest, now: datetime) -> Complet
         user_message=_stored(user, photo),
         assistant_message=_stored(assistant),
         truncated=bool(payload.get("truncated")),
+        recipes=message_recipes.stored_recipes_for_message(session, assistant.id),
     )
 
 
@@ -521,16 +528,22 @@ def complete_turn(
     *,
     truncated: bool,
     clock: Callable[[], datetime],
+    recipes: tuple[Recipe, ...] = (),
 ) -> CompletedTurn:
     """Store the assistant's reply and complete the request, as one transaction.
 
     `clock` is called once, after the conversation has been locked (see begin_turn).
     The conversation's activity time moves to that instant, the reply is stored as an
     assistant message that expires RETENTION after it, and the request moves
-    PROCESSING -> COMPLETED with the reply in result_payload. LeaseLost if the attempt
-    no longer owns the request: it ended or was retired, another attempt claimed it, or
-    this attempt's own lease has run out at that instant (the exception rolls
-    everything back, the message included).
+    PROCESSING -> COMPLETED with the reply in result_payload. The validated structured
+    `recipes` the same answer produced are stored beside the message in this very
+    transaction (message_recipes.record_validated_recipes), so there is never a message
+    without the recipes it was committed with, nor a recipe without its message. A
+    failure there rolls the whole turn back.
+
+    LeaseLost if the attempt no longer owns the request: it ended or was retired,
+    another attempt claimed it, or this attempt's own lease has run out at that instant
+    (the exception rolls everything back, the message and its recipes included).
     """
     if not isinstance(reply, str) or not reply:
         raise ValueError("a reply needs text")
@@ -579,6 +592,11 @@ def complete_turn(
         .values(updated_at=now)
         .execution_options(synchronize_session=False)
     )
+    stored_recipes = (
+        message_recipes.record_validated_recipes(session, message.id, recipes, now=now)
+        if recipes
+        else ()
+    )
     user = session.get(Message, claim.user_message_id)
     photo = att.refs_for_messages(session, [user.id], now=now).get(user.id)
     return CompletedTurn(
@@ -587,6 +605,7 @@ def complete_turn(
         user_message=_stored(user, photo),
         assistant_message=_stored(message),
         truncated=truncated,
+        recipes=stored_recipes,
     )
 
 

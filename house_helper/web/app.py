@@ -97,7 +97,11 @@ async def _lifespan(app: FastAPI):
     bot_http: Optional[httpx.AsyncClient] = None
     backend: Optional[ChatBackend] = app.state.chat_backend
     if backend is None and settings.provider is not None:
-        backend = StandaloneOpenAIBackend(settings.provider)
+        # The switch is read once, here: off (the default) sends exactly the prompt this
+        # application has always sent and never looks for protocol blocks.
+        backend = StandaloneOpenAIBackend(
+            settings.provider, recipe_protocol=settings.structured_recipes
+        )
     try:
         oidc: Optional[TelegramOidc] = None
         if settings.auth is not None:

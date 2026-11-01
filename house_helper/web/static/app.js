@@ -88,6 +88,9 @@
   }
 
   var maxLength = parseLimit(body.getAttribute("data-max-length"));
+  // The server's structured-recipe switch (public feature flag): when it is off the page
+  // offers no per-recipe Save control, even for an answer that has stored recipes.
+  var structuredRecipes = body.getAttribute("data-structured-recipes") === "1";
 
   // --- small helpers ---------------------------------------------------------------------
 
@@ -109,6 +112,11 @@
         node.className = value;
       } else if (name === "text") {
         node.textContent = value;
+      } else if (name === "value") {
+        // A form field's current value, as a property (the attribute alone is only the
+        // default value and does not follow what the page means to show).
+        node.value = String(value);
+        node.setAttribute("value", String(value));
       } else {
         node.setAttribute(name, value === true ? "" : String(value));
       }
@@ -187,6 +195,7 @@
       return Date.now();
     },
     maxLength: maxLength,
+    structuredRecipes: structuredRecipes,
     onChange: scheduleRender,
     announce: announce,
   });
@@ -603,12 +612,358 @@
       if (current.meta) {
         box.appendChild(h("p", { class: "hint recipe-meta", text: current.meta }));
       }
-      var text = textBlocks(current.text);
-      text.className += " recipe-text";
-      box.appendChild(text);
-      box.appendChild(removalControls(current));
+      if (current.editor) {
+        box.appendChild(recipeEditor(current));
+      } else {
+        box.appendChild(recipeContent(current));
+        box.appendChild(
+          h("div", { class: "recipe-actions" }, [
+            action(Logic.TEXT.editAction, "btn-secondary", function () {
+              wantFocus = "edit-title";
+              controller.beginEditFavorite();
+            }),
+          ])
+        );
+        box.appendChild(removalControls(current));
+      }
     }
     box.scrollTop = scrolled;
+  }
+
+  // The card as it was stored: a structured favorite draws its fields (the text is the
+  // same content rendered for older clients), a legacy one draws its text exactly as it
+  // is. All of it goes into the page as text nodes.
+  function recipeContent(current) {
+    var wrapper = h("div", { class: "recipe-content" });
+    if (current.kind === "structured") {
+      if (current.servings) {
+        wrapper.appendChild(
+          h("p", { class: "recipe-servings" }, [
+            h("span", { class: "visually-hidden", text: Logic.TEXT.servings + ": " }),
+            document.createTextNode(current.servings),
+          ])
+        );
+      }
+      wrapper.appendChild(
+        recipeSection(
+          Logic.TEXT.ingredients,
+          h(
+            "ul",
+            { class: "recipe-list" },
+            current.ingredients.map(function (ingredient) {
+              return h("li", { text: ingredient.name + " — " + ingredient.amount });
+            })
+          )
+        )
+      );
+      wrapper.appendChild(
+        recipeSection(
+          Logic.TEXT.steps,
+          h(
+            "ol",
+            { class: "recipe-list recipe-steps" },
+            current.steps.map(function (step) {
+              return h("li", { text: step });
+            })
+          )
+        )
+      );
+    } else {
+      var text = textBlocks(current.text);
+      text.className += " recipe-text";
+      wrapper.appendChild(text);
+    }
+    if (current.notes) {
+      wrapper.appendChild(recipeSection(Logic.TEXT.notes, textBlocks(current.notes)));
+    }
+    return wrapper;
+  }
+
+  function recipeSection(title, body) {
+    return h("section", { class: "recipe-section" }, [h("h2", { class: "recipe-heading", text: title }), body]);
+  }
+
+  // The editor. Nothing is sent until Save; every button collects the fields as they are
+  // in the page first, so a change typed but not yet acted on is never lost by a redraw.
+  function recipeEditor(current) {
+    var editor = current.editor;
+    var draft = editor.draft;
+    var saving = editor.phase === "saving";
+    var conflict = editor.phase === "conflict";
+    var structured = current.kind === "structured";
+    var ingredientInputs = [];
+    var stepInputs = [];
+
+    function field(labelText, input) {
+      // The field is inside its label, so it is associated without an id to invent and
+      // the label is a target a thumb can hit.
+      return h("label", { class: "edit-field" }, [
+        h("span", { class: "edit-label", text: labelText }),
+        input,
+      ]);
+    }
+
+    function textArea(value, rows) {
+      var node = h("textarea", { rows: rows, readonly: saving, value: false });
+      node.textContent = value;
+      node.value = value;
+      return node;
+    }
+
+    function collect() {
+      return {
+        title: titleInput.value,
+        text: textField ? textField.value : draft.text,
+        notes: notesField.value,
+        servings: servingsInput ? servingsInput.value : draft.servings,
+        ingredients: ingredientInputs.map(function (pair) {
+          return { name: pair.name.value, amount: pair.amount.value };
+        }),
+        steps: stepInputs.map(function (input) {
+          return input.value;
+        }),
+      };
+    }
+
+    // Typing is kept in the controller's draft as it happens, not only in the page: a
+    // session recheck, a return to the tab, an online event or any other redrawing
+    // rebuilds this form from the draft, and an edit that was typed but not submitted
+    // must survive it. Nothing is redrawn here (that would take the caret away) and
+    // nothing is sent.
+    function keepDraft(node) {
+      node.addEventListener("input", function () {
+        controller.syncFavoriteDraft(collect());
+      });
+      return node;
+    }
+
+    function submitEdit() {
+      if (saving) {
+        return;
+      }
+      var saved = conflict
+        ? controller.overwriteFavorite(collect())
+        : controller.saveFavoriteEdit(collect());
+      if (saved && saved.then) {
+        saved.then(
+          function (result) {
+            if (result && result.ok) {
+              els.recipeTitle.focus(); // (the form is gone; the card is back)
+            }
+          },
+          function () {
+            // (the controller reports a failed save in the editor; nothing to add here)
+          }
+        );
+      }
+    }
+
+    function moveStep(index, delta) {
+      var target = index + delta;
+      if (saving || target < 0 || target >= stepInputs.length) {
+        return;
+      }
+      var next = collect();
+      var moved = next.steps.splice(index, 1)[0];
+      next.steps.splice(target, 0, moved);
+      controller.updateFavoriteDraft(next);
+    }
+
+    var form = h("form", { class: "recipe-editor", novalidate: true, "aria-label": "Редактирование рецепта" });
+    form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      submitEdit();
+    });
+
+    var titleInput = keepDraft(h("input", {
+      id: "recipe-edit-title",
+      class: "edit-title",
+      type: "text",
+      value: draft.title,
+      readonly: saving,
+      autocomplete: "off",
+    }));
+    focusNodes["edit-title"] = titleInput;
+    form.appendChild(field(Logic.TEXT.editTitleLabel, titleInput));
+
+    var textField = null;
+    var servingsInput = null;
+    if (structured) {
+      servingsInput = keepDraft(h("input", {
+        class: "edit-servings",
+        type: "text",
+        value: draft.servings,
+        readonly: saving,
+        autocomplete: "off",
+      }));
+      form.appendChild(field(Logic.TEXT.editServingsLabel, servingsInput));
+
+      var ingredients = h("div", { class: "edit-lines" });
+      draft.ingredients.forEach(function (ingredient, index) {
+        var name = keepDraft(h("input", {
+          class: "ingredient-name",
+          type: "text",
+          value: ingredient.name,
+          readonly: saving,
+          autocomplete: "off",
+          "aria-label": Logic.TEXT.editIngredientName + " " + (index + 1),
+        }));
+        var amount = keepDraft(h("input", {
+          class: "ingredient-amount",
+          type: "text",
+          value: ingredient.amount,
+          readonly: saving,
+          autocomplete: "off",
+          "aria-label": Logic.TEXT.editIngredientAmount + " " + (index + 1),
+        }));
+        ingredientInputs.push({ name: name, amount: amount });
+        ingredients.appendChild(
+          h("div", { class: "edit-row" }, [
+            name,
+            amount,
+            action(
+              "Удалить",
+              "btn-quiet",
+              function () {
+                var next = collect();
+                next.ingredients.splice(index, 1);
+                controller.updateFavoriteDraft(next);
+              },
+              Logic.TEXT.editRemoveIngredient + " " + (index + 1)
+            ),
+          ])
+        );
+      });
+      form.appendChild(
+        h("section", { class: "edit-section" }, [
+          h("h2", { class: "recipe-heading", text: Logic.TEXT.ingredients }),
+          ingredients,
+          action(Logic.TEXT.editAddIngredient, "btn-secondary", function () {
+            if (saving) {
+              return;
+            }
+            var next = collect();
+            next.ingredients.push({ name: "", amount: "" });
+            controller.updateFavoriteDraft(next);
+          }),
+        ])
+      );
+
+      var steps = h("div", { class: "edit-lines" });
+      draft.steps.forEach(function (step, index) {
+        var input = keepDraft(h("input", {
+          class: "edit-step",
+          type: "text",
+          value: step,
+          readonly: saving,
+          autocomplete: "off",
+          "aria-label": Logic.TEXT.editStep + " " + (index + 1),
+        }));
+        stepInputs.push(input);
+        steps.appendChild(
+          h("div", { class: "edit-row edit-row-step" }, [
+            input,
+            action(
+              Logic.TEXT.editMoveUp,
+              "btn-quiet",
+              function () {
+                moveStep(index, -1);
+              },
+              Logic.TEXT.editMoveUp + " " + (index + 1)
+            ),
+            action(
+              Logic.TEXT.editMoveDown,
+              "btn-quiet",
+              function () {
+                moveStep(index, 1);
+              },
+              Logic.TEXT.editMoveDown + " " + (index + 1)
+            ),
+            action(
+              "Удалить",
+              "btn-quiet",
+              function () {
+                var next = collect();
+                next.steps.splice(index, 1);
+                controller.updateFavoriteDraft(next);
+              },
+              Logic.TEXT.editRemoveStep + " " + (index + 1)
+            ),
+          ])
+        );
+      });
+      form.appendChild(
+        h("section", { class: "edit-section" }, [
+          h("h2", { class: "recipe-heading", text: Logic.TEXT.steps }),
+          steps,
+          action(Logic.TEXT.editAddStep, "btn-secondary", function () {
+            if (saving) {
+              return;
+            }
+            var next = collect();
+            next.steps.push("");
+            controller.updateFavoriteDraft(next);
+          }),
+        ])
+      );
+    } else {
+      textField = keepDraft(textArea(draft.text, 10));
+      textField.className = "edit-text";
+      textField.setAttribute("aria-label", Logic.TEXT.editTextLabel);
+      form.appendChild(field(Logic.TEXT.editTextLabel, textField));
+    }
+
+    var notesField = keepDraft(textArea(draft.notes, 3));
+    notesField.className = "edit-notes";
+    notesField.setAttribute("aria-label", Logic.TEXT.editNotesLabel);
+    form.appendChild(field(Logic.TEXT.editNotesLabel, notesField));
+
+    if (editor.error) {
+      form.appendChild(
+        h("p", { class: "notice notice-error", role: "alert", text: editor.error.text })
+      );
+      if (editor.error.correlationId) {
+        form.appendChild(
+          h("p", { class: "hint", text: Logic.TEXT.correlation.replace("{id}", editor.error.correlationId) })
+        );
+      }
+    }
+
+    var buttons = h("div", { class: "edit-actions" });
+    if (conflict) {
+      // A real submit button, so Enter in a field also sends the form.
+      buttons.appendChild(
+        h("button", {
+          class: "btn btn-primary",
+          type: "submit",
+          text: Logic.TEXT.editOverwrite,
+        })
+      );
+      buttons.appendChild(
+        action(Logic.TEXT.editReload, "btn-secondary", function () {
+          controller.reloadFavoriteAfterConflict();
+        })
+      );
+    } else {
+      buttons.appendChild(
+        h("button", {
+          class: "btn " + (saving ? "btn-quiet" : "btn-primary"),
+          type: "submit",
+          text: saving ? Logic.TEXT.editSaving : Logic.TEXT.editSave,
+          "aria-disabled": saving ? "true" : false,
+        })
+      );
+    }
+    buttons.appendChild(
+      action(Logic.TEXT.editCancel, "btn-quiet", function () {
+        if (saving) {
+          return;
+        }
+        controller.cancelEditFavorite();
+      })
+    );
+    form.appendChild(buttons);
+    return form;
   }
 
   // "Убрать из избранного", and after it the question, which is answered before anything is removed.
@@ -655,7 +1010,22 @@
     return row;
   }
 
+  // Opening another card or leaving the page gives up an open editor: ask first, unless
+  // the browser has nobody to ask (the call is best effort).
+  function leaveEditor() {
+    if (!controller.hasUnsavedChanges()) {
+      return true;
+    }
+    if (typeof window.confirm !== "function") {
+      return true;
+    }
+    return window.confirm(Logic.TEXT.editUnsaved);
+  }
+
   function openFavorite(id) {
+    if (!leaveEditor()) {
+      return;
+    }
     setDrawer(false, false);
     wantFocus = "recipe";
     controller.openFavorite(id);
@@ -695,6 +1065,70 @@
           }
         });
       }, "Сохранить этот ответ в избранное")
+    );
+    return row;
+  }
+
+  // A recipe title on a control: long enough to know which recipe, short enough for a
+  // phone. (The title itself may be up to 200 characters; it stays a text node.)
+  function shortTitle(title) {
+    var points = Array.from(String(title));
+    return points.length <= 48 ? String(title) : points.slice(0, 48).join("") + "…";
+  }
+
+  // Under an answer that carries structured recipes: one independent Save control for
+  // each, named by the recipe and identified by (message, position). One recipe's state
+  // never changes another's.
+  function recipeActions(recipe, messageId, conversationId) {
+    var row = h("div", { class: "msg-actions msg-favorite" });
+    var shown = shortTitle(recipe.title);
+    var label = Logic.TEXT.saveRecipeNamed.replace("{title}", shown);
+    if (recipe.state === "saved") {
+      row.appendChild(
+        h("span", { class: "fav-mark", text: shown + " — " + Logic.TEXT.recipeSaved })
+      );
+      row.appendChild(
+        action(
+          Logic.TEXT.openRecipe,
+          "btn-quiet",
+          function () {
+            openFavorite(recipe.favoriteId);
+          },
+          "Открыть сохраненный рецепт «" + recipe.title + "»"
+        )
+      );
+      return row;
+    }
+    if (recipe.state === "saving") {
+      row.appendChild(
+        h("p", { class: "msg-note" }, [
+          h("span", { class: "spinner", "aria-hidden": "true" }),
+          h("span", { text: shown + ": " + Logic.TEXT.recipeSaving }),
+        ])
+      );
+      return row;
+    }
+    if (recipe.state === "error") {
+      row.appendChild(
+        h("p", { class: "msg-note msg-note-error", text: shown + ": " + recipe.error.text })
+      );
+    }
+    row.appendChild(
+      action(label, "btn-quiet", function () {
+        controller.keepFavorite(conversationId, messageId, recipe.position).then(function (result) {
+          if (result && !result.ok && result.reason !== "busy" && result.reason !== "stale") {
+            var failed = lastView && lastView.thread.items.filter(function (item) {
+              return item.type === "message" && item.id === messageId;
+            })[0];
+            var mark = failed && failed.recipes ? failed.recipes.filter(function (found) {
+              return found.position === recipe.position;
+            })[0] : null;
+            if (mark && mark.error) {
+              alertText(mark.error.text);
+            }
+          }
+        });
+      }, label)
     );
     return row;
   }
@@ -758,7 +1192,11 @@
         );
         node.appendChild(row);
       }
-      if (item.favorite) {
+      if (item.recipes && item.recipes.length) {
+        item.recipes.forEach(function (recipe) {
+          node.appendChild(recipeActions(recipe, item.id, conversationId));
+        });
+      } else if (item.favorite) {
         node.appendChild(favoriteActions(item.favorite, item.id, conversationId));
       }
       return node;
@@ -1111,6 +1549,9 @@
     if (els.logout.getAttribute("aria-disabled") === "true") {
       return;
     }
+    if (!leaveEditor()) {
+      return;
+    }
     els.logout.setAttribute("aria-disabled", "true");
     controller.logout().then(
       function () {
@@ -1181,6 +1622,14 @@
 
   window.addEventListener("online", function () {
     controller.recheck();
+  });
+  // A refresh or a closed tab cannot be stopped by the application: the browser's own
+  // question is the best that can be done for an editor that was not saved.
+  window.addEventListener("beforeunload", function (event) {
+    if (controller.hasUnsavedChanges()) {
+      event.preventDefault();
+      event.returnValue = "";
+    }
   });
   // A page restored from the browser's back/forward cache is as it was when it was left, which may be
   // the page of somebody who has signed out since: ask who is signed in again.

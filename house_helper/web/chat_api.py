@@ -35,6 +35,15 @@ the Telegram bot's: 400 invalid_idempotency_key) is required, and the body is
          error, and sending again with the SAME key tries again. A failed message does
          not become part of what the assistant is shown later.
 
+Structured recipes. An assistant answer may carry validated recipes (the protocol of
+house_helper.core.recipes, when the owner has switched it on). The history and the turn
+answer name each of them as `"recipes": [{"position": 0, "title": "..."}]` on the
+assistant message; that is all the page needs to offer one Save control for each, and the
+favorite itself is copied by the favorites API from the stored recipe. A message without
+one has no `recipes` field at all, so an ordinary answer keeps the response shape it
+always had. The text is always the rendered answer: no marker or JSON block reaches a
+client.
+
 Errors. The catalogue and the shape of every error body are in diagnostics.py. Every
 response, success or error, carries X-Correlation-ID (made by the server for this
 request), `Cache-Control: no-store` and `Referrer-Policy: no-referrer`. Nothing the
@@ -70,7 +79,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from starlette.requests import ClientDisconnect
 
 from house_helper.core.limits import MAX_INPUT_LENGTH
-from house_helper.persistence import attachments, conversations
+from house_helper.persistence import attachments, conversations, message_recipes
 from house_helper.persistence.authn import AuthenticatedSession
 from house_helper.persistence.conversations import ConversationNotFound, MessageView
 from house_helper.persistence.identifiers import TELEGRAM_UPDATE_KEY_PREFIX, validate_idempotency_key
@@ -209,10 +218,11 @@ def _query_number(
     return number
 
 
-async def _read_json_object(request: Request) -> dict:
+async def _read_json_object(request: Request, *, limit: int = MAX_BODY) -> dict:
     """The body as a JSON object. ApiError for anything else: a content type other than
-    application/json (UTF-8 if it says), a body over MAX_BODY, bytes that are not UTF-8,
-    JSON that does not parse or repeats a key, or a value that is not an object."""
+    application/json (UTF-8 if it says), a body over `limit` (MAX_BODY unless the route
+    has a larger bound of its own), bytes that are not UTF-8, JSON that does not parse or
+    repeats a key, or a value that is not an object."""
     media, *parameters = (part.strip() for part in request.headers.get("content-type", "").split(";"))
     if media.lower() != "application/json":
         raise ApiError("unsupported_media_type")
@@ -222,12 +232,12 @@ async def _read_json_object(request: Request) -> dict:
             raise ApiError("unsupported_media_type")
 
     declared = request.headers.get("content-length")
-    if declared is not None and (not declared.isascii() or not declared.isdigit() or int(declared) > MAX_BODY):
+    if declared is not None and (not declared.isascii() or not declared.isdigit() or int(declared) > limit):
         raise ApiError("request_too_large")
     chunks, size = [], 0
     async for chunk in request.stream():
         size += len(chunk)
-        if size > MAX_BODY:
+        if size > limit:
             raise ApiError("request_too_large")
         chunks.append(chunk)
 
@@ -300,7 +310,19 @@ def _conversation_json(summary: conversations.ConversationSummary) -> dict[str, 
     }
 
 
-def _message_json(view: MessageView) -> dict[str, Any]:
+def _recipe_json(
+    recipe: message_recipes.RecipeSummary | message_recipes.StoredRecipe,
+) -> dict[str, Any]:
+    """One stored recipe as the page names it under its answer: where to save it from
+    (message id is the message's own) and what to call its button. The recipe itself is
+    read by the favorites API when the person saves it."""
+    return {"position": recipe.position, "title": recipe.title}
+
+
+def _message_json(
+    view: MessageView,
+    recipes: tuple[message_recipes.RecipeSummary, ...] = (),
+) -> dict[str, Any]:
     body: dict[str, Any] = {
         "id": view.id,
         "role": view.role,
@@ -314,6 +336,10 @@ def _message_json(view: MessageView) -> dict[str, Any]:
         body["error_code"] = view.error_code
     if view.attachment is not None:
         body["attachments"] = [_attachment_json(view.attachment)]
+    if recipes:
+        # Only an answer of the assistant can have them, and only when it carried some:
+        # an ordinary answer keeps the response shape it always had.
+        body["recipes"] = [_recipe_json(recipe) for recipe in recipes]
     return body
 
 
@@ -338,16 +364,19 @@ def _turn_json(result: TurnResult) -> dict[str, Any]:
     }
     if done.user_message.attachment is not None:
         user_message["attachments"] = [_attachment_json(done.user_message.attachment)]
+    assistant_message: dict[str, Any] = {
+        "id": done.assistant_message.id,
+        "role": "assistant",
+        "text": done.assistant_message.text,
+        "created_at": _timestamp(done.assistant_message.created_at),
+        "status": conversations.MESSAGE_COMPLETED,
+    }
+    if done.recipes:
+        assistant_message["recipes"] = [_recipe_json(recipe) for recipe in done.recipes]
     return {
         "conversation_id": str(done.conversation_id),
         "user_message": user_message,
-        "assistant_message": {
-            "id": done.assistant_message.id,
-            "role": "assistant",
-            "text": done.assistant_message.text,
-            "created_at": _timestamp(done.assistant_message.created_at),
-            "status": conversations.MESSAGE_COMPLETED,
-        },
+        "assistant_message": assistant_message,
         "truncated": done.truncated,
         "replayed": result.replayed,
     }
@@ -437,18 +466,29 @@ async def list_messages(
     )
     before = _query_number(request, "before", default=None, low=1, high=2**62)
     now = request.app.state.clock()
-    try:
-        page = await database.run(
-            lambda session: conversations.list_messages(
-                session, current.user_id, wanted, now=now, limit=limit, before=before
-            )
+
+    def read_history(session: Any) -> Any:
+        page = conversations.list_messages(
+            session, current.user_id, wanted, now=now, limit=limit, before=before
         )
+        # One extra read in the same transaction: which of the visible answers carry
+        # structured recipes, so the page can offer one Save control for each. The
+        # caller has just found these messages through the user's conversation.
+        recipes = message_recipes.summaries_for_messages(
+            session, [view.id for view in page.messages]
+        )
+        return page, recipes
+
+    try:
+        page, recipes = await database.run(read_history)
     except ConversationNotFound:
         raise ApiError("conversation_not_found") from None
     return JSONResponse(
         {
             "conversation_id": str(wanted),
-            "messages": [_message_json(view) for view in page.messages],
+            "messages": [
+                _message_json(view, recipes.get(view.id, ())) for view in page.messages
+            ],
             "has_more": page.has_more,
             "next_before": page.messages[0].id if page.has_more and page.messages else None,
         }

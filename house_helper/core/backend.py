@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from house_helper.core.identity import ConversationKey
+from house_helper.core.recipes import Recipe
 
 
 class BackendError(Exception):
@@ -51,11 +52,19 @@ class BackendReply:
     `truncated` is True when the provider stopped because the answer reached the
     length cap, so `text` ends mid-thought. Only a backend that can tell sets it;
     the default (False) is what every other one means.
+
+    `recipes` are the validated structured recipes of the same answer, in its
+    order. A backend parses the provider's own output before it renders `text`
+    (see StandaloneOpenAIBackend); `text` is always the plain rendering a person
+    may read, with no protocol markers, and the recipes are never extracted from
+    it afterwards. Empty when the backend does not speak the protocol or the
+    answer carried none.
     """
 
     text: str
     usage: dict[str, int] | None = None
     truncated: bool = False
+    recipes: tuple[Recipe, ...] = ()
 
 
 class ChatBackend(Protocol):

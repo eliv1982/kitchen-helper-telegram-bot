@@ -14,9 +14,10 @@ it is a hash of the fields, not a key, and editing a favourite would make it mea
 Ownership. There is no user column here. A recipe belongs to an assistant message, which
 belongs to a conversation, which belongs to a user; every read that serves a request takes
 the user id of the server-side session and joins through the conversation, so a recipe of
-somebody else's answer is not found. The supported writer, record_recipes_for_message, is
-run by the code that owns the message (a later increment stores the recipes when the
-answer is committed; this stage does not call it from the turn runner).
+somebody else's answer is not found. There are two writers: record_validated_recipes takes
+the Recipe objects a backend already parsed and validated, and is what the turn runner
+calls (through persistence.turns.complete_turn) in the transaction that stores the answer;
+record_recipes_for_message parses a stored answer, for a caller that has only its text.
 
 Retention. The parent is an assistant message and the foreign key is ON DELETE CASCADE:
 a recipe is deleted with its message when the 365-day retention expires it, when its
@@ -30,10 +31,13 @@ values are validated again by the protocol's own rules (recipes.validate_recipe)
 are read for a copy, so a row hand-edited in the database cannot become a favourite that
 the protocol would not have produced.
 
-Writers write first, as everywhere in this layer (see persistence.database):
-record_recipes_for_message starts with a DELETE (it replaces the recipes of its message,
-so running it twice for one answer leaves one set). Reads write nothing. Nothing here
-commits; the caller owns the transaction. Results are plain values, not ORM objects.
+Writers write first, as everywhere in this layer (see persistence.database): both
+record_validated_recipes and record_recipes_for_message start with a DELETE (they replace
+the recipes of their message, so running one twice for an answer leaves one set).
+Positions are the place of each accepted recipe in the answer (0, 1, ...), assigned when
+it is written; the protocol's content fingerprint is not a stored key. Reads write
+nothing. Nothing here commits; the caller owns the transaction. Results are plain values,
+not ORM objects.
 """
 
 from dataclasses import dataclass
@@ -44,7 +48,7 @@ from uuid import UUID
 import sqlalchemy as sa
 from sqlalchemy.orm import Session as OrmSession
 
-from house_helper.core.recipes import Ingredient, parse_reply, validate_recipe
+from house_helper.core.recipes import Ingredient, Recipe, parse_reply, validate_recipe
 from house_helper.persistence.models import (
     Conversation,
     Message,
@@ -77,6 +81,15 @@ class StoredRecipe:
     ingredients: tuple[Ingredient, ...]
     steps: tuple[str, ...]
     created_at: datetime
+
+
+@dataclass(frozen=True)
+class RecipeSummary:
+    """Enough of one stored recipe to name it under its answer: where it is and its title."""
+
+    message_id: int
+    position: int
+    title: str
 
 
 def _ingredients(value: Any) -> tuple[Ingredient, ...]:
@@ -113,17 +126,20 @@ def _checked(recipe: StoredRecipe) -> StoredRecipe:
     )
 
 
-def record_recipes_for_message(
-    session: OrmSession, message_id: int, text: str, *, now: datetime
+def record_validated_recipes(
+    session: OrmSession, message_id: int, recipes: Iterable[Recipe], *, now: datetime
 ) -> tuple[StoredRecipe, ...]:
-    """Parse `text` and replace the recipes of the assistant message `message_id` with them.
+    """Replace the recipes of the assistant message `message_id` with `recipes`.
 
-    An answer with no accepted recipe leaves none (and clears any earlier set, so a retry
-    of the same completion does not duplicate or keep stale rows). Invalid blocks are not
-    stored; the parser's notices are for the person, not the database. NotAnAnswer if the
-    message does not exist or is not an assistant message. The DELETE is the first
-    statement. The caller owns the transaction and has established that the message is
-    the user's; this function has no user argument because a recipe has no owner.
+    The recipes are the validated objects a backend carried beside its rendered text
+    (BackendReply.recipes); they are never extracted from rendered text here. Positions
+    are the deterministic place of each recipe in this sequence (0, 1, ...), and every
+    recipe is checked by the protocol's own rules again before it is stored. An empty
+    sequence leaves none (and clears any earlier set, so a retry of the same completion
+    does not duplicate or keep stale rows). NotAnAnswer if the message does not exist or
+    is not an assistant message. The DELETE is the first statement. The caller owns the
+    transaction and has established that the message is the user's; this function has
+    no user argument because a recipe has no owner.
     """
     session.execute(
         sa.delete(MessageRecipe)
@@ -133,36 +149,57 @@ def record_recipes_for_message(
     role = session.scalar(sa.select(Message.role).where(Message.id == message_id))
     if role != MessageRole.ASSISTANT.value:
         raise NotAnAnswer
-    parsed = parse_reply(text)
-    rows = [
-        MessageRecipe(
-            message_id=message_id,
-            position=recipe.index,
-            title=recipe.title,
-            servings=recipe.servings,
-            ingredients=[
-                {"name": ingredient.name, "amount": ingredient.amount}
-                for ingredient in recipe.ingredients
-            ],
-            steps=list(recipe.steps),
-            created_at=now,
+
+    stored: list[StoredRecipe] = []
+    rows: list[MessageRecipe] = []
+    for position, recipe in enumerate(recipes):
+        if not isinstance(recipe, Recipe):
+            raise ValueError("a recipe must be a validated Recipe")
+        checked = validate_recipe(
+            position, recipe.title, recipe.servings, recipe.ingredients, recipe.steps
         )
-        for recipe in parsed.recipes
-    ]
+        rows.append(
+            MessageRecipe(
+                message_id=message_id,
+                position=checked.index,
+                title=checked.title,
+                servings=checked.servings,
+                ingredients=[
+                    {"name": ingredient.name, "amount": ingredient.amount}
+                    for ingredient in checked.ingredients
+                ],
+                steps=list(checked.steps),
+                created_at=now,
+            )
+        )
+        stored.append(
+            StoredRecipe(
+                message_id=message_id,
+                position=checked.index,
+                title=checked.title,
+                servings=checked.servings,
+                ingredients=checked.ingredients,
+                steps=checked.steps,
+                created_at=now,
+            )
+        )
     session.add_all(rows)
     session.flush()
-    return tuple(
-        StoredRecipe(
-            message_id=message_id,
-            position=recipe.index,
-            title=recipe.title,
-            servings=recipe.servings,
-            ingredients=recipe.ingredients,
-            steps=recipe.steps,
-            created_at=now,
-        )
-        for recipe in parsed.recipes
-    )
+    return tuple(stored)
+
+
+def record_recipes_for_message(
+    session: OrmSession, message_id: int, text: str, *, now: datetime
+) -> tuple[StoredRecipe, ...]:
+    """Parse `text` and replace the recipes of the assistant message `message_id` with them.
+
+    For a caller that has the answer's text only, such as a repair or a test. The live
+    turn path uses record_validated_recipes: its text is already rendered and no longer
+    carries the blocks. The rules are otherwise the same -- an answer with no accepted
+    recipe leaves none, invalid blocks are not stored, the DELETE is first, and the
+    caller owns the transaction.
+    """
+    return record_validated_recipes(session, message_id, parse_reply(text).recipes, now=now)
 
 
 def recipe_at(session: OrmSession, message_id: int, position: int) -> StoredRecipe:
@@ -204,6 +241,60 @@ def _owned_message(session: OrmSession, user_id: UUID, message_id: int, *, now: 
     if found is None:
         raise MessageNotFound
     return found
+
+
+def stored_recipes_for_message(
+    session: OrmSession, message_id: int
+) -> tuple[StoredRecipe, ...]:
+    """Every stored recipe of `message_id`, in answer order, with no ownership check.
+
+    For a caller that has already established ownership of the message in the same
+    transaction (persistence.turns._completed replays a request that was found under the
+    user's conversation lock). A request-facing read uses recipes_for_message. A plain
+    read; the rows are not validated again, because a replay must answer with what was
+    stored, not fail over a hand-edited row.
+    """
+    rows = session.execute(
+        sa.select(
+            MessageRecipe.message_id,
+            MessageRecipe.position,
+            MessageRecipe.title,
+            MessageRecipe.servings,
+            MessageRecipe.ingredients,
+            MessageRecipe.steps,
+            MessageRecipe.created_at,
+        )
+        .where(MessageRecipe.message_id == message_id)
+        .order_by(MessageRecipe.position)
+    ).all()
+    return tuple(_stored(row) for row in rows)
+
+
+def summaries_for_messages(
+    session: OrmSession, message_ids: Iterable[int]
+) -> dict[int, tuple[RecipeSummary, ...]]:
+    """The stored recipes of each of `message_ids`, in answer order, as summaries.
+
+    The caller has already found the messages through the user's conversation (the
+    history route does), so this makes no ownership decision of its own. A message with
+    no stored recipe is absent from the mapping. A plain read.
+    """
+    ids = list(message_ids)
+    if not ids:
+        return {}
+    rows = session.execute(
+        sa.select(
+            MessageRecipe.message_id, MessageRecipe.position, MessageRecipe.title
+        )
+        .where(MessageRecipe.message_id.in_(ids))
+        .order_by(MessageRecipe.message_id, MessageRecipe.position)
+    ).all()
+    grouped: dict[int, list[RecipeSummary]] = {}
+    for row in rows:
+        grouped.setdefault(row.message_id, []).append(
+            RecipeSummary(message_id=row.message_id, position=row.position, title=row.title)
+        )
+    return {message_id: tuple(items) for message_id, items in grouped.items()}
 
 
 def recipes_for_message(
@@ -260,10 +351,14 @@ __all__ = [
     "MessageNotFound",
     "NotAnAnswer",
     "RecipeNotFound",
+    "RecipeSummary",
     "StoredRecipe",
     "get_recipe_for_user",
     "message_ids_with_recipes",
     "recipe_at",
     "recipes_for_message",
     "record_recipes_for_message",
+    "record_validated_recipes",
+    "stored_recipes_for_message",
+    "summaries_for_messages",
 ]

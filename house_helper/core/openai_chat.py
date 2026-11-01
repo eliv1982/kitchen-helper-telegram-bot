@@ -44,11 +44,44 @@ from house_helper.core.backend import (
 from house_helper.core.identity import ConversationKey
 from house_helper.core.kitchen_prompt import KITCHEN_SYSTEM_PROMPT
 from house_helper.core.provider_settings import ProviderSettings
+from house_helper.core.recipes import parse_reply, render_parsed_reply
 
 logger = logging.getLogger(__name__)
 
 # The provider's own word for "stopped because the answer reached the token cap".
 FINISH_REASON_LENGTH = "length"
+
+# Appended to the shared prompt only when structured recipes are switched on
+# (house_helper.web.settings, HOUSE_HELPER_STRUCTURED_RECIPES). The shared text is
+# never changed: this is a formatting addition, and the words about what to answer
+# stay the ones both channels already use. The block is defined by the sentinels of
+# house_helper.core.recipes; the model is told not to repeat it in prose and not to
+# wrap it in Markdown. Nothing here asks for response_format or for a second call.
+RECIPE_PROTOCOL_PROMPT = (
+    "\n\n"
+    "ДОПОЛНЕНИЕ К ОФОРМЛЕНИЮ РЕЦЕПТОВ (служебное).\n"
+    "Правила содержания ответа не меняются. Когда в ответе есть готовый рецепт с полным "
+    "списком ингредиентов и шагами приготовления, оформи сам рецепт отдельным блоком, а в "
+    "обычном тексте оставь разговорную часть: короткое пояснение до или после, уточнения, "
+    "советы. Не повторяй в обычном тексте то, что уже вошло в блок, и не упоминай саму "
+    "разметку.\n"
+    "Для каждого рецепта — один блок ровно такого вида:\n"
+    "<<<RECIPE>>>\n"
+    '{"title": "Название", "servings": "4 порции", "ingredients": '
+    '[{"name": "Свекла", "amount": "2 шт."}], "steps": ["Первый шаг.", "Второй шаг."]}\n'
+    "<<<END_RECIPE>>>\n"
+    "В блоке строго один JSON-объект с четырьмя ключами:\n"
+    "- title — короткое название, строка;\n"
+    "- servings — число порций словами или null, если не знаешь;\n"
+    "- ingredients — непустой список объектов ровно с ключами name и amount (строки);\n"
+    "- steps — непустой список строк, по одному шагу в каждом.\n"
+    "Не добавляй другие ключи, комментарии или текст внутри блока. Не оборачивай блок в "
+    "Markdown или код. Метки <<<RECIPE>>> и <<<END_RECIPE>>> используй только как границы "
+    "блоков и больше нигде.\n"
+    "Если рецептов несколько, дай отдельный блок для каждого, в том же порядке, не больше "
+    "пяти. Если готового рецепта в ответе нет (обычный разговор, совет, замена продукта, "
+    "короткий ответ), не добавляй ни одного блока."
+)
 
 # What of the provider's error may be logged besides its class and status: its `code` and
 # `param`, when they are plain identifiers ("insufficient_quota", "max_tokens"). They are
@@ -84,12 +117,27 @@ class StandaloneOpenAIBackend:
 
     `client` is a seam for tests: an object shaped like AsyncOpenAI that this backend
     uses instead of building one (and does not close).
+
+    `recipe_protocol` switches the structured-recipe mode on: the shared prompt gets
+    RECIPE_PROTOCOL_PROMPT appended, and the answer is parsed by
+    house_helper.core.recipes *before* it is rendered. `BackendReply.text` is the
+    plain text a person reads (never a marker or JSON block), and `BackendReply.recipes`
+    carries the validated recipes the same answer produced. One provider call, the
+    same token limits, no response_format. With the switch off, nothing of the protocol
+    is sent and the answer is returned exactly as before.
     """
 
-    def __init__(self, settings: ProviderSettings, *, client: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        settings: ProviderSettings,
+        *,
+        client: Optional[Any] = None,
+        recipe_protocol: bool = False,
+    ) -> None:
         self._settings = settings
         self._client = client
         self._owns_client = client is None
+        self._recipe_protocol = recipe_protocol
 
     def _get_client(self) -> Any:
         if self._client is None:
@@ -138,11 +186,16 @@ class StandaloneOpenAIBackend:
                 label,
                 context_len,
             )
+        system_prompt = KITCHEN_SYSTEM_PROMPT
+        if self._recipe_protocol:
+            # The shared prompt itself is untouched: the protocol is an addition to its
+            # formatting rules, sent only when structured recipes are switched on.
+            system_prompt = KITCHEN_SYSTEM_PROMPT + RECIPE_PROTOCOL_PROMPT
         try:
             response = await self._get_client().chat.completions.create(
                 model=settings.model,
                 messages=[
-                    {"role": "system", "content": KITCHEN_SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     *to_openai_messages(messages),
                 ],
                 **settings.completion_params(),
@@ -157,7 +210,7 @@ class StandaloneOpenAIBackend:
             self._log_failure("API error", exc, label)
             raise BackendError("OpenAI API error") from exc
 
-        return self._reply_from(response, label)
+        return self._reply_from(response, label, self._recipe_protocol)
 
     @staticmethod
     def _log_failure(what: str, exc: BaseException, label: str) -> None:
@@ -171,7 +224,9 @@ class StandaloneOpenAIBackend:
         )
 
     @staticmethod
-    def _reply_from(response: Any, label: str) -> BackendReply:
+    def _reply_from(
+        response: Any, label: str, recipe_protocol: bool = False
+    ) -> BackendReply:
         choices = getattr(response, "choices", None)
         if not choices:
             logger.error("OpenAI response has no choices for conversation=%s", label)
@@ -206,7 +261,19 @@ class StandaloneOpenAIBackend:
                 usage["total_tokens"],
                 f", reasoning_tokens={usage['reasoning_tokens']}" if "reasoning_tokens" in usage else "",
             )
-        return BackendReply(text=content, usage=usage, truncated=truncated)
+        if not recipe_protocol:
+            return BackendReply(text=content, usage=usage, truncated=truncated)
+
+        # The provider's own answer is parsed before anything is rendered: the blocks
+        # are the only source of the structured recipes, and `text` is built from the
+        # same parse, so a recipe can never be read back out of the rendered text.
+        parsed = parse_reply(content)
+        return BackendReply(
+            text=render_parsed_reply(parsed),
+            usage=usage,
+            truncated=truncated,
+            recipes=parsed.recipes,
+        )
 
 
 def _error_identifiers(exc: BaseException) -> str:

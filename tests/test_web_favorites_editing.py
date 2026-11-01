@@ -1,9 +1,10 @@
 """Structured favorites and editing through the API: the contract old clients keep.
 
 The assistant is a ScriptedBackend and the conversations are real ones made through the
-chat API. The turn runner does not extract recipes in this stage (KH-F06B), so the tests
-seed message_recipes through the supported persistence writer, from the text the answer
-was stored with. Nothing reaches a provider.
+chat API. These tests are about the favorites API alone, so they seed message_recipes
+through the supported persistence writer, from the text the answer was stored with,
+instead of going through a protocol-speaking backend (the turn integration is in
+tests/test_web_structured_recipes.py). Nothing reaches a provider.
 """
 
 import json
@@ -14,6 +15,7 @@ import pytest
 import sqlalchemy as sa
 
 from house_helper.core.recipes import (
+    MAX_RECIPE_BLOCK_LENGTH,
     RECIPE_END,
     RECIPE_START,
     Ingredient,
@@ -78,7 +80,7 @@ def stored_answer(chat, message_id):
 
 
 def seed(chat, message_id, text=None):
-    """Store the recipes of the answer as the turn runner will in KH-F06C."""
+    """Store the recipes of the answer as the turn runner does when it commits one."""
     with chat.base.factory() as db, db.begin():
         message_recipes.record_recipes_for_message(
             db, message_id, text if text is not None else stored_answer(chat, message_id), now=chat.clock()
@@ -99,6 +101,15 @@ async def keep_raw(chat, body, client=None):
 async def patch(chat, favorite_id, document, client=None):
     return await (client or chat.client).patch(
         f"/api/favorites/{favorite_id}", json=document, headers=post_headers()
+    )
+
+
+async def patch_wire(chat, favorite_id, wire, client=None):
+    """An edit whose body is sent as written, so a test controls its exact bytes."""
+    return await (client or chat.client).patch(
+        f"/api/favorites/{favorite_id}",
+        content=wire,
+        headers={**post_headers(), "Content-Type": "application/json"},
     )
 
 
@@ -392,6 +403,7 @@ async def test_the_fields_of_the_other_kind_are_refused(tmp_path):
         {"ingredients": "x"},
         {"steps": []},
         {"steps": [1]},
+        {"steps": ["x" * 1001]},
         {"servings": 4},
         {"servings": "x" * 101},
     ],
@@ -452,6 +464,137 @@ async def test_the_limit_counts_text_and_structured_together(tmp_path, monkeypat
         assert full.status_code == 409 and error_of(full)["detail"] == "favorites_full"
         assert repeated.status_code == 200 and repeated.json()["created"] is False
         assert len(rows(chat)) == 2
+
+
+# --- the edit request-body bound (KH-F06C review, blocker 2) -------------------------------------
+
+
+def compact_block(recipe):
+    """A protocol block whose JSON is written compactly, so a test can use the whole
+    MAX_RECIPE_BLOCK_LENGTH without the default separators pushing it over."""
+    return (
+        f"{RECIPE_START}"
+        f"{json.dumps(recipe, ensure_ascii=False, separators=(',', ':'))}"
+        f"{RECIPE_END}"
+    )
+
+
+async def test_the_reported_cyrillic_recipe_at_the_protocol_limit_is_edited(tmp_path):
+    # The shape of the review's reproduction: 20 steps of 992 Cyrillic characters, a
+    # compact protocol block of 19,999 characters (the limit is 20,000) and an edit body
+    # of about 39.9 KiB -- more than the chat API's 32 KiB, so it used to be refused with
+    # 413 request_too_large although the recipe is valid.
+    step = "я" * 992
+    recipe = {
+        "title": "Борщ",
+        "servings": "4 порции",
+        "ingredients": [{"name": "свёкла", "amount": "2 шт."}],
+        "steps": [step] * 20,
+    }
+    protocol = json.dumps(recipe, ensure_ascii=False, separators=(",", ":"))
+    assert 19_000 < len(protocol) <= MAX_RECIPE_BLOCK_LENGTH
+    answer = "Вот рецепт.\n" + compact_block(recipe)
+
+    async with chat_app(tmp_path, ScriptedBackend(default=answer)) as chat:
+        conversation, _, assistant = await answered(chat)
+        seed(chat, assistant)
+        kept = (await keep(chat, conversation, assistant, recipe_index=0)).json()
+        calls = chat.backend.calls
+
+        body = {"expected_version": kept["version"], **recipe, "notes": None}
+        wire = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        assert len(wire) > 32 * 1024, "the reproduction must exceed the old bound"
+
+        response = await patch_wire(chat, kept["id"], wire)
+
+        assert response.status_code == 200, response.text
+        assert response.json()["version"] == kept["version"] + 1
+        assert response.json()["steps"] == [step] * 20
+        assert response.json()["ingredients"] == recipe["ingredients"]
+        assert chat.backend.calls == calls, "no model is named by an edit"
+
+        stale = await patch_wire(chat, kept["id"], wire)
+        assert stale.status_code == 409
+        assert error_of(stale)["detail"] == "favorite_conflict"
+        found = (await chat.client.get(f"/api/favorites/{kept['id']}")).json()
+        assert found["version"] == kept["version"] + 1, "the version incremented exactly once"
+        assert chat.backend.calls == calls
+
+
+async def test_a_text_favorite_at_its_maximum_is_edited(tmp_path):
+    # The largest valid text, in characters outside the basic plane (four UTF-8 bytes
+    # each): 100,000 characters, a body of about 400 KiB. Nothing is truncated.
+    text = "🍅" * favorites_module.MAX_FAVORITE_TEXT_LENGTH
+    async with chat_app(tmp_path, ScriptedBackend(default=ANSWER)) as chat:
+        conversation, _, assistant = await answered(chat)
+        kept = (await keep(chat, conversation, assistant)).json()
+        calls = chat.backend.calls
+
+        wire = json.dumps(
+            {"expected_version": 1, "title": "Самый длинный", "text": text},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        response = await patch_wire(chat, kept["id"], wire)
+
+        assert response.status_code == 200, response.text
+        assert response.json()["version"] == 2
+        assert response.json()["text"] == text, "stored as entered, not truncated"
+        assert chat.backend.calls == calls
+
+
+async def test_an_edit_body_over_its_own_bound_is_still_refused(tmp_path):
+    # A finite bound remains, and it is enforced for a declared length and for a streamed
+    # body alike; nothing is parsed and nothing is written.
+    async with chat_app(tmp_path, ScriptedBackend(default=ANSWER)) as chat:
+        conversation, _, assistant = await answered(chat)
+        kept = (await keep(chat, conversation, assistant)).json()
+
+        declared = await patch_wire(
+            chat,
+            kept["id"],
+            b'{"expected_version": 1, "title": "x", "notes": "' + b"a" * (2 * 1024 * 1024) + b'"}',
+        )
+
+        async def streamed_body():
+            for _ in range(20):
+                yield b"a" * 65536
+
+        streamed = await chat.client.patch(
+            f"/api/favorites/{kept['id']}",
+            content=streamed_body(),
+            headers={**post_headers(), "Content-Type": "application/json"},
+        )
+
+        for response in (declared, streamed):
+            assert response.status_code == 413
+            assert error_of(response)["detail"] == "request_too_large"
+        found = (await chat.client.get(f"/api/favorites/{kept['id']}")).json()
+        assert found["version"] == 1 and found["text"] == stored_answer(chat, assistant)
+
+
+async def test_the_other_body_bounds_are_unchanged(tmp_path):
+    # The larger limit belongs to the edit route alone: keeping a favorite and the chat
+    # API keep the shared 32 KiB bound.
+    async with chat_app(tmp_path, ScriptedBackend(default=ANSWER)) as chat:
+        conversation, _, assistant = await answered(chat)
+
+        big = json.dumps(
+            {"conversation_id": conversation, "message_id": assistant, "pad": "a" * (40 * 1024)}
+        ).encode("ascii")
+        kept = await chat.client.post(
+            "/api/favorites",
+            content=big,
+            headers={**post_headers(), "Content-Type": "application/json"},
+        )
+        sent = await chat.client.post(
+            f"/api/conversations/{conversation}/messages",
+            content=b'{"text": "' + b"a" * (40 * 1024) + b'"}',
+            headers={**post_headers("k-big"), "Content-Type": "application/json"},
+        )
+
+        assert kept.status_code == 413 and sent.status_code == 413
+        assert error_of(kept)["detail"] == error_of(sent)["detail"] == "request_too_large"
+        assert rows(chat) == []
 
 
 # --- protections and observability ---------------------------------------------------------------

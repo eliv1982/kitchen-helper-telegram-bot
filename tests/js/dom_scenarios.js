@@ -58,10 +58,18 @@ function deferred() {
   return { promise, resolve };
 }
 
-async function open(configure = (env) => env.signedIn([]), { narrow = false, shell = shellHtml } = {}) {
-  const env = H.makeEnv();
+async function open(
+  configure = (env) => env.signedIn([]),
+  { narrow = false, shell = shellHtml, structured = false, confirm = undefined } = {}
+) {
+  const env = H.makeEnv({ structuredRecipes: structured });
   configure(env);
   const doc = parseShell(shell);
+  if (structured) {
+    // The shell the server sends for a deployment with the switch on; the flag is the
+    // only difference, and it is read by app.js as the page starts.
+    doc.body.attrs.set("data-structured-recipes", "1");
+  }
   const change = [];
   const windowListeners = {};
   // The page reads the time as Date.now(); here it is the scenario's clock, not the day the test runs on, so
@@ -90,6 +98,9 @@ async function open(configure = (env) => env.signedIn([]), { narrow = false, she
     matchMedia: () => ({ matches: narrow, addEventListener: (type, fn) => change.push(fn) }),
     addEventListener: (type, fn) => (windowListeners[type] = [...(windowListeners[type] || []), fn]),
   };
+  if (confirm !== undefined) {
+    sandbox.confirm = confirm;
+  }
   sandbox.window = sandbox;
   sandbox.self = sandbox;
   const context = vm.createContext(sandbox);
@@ -117,6 +128,11 @@ async function open(configure = (env) => env.signedIn([]), { narrow = false, she
       const input = page.el(id);
       input.value = value;
       input.fire("input");
+    },
+    // Type into a field the way a browser reports it: the new value, then the input event.
+    editField(node, value) {
+      node.value = value;
+      node.fire("input");
     },
     async send(value) {
       page.type(value);
@@ -1097,6 +1113,7 @@ scenario("an_answer_is_kept_from_the_chat_and_then_says_so_and_opens_the_recipe"
   const article = () => page.articles()[1];
   assert.deepEqual(article().buttons("В избранное").length, 1);
   assert.equal(page.articles()[0].buttons("В избранное").length, 0, "only the assistant's answers");
+  assert.ok(!article().textContent.includes("Сохранить «"), "no per-recipe controls without the switch");
 
   article().buttons("В избранное")[0].click();
   await page.settle();
@@ -1615,6 +1632,714 @@ scenario("no_photo_means_no_image", async () => {
 
   assert.equal(page.messages().byTag("img").length, 0);
   assert.deepEqual(page.doc.attributeLog.filter(([, name]) => name === "src"), []);
+});
+
+// ============================================================================================
+// Structured recipes: one Save per recipe, and the editable card
+// ============================================================================================
+
+const ANSWER_TEXT = "Вот два варианта.";
+const BORSH = {
+  title: "Борщ",
+  servings: "4 порции",
+  ingredients: [
+    { name: "свекла", amount: "2 шт." },
+    { name: "капуста", amount: "300 г" },
+  ],
+  steps: ["Сварите бульон.", "Добавьте овощи."],
+  notes: "Больше укропа.",
+  version: 3,
+};
+const UKHA = { title: "Уха", servings: null, ingredients: [{ name: "рыба", amount: "1 кг" }], steps: ["Сварите."] };
+
+const structuredThread = () => [
+  message(1, "user", "Что приготовить?"),
+  message(2, "assistant", ANSWER_TEXT, {
+    recipes: [
+      { position: 0, title: BORSH.title },
+      { position: 1, title: UKHA.title },
+    ],
+  }),
+];
+
+const structuredFavoriteItem = (extra = {}) =>
+  H.structuredFavorite(H.FAV_1, 2, BORSH.title, 0, 0, {
+    servings: BORSH.servings,
+    ingredients: BORSH.ingredients,
+    steps: BORSH.steps,
+    notes: BORSH.notes,
+    version: BORSH.version,
+    ...extra,
+  });
+
+function structuredThreadOnly() {
+  return (env) => {
+    env.signedIn([conversation(CONV_A, 0)], { [CONV_A]: historyBody(CONV_A, structuredThread()) });
+  };
+}
+
+function structuredCard(extraRoutes = () => {}) {
+  return (env) => {
+    env.signedIn([conversation(CONV_A, 0)], { [CONV_A]: historyBody(CONV_A, structuredThread()) });
+    const item = structuredFavoriteItem();
+    env.net.route("GET", "/api/favorites", H.favoritesBody([item]));
+    env.net.route("GET", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(item, "Борщ\n\n1. Сварите бульон."));
+    extraRoutes(env, item);
+  };
+}
+
+scenario("structured_under_an_answer_each_recipe_has_its_own_save_button", async () => {
+  const page = await open(structuredThreadOnly(), { structured: true });
+  let article = page.articles().find((node) => node.textContent.includes(ANSWER_TEXT));
+
+  assert.equal(article.buttons("Сохранить «Борщ»").length, 1);
+  assert.equal(article.buttons("Сохранить «Уха»").length, 1);
+  assert.equal(article.buttons("В избранное").length, 0, "no whole-answer button when recipes are offered");
+  assert.ok(!page.root().includes("<<<RECIPE>>>"));
+
+  page.env.net.route("POST", "/api/favorites", H.keptBody(structuredFavoriteItem()));
+  article.buttons("Сохранить «Борщ»")[0].click();
+  await page.settle();
+
+  assert.deepEqual(page.env.net.requests("POST", "/api/favorites")[0].body, {
+    conversation_id: CONV_A,
+    message_id: 2,
+    recipe_index: 0,
+  });
+  article = page.articles().find((node) => node.textContent.includes(ANSWER_TEXT));
+  assert.equal(article.buttons("Сохранить «Борщ»").length, 0);
+  assert.equal(article.buttons("Сохранить «Уха»").length, 1, "the other recipe keeps its own control");
+  assert.ok(article.textContent.includes(Logic.TEXT.recipeSaved));
+  assert.equal(article.buttons(Logic.TEXT.openRecipe).length, 1);
+});
+
+scenario("structured_an_ordinary_answer_has_no_save_control_at_all", async () => {
+  const page = await open(oneConversation(), { structured: true });
+  const article = page.articles()[1];
+
+  assert.equal(article.buttons("В избранное").length, 0, "the legacy whole-answer save is not a fallback");
+  assert.ok(!article.textContent.includes("Сохранить «"));
+  assert.equal(article.byClass("msg-favorite").length, 0);
+});
+
+scenario("structured_a_fresh_ordinary_answer_has_no_save_control", async () => {
+  const page = await open(oneConversation(), { structured: true });
+  page.env.net.route("POST", URL_A, turnBody(CONV_A, 3, "Еще?", 4, "Просто совет."));
+  await page.send("Еще?");
+  await page.settle();
+
+  const article = page.articles().find((node) => node.textContent.includes("Просто совет."));
+  assert.equal(article.buttons("В избранное").length, 0, "no fallback for a freshly generated answer");
+  assert.ok(!article.textContent.includes("Сохранить «"));
+});
+
+scenario("structured_an_answer_with_one_recipe_has_one_save_button", async () => {
+  const page = await open(
+    (env) => {
+      env.signedIn([conversation(CONV_A, 0)], {
+        [CONV_A]: historyBody(CONV_A, [
+          message(1, "user", "Что приготовить?"),
+          message(2, "assistant", ANSWER_TEXT, { recipes: [{ position: 0, title: UKHA.title }] }),
+        ]),
+      });
+    },
+    { structured: true }
+  );
+  const article = page.articles().find((node) => node.textContent.includes(ANSWER_TEXT));
+
+  assert.equal(article.buttons("Сохранить «Уха»").length, 1);
+  assert.equal(article.buttons("В избранное").length, 0, "one recipe leaves no room for the whole-answer save");
+});
+
+scenario("structured_a_fresh_answer_with_one_recipe_has_one_save_button", async () => {
+  const page = await open(oneConversation(), { structured: true });
+  page.env.net.route(
+    "POST",
+    URL_A,
+    turnBody(CONV_A, 3, "Еще?", 4, "Вот рецепт.", false, [{ position: 0, title: "Уха" }])
+  );
+  await page.send("Еще?");
+  await page.settle();
+
+  const article = page.articles().find((node) => node.textContent.includes("Вот рецепт."));
+  assert.equal(article.buttons("Сохранить «Уха»").length, 1);
+  assert.equal(article.buttons("В избранное").length, 0);
+});
+
+scenario("structured_a_malformed_recipe_list_has_no_save_control", async () => {
+  const page = await open(
+    oneConversation([message(3, "assistant", "Ответ с мусором.", { recipes: [{ position: "0", title: "Борщ" }, null] })]),
+    { structured: true }
+  );
+  const article = page.articles().find((node) => node.textContent.includes("Ответ с мусором."));
+
+  assert.equal(article.buttons("В избранное").length, 0, "no fallback to the whole-answer save");
+  assert.ok(!article.textContent.includes("Сохранить «"));
+  assert.equal(article.byClass("msg-favorite").length, 0);
+});
+
+scenario("structured_favorites_remain_accessible_editable_and_removable_whatever_the_switch", async () => {
+  for (const structured of [false, true]) {
+    const page = await open(
+      (env) => {
+        env.signedIn([conversation(CONV_A, 0)], { [CONV_A]: historyBody(CONV_A, structuredThread()) });
+        const item = structuredFavoriteItem();
+        env.net.route("GET", "/api/favorites", H.favoritesBody([item]));
+        env.net.route("GET", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(item, "Борщ\n\n1. Сварите бульон."));
+      },
+      { structured }
+    );
+    page.el("tab-favorites").click();
+    await page.settle();
+    page.el("favorite-list").byTag("button")[0].click();
+    await page.settle();
+
+    const body = page.el("recipe-body");
+    const label = "switch " + (structured ? "on" : "off");
+    assert.ok(body.textContent.includes("4 порции"), label);
+    assert.equal(body.buttons("Редактировать").length, 1, label);
+    body.buttons("Редактировать")[0].click();
+    await page.settle();
+    assert.equal(page.el("recipe-body").byClass("edit-title")[0].value, "Борщ", label);
+
+    page.el("recipe-body").buttons(Logic.TEXT.editCancel)[0].click();
+    await page.settle();
+    page.env.net.route("DELETE", `/api/favorites/${H.FAV_1}`, H.removedBody());
+    page.el("recipe-body").buttons("Убрать из избранного")[0].click();
+    await page.settle();
+    page.el("recipe-body").buttons("Убрать")[0].click();
+    await page.settle();
+    assert.equal(page.env.net.requests("DELETE", `/api/favorites/${H.FAV_1}`).length, 1, label);
+    assert.equal(page.el("favorite-list").byTag("button").length, 0, label);
+  }
+});
+
+scenario("structured_the_card_shows_its_fields_and_is_edited_in_the_page", async () => {
+  const page = await open(structuredCard(), { structured: true });
+  page.el("tab-favorites").click();
+  await page.settle();
+  page.el("favorite-list").byTag("button")[0].click();
+  await page.settle();
+
+  const body = page.el("recipe-body");
+  assert.ok(body.textContent.includes("4 порции"));
+  assert.ok(body.textContent.includes("свекла") && body.textContent.includes("2 шт."));
+  assert.ok(body.textContent.includes("Сварите бульон."));
+  assert.ok(body.textContent.includes(BORSH.notes));
+  assert.equal(body.buttons("Редактировать").length, 1);
+  assert.equal(body.buttons("Убрать из избранного").length, 1);
+
+  body.buttons("Редактировать")[0].click();
+  await page.settle();
+  assert.equal(page.el("recipe-body").byClass("edit-title")[0].value, "Борщ");
+  assert.deepEqual(page.el("recipe-body").byClass("ingredient-name").map((input) => input.value), ["свекла", "капуста"]);
+  assert.deepEqual(page.el("recipe-body").byClass("ingredient-amount").map((input) => input.value), ["2 шт.", "300 г"]);
+  assert.deepEqual(page.el("recipe-body").byClass("edit-step").map((input) => input.value), BORSH.steps);
+
+  page.el("recipe-body").byClass("edit-title")[0].value = "Борщ по-домашнему";
+  page.el("recipe-body").buttons(Logic.TEXT.editAddStep)[0].click();
+  await page.settle();
+  assert.equal(page.el("recipe-body").byClass("edit-step").length, 3);
+  page.el("recipe-body").byClass("edit-step")[2].value = "Дайте настояться.";
+  page.el("recipe-body").byClass("edit-notes")[0].value = "Еще укропа.";
+  // Reorder: the first step goes below the second.
+  page.el("recipe-body").buttons(Logic.TEXT.editMoveDown)[0].click();
+  await page.settle();
+  assert.deepEqual(
+    page.el("recipe-body").byClass("edit-step").map((input) => input.value),
+    ["Добавьте овощи.", "Сварите бульон.", "Дайте настояться."]
+  );
+
+  const updated = structuredFavoriteItem({
+    title: "Борщ по-домашнему",
+    steps: ["Добавьте овощи.", "Сварите бульон.", "Дайте настояться."],
+    notes: "Еще укропа.",
+    version: 4,
+  });
+  page.env.net.route(
+    "PATCH",
+    `/api/favorites/${H.FAV_1}`,
+    H.favoriteDetail(updated, "Борщ по-домашнему\n\n1. Сварите бульон.")
+  );
+  page.el("recipe-body").buttons(Logic.TEXT.editSave)[0].click();
+  await page.settle();
+
+  const sent = page.env.net.requests("PATCH", `/api/favorites/${H.FAV_1}`)[0].body;
+  assert.deepEqual(sent, {
+    expected_version: 3,
+    title: "Борщ по-домашнему",
+    notes: "Еще укропа.",
+    servings: "4 порции",
+    ingredients: BORSH.ingredients,
+    steps: ["Добавьте овощи.", "Сварите бульон.", "Дайте настояться."],
+  });
+  assert.equal(page.el("recipe-title").textContent, "Борщ по-домашнему");
+  assert.equal(page.el("recipe-body").buttons(Logic.TEXT.editSave).length, 0);
+  assert.ok(page.el("recipe-body").textContent.includes("Дайте настояться."));
+  assert.ok(
+    !page.doc.attributeLog.some(([, name, value]) => /^(on|style)/i.test(name) || /javascript:/.test(value))
+  );
+});
+
+scenario("structured_hostile_recipe_fields_are_only_text", async () => {
+  const hostileTitle = '<img src=x onerror=alert(1)>';
+  const hostileName = '<script>alert(2)</script>';
+  const hostileAmount = '"><svg onload=alert(3)>';
+  const hostileStep = "</div><button onclick=alert(4)>нажми</button>";
+  const item = structuredFavoriteItem({
+    title: hostileTitle,
+    ingredients: [{ name: hostileName, amount: hostileAmount }],
+    steps: [hostileStep],
+    notes: "<b>заметка</b>",
+  });
+  const page = await open(
+    (env) => {
+      env.signedIn([conversation(CONV_A, 0)], { [CONV_A]: historyBody(CONV_A, structuredThread()) });
+      env.net.route("GET", "/api/favorites", H.favoritesBody([item]));
+      env.net.route("GET", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(item, "текст"));
+    },
+    { structured: true }
+  );
+  page.el("tab-favorites").click();
+  await page.settle();
+  page.el("favorite-list").byTag("button")[0].click();
+  await page.settle();
+
+  const body = page.el("recipe-body");
+  assert.equal(body.byTag("img").length, 0);
+  assert.equal(body.byTag("script").length, 0);
+  assert.equal(body.byTag("svg").length, 0);
+  assert.equal(body.byTag("b").length, 0);
+  assert.equal(page.el("recipe-title").textContent, hostileTitle);
+  assert.ok(body.textContent.includes(hostileName));
+  assert.ok(body.textContent.includes(hostileAmount));
+  assert.ok(body.textContent.includes(hostileStep));
+  assert.ok(body.textContent.includes("<b>заметка</b>"));
+
+  body.buttons("Редактировать")[0].click();
+  await page.settle();
+  const edited = page.el("recipe-body");
+  assert.equal(edited.byClass("edit-title")[0].value, hostileTitle);
+  assert.equal(edited.byClass("ingredient-name")[0].value, hostileName);
+  assert.equal(edited.byClass("edit-step")[0].value, hostileStep);
+  assert.ok(!page.doc.attributeLog.some(([, name]) => /^(on|style)/i.test(name)));
+});
+
+scenario("structured_a_conflict_shows_the_question_and_the_two_choices", async () => {
+  const page = await open(structuredCard(), { structured: true });
+  page.el("tab-favorites").click();
+  await page.settle();
+  page.el("favorite-list").byTag("button")[0].click();
+  await page.settle();
+  page.el("recipe-body").buttons("Редактировать")[0].click();
+  await page.settle();
+
+  page.el("recipe-body").byClass("edit-title")[0].value = "Черновик";
+  page.env.net.route("PATCH", `/api/favorites/${H.FAV_1}`, apiError(409, "favorite_conflict"));
+  page.el("recipe-body").buttons(Logic.TEXT.editSave)[0].click();
+  await page.settle();
+
+  const body = page.el("recipe-body");
+  assert.ok(body.textContent.includes(Logic.TEXT.editConflict));
+  assert.equal(body.buttons(Logic.TEXT.editOverwrite).length, 1);
+  assert.equal(body.buttons(Logic.TEXT.editReload).length, 1);
+  assert.equal(body.buttons(Logic.TEXT.editSave).length, 0);
+  assert.equal(body.byClass("edit-title")[0].value, "Черновик", "the draft is still in the page");
+
+  const changed = structuredFavoriteItem({ title: "Изменено в другом месте", version: 5 });
+  page.env.net.route("GET", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(changed, "Борщ\n\n1. Сварите бульон."));
+  body.buttons(Logic.TEXT.editReload)[0].click();
+  await page.settle();
+
+  const after = page.el("recipe-body");
+  assert.equal(page.el("recipe-title").textContent, "Изменено в другом месте");
+  assert.equal(after.buttons(Logic.TEXT.editSave).length, 0);
+  assert.equal(after.byClass("edit-title").length, 0);
+});
+
+scenario("structured_an_unsaved_editor_is_not_left_without_a_question", async () => {
+  const page = await open(structuredCard(), { structured: true });
+  page.el("tab-favorites").click();
+  await page.settle();
+  page.el("favorite-list").byTag("button")[0].click();
+  await page.settle();
+  page.el("recipe-body").buttons("Редактировать")[0].click();
+  await page.settle();
+
+  let prevented = false;
+  page.fireWindow("beforeunload", {
+    preventDefault() {
+      prevented = true;
+    },
+  });
+  assert.equal(prevented, true, "the browser is asked to warn about a refresh or close");
+
+  let asked = 0;
+  page.window.confirm = () => {
+    asked++;
+    return false;
+  };
+  page.el("logout").click();
+  await page.settle();
+  assert.equal(asked, 1);
+  assert.equal(page.visible("screen-app"), true, "a refused question leaves the person where they were");
+  assert.equal(page.env.net.requests("POST", "/auth/logout").length, 0);
+
+  page.el("recipe-body").buttons(Logic.TEXT.editCancel)[0].click();
+  await page.settle();
+  prevented = false;
+  page.fireWindow("beforeunload", {
+    preventDefault() {
+      prevented = true;
+    },
+  });
+  assert.equal(prevented, false);
+});
+
+// --- an unsaved edit survives the page's own refreshes --------------------------------------
+
+const TEXT_RECIPE = "Борщ классический\n\nПорции: 4.\n1. Сварите бульон.";
+
+function textCard() {
+  return (env) => {
+    env.signedIn([conversation(CONV_A, 0)], { [CONV_A]: historyBody(CONV_A, structuredThread()) });
+    const item = H.favorite(H.FAV_1, 2, "Борщ классический", 0, { version: 2 });
+    env.net.route("GET", "/api/favorites", H.favoritesBody([item]));
+    env.net.route("GET", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(item, TEXT_RECIPE));
+  };
+}
+
+async function openEditor(page) {
+  page.el("tab-favorites").click();
+  await page.settle();
+  page.el("favorite-list").byTag("button")[0].click();
+  await page.settle();
+  page.el("recipe-body").buttons(Logic.TEXT.editAction)[0].click();
+  await page.settle();
+}
+
+scenario("structured_an_unsaved_edit_survives_a_tab_switch_and_an_online_event_whatever_the_switch", async () => {
+  // The review's reproduction: edit a saved recipe, switch tabs, come back. The page
+  // asks the server who is signed in on the way (and holds the app back while it does),
+  // which used to redraw the editor from the fields as they were when editing began.
+  for (const structured of [false, true]) {
+    const page = await open(structuredCard(), { structured });
+    const label = "switch " + (structured ? "on" : "off");
+    await openEditor(page);
+
+    const body = () => page.el("recipe-body");
+    page.editField(body().byClass("edit-title")[0], "UNSAVED REVIEW DRAFT");
+    page.editField(body().byClass("ingredient-name")[1], "морковь");
+    page.editField(body().byClass("ingredient-amount")[1], "2 шт.");
+    page.editField(body().byClass("edit-notes")[0], "Черновик заметки");
+    body().buttons(Logic.TEXT.editAddStep)[0].click();
+    await page.settle();
+    page.editField(body().byClass("edit-step")[2], "Дайте настояться.");
+    body().buttons(Logic.TEXT.editMoveDown)[0].click();
+    await page.settle();
+    page.editField(body().byClass("edit-title")[0], "UNSAVED REVIEW DRAFT");
+
+    // Away and back: the session is checked, and the same person keeps the editor.
+    page.doc.visibilityState = "hidden";
+    page.doc.fire("visibilitychange");
+    await page.settle();
+    page.doc.visibilityState = "visible";
+    page.doc.fire("visibilitychange");
+    await page.settle();
+
+    assert.equal(page.visible("screen-app"), true, label);
+    const after = page.el("recipe-body");
+    assert.equal(after.byClass("edit-title")[0].value, "UNSAVED REVIEW DRAFT", label);
+    assert.deepEqual(after.byClass("ingredient-name").map((input) => input.value), ["свекла", "морковь"], label);
+    assert.deepEqual(after.byClass("ingredient-amount").map((input) => input.value), ["2 шт.", "2 шт."], label);
+    assert.deepEqual(
+      after.byClass("edit-step").map((input) => input.value),
+      ["Добавьте овощи.", "Сварите бульон.", "Дайте настояться."],
+      label + ": every row and its order"
+    );
+    assert.equal(after.byClass("edit-notes")[0].value, "Черновик заметки", label);
+    assert.equal(page.env.net.requests("PATCH", `/api/favorites/${H.FAV_1}`).length, 0, label + ": nothing was saved");
+
+    // The network comes back: the same editor and the same draft.
+    page.editField(page.el("recipe-body").byClass("edit-title")[0], "STILL NOT SAVED");
+    page.fireWindow("online");
+    await page.settle();
+    assert.equal(page.el("recipe-body").byClass("edit-title")[0].value, "STILL NOT SAVED", label);
+    assert.equal(page.env.net.requests("PATCH", `/api/favorites/${H.FAV_1}`).length, 0, label);
+
+    // Saving is still an explicit act, and it sends exactly the draft on the page.
+    const updated = structuredFavoriteItem({
+      title: "STILL NOT SAVED",
+      ingredients: [
+        { name: "свекла", amount: "2 шт." },
+        { name: "морковь", amount: "2 шт." },
+      ],
+      steps: ["Добавьте овощи.", "Сварите бульон.", "Дайте настояться."],
+      notes: "Черновик заметки",
+      version: 4,
+    });
+    page.env.net.route("PATCH", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(updated, "новый текст"));
+    page.el("recipe-body").buttons(Logic.TEXT.editSave)[0].click();
+    await page.settle();
+
+    const sent = page.env.net.requests("PATCH", `/api/favorites/${H.FAV_1}`)[0].body;
+    assert.deepEqual(sent, {
+      expected_version: 3,
+      title: "STILL NOT SAVED",
+      notes: "Черновик заметки",
+      servings: "4 порции",
+      ingredients: [
+        { name: "свекла", amount: "2 шт." },
+        { name: "морковь", amount: "2 шт." },
+      ],
+      steps: ["Добавьте овощи.", "Сварите бульон.", "Дайте настояться."],
+    }, label);
+    assert.equal(page.el("recipe-title").textContent, "STILL NOT SAVED", label);
+
+    // A refresh with no editor open still works: the stored card stays as it was saved.
+    page.doc.visibilityState = "visible";
+    page.doc.fire("visibilitychange");
+    await page.settle();
+    assert.equal(page.el("recipe-body").buttons(Logic.TEXT.editSave).length, 0, label);
+    assert.ok(page.el("recipe-body").textContent.includes("Черновик заметки"), label);
+  }
+});
+
+scenario("a_legacy_text_draft_survives_a_tab_switch_and_an_online_event", async () => {
+  const page = await open(textCard(), { structured: true });
+  await openEditor(page);
+
+  const body = () => page.el("recipe-body");
+  assert.equal(body().byClass("edit-step").length, 0, "a text favorite has no structured rows");
+  page.editField(body().byClass("edit-title")[0], "Мой борщ");
+  page.editField(body().byClass("edit-text")[0], "Борщ по-моему.\n\n1. Сварить.");
+  page.editField(body().byClass("edit-notes")[0], "Больше свеклы.");
+
+  page.doc.visibilityState = "hidden";
+  page.doc.fire("visibilitychange");
+  await page.settle();
+  page.doc.visibilityState = "visible";
+  page.doc.fire("visibilitychange");
+  await page.settle();
+
+  const after = page.el("recipe-body");
+  assert.equal(after.byClass("edit-title")[0].value, "Мой борщ");
+  assert.equal(after.byClass("edit-text")[0].value, "Борщ по-моему.\n\n1. Сварить.");
+  assert.equal(after.byClass("edit-notes")[0].value, "Больше свеклы.");
+  assert.equal(page.env.net.requests("PATCH", `/api/favorites/${H.FAV_1}`).length, 0);
+
+  page.editField(page.el("recipe-body").byClass("edit-text")[0], "Совсем другой текст.");
+  page.fireWindow("online");
+  await page.settle();
+  assert.equal(page.el("recipe-body").byClass("edit-text")[0].value, "Совсем другой текст.");
+  assert.equal(page.env.net.requests("PATCH", `/api/favorites/${H.FAV_1}`).length, 0);
+
+  const saved = H.favorite(H.FAV_1, 2, "Мой борщ", 0, { version: 3 });
+  page.env.net.route(
+    "PATCH",
+    `/api/favorites/${H.FAV_1}`,
+    H.favoriteDetail(saved, "Совсем другой текст.", { notes: "Больше свеклы." })
+  );
+  page.el("recipe-body").buttons(Logic.TEXT.editSave)[0].click();
+  await page.settle();
+
+  assert.deepEqual(page.env.net.requests("PATCH", `/api/favorites/${H.FAV_1}`)[0].body, {
+    expected_version: 2,
+    title: "Мой борщ",
+    text: "Совсем другой текст.",
+    notes: "Больше свеклы.",
+  });
+  assert.equal(page.el("recipe-title").textContent, "Мой борщ");
+});
+
+// --- the editor keeps every character the person typed ---------------------------------------
+
+scenario("structured_a_step_of_emoji_and_ascii_survives_an_online_event_and_is_saved_whole", async () => {
+  // The review's reproduction: a valid step of 1,000 Unicode characters (500 outside the
+  // basic plane), cut to 501 by the old UTF-16 .slice() on the next page refresh.
+  const step = "🍅".repeat(500) + "a".repeat(500);
+  const page = await open(
+    (env) => {
+      env.signedIn([conversation(CONV_A, 0)], { [CONV_A]: historyBody(CONV_A, structuredThread()) });
+      const item = structuredFavoriteItem({ steps: [step, "Добавьте овощи."] });
+      env.net.route("GET", "/api/favorites", H.favoritesBody([item]));
+      env.net.route("GET", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(item, "Борщ\n\n1. Сварите бульон."));
+    },
+    { structured: true }
+  );
+  await openEditor(page);
+  const body = () => page.el("recipe-body");
+  assert.equal(body().byClass("edit-step")[0].value, step);
+
+  page.editField(body().byClass("edit-title")[0], "Борщ по-домашнему");
+
+  // Away and back: the session is checked and the editor is redrawn from the draft.
+  page.doc.visibilityState = "hidden";
+  page.doc.fire("visibilitychange");
+  await page.settle();
+  page.doc.visibilityState = "visible";
+  page.doc.fire("visibilitychange");
+  await page.settle();
+  assert.equal(page.el("recipe-body").byClass("edit-step")[0].value, step);
+
+  // The network comes back: the same, and nothing is sent.
+  page.fireWindow("online");
+  await page.settle();
+  let after = page.el("recipe-body");
+  assert.equal(after.byClass("edit-step")[0].value, step);
+  assert.equal(Logic.countCodePoints(after.byClass("edit-step")[0].value), 1000);
+  assert.equal(page.env.net.requests("PATCH", `/api/favorites/${H.FAV_1}`).length, 0, "a refresh saves nothing");
+
+  // A re-render of the form (a row added) keeps the same characters.
+  after.buttons(Logic.TEXT.editAddStep)[0].click();
+  await page.settle();
+  after = page.el("recipe-body");
+  assert.equal(after.byClass("edit-step")[0].value, step);
+  page.editField(after.byClass("edit-step")[2], "Дайте настояться.");
+
+  const updated = structuredFavoriteItem({
+    title: "Борщ по-домашнему",
+    steps: [step, "Добавьте овощи.", "Дайте настояться."],
+    version: 4,
+  });
+  page.env.net.route("PATCH", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(updated, "Борщ"));
+  page.el("recipe-body").buttons(Logic.TEXT.editSave)[0].click();
+  await page.settle();
+
+  const sent = page.env.net.requests("PATCH", `/api/favorites/${H.FAV_1}`)[0].body;
+  assert.deepEqual(sent.steps, [step, "Добавьте овощи.", "Дайте настояться."]);
+  assert.equal(Logic.countCodePoints(sent.steps[0]), 1000);
+  assert.equal(page.env.net.log.filter((request) => request.method === "POST").length, 0, "no model is called");
+});
+
+scenario("a_legacy_text_of_one_hundred_thousand_characters_survives_the_page_refreshes_and_saves_whole", async () => {
+  const legacy = "🍅".repeat(50000) + "a".repeat(50000); // 100,000 code points, 150,000 UTF-16 units
+  const page = await open((env) => {
+    env.signedIn([conversation(CONV_A, 0)], { [CONV_A]: historyBody(CONV_A, structuredThread()) });
+    const item = H.favorite(H.FAV_1, 2, "Старый текст", 0, { version: 2 });
+    env.net.route("GET", "/api/favorites", H.favoritesBody([item]));
+    env.net.route("GET", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(item, legacy));
+  });
+  await openEditor(page);
+  const body = () => page.el("recipe-body");
+  assert.equal(body().byClass("edit-text")[0].value, legacy);
+  assert.equal(body().byClass("edit-text")[0].getAttribute("maxlength"), null, "no UTF-16 maxlength");
+
+  page.editField(body().byClass("edit-title")[0], "Новое имя");
+  page.doc.visibilityState = "hidden";
+  page.doc.fire("visibilitychange");
+  await page.settle();
+  page.doc.visibilityState = "visible";
+  page.doc.fire("visibilitychange");
+  await page.settle();
+
+  assert.equal(page.el("recipe-body").byClass("edit-text")[0].value, legacy);
+  assert.equal(page.env.net.requests("PATCH", `/api/favorites/${H.FAV_1}`).length, 0);
+
+  const saved = H.favorite(H.FAV_1, 2, "Новое имя", 0, { version: 3 });
+  page.env.net.route("PATCH", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(saved, legacy));
+  page.el("recipe-body").buttons(Logic.TEXT.editSave)[0].click();
+  await page.settle();
+
+  const sent = page.env.net.requests("PATCH", `/api/favorites/${H.FAV_1}`)[0].body;
+  assert.equal(sent.text, legacy);
+  assert.equal(sent.title, "Новое имя");
+});
+
+scenario("an_over_limit_field_shows_an_explicit_reason_and_the_whole_draft_stays", async () => {
+  const page = await open(structuredCard(), { structured: true });
+  await openEditor(page);
+  const body = () => page.el("recipe-body");
+  const tooLong = "🍅".repeat(1001); // 1,001 code points: one over the server's step length
+
+  page.editField(body().byClass("edit-step")[0], tooLong);
+  page.editField(body().byClass("edit-title")[0], "Черновик");
+  page.editField(body().byClass("edit-notes")[0], "Не потерять");
+  body().buttons(Logic.TEXT.editSave)[0].click();
+  await page.settle();
+
+  const refused = page.el("recipe-body");
+  assert.ok(refused.textContent.includes(Logic.TEXT.editStepTooLong), "an explicit Russian reason is shown");
+  assert.equal(refused.byClass("edit-step")[0].value, tooLong, "the whole overdraft stays in the field");
+  assert.equal(refused.byClass("edit-title")[0].value, "Черновик");
+  assert.equal(refused.byClass("edit-notes")[0].value, "Не потерять");
+  assert.equal(
+    page.env.net.requests("PATCH", `/api/favorites/${H.FAV_1}`).length,
+    0,
+    "nothing over the limit is sent"
+  );
+
+  // Nothing was cut: shortening the field saves every other field exactly as it was left.
+  page.editField(page.el("recipe-body").byClass("edit-step")[0], "Сварите бульон.");
+  const updated = structuredFavoriteItem({ title: "Черновик", notes: "Не потерять", version: 4 });
+  page.env.net.route("PATCH", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(updated, "Борщ"));
+  page.el("recipe-body").buttons(Logic.TEXT.editSave)[0].click();
+  await page.settle();
+
+  const sent = page.env.net.requests("PATCH", `/api/favorites/${H.FAV_1}`)[0].body;
+  assert.equal(sent.title, "Черновик");
+  assert.equal(sent.notes, "Не потерять");
+  assert.deepEqual(sent.steps, ["Сварите бульон.", "Добавьте овощи."]);
+});
+
+scenario("the_editor_fields_carry_no_utf16_maxlength_and_a_full_astral_title_saves", async () => {
+  const page = await open(structuredCard(), { structured: true });
+  await openEditor(page);
+  const body = () => page.el("recipe-body");
+  for (const selector of ["edit-title", "edit-servings", "ingredient-name", "ingredient-amount", "edit-step", "edit-notes"]) {
+    for (const field of body().byClass(selector)) {
+      assert.equal(field.getAttribute("maxlength"), null, selector + " must not carry a UTF-16 maxlength");
+    }
+  }
+
+  // 200 code points outside the basic plane are exactly the server's title maximum, though
+  // the browser's maxlength would count them as 400 and block the last 100.
+  const title = "🍅".repeat(200);
+  page.editField(body().byClass("edit-title")[0], title);
+  const updated = structuredFavoriteItem({ title, version: 4 });
+  page.env.net.route("PATCH", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(updated, "Борщ"));
+  body().buttons(Logic.TEXT.editSave)[0].click();
+  await page.settle();
+
+  const sent = page.env.net.requests("PATCH", `/api/favorites/${H.FAV_1}`)[0].body;
+  assert.equal(sent.title, title);
+  assert.equal(Logic.countCodePoints(sent.title), 200);
+});
+
+scenario("a_draft_is_never_shown_after_the_session_ends_or_another_person_signs_in", async () => {
+  // The session ends: nothing of the draft stays on the page.
+  const ended = await open(structuredCard(), { structured: true });
+  await openEditor(ended);
+  ended.editField(ended.el("recipe-body").byClass("edit-title")[0], "UNSAVED REVIEW DRAFT");
+  ended.env.net.route("GET", "/auth/me", notAuthenticated());
+  ended.doc.visibilityState = "visible";
+  ended.doc.fire("visibilitychange");
+  await ended.settle();
+
+  assert.equal(ended.visible("screen-login"), true);
+  assert.ok(!ended.root().includes("UNSAVED REVIEW DRAFT"), "the draft is gone from the page");
+  assert.equal(ended.el("recipe-body").textContent, "");
+
+  // Another person signs in in the same browser: the page starts over, without the draft.
+  const other = await open(structuredCard(), { structured: true });
+  await openEditor(other);
+  other.editField(other.el("recipe-body").byClass("edit-title")[0], "UNSAVED REVIEW DRAFT");
+  other.env.net.route("GET", "/auth/me", me(86400, H.USER_B));
+  other.env.net.route("GET", "/api/conversations", listBody([conversation(CONV_B, 0)]));
+  other.env.net.route(
+    "GET",
+    new RegExp("/api/conversations/" + CONV_B + "/messages(\\?|$)"),
+    historyBody(CONV_B, [message(7, "user", "Про суп Бориса"), message(8, "assistant", "Суп так")])
+  );
+  other.env.net.route("GET", "/api/favorites", H.favoritesBody([]));
+  other.doc.visibilityState = "visible";
+  other.doc.fire("visibilitychange");
+  await other.settle();
+
+  assert.equal(other.visible("screen-app"), true);
+  assert.ok(!other.root().includes("UNSAVED REVIEW DRAFT"));
+  assert.ok(!other.root().includes("Борщ"), "nothing of the last person's card is left");
+  assert.equal(other.el("recipe-body").byClass("edit-title").length, 0);
 });
 
 module.exports = { scenarios, useShell, useNoLoginShell };

@@ -2,7 +2,8 @@
 
 Five routes under /api, all answering JSON, built the way chat_api.py's are (the same route
 class, so the same correlation id, headers, error catalogue and log line; the same session,
-Origin and body rules):
+Origin and body rules, except that an edit's body has a larger bound of its own: it carries
+every field of the favorite, see MAX_EDIT_BODY):
 
   GET    /api/favorites                the user's favorites, newest first, without their text
   POST   /api/favorites                keep an answer, or one recipe of it
@@ -19,8 +20,8 @@ not the user's (or not a UUID) is the same 404 "conversation_not_found" as in th
 Keeping an answer (POST). The body is {"conversation_id", "message_id"} and, optionally,
 "recipe_index" (0 to MAX_RECIPES_PER_REPLY - 1). Without it, the old behaviour is exactly
 preserved: the whole assistant answer is copied as text. With it, only that structured
-recipe of the answer is copied, from message_recipes, which the turn runner does not
-populate yet in this stage (KH-F06C). The text and the fields are read from the database,
+recipe of the answer is copied, from message_recipes, which the turn runner populates when
+the answer is committed (KH-F06C). The text and the fields are read from the database,
 never from the request, so a favorite can only ever be a real answer (or a real recipe of
 one) of the assistant to this user. The answers:
 
@@ -55,15 +56,18 @@ Editing is server-side and DB-only: no model, no provider, no spelling correctio
 favorite's text is stored as entered; a structured favorite's content is rendered again by
 persistence.favorites.favorite_content from the validated fields.
 
-Feature switch (for a later release). There is no runtime flag in this stage. If structured
-favorites must be turned off without a schema change, the minimal non-destructive switch is
-a setting read once at start-up and consulted at exactly the application boundaries above:
-POST when "recipe_index" is present, PATCH when the favorite is structured, and the later
-extraction call site (KH-F06C). With it off: answer recipe_not_found (or a 503
-feature-disabled code, if one is added then) for the two structured writes, keep GET, list
-and DELETE working for every stored favorite, leave legacy text favorites untouched, and
-never delete or rewrite a structured row. The schema guard must stay at 0010: disabling a
-feature is not a downgrade.
+Feature switch. HOUSE_HELPER_STRUCTURED_RECIPES (web.settings, off by default) switches
+the *generation* of structured recipes: the assistant's prompt addition and the parser in
+front of rendering (core.openai_chat), and the page's per-recipe Save controls. It is not a
+switch of these routes, deliberately. GET and the detail read serve stored favorites of
+both kinds; PATCH and DELETE must keep working for a structured favorite that already
+exists (turning generation off is not a reason to strand it); and POST with
+"recipe_index" copies a recipe that is already stored, makes no provider call and creates
+no new structured content, so refusing it would add a failure mode without protecting
+anything. What the switch does prevent is new structured rows: with it off the backend the
+application builds is asked for no blocks and parses none, so the turn runner is given no
+Recipe to store. It never deletes or rewrites a stored row, and the schema guard stays at
+0010: disabling a feature is not a downgrade.
 """
 
 from typing import Any, Optional
@@ -72,9 +76,14 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse
 
-from house_helper.core.recipes import MAX_RECIPES_PER_REPLY
+from house_helper.core.recipes import (
+    MAX_RECIPE_BLOCK_LENGTH,
+    MAX_RECIPES_PER_REPLY,
+    MAX_TITLE_LENGTH,
+)
 from house_helper.persistence import favorites
 from house_helper.persistence.authn import AuthenticatedSession
+from house_helper.persistence.models import MAX_FAVORITE_NOTES_LENGTH
 from house_helper.persistence.conversations import ConversationNotFound
 from house_helper.web.chat_api import (
     _UUID,
@@ -91,6 +100,23 @@ from house_helper.web.diagnostics import ApiError
 
 # The largest message id the body may name (the same bound as the history's ?before=).
 _MAX_MESSAGE_ID = 2**62
+
+# The largest body a valid edit can send, which is much larger than the chat API's
+# MAX_BODY: an edit carries every field of the favorite, and a favorite's own bounds are
+# far wider than a message's. A text favorite's text is at most MAX_FAVORITE_TEXT_LENGTH
+# characters; a structured favorite's title, servings, ingredients and steps are at most
+# MAX_RECIPE_BLOCK_LENGTH characters together on the protocol's compact wire form. A
+# title and the notes are bounded separately (MAX_TITLE_LENGTH, and the notes' own
+# MAX_FAVORITE_NOTES_LENGTH). JSON may write one character as twelve bytes (the two
+# \uXXXX escapes of one outside the basic plane; a quote or a backslash takes two, other
+# characters one to four), and the field names, the expected version and the punctuation
+# add a few dozen more. The larger kind decides. It is still one finite, defensive bound,
+# larger than any valid edit and far smaller than an oversized request may claim.
+MAX_EDIT_BODY = 12 * (
+    max(favorites.MAX_FAVORITE_TEXT_LENGTH, MAX_RECIPE_BLOCK_LENGTH)
+    + MAX_TITLE_LENGTH
+    + MAX_FAVORITE_NOTES_LENGTH
+) + 1024
 
 _EDITABLE_FIELDS = frozenset(
     {"expected_version", "title", "text", "notes", "servings", "ingredients", "steps"}
@@ -239,7 +265,9 @@ async def edit_favorite(
     database: WebDatabase = Depends(get_database),
 ) -> Response:
     wanted = _favorite_id(favorite_id)
-    expected_version, changes = _edit(await _read_json_object(request))
+    expected_version, changes = _edit(
+        await _read_json_object(request, limit=MAX_EDIT_BODY)
+    )
     now = request.app.state.clock()
     try:
         updated = await database.run(

@@ -12,8 +12,15 @@ call in the middle and NO transaction open while it runs:
      conversation at a time", the user's message and its request stored, the request
      claimed with a lease, and the context built. Or the answer to a repeated key.
   2. the backend call, bounded by `deadline_seconds`.
-  3. complete_turn (one transaction): the assistant message and the completion
-     together; or fail_turn: the request marked FAILED, which the same key retries.
+  3. complete_turn (one transaction): the assistant message, its validated structured
+     recipes and the completion together; or fail_turn: the request marked FAILED, which
+     the same key retries.
+
+The answer's recipes come from the backend, which parses the provider's own output before
+it renders the text (BackendReply.recipes). The runner carries the rendered text and those
+objects side by side; it never looks for recipes in the rendered text, which no longer
+carries the protocol blocks. A replay is answered from the stored message and reads its
+stored recipes back: nothing is generated or parsed twice.
 
 The lease. A request is claimed for the deadline (60 s) and a margin (30 s): 90 s. The
 lease runs from the instant of the claim, which begin_turn takes after it holds the
@@ -113,6 +120,7 @@ from house_helper.core.identity import ConversationKey
 from house_helper.core.limits import MAX_HISTORY_MESSAGES
 from house_helper.core.orthography import replace_yo
 from house_helper.core.outcomes import OutcomeStatus
+from house_helper.core.recipes import Recipe
 from house_helper.persistence import attachments, turns
 from house_helper.persistence.conversations import ConversationNotFound
 from house_helper.persistence.turns import CompletedTurn
@@ -512,7 +520,9 @@ class WebTurnRunner:
 
         # 2. The call.
         try:
-            text_out, truncated = await self._generate(claim, conversation_id, correlation_id)
+            text_out, truncated, recipes = await self._generate(
+                claim, conversation_id, correlation_id
+            )
         except ApiError as failure:
             await self._record_failure(claim, failure.code, correlation_id)
             failure.user_message_id = claim.user_message_id
@@ -520,10 +530,17 @@ class WebTurnRunner:
             raise
 
         # 3. The completion. complete_turn reads the clock under the lock as well, and
-        # refuses when the lease has run out by then.
+        # refuses when the lease has run out by then. The answer's validated recipes are
+        # stored with the message in that one transaction; they are never parsed from
+        # the rendered text, which no longer carries the protocol blocks.
         completion = self._start_unit(
             lambda session: turns.complete_turn(
-                session, claim, text_out, truncated=truncated, clock=self._clock
+                session,
+                claim,
+                text_out,
+                truncated=truncated,
+                clock=self._clock,
+                recipes=recipes,
             )
         )
         try:
@@ -562,10 +579,13 @@ class WebTurnRunner:
 
     async def _generate(
         self, claim: turns.Claim, conversation_id: UUID, correlation_id: str
-    ) -> tuple[str, bool]:
-        """The reply as (text, truncated). Raises the ApiError that says why there is
-        none. Cancellation is not an error to report: the request is marked
-        interrupted and the cancellation goes on."""
+    ) -> tuple[str, bool, tuple[Recipe, ...]]:
+        """The reply as (text, truncated, recipes). `text` is the rendered answer a person
+        may read; `recipes` are the validated recipes the backend parsed from the same
+        provider answer before rendering it (empty when it spoke no protocol or the
+        answer carried none). Raises the ApiError that says why there is none.
+        Cancellation is not an error to report: the request is marked interrupted and the
+        cancellation goes on."""
         try:
             reply = await asyncio.wait_for(
                 self._backend.complete(
@@ -598,7 +618,8 @@ class WebTurnRunner:
         truncated = bool(getattr(reply, "truncated", False))
         if truncated:
             text += TRUNCATED_NOTE
-        return text, truncated
+        recipes = tuple(getattr(reply, "recipes", ()) or ())
+        return text, truncated, recipes
 
     # --- what follows a turn that was cancelled while it waited for the database ------------
 

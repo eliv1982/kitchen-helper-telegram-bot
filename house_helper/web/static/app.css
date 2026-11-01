@@ -770,6 +770,130 @@ textarea[aria-invalid="true"] {
   margin-top: 1.1rem;
 }
 
+/* A structured recipe draws its fields; a legacy one keeps its text. */
+.recipe-content {
+  max-width: 46rem;
+}
+
+.recipe-servings {
+  margin: 0 0 0.6rem;
+  font-weight: 600;
+}
+
+.recipe-section {
+  margin-top: 1rem;
+}
+
+.recipe-heading {
+  margin: 0 0 0.35rem;
+  font-size: 1.05rem;
+}
+
+.recipe-list {
+  margin: 0;
+  padding-left: 1.35rem;
+  overflow-wrap: anywhere;
+}
+
+.recipe-list li {
+  margin: 0.2rem 0;
+}
+
+.recipe-notes .msg-text {
+  padding: 0.6rem 0.8rem;
+  border-left: 4px solid var(--green);
+  background: var(--surface);
+}
+
+/* The editor: one field per line, large enough for a thumb, and no horizontal scroll. */
+.recipe-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+  max-width: 46rem;
+}
+
+.edit-field,
+.edit-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.edit-field {
+  font-weight: 400; /* the field is inside its label; only the caption is bold */
+}
+
+.edit-label {
+  font-weight: 600;
+}
+
+.edit-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.edit-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.edit-row-step {
+  grid-template-columns: minmax(0, 1fr) repeat(3, auto);
+}
+
+.recipe-editor input[type="text"],
+.recipe-editor textarea {
+  width: 100%;
+  min-height: 2.75rem;
+  padding: 0.55rem 0.75rem;
+  border: 2px solid var(--field-edge);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+}
+
+.recipe-editor textarea {
+  display: block;
+  min-height: 4.5rem;
+  max-height: 20rem;
+  resize: vertical;
+  overflow-y: auto;
+  line-height: 1.45;
+}
+
+.recipe-editor input[readonly],
+.recipe-editor textarea[readonly] {
+  background: var(--pale);
+}
+
+.edit-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.25rem;
+}
+
+@media (max-width: 30rem) {
+  .edit-row,
+  .edit-row-step {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+
+  .edit-row .btn,
+  .edit-row-step .btn {
+    min-height: 2.75rem;
+  }
+
+  .edit-row-step input[type="text"] {
+    grid-column: 1 / -1;
+  }
+}
+
 .confirm {
   padding: 0.8rem 0.95rem;
   border: 2px solid var(--red);

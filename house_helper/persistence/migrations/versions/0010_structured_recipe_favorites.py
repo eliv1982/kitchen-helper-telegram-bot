@@ -12,9 +12,10 @@ Two changes, one transaction.
    by a CHECK and the composite foreign key (message_id, message_role) points at
    messages (id, role), whose new unique index is the target. The key is ON DELETE
    CASCADE, so the 365-day retention, the purge and the deletion of a user take the
-   recipes with the message. Nothing in the application writes this table yet: the turn
-   runner is deliberately not integrated in this revision (KH-F06B); the persistence
-   function exists for the later integration (KH-F06C).
+   recipes with the message. The turn runner writes this table in the same transaction
+   that stores the assistant message (persistence.turns.complete_turn calls
+   message_recipes.record_validated_recipes), when structured generation is switched on;
+   with it off no recipe is produced to store.
 
 2. favorite_recipes learns structured favorites, and one answer may now yield several
    favorites (one per recipe) without disturbing the text favorites:
@@ -72,12 +73,15 @@ knows 0009 refuses a database at 0010, and the image that knows 0010 refuses one
 Moving production back therefore requires the downgrade above (destructive for structured
 data) as well as the image, and moving forward again requires the upgrade.
 
-Feature switch. Nothing here is turned off by a flag. If structured favorites must be
-disabled after a release without a schema change, the switch belongs at the application
-boundaries named in web/favorites_api.py (the POST that names recipe_index, the PATCH of a
-structured favorite, and the later extraction call site): the schema guard stays at this
-revision, text favorites keep working, and no stored row is deleted or rewritten by being
-disabled.
+Feature switch. Nothing here is turned off by a flag. The switch that exists
+(HOUSE_HELPER_STRUCTURED_RECIPES) changes only whether new structured recipes are
+produced: with it off the backend is asked for no blocks, so the turn runner has nothing
+to store. It deliberately does not disable the favorites routes: GET and the detail read
+serve stored favorites of both kinds, POST with recipe_index copies a recipe that is
+already stored and makes no provider call, and PATCH and DELETE keep working for a
+structured favorite that already exists, because turning generation off must not strand a
+stored row. The schema guard stays at this revision, text favorites keep working, and no
+stored row is deleted or rewritten by being disabled.
 
 Written out in full rather than imported from the models (see 0001). Constraint and index
 names are spelled out (op.f).

@@ -243,15 +243,43 @@ function conversation(id, minutes = 0, title = null) {
 const listBody = (conversations, hasMore = false) => json(200, { conversations, has_more: hasMore });
 
 // The favorites, in the shapes of the real API (tests/test_web_favorites.py checks those).
-function favorite(id, messageId, title, minutes = 0) {
+function favorite(id, messageId, title, minutes = 0, extra = {}) {
   const at = new Date(START - 86400_000 + minutes * 60_000).toISOString().replace("Z", "+00:00");
-  return { id, title, message_id: messageId, created_at: at };
+  return {
+    id,
+    title,
+    message_id: messageId,
+    created_at: at,
+    kind: "text",
+    recipe_index: -1,
+    version: 1,
+    ...extra,
+  };
+}
+
+// One recipe of an answer, kept on its own.
+function structuredFavorite(id, messageId, title, recipeIndex, minutes = 0, extra = {}) {
+  return favorite(id, messageId, title, minutes, {
+    kind: "structured",
+    recipe_index: recipeIndex,
+    ...extra,
+  });
 }
 
 const favoritesBody = (favorites) => json(200, { favorites });
 
-function favoriteDetail(item, textValue) {
-  return json(200, { ...item, text: textValue });
+function favoriteDetail(item, textValue, extra = {}) {
+  const at = new Date(START - 86400_000).toISOString().replace("Z", "+00:00");
+  return json(200, {
+    ...item,
+    text: textValue,
+    updated_at: item.updated_at || at,
+    notes: item.notes === undefined ? null : item.notes,
+    servings: item.servings === undefined ? null : item.servings,
+    ingredients: item.ingredients === undefined ? null : item.ingredients,
+    steps: item.steps === undefined ? null : item.steps,
+    ...extra,
+  });
 }
 
 // 201 (kept now) or 200 (it already was)
@@ -271,11 +299,19 @@ function historyBody(id, messages, { hasMore = false, nextBefore = null } = {}) 
   });
 }
 
-function turnBody(id, userId, userText, assistantId, assistantText, replayed = false) {
+function turnBody(id, userId, userText, assistantId, assistantText, replayed = false, recipes = null) {
+  const assistant = {
+    id: assistantId,
+    role: "assistant",
+    text: assistantText,
+    created_at: iso(assistantId),
+    status: "completed",
+  };
+  if (recipes) assistant.recipes = recipes;
   const body = {
     conversation_id: id,
     user_message: { id: userId, role: "user", text: userText, created_at: iso(userId), status: "completed" },
-    assistant_message: { id: assistantId, role: "assistant", text: assistantText, created_at: iso(assistantId), status: "completed" },
+    assistant_message: assistant,
     truncated: false,
     replayed,
   };
@@ -338,6 +374,7 @@ function makeEnv(options = {}) {
     now: () => timers.now,
     AbortController,
     maxLength: options.maxLength,
+    structuredRecipes: options.structuredRecipes === true,
     onChange: () => {
       changes.count++;
     },
@@ -409,6 +446,7 @@ module.exports = {
   conversation,
   listBody,
   favorite,
+  structuredFavorite,
   favoritesBody,
   favoriteDetail,
   keptBody,

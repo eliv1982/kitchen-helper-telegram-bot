@@ -3079,7 +3079,7 @@ scenario("the_favorites_section_lists_newest_first_and_a_recipe_is_opened_by_ask
   );
   assert.deepEqual(view.favorites.items.map((i) => i.current), [false, true]);
   assert.equal(gets(env, FAV_URL_1), 1);
-  assert.equal(gets(env, FAVORITES_URL), 1, "the list was read at the start and not again");
+  assert.equal(gets(env, FAVORITES_URL), 2, "the list is read at the start and again when Favorites is opened");
 });
 
 scenario("a_recipe_that_is_loading_is_shown_with_its_title_from_the_list", async () => {
@@ -3394,6 +3394,757 @@ scenario("every_favorites_call_is_made_with_the_session_cookie_only_and_names_no
     assert.deepEqual(Object.keys(request.headers).sort(), request.body === undefined ? ["accept"] : ["accept", "content-type"]);
     assert.ok(!JSON.stringify(request).includes(USER_A));
   }
+});
+
+// --- structured recipes: one Save per recipe, and the editor ---------------------------------
+
+const BORSH_RECIPE = {
+  title: "Борщ",
+  servings: "4 порции",
+  ingredients: [
+    { name: "свекла", amount: "2 шт." },
+    { name: "капуста", amount: "300 г" },
+  ],
+  steps: ["Сварите бульон.", "Добавьте овощи."],
+};
+const UKHA_RECIPE = {
+  title: "Уха",
+  servings: null,
+  ingredients: [{ name: "рыба", amount: "1 кг" }],
+  steps: ["Сварите.", "Дайте настояться."],
+};
+const STRUCTURED_TEXT = "Борщ\n\nИнгредиенты:\n- свекла — 2 шт.\n\nПриготовление:\n1. Сварите бульон.";
+
+function structuredAnswer(recipes = [BORSH_RECIPE, UKHA_RECIPE]) {
+  return message(2, "assistant", STRUCTURED_TEXT, {
+    recipes: recipes.map((recipe, position) => ({ position, title: recipe.title })),
+  });
+}
+
+async function withStructuredAnswer(options = {}) {
+  const env = makeEnv({ structuredRecipes: true, ...options }).signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что приготовить?"), structuredAnswer()]),
+  });
+  await env.boot();
+  return env;
+}
+
+function structuredFavoriteItem(extra = {}) {
+  return H.structuredFavorite(H.FAV_1, 2, "Борщ", 0, 0, {
+    servings: "4 порции",
+    ingredients: BORSH_RECIPE.ingredients,
+    steps: BORSH_RECIPE.steps,
+    notes: "Больше укропа.",
+    version: 3,
+    ...extra,
+  });
+}
+
+async function withOpenStructuredFavorite(extra = {}) {
+  const item = structuredFavoriteItem(extra);
+  const env = makeEnv({ structuredRecipes: true }).signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что?"), structuredAnswer()]),
+  });
+  env.net.route("GET", FAVORITES_URL, H.favoritesBody([item]));
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(item, STRUCTURED_TEXT));
+  await env.boot();
+  await env.ctl.openFavorite(H.FAV_1);
+  await env.settle();
+  return { env, item };
+}
+
+const assistantItem = (env) => timeline(env).find((item) => item.role === "assistant");
+
+scenario("structured_each_recipe_of_one_answer_has_its_own_save_control", async () => {
+  const env = await withStructuredAnswer();
+  let answer = assistantItem(env);
+
+  assert.equal(answer.favorite, null, "no whole-answer button when the answer has recipes");
+  assert.deepEqual(
+    answer.recipes.map((recipe) => [recipe.position, recipe.title, recipe.state]),
+    [[0, "Борщ", "none"], [1, "Уха", "none"]]
+  );
+
+  env.net.route("POST", FAVORITES_URL, H.keptBody(structuredFavoriteItem()));
+  assert.deepEqual(await env.ctl.keepFavorite(CONV_A, 2, 0), { ok: true, reason: "created" });
+  assert.deepEqual(env.net.requests("POST", FAVORITES_URL)[0].body, {
+    conversation_id: CONV_A,
+    message_id: 2,
+    recipe_index: 0,
+  });
+
+  answer = assistantItem(env);
+  assert.deepEqual(answer.recipes.map((recipe) => recipe.state), ["saved", "none"]);
+  assert.equal(answer.recipes[1].favoriteId, null);
+
+  assert.deepEqual(await env.ctl.keepFavorite(CONV_A, 2, 0), { ok: true, reason: "already" });
+  assert.equal(env.net.requests("POST", FAVORITES_URL).length, 1, "a kept recipe is never saved twice");
+});
+
+scenario("structured_a_fresh_answer_shows_its_recipe_controls_without_a_reload", async () => {
+  const env = await withConversation({ structuredRecipes: true });
+  env.net.route("POST", URL_A, turnBody(CONV_A, 3, "Еще?", 4, "Вот.", false, [{ position: 0, title: "Уха" }]));
+
+  assert.equal((await env.ctl.send("Еще?")).ok, true);
+  await env.settle();
+
+  const answer = timeline(env).find((item) => item.type === "message" && item.id === 4);
+  assert.deepEqual(answer.recipes.map((recipe) => [recipe.position, recipe.title, recipe.state]), [[0, "Уха", "none"]]);
+  assert.equal(answer.favorite, null);
+});
+
+scenario("structured_two_save_controls_are_independent_in_failure_and_success", async () => {
+  const env = await withStructuredAnswer();
+  env.net.route(
+    "POST",
+    FAVORITES_URL,
+    apiError(409, "favorites_full"),
+    H.keptBody(H.structuredFavorite(H.FAV_2, 2, "Уха", 1))
+  );
+
+  assert.equal((await env.ctl.keepFavorite(CONV_A, 2, 0)).reason, "rejected");
+  let answer = assistantItem(env);
+  assert.deepEqual(answer.recipes.map((recipe) => recipe.state), ["error", "none"]);
+  assert.equal(answer.recipes[0].error.text, Logic.CODE_MESSAGES.favorites_full);
+
+  assert.deepEqual(await env.ctl.keepFavorite(CONV_A, 2, 1), { ok: true, reason: "created" });
+  answer = assistantItem(env);
+  assert.deepEqual(answer.recipes.map((recipe) => recipe.state), ["error", "saved"]);
+});
+
+scenario("structured_off_an_ordinary_answer_keeps_the_legacy_whole_answer_save", async () => {
+  const env = await withConversation(); // (the switch is off, the default)
+  const answer = assistantItem(env);
+
+  assert.deepEqual(answer.recipes, [], "no per-recipe controls while generation is off");
+  assert.deepEqual(answer.favorite, { state: "none", id: null, error: null }, "the legacy save stays");
+
+  env.net.route("POST", FAVORITES_URL, H.keptBody(F1));
+  assert.deepEqual(await env.ctl.keepFavorite(CONV_A, 2), { ok: true, reason: "created" });
+  const sent = env.net.requests("POST", FAVORITES_URL)[0].body;
+  assert.deepEqual(sent, { conversation_id: CONV_A, message_id: 2 }, "no recipe identity is fabricated");
+});
+
+scenario("structured_an_ordinary_answer_has_no_save_control_at_all", async () => {
+  const env = await withConversation({ structuredRecipes: true });
+  const answer = assistantItem(env);
+
+  assert.deepEqual(answer.recipes, []);
+  assert.equal(answer.favorite, null, "no whole-answer Save, and no legacy fallback");
+  assert.equal(env.net.requests("POST", FAVORITES_URL).length, 0, "nothing is offered to send");
+});
+
+scenario("structured_one_recipe_in_the_history_has_one_independent_save_control", async () => {
+  const env = makeEnv({ structuredRecipes: true }).signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [
+      message(1, "user", "Что приготовить?"),
+      structuredAnswer([UKHA_RECIPE]),
+    ]),
+  });
+  await env.boot();
+
+  let answer = assistantItem(env);
+  assert.equal(answer.favorite, null);
+  assert.deepEqual(
+    answer.recipes.map((recipe) => [recipe.position, recipe.title, recipe.state]),
+    [[0, "Уха", "none"]]
+  );
+
+  env.net.route("POST", FAVORITES_URL, H.keptBody(H.structuredFavorite(H.FAV_2, 2, "Уха", 0)));
+  assert.deepEqual(await env.ctl.keepFavorite(CONV_A, 2, 0), { ok: true, reason: "created" });
+
+  answer = assistantItem(env);
+  assert.deepEqual(answer.recipes.map((recipe) => [recipe.position, recipe.state]), [[0, "saved"]]);
+  assert.equal(answer.favorite, null, "one recipe never brings the whole-answer Save back");
+});
+
+scenario("structured_a_malformed_recipe_list_offers_no_save_control", async () => {
+  // The server stores only validated recipes, but a page must not turn an answer whose
+  // recipe list is unrecognized into a whole-answer Save: it offers nothing.
+  const malformed = [
+    "Борщ",
+    null,
+    { position: 0, title: "Борщ" },
+    [{ position: "0", title: "Борщ" }, { position: -1, title: "Борщ" }, { position: 0, title: "" }, { position: 0 }],
+    [{ title: "Борщ" }, { position: 9, title: "Борщ" }, "Борщ", null],
+  ];
+  for (const recipes of malformed) {
+    const env = makeEnv({ structuredRecipes: true }).signedIn([conversation(CONV_A, 0)], {
+      [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что?"), message(2, "assistant", "Ответ.", { recipes })]),
+    });
+    await env.boot();
+    const answer = assistantItem(env);
+    const label = JSON.stringify(recipes);
+
+    assert.deepEqual(answer.recipes, [], label);
+    assert.equal(answer.favorite, null, "no fallback to the whole-answer save: " + label);
+  }
+});
+
+scenario("structured_a_replayed_answer_shows_the_same_controls_and_no_whole_answer_save", async () => {
+  const env = await withConversation({ structuredRecipes: true });
+  const recipes = [{ position: 0, title: "Уха" }];
+  env.net.route("POST", URL_A, fail(), turnBody(CONV_A, 3, "Еще?", 4, "Вот.", true, recipes));
+
+  const sent = await env.ctl.send("Еще?");
+  await sent.done;
+  await env.settle();
+  await env.ctl.retry(CONV_A);
+  await env.settle();
+
+  const answer = timeline(env).find((item) => item.type === "message" && item.id === 4);
+  assert.deepEqual(
+    answer.recipes.map((recipe) => [recipe.position, recipe.title, recipe.state]),
+    [[0, "Уха", "none"]]
+  );
+  assert.equal(answer.favorite, null);
+  assert.equal(new Set(env.keys(CONV_A)).size, 1, "the same key: a replay, not a second run");
+});
+
+scenario("structured_off_a_structured_favorite_still_opens_and_edits", async () => {
+  // The switch only changes what the chat offers; the favorites routes and the card are
+  // not gated by it.
+  const item = structuredFavoriteItem();
+  const env = makeEnv().signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что?"), message(2, "assistant", STRUCTURED_TEXT)]),
+  });
+  env.net.route("GET", FAVORITES_URL, H.favoritesBody([item]));
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(item, STRUCTURED_TEXT));
+  await env.boot();
+  await env.ctl.openFavorite(H.FAV_1);
+  await env.settle();
+
+  let current = env.view().favorites.current;
+  assert.deepEqual(
+    [current.kind, current.title, current.servings],
+    ["structured", "Борщ", "4 порции"],
+    "a stored structured favorite is still readable with the switch off"
+  );
+
+  env.ctl.beginEditFavorite();
+  const draft = Object.assign({}, env.view().favorites.current.editor.draft, { notes: "Поправка" });
+  const updated = structuredFavoriteItem({ notes: "Поправка", version: 4 });
+  env.net.route("PATCH", FAV_URL_1, H.favoriteDetail(updated, STRUCTURED_TEXT));
+  assert.deepEqual(await env.ctl.saveFavoriteEdit(draft), { ok: true });
+
+  assert.deepEqual(env.net.requests("PATCH", FAV_URL_1)[0].body, {
+    expected_version: 3,
+    title: "Борщ",
+    notes: "Поправка",
+    servings: "4 порции",
+    ingredients: BORSH_RECIPE.ingredients,
+    steps: BORSH_RECIPE.steps,
+  });
+  current = env.view().favorites.current;
+  assert.equal(current.editor, null);
+  assert.equal(current.notes, "Поправка");
+  assert.deepEqual(
+    assistantItem(env).favorite,
+    { state: "none", id: null, error: null },
+    "the chat's legacy control is unchanged with the switch off"
+  );
+});
+
+scenario("structured_the_controls_disappear_when_the_feature_is_off", async () => {
+  const env = makeEnv().signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что?"), structuredAnswer()]),
+  });
+  await env.boot();
+  const answer = assistantItem(env);
+
+  assert.deepEqual(answer.recipes, [], "stored recipes are not controls while generation is off");
+  assert.deepEqual(answer.favorite, { state: "none", id: null, error: null });
+});
+
+scenario("structured_a_saved_recipe_opens_from_the_chat_and_the_card_has_its_fields", async () => {
+  const { env } = await withOpenStructuredFavorite();
+  const current = env.view().favorites.current;
+
+  assert.equal(env.view().section, "favorites");
+  assert.deepEqual(
+    [current.kind, current.title, current.servings, current.version],
+    ["structured", "Борщ", "4 порции", 3]
+  );
+  assert.deepEqual(current.ingredients, BORSH_RECIPE.ingredients);
+  assert.deepEqual(current.steps, BORSH_RECIPE.steps);
+  assert.equal(current.notes, "Больше укропа.");
+  assert.equal(current.editor, null);
+});
+
+scenario("structured_the_editor_saves_every_edited_field_and_no_model_is_named", async () => {
+  const { env } = await withOpenStructuredFavorite();
+  assert.equal(env.ctl.hasUnsavedChanges(), false);
+  assert.equal(env.ctl.beginEditFavorite(), true);
+  assert.equal(env.ctl.hasUnsavedChanges(), true);
+
+  let current = env.view().favorites.current;
+  assert.equal(current.editor.phase, "editing");
+  assert.deepEqual(current.editor.draft.ingredients, BORSH_RECIPE.ingredients);
+  assert.deepEqual(current.editor.draft.steps, BORSH_RECIPE.steps);
+
+  const draft = {
+    title: "Борщ по-домашнему",
+    notes: "Еще укропа.",
+    servings: "6 порций",
+    ingredients: [
+      { name: "свекла", amount: "3 шт." },
+      { name: "капуста", amount: "400 г" },
+    ],
+    steps: ["Сварите бульон.", "Добавьте овощи.", "Дайте настояться."],
+  };
+  const updated = structuredFavoriteItem({
+    title: draft.title,
+    servings: draft.servings,
+    ingredients: draft.ingredients,
+    steps: draft.steps,
+    notes: draft.notes,
+    version: 4,
+  });
+  env.net.route("PATCH", FAV_URL_1, H.favoriteDetail(updated, "новый текст"));
+
+  assert.deepEqual(await env.ctl.saveFavoriteEdit(draft), { ok: true });
+  assert.deepEqual(env.net.requests("PATCH", FAV_URL_1)[0].body, {
+    expected_version: 3,
+    title: "Борщ по-домашнему",
+    notes: "Еще укропа.",
+    servings: "6 порций",
+    ingredients: draft.ingredients,
+    steps: draft.steps,
+  });
+  current = env.view().favorites.current;
+  assert.equal(current.editor, null);
+  assert.equal(env.ctl.hasUnsavedChanges(), false);
+  assert.deepEqual([current.title, current.version, current.notes], ["Борщ по-домашнему", 4, "Еще укропа."]);
+  assert.ok(env.announced.includes(Logic.TEXT.editSaved));
+});
+
+scenario("structured_a_conflict_keeps_the_draft_and_offers_reload_or_overwrite", async () => {
+  const { env, item } = await withOpenStructuredFavorite();
+  env.ctl.beginEditFavorite();
+  const draft = Object.assign({}, env.view().favorites.current.editor.draft, {
+    title: "Черновик, который нельзя потерять",
+  });
+  env.net.route("PATCH", FAV_URL_1, apiError(409, "favorite_conflict"));
+
+  assert.deepEqual(await env.ctl.saveFavoriteEdit(draft), { ok: false, reason: "conflict" });
+  let current = env.view().favorites.current;
+  assert.equal(current.editor.phase, "conflict");
+  assert.equal(current.editor.draft.title, "Черновик, который нельзя потерять");
+  assert.equal(current.editor.error.text, Logic.TEXT.editConflict);
+
+  const changed = structuredFavoriteItem({ title: "Борщ, измененный в другом месте", version: 4 });
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(changed, STRUCTURED_TEXT));
+  await env.ctl.reloadFavoriteAfterConflict();
+  await env.settle();
+
+  current = env.view().favorites.current;
+  assert.equal(current.editor, null);
+  assert.deepEqual([current.title, current.version, item.title], ["Борщ, измененный в другом месте", 4, "Борщ"]);
+});
+
+scenario("structured_overwrite_reads_the_current_version_first_and_names_it", async () => {
+  const { env } = await withOpenStructuredFavorite();
+  env.ctl.beginEditFavorite();
+  const draft = Object.assign({}, env.view().favorites.current.editor.draft, { title: "Поверх" });
+  env.net.route("PATCH", FAV_URL_1, apiError(409, "favorite_conflict"));
+  await env.ctl.saveFavoriteEdit(draft);
+  assert.equal(env.view().favorites.current.editor.phase, "conflict");
+
+  const latest = structuredFavoriteItem({ title: "Изменено", version: 7 });
+  const saved = structuredFavoriteItem({ title: "Поверх", version: 8 });
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(latest, STRUCTURED_TEXT));
+  env.net.route("PATCH", FAV_URL_1, H.favoriteDetail(saved, STRUCTURED_TEXT));
+  // The person may edit the conflict view itself: the fields as they are now are what
+  // "Сохранить поверх" sends.
+  assert.deepEqual(
+    await env.ctl.overwriteFavorite(Object.assign({}, draft, { notes: "Правка в окне конфликта" })),
+    { ok: true }
+  );
+
+  const patches = env.net.requests("PATCH", FAV_URL_1);
+  assert.equal(patches.length, 2);
+  assert.equal(patches[1].body.expected_version, 7, "the overwrite names the version it just read");
+  assert.equal(patches[1].body.title, "Поверх");
+  assert.equal(patches[1].body.notes, "Правка в окне конфликта");
+  assert.equal(env.view().favorites.current.editor, null);
+  assert.equal(env.view().favorites.current.title, "Поверх");
+});
+
+scenario("structured_a_network_error_keeps_the_draft_and_a_second_save_works", async () => {
+  const { env } = await withOpenStructuredFavorite();
+  env.ctl.beginEditFavorite();
+  const draft = Object.assign({}, env.view().favorites.current.editor.draft, { notes: "Не потерять" });
+  env.net.route("PATCH", FAV_URL_1, fail());
+  assert.equal((await env.ctl.saveFavoriteEdit(draft)).reason, "uncertain");
+
+  let current = env.view().favorites.current;
+  assert.equal(current.editor.phase, "editing");
+  assert.equal(current.editor.draft.notes, "Не потерять");
+  assert.equal(current.editor.error.text, Logic.TEXT.network);
+
+  env.net.route(
+    "PATCH",
+    FAV_URL_1,
+    H.favoriteDetail(structuredFavoriteItem({ notes: "Не потерять", version: 4 }), STRUCTURED_TEXT)
+  );
+  assert.deepEqual(await env.ctl.saveFavoriteEdit(current.editor.draft), { ok: true });
+  assert.equal(env.view().favorites.current.editor, null);
+});
+
+scenario("structured_the_legacy_editor_sends_title_text_and_notes_and_never_structured_fields", async () => {
+  const item = H.favorite(H.FAV_1, 2, "Борщ классический", 0, { version: 2 });
+  const env = makeEnv({ structuredRecipes: true }).signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что?"), message(2, "assistant", RECIPE_TEXT)]),
+  });
+  env.net.route("GET", FAVORITES_URL, H.favoritesBody([item]));
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(item, RECIPE_TEXT));
+  await env.boot();
+  assert.equal(assistantItem(env).favorite, null, "the whole-answer row is not the chat's fallback under the switch");
+  assert.deepEqual(env.view().favorites.items.map((favorite) => favorite.id), [H.FAV_1]);
+  await env.ctl.openFavorite(H.FAV_1);
+  await env.settle();
+
+  assert.equal(env.view().favorites.current.kind, "text");
+  env.ctl.beginEditFavorite();
+  const draft = {
+    title: "Мой борщ",
+    text: "Борщ по-моему.\n\n1. Сварить.",
+    notes: "Больше свеклы.",
+    servings: "не надо",
+    ingredients: [{ name: "не", amount: "надо" }],
+    steps: ["не надо"],
+  };
+  env.net.route(
+    "PATCH",
+    FAV_URL_1,
+    H.favoriteDetail(
+      H.favorite(H.FAV_1, 2, "Мой борщ", 0, { version: 3 }),
+      draft.text,
+      { notes: draft.notes }
+    )
+  );
+  assert.deepEqual(await env.ctl.saveFavoriteEdit(draft), { ok: true });
+
+  assert.deepEqual(env.net.requests("PATCH", FAV_URL_1)[0].body, {
+    expected_version: 2,
+    title: "Мой борщ",
+    text: draft.text,
+    notes: "Больше свеклы.",
+  });
+  assert.equal(env.view().favorites.current.text, draft.text);
+});
+
+scenario("structured_a_draft_survives_a_session_recheck_and_typing_redraws_nothing", async () => {
+  const { env } = await withOpenStructuredFavorite();
+  env.ctl.beginEditFavorite();
+  const draft = Object.assign({}, env.view().favorites.current.editor.draft, {
+    title: "UNSAVED REVIEW DRAFT",
+    notes: "Черновик заметки",
+    ingredients: [
+      { name: "свекла", amount: "2 шт." },
+      { name: "морковь", amount: "2 шт." },
+    ],
+    steps: ["Первый.", "Второй.", "Третий."],
+  });
+  const changes = env.changes.count;
+
+  // The page hands over every keystroke: the draft is kept, and nothing is redrawn or sent.
+  assert.equal(env.ctl.syncFavoriteDraft(draft), true);
+  assert.equal(env.changes.count, changes, "typing redraws nothing");
+  assert.equal(env.net.requests("PATCH", FAV_URL_1).length, 0);
+
+  // The tab comes back: the session is asked about again, the page is held back while it
+  // is, and the same person gets the editor back as it was left.
+  env.ctl.recheck();
+  assert.equal(env.view().screen, "verifying");
+  await env.settle();
+
+  const current = env.view().favorites.current;
+  assert.equal(env.view().screen, "app");
+  assert.equal(current.editor.phase, "editing");
+  assert.equal(current.editor.draft.title, "UNSAVED REVIEW DRAFT");
+  assert.equal(current.editor.draft.notes, "Черновик заметки");
+  assert.deepEqual(current.editor.draft.ingredients, draft.ingredients);
+  assert.deepEqual(current.editor.draft.steps, ["Первый.", "Второй.", "Третий."]);
+  assert.equal(env.ctl.hasUnsavedChanges(), true);
+  assert.equal(env.net.requests("PATCH", FAV_URL_1).length, 0, "a recheck never saves");
+});
+
+scenario("structured_a_draft_is_dropped_when_the_session_ends_or_another_person_signs_in", async () => {
+  // The session ends: the editor is gone with everything else in memory.
+  const ended = await withOpenStructuredFavorite();
+  ended.env.ctl.beginEditFavorite();
+  ended.env.ctl.syncFavoriteDraft({ title: "UNSAVED REVIEW DRAFT" });
+  ended.env.net.route("GET", "/auth/me", notAuthenticated());
+  ended.env.ctl.recheck();
+  await ended.env.settle();
+
+  assert.equal(ended.env.view().screen, "login");
+  assert.equal(ended.env.ctl._state().favorites.editor, null);
+  assert.equal(ended.env.ctl._state().favorites.detail, null);
+  assert.ok(!JSON.stringify(ended.env.view()).includes("UNSAVED REVIEW DRAFT"));
+
+  // Another person: the page starts over, and the draft is not theirs.
+  const other = await withOpenStructuredFavorite();
+  other.env.ctl.beginEditFavorite();
+  other.env.ctl.syncFavoriteDraft({ title: "UNSAVED REVIEW DRAFT" });
+  borisIsSignedIn(other.env);
+  other.env.net.route("GET", "/api/favorites", H.favoritesBody([]));
+  other.env.ctl.recheck();
+  await other.env.settle();
+
+  const view = other.env.view();
+  assert.equal(view.screen, "app");
+  assert.equal(view.currentId, CONV_B);
+  assert.equal(view.favorites.current, null);
+  assert.deepEqual(view.favorites.items, []);
+  assert.equal(other.env.ctl._state().favorites.editor, null);
+  assert.ok(!JSON.stringify(view).includes("UNSAVED REVIEW DRAFT"));
+});
+
+scenario("structured_returning_to_favorites_refreshes_the_open_card_without_losing_a_draft", async () => {
+  const { env } = await withOpenStructuredFavorite();
+  env.ctl.showSection("chats");
+  const changed = structuredFavoriteItem({ title: "Борщ, измененный в другом месте", version: 9 });
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(changed, STRUCTURED_TEXT));
+
+  env.ctl.showSection("favorites");
+  await env.settle();
+  let current = env.view().favorites.current;
+  assert.deepEqual([current.title, current.version], ["Борщ, измененный в другом месте", 9]);
+
+  // With a draft open the background refresh leaves both the card and the draft alone.
+  env.ctl.beginEditFavorite();
+  const draft = Object.assign({}, env.view().favorites.current.editor.draft, { title: "Мой черновик" });
+  env.ctl.updateFavoriteDraft(draft);
+  env.ctl.showSection("chats");
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(structuredFavoriteItem({ title: "Еще одно", version: 10 }), STRUCTURED_TEXT));
+  env.ctl.showSection("favorites");
+  await env.settle();
+  current = env.view().favorites.current;
+  assert.equal(current.title, "Борщ, измененный в другом месте");
+  assert.equal(current.editor.draft.title, "Мой черновик");
+});
+
+scenario("structured_returning_to_favorites_refreshes_the_list", async () => {
+  const env = makeEnv({ structuredRecipes: true }).signedIn([]);
+  env.net.route("GET", FAVORITES_URL, H.favoritesBody([F1]), H.favoritesBody([F2]));
+  await env.boot();
+  assert.deepEqual(env.view().favorites.items.map((item) => item.title), ["Борщ классический"]);
+
+  env.ctl.showSection("favorites");
+  await env.settle();
+  assert.deepEqual(env.view().favorites.items.map((item) => item.title), ["Плов с курицей"]);
+
+  env.ctl.showSection("chats");
+  await env.ctl.showSection("favorites");
+  assert.deepEqual(env.view().favorites.items.map((item) => item.title), ["Плов с курицей"]);
+  assert.equal(gets(env, FAVORITES_URL), 3, "every return asks the server again");
+});
+
+// ============================================================================================
+// A draft is kept exactly as written: no field is ever shortened
+// ============================================================================================
+
+// The review's reproduction: a valid step of 1,000 Unicode characters, 500 of them outside
+// the basic plane. JavaScript's .length counts 1,500 UTF-16 units for it.
+const EMOJI_STEP = "🍅".repeat(500) + "a".repeat(500);
+
+// Mixed scripts: Cyrillic, combining marks, an emoji sequence, a supplementary-plane symbol.
+const MIXED_TEXT = "Све́кла 🍅 𝄞 е́ и 👨‍🍳";
+
+scenario("structured_a_step_of_emoji_and_ascii_survives_synchronization_a_recheck_and_saving", async () => {
+  const { env } = await withOpenStructuredFavorite({ steps: [EMOJI_STEP, "Добавьте овощи."] });
+  assert.equal(env.ctl.beginEditFavorite(), true);
+
+  // What app.js hands over on every keystroke: every field as it now is on the page.
+  const draft = Object.assign({}, env.view().favorites.current.editor.draft, { title: "Борщ по-домашнему" });
+  assert.equal(env.ctl.syncFavoriteDraft(draft), true);
+
+  let current = env.view().favorites.current;
+  assert.equal(current.editor.draft.steps[0], EMOJI_STEP);
+  assert.equal(Logic.countCodePoints(current.editor.draft.steps[0]), 1000);
+  assert.equal(current.editor.draft.steps[0].length, 1500, "the old code cut this at 1,001 UTF-16 units");
+  assert.equal(env.net.requests("PATCH", FAV_URL_1).length, 0, "typing saves nothing");
+
+  // A return to the tab checks the session and redraws the editor from the same draft.
+  env.ctl.recheck();
+  await env.settle();
+  current = env.view().favorites.current;
+  assert.equal(current.editor.draft.steps[0], EMOJI_STEP);
+  assert.equal(env.net.requests("PATCH", FAV_URL_1).length, 0, "a recheck saves nothing");
+
+  const updated = structuredFavoriteItem({
+    title: "Борщ по-домашнему",
+    steps: [EMOJI_STEP, "Добавьте овощи."],
+    version: 4,
+  });
+  env.net.route("PATCH", FAV_URL_1, H.favoriteDetail(updated, STRUCTURED_TEXT));
+  assert.deepEqual(await env.ctl.saveFavoriteEdit(current.editor.draft), { ok: true });
+
+  const sent = env.net.requests("PATCH", FAV_URL_1)[0].body;
+  assert.equal(sent.steps[0], EMOJI_STEP);
+  assert.equal(Logic.countCodePoints(sent.steps[0]), 1000);
+  assert.equal(env.net.log.filter((request) => request.method === "POST").length, 0, "no model is called");
+});
+
+scenario("structured_editing_only_the_title_keeps_every_other_field_exactly_as_it_was", async () => {
+  const ingredients = [
+    { name: "Све́кла 🍅", amount: "2 шт. 𝄞" },
+    { name: "Лук 👨‍🍳", amount: "1 é" },
+  ];
+  const steps = ["Обжарьте лук.", MIXED_TEXT];
+  const notes = "Заметка с ё и знаками ударения: е́, а́.";
+  const servings = "4 порции 🍲";
+  const { env } = await withOpenStructuredFavorite({ ingredients, steps, notes, servings });
+  env.ctl.beginEditFavorite();
+  const draft = Object.assign({}, env.view().favorites.current.editor.draft, { title: "Новый заголовок 🍲" });
+
+  const updated = structuredFavoriteItem({
+    title: "Новый заголовок 🍲",
+    ingredients,
+    steps,
+    notes,
+    servings,
+    version: 4,
+  });
+  env.net.route("PATCH", FAV_URL_1, H.favoriteDetail(updated, STRUCTURED_TEXT));
+  assert.deepEqual(await env.ctl.saveFavoriteEdit(draft), { ok: true });
+
+  const sent = env.net.requests("PATCH", FAV_URL_1)[0].body;
+  assert.equal(sent.title, "Новый заголовок 🍲");
+  assert.equal(sent.servings, servings);
+  assert.equal(sent.notes, notes);
+  assert.deepEqual(sent.ingredients, ingredients, "every name and amount, in order");
+  assert.deepEqual(sent.steps, steps, "every step, in order");
+});
+
+scenario("a_legacy_text_of_one_hundred_thousand_characters_survives_synchronization_and_saves_whole", async () => {
+  const legacy = "🍅".repeat(50000) + "a".repeat(50000); // 100,000 code points, 150,000 UTF-16 units
+  const item = H.favorite(H.FAV_1, 2, "Старый текст", 0, { version: 2 });
+  const env = makeEnv().signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что?"), message(2, "assistant", RECIPE_TEXT)]),
+  });
+  env.net.route("GET", FAVORITES_URL, H.favoritesBody([item]));
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(item, legacy));
+  await env.boot();
+  await env.ctl.openFavorite(H.FAV_1);
+  await env.settle();
+
+  env.ctl.beginEditFavorite();
+  assert.equal(env.view().favorites.current.editor.draft.text, legacy);
+  assert.equal(Logic.countCodePoints(legacy), 100000);
+  assert.equal(legacy.length, 150000, "the old code reduced this to 50,001 characters");
+
+  // The person changes only the title; the text is handed over whole on every keystroke.
+  const draft = Object.assign({}, env.view().favorites.current.editor.draft, { title: "Новое имя" });
+  env.ctl.syncFavoriteDraft(draft);
+  env.ctl.recheck();
+  await env.settle();
+  assert.equal(env.view().favorites.current.editor.draft.text, legacy);
+  assert.equal(env.net.requests("PATCH", FAV_URL_1).length, 0, "nothing is saved by a refresh");
+
+  const saved = H.favorite(H.FAV_1, 2, "Новое имя", 0, { version: 3 });
+  env.net.route("PATCH", FAV_URL_1, H.favoriteDetail(saved, legacy));
+  assert.deepEqual(await env.ctl.saveFavoriteEdit(env.view().favorites.current.editor.draft), { ok: true });
+
+  const sent = env.net.requests("PATCH", FAV_URL_1)[0].body;
+  assert.equal(sent.text, legacy);
+  assert.equal(sent.title, "Новое имя");
+});
+
+scenario("the_maximum_valid_field_lengths_survive_editing_and_saving_a_structured_favorite", async () => {
+  // Every field at the server's maximum, measured in code points (outside the basic plane,
+  // so each of these is longer in UTF-16 than the limit it is exactly at).
+  const title = "🍅".repeat(200);
+  const changed = "🍲" + "🍅".repeat(199); // still 200 code points
+  const servings = "🍲".repeat(100);
+  const ingredients = [{ name: "🍅".repeat(200), amount: "🍅".repeat(100) }];
+  const steps = ["🍅".repeat(1000)];
+  const notes = "🍅".repeat(2000);
+  const { env } = await withOpenStructuredFavorite({ title, servings, ingredients, steps, notes });
+  env.ctl.beginEditFavorite();
+  const draft = Object.assign({}, env.view().favorites.current.editor.draft, { title: changed });
+
+  const updated = structuredFavoriteItem({ title: changed, servings, ingredients, steps, notes, version: 4 });
+  env.net.route("PATCH", FAV_URL_1, H.favoriteDetail(updated, STRUCTURED_TEXT));
+  assert.deepEqual(await env.ctl.saveFavoriteEdit(draft), { ok: true });
+
+  const sent = env.net.requests("PATCH", FAV_URL_1)[0].body;
+  assert.equal(sent.title, changed);
+  assert.equal(sent.servings, servings);
+  assert.deepEqual(sent.ingredients, ingredients);
+  assert.deepEqual(sent.steps, steps);
+  assert.equal(sent.notes, notes);
+});
+
+scenario("an_over_limit_structured_field_is_refused_with_a_reason_and_the_whole_draft_stays", async () => {
+  const cases = [
+    { change: { title: "я".repeat(201) }, message: Logic.TEXT.editTitleTooLong },
+    { change: { notes: "😀".repeat(2001) }, message: Logic.TEXT.editNotesTooLong },
+    { change: { servings: "🍲".repeat(101) }, message: Logic.TEXT.editServingsTooLong },
+    {
+      change: { ingredients: [{ name: "🍅".repeat(201), amount: "1" }] },
+      message: Logic.TEXT.editIngredientNameTooLong,
+    },
+    {
+      change: { ingredients: [{ name: "свекла", amount: "🍅".repeat(101) }] },
+      message: Logic.TEXT.editIngredientAmountTooLong,
+    },
+    { change: { steps: ["🍅".repeat(1001)] }, message: Logic.TEXT.editStepTooLong },
+    {
+      change: { ingredients: Array.from({ length: 101 }, () => ({ name: "a", amount: "1" })) },
+      message: Logic.TEXT.editTooManyIngredients,
+    },
+    {
+      change: { steps: Array.from({ length: 51 }, (_, index) => "Шаг " + index) },
+      message: Logic.TEXT.editTooManySteps,
+    },
+  ];
+  for (const entry of cases) {
+    const { env } = await withOpenStructuredFavorite();
+    env.ctl.beginEditFavorite();
+    const draft = Object.assign({}, env.view().favorites.current.editor.draft, entry.change);
+
+    assert.deepEqual(await env.ctl.saveFavoriteEdit(draft), { ok: false, reason: "invalid" });
+    const current = env.view().favorites.current;
+    assert.equal(current.editor.phase, "editing");
+    assert.equal(current.editor.error.text, entry.message);
+    assert.deepEqual(current.editor.draft, draft, "the whole draft, byte for character");
+    assert.equal(env.net.requests("PATCH", FAV_URL_1).length, 0, "nothing over the limit is sent");
+  }
+});
+
+scenario("an_over_limit_legacy_text_is_refused_with_a_reason_and_never_shortened", async () => {
+  const stored = "🍅".repeat(100000); // exactly the server's maximum
+  const item = H.favorite(H.FAV_1, 2, "Старый текст", 0, { version: 2 });
+  const env = makeEnv().signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что?"), message(2, "assistant", RECIPE_TEXT)]),
+  });
+  env.net.route("GET", FAVORITES_URL, H.favoritesBody([item]));
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(item, stored));
+  await env.boot();
+  await env.ctl.openFavorite(H.FAV_1);
+  await env.settle();
+  env.ctl.beginEditFavorite();
+
+  const tooLong = stored + "🍅"; // 100,001 code points
+  const draft = Object.assign({}, env.view().favorites.current.editor.draft, { text: tooLong });
+  assert.deepEqual(await env.ctl.saveFavoriteEdit(draft), { ok: false, reason: "invalid" });
+
+  let current = env.view().favorites.current;
+  assert.equal(current.editor.error.text, Logic.TEXT.editTextTooLong);
+  assert.equal(current.editor.draft.text, tooLong, "the entire draft is kept");
+  assert.equal(env.net.requests("PATCH", FAV_URL_1).length, 0);
+
+  // Nothing was lost: removing the extra character lets the same draft save.
+  const saved = H.favorite(H.FAV_1, 2, "Старый текст", 0, { version: 3 });
+  env.net.route("PATCH", FAV_URL_1, H.favoriteDetail(saved, stored));
+  assert.deepEqual(
+    await env.ctl.saveFavoriteEdit(Object.assign({}, current.editor.draft, { text: stored })),
+    { ok: true }
+  );
+  assert.equal(env.net.requests("PATCH", FAV_URL_1)[0].body.text, stored);
 });
 
 // ============================================================================================

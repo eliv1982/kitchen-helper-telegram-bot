@@ -125,7 +125,7 @@ _SHELL = """\
 <link rel="icon" type="image/svg+xml" href="/static/icon.svg">
 <link rel="stylesheet" href="/static/app.css">
 </head>
-<body data-telegram="@TELEGRAM_FLAG@" data-email="@EMAIL_FLAG@" data-max-length="@MAX_LENGTH@">
+<body data-telegram="@TELEGRAM_FLAG@" data-email="@EMAIL_FLAG@" data-max-length="@MAX_LENGTH@" data-structured-recipes="@STRUCTURED_RECIPES_FLAG@">
 <div id="announcer" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></div>
 <div id="alerter" class="visually-hidden" role="alert" aria-atomic="true"></div>
 <noscript>
@@ -231,9 +231,17 @@ _SHELL = """\
 """
 
 
-def render_shell(*, telegram: bool, email: bool, max_length: int = MAX_INPUT_LENGTH) -> str:
+def render_shell(
+    *,
+    telegram: bool,
+    email: bool,
+    max_length: int = MAX_INPUT_LENGTH,
+    structured_recipes: bool = False,
+) -> str:
     """The shell for a deployment with these ways of signing in. The flags are the only
-    thing that varies; each draws its own markup, or nothing."""
+    thing that varies; each draws its own markup, or nothing. `structured_recipes` tells
+    the page whether to offer the per-recipe Save controls; it is a public feature flag
+    (no user data), and the gate on generation itself is the server's."""
     if telegram and email:
         login = _TELEGRAM + _DIVIDER + _EMAIL
     elif telegram:
@@ -246,6 +254,7 @@ def render_shell(*, telegram: bool, email: bool, max_length: int = MAX_INPUT_LEN
         _SHELL.replace("@TELEGRAM_FLAG@", "1" if telegram else "0")
         .replace("@EMAIL_FLAG@", "1" if email else "0")
         .replace("@MAX_LENGTH@", html.escape(str(int(max_length)), quote=True))
+        .replace("@STRUCTURED_RECIPES_FLAG@", "1" if structured_recipes else "0")
         .replace("@LOGIN@", login)
     )
 
@@ -262,7 +271,11 @@ def _login_methods(request: Request) -> tuple[bool, bool]:
 def page(request: Request) -> Response:
     telegram, email = _login_methods(request)
     return Response(
-        render_shell(telegram=telegram, email=email),
+        render_shell(
+            telegram=telegram,
+            email=email,
+            structured_recipes=request.app.state.settings.structured_recipes,
+        ),
         media_type="text/html",
         headers=PAGE_HEADERS,
     )

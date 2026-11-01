@@ -56,6 +56,20 @@ and answers a message with 503 "chat_unavailable"; with it, every other provider
 variable is validated at start (a malformed one refuses to start, naming the variable
 and never its value). A key with nothing else set uses the defaults.
 
+Structured recipes (the sentinel-delimited protocol of house_helper.core.recipes) are a
+feature switch of their own, off unless it is set:
+
+  HOUSE_HELPER_STRUCTURED_RECIPES   1/true/on/yes enable it; 0/false/off/no (or empty)
+                                    keep it off. Anything else refuses to start.
+
+Off is the safe default until the protocol has been validated with the provider: the
+model is asked for nothing structured, answers are rendered exactly as before, legacy
+text favorites keep working, and stored structured favorites are neither deleted nor
+changed (GET, PATCH and DELETE keep working for them). On, the assistant may add the
+protocol blocks to its answers and the page offers one Save control for each recipe.
+Starting with the wording unchanged is the whole point: the switch only adds a
+formatting addition to the shared prompt and a parser in front of the rendering.
+
 The public URL is configuration, never read from a request: the redirect URI the
 provider is given, the address in a mailed link, the Origin accepted on logout and
 the cookie attributes all derive from it, so a forged Host header changes none of
@@ -108,6 +122,7 @@ SMTP_PASSWORD_ENV = "HOUSE_HELPER_SMTP_PASSWORD"
 EMAIL_FROM_ENV = "HOUSE_HELPER_EMAIL_FROM"
 TELEGRAM_BOT_TOKEN_ENV = "HOUSE_HELPER_TELEGRAM_BOT_TOKEN"
 TELEGRAM_BOT_USERNAME_ENV = "HOUSE_HELPER_TELEGRAM_BOT_USERNAME"
+STRUCTURED_RECIPES_ENV = "HOUSE_HELPER_STRUCTURED_RECIPES"
 
 TELEGRAM_CALLBACK_PATH = "/auth/telegram/callback"
 
@@ -372,6 +387,10 @@ class WebSettings:
     provider: Optional[ProviderSettings] = None
     # The Telegram bot. None: not configured, and the website offers no pairing.
     telegram_bot: Optional[BotSettings] = None
+    # The structured-recipe protocol. Off until the owner approves it after a provider
+    # validation (see the module docstring): the same safe default for every constructor,
+    # including one built by hand.
+    structured_recipes: bool = False
 
     @property
     def session(self) -> Optional[SessionSettings]:
@@ -524,6 +543,27 @@ def load_bot_settings(env: Optional[Mapping[str, str]] = None) -> Optional[BotSe
     )
 
 
+_TRUE_VALUES = frozenset({"1", "true", "on", "yes"})
+_FALSE_VALUES = frozenset({"0", "false", "off", "no", ""})
+
+
+def load_structured_recipes(env: Optional[Mapping[str, str]] = None) -> bool:
+    """The structured-recipe switch from `env` (os.environ by default). Off when the
+    variable is unset or empty. Anything but the documented words is a WebConfigError:
+    a value nobody meant is not treated as "on"."""
+    source = os.environ if env is None else env
+    raw = source.get(STRUCTURED_RECIPES_ENV)
+    value = "" if raw is None else raw.strip().lower()
+    if value in _TRUE_VALUES:
+        return True
+    if value in _FALSE_VALUES:
+        return False
+    raise WebConfigError(
+        f"{STRUCTURED_RECIPES_ENV} must be one of 1, true, on, yes (enable) or "
+        "0, false, off, no (disable)"
+    )
+
+
 def load_web_settings(env: Optional[Mapping[str, str]] = None) -> WebSettings:
     """Settings from `env` (os.environ by default). Raises WebConfigError."""
     source = os.environ if env is None else env
@@ -533,4 +573,5 @@ def load_web_settings(env: Optional[Mapping[str, str]] = None) -> WebSettings:
         email=load_email_settings(source),
         provider=load_provider_settings(source),
         telegram_bot=load_bot_settings(source),
+        structured_recipes=load_structured_recipes(source),
     )
