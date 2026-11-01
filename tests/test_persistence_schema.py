@@ -27,6 +27,7 @@ TABLES = {
     "telegram_links",
     "telegram_link_codes",
     "message_attachments",
+    "message_recipes",
     "conversations",
     "messages",
     "turn_requests",
@@ -35,8 +36,17 @@ TABLES = {
 POSTGRESQL_IDENTIFIER_LIMIT = 63
 
 
-def test_the_schema_has_exactly_the_fourteen_tables():
+def test_the_schema_has_exactly_the_fifteen_tables():
     assert set(Base.metadata.tables) == TABLES
+
+
+def test_the_database_position_limit_is_the_protocol_limit():
+    # models cannot import the chat core (the administrative commands import the models
+    # and must not load it), so the number is repeated there; this keeps them one rule.
+    from house_helper.core.recipes import MAX_RECIPES_PER_REPLY
+    from house_helper.persistence.models import MAX_RECIPES_PER_MESSAGE
+
+    assert MAX_RECIPES_PER_MESSAGE == MAX_RECIPES_PER_REPLY
 
 
 def test_every_table_has_a_named_primary_key():
@@ -96,6 +106,7 @@ def test_constraint_names_follow_the_convention():
     assert {i.name for i in messages.indexes} == {
         "ix_messages_conversation_id_id",
         "ix_messages_expires_at",
+        "uq_messages_id_role",  # the target of message_recipes' composite foreign key
     }
 
 
@@ -269,6 +280,7 @@ def test_lists_of_values_fit_their_columns():
     from house_helper.persistence.models import (
         AllowlistProvider,
         FailureKind,
+        FavoriteKind,
         MessageRole,
         TurnStatus,
     )
@@ -276,11 +288,13 @@ def test_lists_of_values_fit_their_columns():
     messages = Base.metadata.tables["messages"]
     turns = Base.metadata.tables["turn_requests"]
     allowlist = Base.metadata.tables["allowlist_entries"]
+    favorites = Base.metadata.tables["favorite_recipes"]
 
     assert max(len(r.value) for r in MessageRole) <= messages.c.role.type.length
     assert max(len(r.value) for r in TurnStatus) <= turns.c.status.type.length
     assert max(len(r.value) for r in FailureKind) <= turns.c.failure_kind.type.length
     assert max(len(r.value) for r in AllowlistProvider) <= allowlist.c.provider.type.length
+    assert max(len(r.value) for r in FavoriteKind) <= favorites.c.kind.type.length
 
 
 # --- the shape of the references ---------------------------------------------------

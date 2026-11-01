@@ -37,7 +37,7 @@ from tests.test_persistence_migrations import (
 )
 from tests.test_persistence_schema import TABLES
 
-TABLES_BEFORE_0007 = TABLES - {"favorite_recipes", "telegram_links", "telegram_link_codes", "message_attachments"}
+TABLES_BEFORE_0007 = TABLES - {"favorite_recipes", "telegram_links", "telegram_link_codes", "message_attachments", "message_recipes"}
 
 
 @pytest.fixture
@@ -83,9 +83,14 @@ def test_the_favorites_table_has_the_keys_and_checks_the_models_say(tmp_path):
             assert table["columns"]["source_message_id"][0] == "INTEGER"  # as messages.id on SQLite
             assert [column for column in table["columns"]] == [
                 "id", "user_id", "title", "content", "source_message_id", "created_at",
+                "kind", "source_recipe_index", "servings", "ingredients", "steps", "notes",
+                "version", "updated_at",
             ]
             assert table["uniques"] == [
-                ("uq_favorite_recipes_user_id_source_message_id", ("user_id", "source_message_id"))
+                (
+                    "uq_favorite_recipes_user_message_recipe",
+                    ("user_id", "source_message_id", "source_recipe_index"),
+                )
             ]
             assert table["indexes"] == [
                 ("ix_favorite_recipes_user_id_created_at", ("user_id", "created_at"), False)
@@ -97,8 +102,14 @@ def test_the_favorites_table_has_the_keys_and_checks_the_models_say(tmp_path):
             ]
             assert [name for name, _ in table["checks"]] == [
                 "ck_favorite_recipes_content_not_empty",
+                "ck_favorite_recipes_kind_consistent",
+                "ck_favorite_recipes_kind_valid",
+                "ck_favorite_recipes_notes_max_length",
+                "ck_favorite_recipes_servings_max_length",
+                "ck_favorite_recipes_source_recipe_index_valid",
                 "ck_favorite_recipes_title_max_length",
                 "ck_favorite_recipes_title_not_empty",
+                "ck_favorite_recipes_version_valid",
             ]
     finally:
         migrated.dispose()

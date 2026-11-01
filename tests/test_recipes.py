@@ -30,6 +30,7 @@ from house_helper.core.recipes import (
     parse_reply,
     render_recipe,
     render_reply,
+    validate_recipe,
 )
 
 TITLE = "Омлет с сыром"
@@ -622,6 +623,121 @@ def test_a_personally_edited_recipe_is_rendered_exactly_as_edited():
         "1. Тушите свёклу."
     )
     assert "ё" in rendered
+
+
+# --- validating fields that did not come from an answer ------------------------------------------------
+
+
+def test_validated_fields_become_a_recipe_and_render_like_a_parsed_one():
+    recipe = validate_recipe(
+        1,
+        TITLE,
+        "2 порции",
+        [Ingredient("яйца", "3 шт."), {"name": "сыр", "amount": "50 г"}],
+        ["Взбейте яйца.", "Обжарьте."],
+    )
+
+    assert recipe == Recipe(
+        index=1,
+        title=TITLE,
+        servings="2 порции",
+        ingredients=(Ingredient("яйца", "3 шт."), Ingredient("сыр", "50 г")),
+        steps=("Взбейте яйца.", "Обжарьте."),
+    )
+    assert render_recipe(recipe) == (
+        "Омлет с сыром\n"
+        "2 порции\n"
+        "\n"
+        "Ингредиенты:\n"
+        "- яйца — 3 шт.\n"
+        "- сыр — 50 г\n"
+        "\n"
+        "Приготовление:\n"
+        "1. Взбейте яйца.\n"
+        "2. Обжарьте."
+    )
+
+
+def test_validation_does_not_spell_the_fields_it_checks():
+    # The parser spells an answer when it stores it; an edit keeps what the person
+    # wrote, so validating it must not turn "свекла" into "свёкла".
+    recipe = validate_recipe(
+        0, "Свекла тушеная", None, [Ingredient("свекла", "2 шт.")], ["Тушите свеклу."]
+    )
+
+    assert recipe.title == "Свекла тушеная"
+    assert recipe.ingredients == (Ingredient("свекла", "2 шт."),)
+    assert recipe.steps == ("Тушите свеклу.",)
+
+
+def test_a_servings_phrase_may_be_absent_and_each_field_may_be_at_its_limit():
+    recipe = validate_recipe(
+        0,
+        "т" * recipes.MAX_TITLE_LENGTH,
+        None,
+        [{"name": "н" * recipes.MAX_INGREDIENT_NAME_LENGTH, "amount": "к" * recipes.MAX_AMOUNT_LENGTH}],
+        ["ш" * recipes.MAX_STEP_LENGTH],
+    )
+
+    assert recipe.servings is None
+    assert len(recipe.title) == recipes.MAX_TITLE_LENGTH
+    assert len(recipe.steps[0]) == recipes.MAX_STEP_LENGTH
+
+
+def test_the_lists_may_be_at_their_limits():
+    recipe = validate_recipe(
+        0,
+        TITLE,
+        None,
+        [{"name": "н", "amount": "1"}] * recipes.MAX_INGREDIENTS,
+        ["ш"] * recipes.MAX_STEPS,
+    )
+
+    assert len(recipe.ingredients) == recipes.MAX_INGREDIENTS
+    assert len(recipe.steps) == recipes.MAX_STEPS
+
+
+@pytest.mark.parametrize(
+    ("index", "title", "servings", "ingredients", "steps"),
+    [
+        (-1, TITLE, None, [{"name": "x", "amount": "1"}], ["s"]),
+        (MAX_RECIPES_PER_REPLY, TITLE, None, [{"name": "x", "amount": "1"}], ["s"]),
+        (True, TITLE, None, [{"name": "x", "amount": "1"}], ["s"]),
+        ("0", TITLE, None, [{"name": "x", "amount": "1"}], ["s"]),
+        (0, "", None, [{"name": "x", "amount": "1"}], ["s"]),
+        (0, "   ", None, [{"name": "x", "amount": "1"}], ["s"]),
+        (0, "x" * (recipes.MAX_TITLE_LENGTH + 1), None, [{"name": "x", "amount": "1"}], ["s"]),
+        (0, "a\nb", None, [{"name": "x", "amount": "1"}], ["s"]),
+        (0, f"a {RECIPE_START} b", None, [{"name": "x", "amount": "1"}], ["s"]),
+        (0, TITLE, 4, [{"name": "x", "amount": "1"}], ["s"]),
+        (0, TITLE, "x" * (recipes.MAX_SERVINGS_LENGTH + 1), [{"name": "x", "amount": "1"}], ["s"]),
+        (0, TITLE, None, [], ["s"]),
+        (0, TITLE, None, "ingredients", ["s"]),
+        (0, TITLE, None, [{"name": "x"}], ["s"]),
+        (0, TITLE, None, [{"name": "x", "amount": "1", "extra": "y"}], ["s"]),
+        (0, TITLE, None, [{"name": "", "amount": "1"}], ["s"]),
+        (0, TITLE, None, [{"name": "x", "amount": "1"}] * (recipes.MAX_INGREDIENTS + 1), ["s"]),
+        (0, TITLE, None, [{"name": "x", "amount": "1"}], []),
+        (0, TITLE, None, [{"name": "x", "amount": "1"}], "steps"),
+        (0, TITLE, None, [{"name": "x", "amount": "1"}], [1]),
+        (0, TITLE, None, [{"name": "x", "amount": "1"}], ["s"] * (recipes.MAX_STEPS + 1)),
+        (0, TITLE, None, [{"name": "x", "amount": "1"}], ["s\x00"]),
+    ],
+)
+def test_validation_refuses_what_the_protocol_would_not_accept(
+    index, title, servings, ingredients, steps
+):
+    with pytest.raises(ValueError):
+        validate_recipe(index, title, servings, ingredients, steps)
+
+
+def test_validation_refuses_a_recipe_whose_fields_together_are_too_large():
+    ingredients = [
+        {"name": "н" * recipes.MAX_INGREDIENT_NAME_LENGTH, "amount": "к" * recipes.MAX_AMOUNT_LENGTH}
+    ] * recipes.MAX_INGREDIENTS
+
+    with pytest.raises(ValueError, match="too large"):
+        validate_recipe(0, TITLE, None, ingredients, ["s"])
 
 
 # --- boundaries --------------------------------------------------------------------------------------

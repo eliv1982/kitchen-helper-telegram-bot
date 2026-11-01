@@ -96,6 +96,19 @@ from house_helper.persistence.sqlchecks import EmailSubjectNormalized, Printable
 MESSAGE_RETENTION_DAYS = RETENTION_DAYS
 MESSAGE_RETENTION = RETENTION
 
+# The position of a favourite that was made from a whole answer (the legacy, text kind).
+# A structured favourite carries the position of its recipe among the accepted recipes of
+# the answer: 0 to MAX_RECIPES_PER_MESSAGE - 1.
+LEGACY_RECIPE_INDEX = -1
+
+# The protocol's MAX_RECIPES_PER_REPLY, repeated here so that the schema does not import
+# the chat core (the administrative commands import this module and must not load it).
+# tests/test_persistence_schema.py pins the two values together.
+MAX_RECIPES_PER_MESSAGE = 5
+
+# The longest personal note of a favourite, in characters (code points).
+MAX_FAVORITE_NOTES_LENGTH = 2_000
+
 
 class MessageRole(str, enum.Enum):
     """Roles kept in a conversation's history.
@@ -111,6 +124,20 @@ class MessageRole(str, enum.Enum):
     USER = "user"
     ASSISTANT = "assistant"
     SYSTEM_NOTE = "system_note"
+
+
+class FavoriteKind(str, enum.Enum):
+    """What a favourite holds.
+
+    TEXT is the original kind: the whole answer, copied out of the conversation exactly
+    as it was stored, with the title as a label. STRUCTURED is one recipe of an answer,
+    copied out as its validated fields (title, servings, ingredients, steps) and kept
+    independently of the message it came from. The column also decides which fields may
+    carry anything (see FavoriteRecipe).
+    """
+
+    TEXT = "text"
+    STRUCTURED = "structured"
 
 
 class AllowlistProvider(str, enum.Enum):
@@ -612,6 +639,12 @@ class Message(Base):
         # the target of turn_requests' composite foreign keys, which pin the
         # conversation and the role of the message they point at.
         sa.UniqueConstraint("conversation_id", "id", "role"),
+        # The target of message_recipes' composite foreign key: it pins the role of
+        # the message a structured recipe belongs to (an assistant message only). A
+        # unique index, not a UniqueConstraint: SQLite cannot add a constraint in
+        # place, and a unique index is a valid foreign key target on SQLite and on
+        # PostgreSQL alike (the same choice as identity_links' (user_id, id), 0002).
+        sa.Index("uq_messages_id_role", "id", "role", unique=True),
         sa.CheckConstraint(_in_list("role", MessageRole), name="role_valid"),
         sa.CheckConstraint("expires_at > created_at", name="expires_after_created"),
         sa.CheckConstraint(WithinRetention("created_at", "expires_at"), name="expires_within_retention"),
@@ -867,38 +900,81 @@ class TurnRequest(Base):
 
 
 class FavoriteRecipe(Base):
-    """An assistant answer that a user chose to keep, copied out of its conversation.
+    """An assistant answer, or one recipe of one, that a user chose to keep.
 
     The copy is the point. A message is history and expires with it (RETENTION_DAYS, then
     the purge deletes it, and a conversation left empty with it); a favorite is something
     the person decided to keep, so it has no deadline and no link to the conversation it
-    came from: content is the exact text of the assistant's answer as it was stored, and
-    nothing here points at a conversation or a message by a foreign key. It therefore
-    survives the expiry of the answer, the purge of the conversation and the deletion of
-    both. Only deleting the user deletes it (user_id, ON DELETE CASCADE), and the person
-    removing it (favorites.remove). The purge does not know this table and never touches it.
+    came from: nothing here points at a conversation or a message by a foreign key. It
+    therefore survives the expiry of the answer, the purge of the conversation and the
+    deletion of both. Only deleting the user deletes it (user_id, ON DELETE CASCADE), and
+    the person removing it (favorites.remove_favorite). The purge does not know this table
+    and never touches it.
 
-    title is a short label made from the first line of the answer when it was saved
-    (favorites.favorite_title); the content is never parsed or rewritten.
+    Two kinds (`kind`):
 
-    source_message_id is the id of the message it was copied from, a plain number kept
-    for two things: saving the same answer twice is one favorite (UNIQUE with user_id),
-    and the page can mark the answers of an open conversation that are already saved.
-    Message ids come from a sequence that never reuses a number (messages.id), so the
-    number cannot come to mean another message after the purge deleted the first.
+      * TEXT is the original kind. content is the exact text of the assistant's answer as
+        it was stored; title is a short label made from its first line when it was saved
+        (favorites.favorite_title). The text is never parsed, rewritten or summarised.
+        source_recipe_index is -1 (LEGACY_RECIPE_INDEX) and the structured columns are NULL.
+      * STRUCTURED is one validated recipe of a multi-recipe answer. title, servings,
+        ingredients and steps are a COPY of the fields the protocol accepted for that
+        recipe (message_recipes), and content is their canonical plain text, rendered by
+        favorites.favorite_content (the accepted renderer, plus the personal note when
+        there is one). Nothing here points at message_recipes: editing a favorite never
+        touches the message it was copied from, and the favorite survives its deletion.
+        source_recipe_index is the recipe's zero-based position in that answer.
+
+    source_message_id is the id of the message the favorite was copied from, a plain
+    number (messages.id is a sequence that never reuses a number). (user_id,
+    source_message_id, source_recipe_index) is unique, so saving the same answer (or the
+    same recipe of it) twice is one favorite; two different recipes of one answer are two
+    favorites. The old rule, unique per (user_id, source_message_id), could not express
+    that, and migration 0010 replaced it.
+
+    notes is the person's own note, editable for both kinds and never derived from the
+    answer. version is the optimistic-concurrency token: every successful edit increments
+    it (favorites.update_favorite), and an edit names the version it started from.
+    updated_at is informational; it says when the row last changed and never decides a
+    conflict. created_at never changes.
 
     The owner is always the user of the session that saved it, never something the
     request says; every function in favorites.py takes it and finds a row only through it.
+    The kind, the source message and the owner never change once the row exists.
     """
 
     __tablename__ = "favorite_recipes"
     __table_args__ = (
-        sa.UniqueConstraint("user_id", "source_message_id"),
+        # An explicit name: the convention's would be past PostgreSQL's 63 characters.
+        sa.UniqueConstraint(
+            "user_id",
+            "source_message_id",
+            "source_recipe_index",
+            name="uq_favorite_recipes_user_message_recipe",
+        ),
         # The user's list, newest first (and the foreign key's cascade).
         sa.Index(None, "user_id", "created_at"),
         _max_length("title", 200),
         sa.CheckConstraint("length(title) >= 1", name="title_not_empty"),
         sa.CheckConstraint("length(content) >= 1", name="content_not_empty"),
+        sa.CheckConstraint(_in_list("kind", FavoriteKind), name="kind_valid"),
+        sa.CheckConstraint(
+            f"source_recipe_index BETWEEN {LEGACY_RECIPE_INDEX} AND {MAX_RECIPES_PER_MESSAGE - 1}",
+            name="source_recipe_index_valid",
+        ),
+        # What each kind may carry, in one rule: a text favorite is the whole answer and
+        # has no structured fields; a structured favorite has the fields it was copied
+        # from (servings may be absent, as the protocol allows).
+        sa.CheckConstraint(
+            "(kind = 'text' AND source_recipe_index = -1 AND servings IS NULL "
+            "AND ingredients IS NULL AND steps IS NULL) OR "
+            "(kind = 'structured' AND source_recipe_index >= 0 "
+            "AND ingredients IS NOT NULL AND steps IS NOT NULL)",
+            name="kind_consistent",
+        ),
+        sa.CheckConstraint("version >= 1", name="version_valid"),
+        _max_length("servings", 100),
+        _max_length("notes", MAX_FAVORITE_NOTES_LENGTH),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
@@ -907,8 +983,85 @@ class FavoriteRecipe(Base):
     content: Mapped[str] = mapped_column(sa.Text)
     source_message_id: Mapped[int] = mapped_column(_BIGINT_ID)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    kind: Mapped[str] = mapped_column(
+        sa.String(16),
+        default=FavoriteKind.TEXT.value,
+        server_default=sa.text("'text'"),
+    )
+    source_recipe_index: Mapped[int] = mapped_column(
+        sa.Integer, default=LEGACY_RECIPE_INDEX, server_default=sa.text("-1")
+    )
+    servings: Mapped[Optional[str]] = mapped_column(sa.String(100))
+    ingredients: Mapped[Optional[list]] = mapped_column(_JSON_PAYLOAD)
+    steps: Mapped[Optional[list]] = mapped_column(_JSON_PAYLOAD)
+    notes: Mapped[Optional[str]] = mapped_column(sa.Text)
+    version: Mapped[int] = mapped_column(sa.Integer, default=1, server_default=sa.text("1"))
+    updated_at: Mapped[datetime] = mapped_column(
+        default=utcnow, onupdate=utcnow, server_default=sa.text("CURRENT_TIMESTAMP")
+    )
 
     user: Mapped[User] = relationship(back_populates="favorites")
+
+
+class MessageRecipe(Base):
+    """One validated recipe of an assistant answer, in the order the answer gave it.
+
+    An answer may carry several recipes (house_helper.core.recipes). Each accepted recipe
+    is stored here as its validated fields -- the protocol's title, the servings phrase
+    (NULL when it named none), the ordered ingredient list and the ordered steps -- so
+    that a person may save any one of them separately. The conversational text of the
+    answer stays in messages.content; this table is the clean structured form, and neither
+    is derived from the other on reading.
+
+    Identity is WHERE it came from: (message_id, position), position being the zero-based
+    place of the recipe among the accepted recipes of its answer (0 to
+    MAX_RECIPES_PER_MESSAGE - 1). The protocol's content fingerprint (Recipe.recipe_id) is
+    deliberately NOT stored: it is not a key, and an edit of the stored fields would make
+    it meaningless. A favourite copies the fields it needs and keeps no reference here.
+
+    The parent is an ASSISTANT message, enforced by the database: message_role is pinned
+    to 'assistant' by a CHECK, and the composite foreign key (message_id, message_role)
+    points at messages (id, role), whose unique index is the target. The key is ON DELETE
+    CASCADE, so a recipe goes with its message -- when the 365-day retention expires it,
+    when its conversation is purged, and when its user is deleted. There is no owner
+    column: access derives from the parent conversation (message_recipes.recipes_for_message
+    joins it and takes the user id of the session).
+
+    ingredients and steps are JSON arrays in the order the protocol accepted (objects with
+    name and amount; strings). The application validates them with the protocol's own
+    rules before writing (core.recipes.validate_recipe); the database's CHECKs hold the
+    widths, the position and the role.
+    """
+
+    __tablename__ = "message_recipes"
+    __table_args__ = (
+        sa.ForeignKeyConstraint(
+            ["message_id", "message_role"],
+            ["messages.id", "messages.role"],
+            name="fk_message_recipes_message",
+            ondelete="CASCADE",
+        ),
+        sa.CheckConstraint("message_role = 'assistant'", name="message_role_is_assistant"),
+        sa.CheckConstraint(
+            f"position BETWEEN 0 AND {MAX_RECIPES_PER_MESSAGE - 1}", name="position_valid"
+        ),
+        _max_length("title", 200),
+        sa.CheckConstraint("length(title) >= 1", name="title_not_empty"),
+        _max_length("servings", 100),
+    )
+
+    message_id: Mapped[int] = mapped_column(_BIGINT_ID, primary_key=True, autoincrement=False)
+    message_role: Mapped[str] = mapped_column(
+        sa.String(16),
+        default=MessageRole.ASSISTANT.value,
+        server_default=sa.text("'assistant'"),
+    )
+    position: Mapped[int] = mapped_column(sa.Integer, primary_key=True)
+    title: Mapped[str] = mapped_column(sa.String(200))
+    servings: Mapped[Optional[str]] = mapped_column(sa.String(100))
+    ingredients: Mapped[list] = mapped_column(_JSON_PAYLOAD, nullable=False)
+    steps: Mapped[list] = mapped_column(_JSON_PAYLOAD, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
 class MessageAttachment(Base):
@@ -1143,6 +1296,19 @@ def _guard_telegram_code_on_update(mapper: Any, connection: Any, target: Any) ->
     _forbid_changes(target, "user_id", "code_hash", "created_at", "expires_at")
 
 
+def _guard_favorite_on_update(mapper: Any, connection: Any, target: Any) -> None:
+    """A favorite's identity, kind and creation time never change. What it holds may
+    (favorites.update_favorite): that is the edit the version guards."""
+    _forbid_changes(
+        target, "user_id", "source_message_id", "source_recipe_index", "kind", "created_at"
+    )
+
+
+def _guard_message_recipe_on_update(mapper: Any, connection: Any, target: Any) -> None:
+    """A stored recipe is a record of what the answer said; it is replaced, never edited."""
+    _forbid_changes(target, "message_id", "message_role", "position", "created_at")
+
+
 sa.event.listen(Session, "before_update", _guard_session_on_update)
 sa.event.listen(OidcState, "before_update", _guard_oidc_state_on_update)
 sa.event.listen(EmailLoginChallenge, "before_update", _guard_challenge_on_update)
@@ -1150,6 +1316,8 @@ sa.event.listen(IdentityInvitation, "before_update", _guard_invitation_on_update
 sa.event.listen(MessageAttachment, "before_update", _guard_attachment_on_update)
 sa.event.listen(TelegramLink, "before_update", _guard_telegram_link_on_update)
 sa.event.listen(TelegramLinkCode, "before_update", _guard_telegram_code_on_update)
+sa.event.listen(FavoriteRecipe, "before_update", _guard_favorite_on_update)
+sa.event.listen(MessageRecipe, "before_update", _guard_message_recipe_on_update)
 sa.event.listen(Message, "before_insert", _guard_retention_on_insert)
 sa.event.listen(Message, "before_update", _guard_message)
 sa.event.listen(TurnRequest, "before_insert", _guard_turn_request_on_insert)

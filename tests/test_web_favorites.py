@@ -238,8 +238,11 @@ async def test_keeping_an_answer(tmp_path):
 
         body = response.json()
         assert response.status_code == 201
-        assert set(body) == {"id", "title", "message_id", "created_at", "created"}
+        assert set(body) == {
+            "id", "title", "message_id", "created_at", "kind", "recipe_index", "version", "created",
+        }
         assert body["created"] is True and body["message_id"] == answer
+        assert (body["kind"], body["recipe_index"], body["version"]) == ("text", -1, 1)
         assert body["title"] == "Омлет с сыром"
         assert body["created_at"] == chat.clock().isoformat()
         (row,) = rows(chat)
@@ -463,11 +466,19 @@ async def test_the_list_is_newest_first_without_text_and_the_detail_has_the_text
         shown = await listed(chat)
 
         assert [item["id"] for item in shown] == [two["id"], one["id"]]
-        assert all(set(item) == {"id", "title", "message_id", "created_at"} for item in shown)
+        assert all(
+            set(item) == {"id", "title", "message_id", "created_at", "kind", "recipe_index", "version"}
+            for item in shown
+        )
         assert [item["title"] for item in shown] == ["Второй рецепт", "Первый рецепт"]
         detail = (await chat.client.get(f"/api/favorites/{one['id']}")).json()
-        assert set(detail) == {"id", "title", "text", "message_id", "created_at"}
+        assert set(detail) == {
+            "id", "title", "text", "message_id", "created_at", "updated_at", "kind",
+            "recipe_index", "version", "notes", "servings", "ingredients", "steps",
+        }
         assert detail["text"] == "Первый рецепт\nшаги" and detail["message_id"] == first
+        assert (detail["kind"], detail["recipe_index"], detail["version"]) == ("text", -1, 1)
+        assert detail["notes"] is None and detail["ingredients"] is None and detail["steps"] is None
 
 
 async def test_an_empty_list_is_an_empty_list(tmp_path):

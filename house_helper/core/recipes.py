@@ -276,6 +276,85 @@ def _recipe_from_json(value: object, index: int) -> Recipe:
     )
 
 
+def validate_recipe(
+    index: object,
+    title: object,
+    servings: object,
+    ingredients: object,
+    steps: object,
+) -> Recipe:
+    """Validate fields that did not come from a model answer, by the same rules.
+
+    This is the protocol's acceptance rule as a public function, for the places that
+    store or edit a recipe after it was parsed: a structured recipe of a message, and
+    a favourite made from one. It checks the field types, the lengths, the control
+    characters, the protocol markers and the per-block size exactly as _recipe_from_json
+    does, and returns the validated Recipe. It does NOT spell the text (replace_yo):
+    parsed answers were already spelled when they were stored, and an edit is kept as
+    it was entered. ValueError for anything the protocol would not have accepted.
+
+    `index` is the position the recipe holds among the accepted recipes of its answer.
+    `ingredients` is a list or tuple of Ingredient objects or of objects with exactly
+    `name` and `amount` (what a JSON body carries); `steps` is a list or tuple of
+    strings.
+    """
+    if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < MAX_RECIPES_PER_REPLY:
+        raise ValueError("index must be an accepted recipe position")
+
+    checked_title = _text(title, max_length=MAX_TITLE_LENGTH, field="title")
+    checked_servings = _servings(servings)
+
+    if not isinstance(ingredients, (list, tuple)):
+        raise ValueError("ingredients must be a list")
+    if not 1 <= len(ingredients) <= MAX_INGREDIENTS:
+        raise ValueError("ingredients must be a non-empty list within the limit")
+    checked_ingredients: list[Ingredient] = []
+    for item in ingredients:
+        if isinstance(item, Ingredient):
+            name, amount = item.name, item.amount
+        elif isinstance(item, dict) and set(item) == _EXPECTED_INGREDIENT_KEYS:
+            name, amount = item["name"], item["amount"]
+        else:
+            raise ValueError("an ingredient must have exactly name and amount")
+        checked_ingredients.append(
+            Ingredient(
+                name=_text(name, max_length=MAX_INGREDIENT_NAME_LENGTH, field="name"),
+                amount=_text(amount, max_length=MAX_AMOUNT_LENGTH, field="amount"),
+            )
+        )
+
+    if not isinstance(steps, (list, tuple)):
+        raise ValueError("steps must be a list")
+    if not 1 <= len(steps) <= MAX_STEPS:
+        raise ValueError("steps must be a non-empty list within the limit")
+    checked_steps = tuple(
+        _text(step, max_length=MAX_STEP_LENGTH, field="step") for step in steps
+    )
+
+    recipe = Recipe(
+        index=index,
+        title=checked_title,
+        servings=checked_servings,
+        ingredients=tuple(checked_ingredients),
+        steps=checked_steps,
+    )
+    block = json.dumps(
+        {
+            "title": recipe.title,
+            "servings": recipe.servings,
+            "ingredients": [
+                {"name": ingredient.name, "amount": ingredient.amount}
+                for ingredient in recipe.ingredients
+            ],
+            "steps": list(recipe.steps),
+        },
+        ensure_ascii=False,
+    )
+    if len(block) > MAX_RECIPE_BLOCK_LENGTH:
+        raise ValueError("the recipe is too large")
+    return recipe
+
+
 def _find_block_end(text: str, start: int) -> int:
     """The first end sentinel after `start` that is not inside a JSON string literal.
 
@@ -479,4 +558,5 @@ __all__ = [
     "render_parsed_reply",
     "render_recipe",
     "render_reply",
+    "validate_recipe",
 ]

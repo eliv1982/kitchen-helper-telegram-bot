@@ -379,7 +379,7 @@ def test_the_database_refuses_a_second_favorite_of_the_same_answer(session):
     session.add(FavoriteRecipe(user_id=user.id, title="a", content="b", source_message_id=7, created_at=NOW))
     session.flush()
 
-    with rejected(session, "favorite_recipes.user_id, favorite_recipes.source_message_id"):
+    with rejected(session, "favorite_recipes.user_id, favorite_recipes.source_message_id, favorite_recipes.source_recipe_index"):
         session.add(FavoriteRecipe(user_id=user.id, title="c", content="d", source_message_id=7, created_at=NOW))
 
     other = new_user(session)  # the same message number under another user is another favorite

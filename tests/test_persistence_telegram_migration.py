@@ -19,6 +19,7 @@ from house_helper.persistence.database import (
     upgrade_database,
 )
 from tests.test_persistence_migrations import (
+    ATTACHMENTS,
     FAVORITES,
     HEAD,
     LATER,
@@ -34,7 +35,8 @@ from tests.test_persistence_schema import TABLES
 
 TELEGRAM_TABLES = {"telegram_links", "telegram_link_codes"}
 PHOTO_TABLES = {"message_attachments"}
-OLD_TABLES = TABLES - TELEGRAM_TABLES - PHOTO_TABLES
+RECIPE_TABLES = {"message_recipes"}
+OLD_TABLES = TABLES - TELEGRAM_TABLES - PHOTO_TABLES - RECIPE_TABLES
 
 
 @pytest.fixture
@@ -65,7 +67,7 @@ def test_each_revision_adds_only_its_own_empty_tables_and_changes_no_row(engine)
     assert _tables(engine) == TABLES | {"alembic_version"}
     assert _snapshot_of(engine, OLD_TABLES) == before  # every row of every old table
     with engine.connect() as connection:
-        for table in TELEGRAM_TABLES | PHOTO_TABLES:
+        for table in TELEGRAM_TABLES | PHOTO_TABLES | RECIPE_TABLES:
             assert connection.exec_driver_sql(f"SELECT count(*) FROM {table}").scalar() == 0
         assert connection.exec_driver_sql("PRAGMA foreign_key_check").all() == []
         assert connection.exec_driver_sql("PRAGMA integrity_check").scalars().all() == ["ok"]
@@ -179,7 +181,7 @@ def test_the_two_revisions_render_as_postgresql_sql_that_only_creates_tables_and
 
     for source, target, tables, indexes in [
         (FAVORITES, TELEGRAM, ["telegram_links", "telegram_link_codes"], 2),
-        (TELEGRAM, HEAD, ["message_attachments"], 2),
+        (TELEGRAM, ATTACHMENTS, ["message_attachments"], 2),
     ]:
         revision = up.split(f"Running upgrade {source} -> {target}")[1].split("-- Running")[0]
         statements = [re.sub(r"\s+", " ", part.strip()) for part in revision.split(";")]
@@ -192,7 +194,7 @@ def test_the_two_revisions_render_as_postgresql_sql_that_only_creates_tables_and
         assert "ALTER TABLE" not in revision and "DROP" not in revision and "DELETE FROM" not in revision
 
     assert "BYTEA" in up and "data BYTEA NOT NULL" in up
-    down = _offline_sql("down_from_head")
+    down = _offline_sql("down_from_attachments")
     uncommented = re.sub(r"^--.*$", "", down, flags=re.MULTILINE)
     assert re.findall(r"^DROP [^;]*", uncommented, re.MULTILINE) == ["DROP TABLE message_attachments"]
     down = _offline_sql("down_from_telegram")

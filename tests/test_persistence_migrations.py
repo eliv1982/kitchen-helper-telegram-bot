@@ -73,7 +73,8 @@ INVITATIONS = "0005_identity_invitations"
 OIDC_STATE = "0006_oidc_state_invitation"
 FAVORITES = "0007_favorite_recipes"
 TELEGRAM = "0008_telegram_links"
-HEAD = "0009_message_attachments"
+ATTACHMENTS = "0009_message_attachments"
+HEAD = "0010_structured_recipe_favorites"
 REPO_ROOT = Path(house_helper.persistence.__file__).resolve().parents[2]
 
 
@@ -102,6 +103,7 @@ def test_the_history_is_one_line_with_one_head():
     assert script.get_heads() == [HEAD]
     assert [revision.revision for revision in script.walk_revisions()] == [
         HEAD,
+        ATTACHMENTS,
         TELEGRAM,
         FAVORITES,
         OIDC_STATE,
@@ -111,7 +113,8 @@ def test_the_history_is_one_line_with_one_head():
         PROVENANCE,
         INITIAL,
     ]
-    assert script.get_revision(HEAD).down_revision == TELEGRAM
+    assert script.get_revision(HEAD).down_revision == ATTACHMENTS
+    assert script.get_revision(ATTACHMENTS).down_revision == TELEGRAM
     assert script.get_revision(TELEGRAM).down_revision == FAVORITES
     assert script.get_revision(FAVORITES).down_revision == OIDC_STATE
     assert script.get_revision(OIDC_STATE).down_revision == INVITATIONS
@@ -488,6 +491,7 @@ ALL_TABLES_BEFORE_0003 = TABLES - {
     "telegram_links",
     "telegram_link_codes",
     "message_attachments",
+    "message_recipes",
 }
 
 
@@ -898,6 +902,7 @@ TABLES_BEFORE_0005 = TABLES - {
     "telegram_links",
     "telegram_link_codes",
     "message_attachments",
+    "message_recipes",
 }
 
 
@@ -925,7 +930,7 @@ def test_the_invitation_migration_adds_one_empty_table_and_changes_nothing_else(
     upgrade_database(empty_engine, INVITATIONS)
 
     assert _version(empty_engine) == [INVITATIONS]
-    assert _tables(empty_engine) == TABLES - {"favorite_recipes", "telegram_links", "telegram_link_codes", "message_attachments"} | {"alembic_version"}
+    assert _tables(empty_engine) == TABLES - {"favorite_recipes", "telegram_links", "telegram_link_codes", "message_attachments", "message_recipes"} | {"alembic_version"}
     assert _snapshot_before_0005(empty_engine) == before  # every row of every old table
     with empty_engine.connect() as connection:
         assert connection.exec_driver_sql("SELECT count(*) FROM identity_invitations").scalar() == 0
@@ -1027,6 +1032,7 @@ TABLES_BEFORE_0006_WITH_ROWS = TABLES - {
     "telegram_links",
     "telegram_link_codes",
     "message_attachments",
+    "message_recipes",
 }
 
 
@@ -1221,8 +1227,10 @@ def _offline_sql(direction: str) -> str:
         command.downgrade(config, f"{FAVORITES}:{OIDC_STATE}", sql=True)
     elif direction == "down_from_telegram":
         command.downgrade(config, f"{TELEGRAM}:{FAVORITES}", sql=True)
+    elif direction == "down_from_attachments":
+        command.downgrade(config, f"{ATTACHMENTS}:{TELEGRAM}", sql=True)
     elif direction == "down_from_head":
-        command.downgrade(config, f"{HEAD}:{TELEGRAM}", sql=True)
+        command.downgrade(config, f"{HEAD}:{ATTACHMENTS}", sql=True)
     else:
         command.downgrade(config, f"{HEAD}:base", sql=True)
     return config.output_buffer.getvalue()
@@ -1248,7 +1256,7 @@ def test_the_upgrade_renders_as_postgresql_sql():
     assert "%" not in sql  # a doubled percent sign would make the offline SQL unrunnable
     assert f"INSERT INTO alembic_version (version_num) VALUES ('{INITIAL}')" in sql
     assert f"UPDATE alembic_version SET version_num='{HEAD}'" in sql
-    assert sql.count("CREATE INDEX") == 21 and sql.count("CREATE UNIQUE INDEX") == 2
+    assert sql.count("CREATE INDEX") == 21 and sql.count("CREATE UNIQUE INDEX") == 3
 
 
 def test_the_downgrade_renders_as_postgresql_sql():
@@ -1449,7 +1457,7 @@ def test_the_migration_and_the_models_build_the_same_schema_in_postgresql_sql():
 
 def test_the_migration_and_the_models_create_the_same_indexes_in_postgresql_sql():
     assert _indexes_in(_offline_sql("up")) == _indexes_in(_models_as_postgresql())
-    assert len(_indexes_in(_models_as_postgresql())) == 23  # 21 plain, 2 unique
+    assert len(_indexes_in(_models_as_postgresql())) == 24  # 21 plain, 3 unique
 
 
 def test_the_postgresql_comparison_does_see_a_difference(monkeypatch):
