@@ -687,6 +687,13 @@ textarea[aria-invalid="true"] {
   border-bottom-left-radius: 0.3rem;
 }
 
+/* A long answer (a recipe, usually) takes the reading column instead of shrinking to the width
+   of its longest line; a short reply keeps a bubble that fits its text (app.js adds the class). */
+.msg-wide {
+  width: 100%;
+  max-width: min(46rem, 100%);
+}
+
 .msg-failed {
   border-color: var(--red);
 }

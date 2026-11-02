@@ -527,6 +527,13 @@
 
   // The favorites ------------------------------------------------------------------------------------------
 
+  // The structured-recipe switch changes what keeps a recipe: one "Сохранить" per recipe
+  // under an answer, not one whole-answer "В избранное". The empty hint must name the control
+  // that is actually there.
+  function favoritesEmptyText() {
+    return structuredRecipes ? Logic.TEXT.favoritesEmptyStructured : Logic.TEXT.favoritesEmpty;
+  }
+
   // Which part is in front: the conversations (the chat) or the favorites (the recipe).
   function drawSection(section) {
     var favorites = section === "favorites";
@@ -547,7 +554,7 @@
       status = list.error ? list.error.text : Logic.TEXT.favoritesFailed;
       els.favoritesRetry.hidden = false;
     } else if (list.status === "ready" && list.items.length === 0) {
-      status = Logic.TEXT.favoritesEmpty;
+      status = favoritesEmptyText();
     }
     els.favoritesStatus.textContent = status;
     clear(els.favoriteList);
@@ -575,7 +582,7 @@
       lastRecipeId = null;
       els.recipeTitle.textContent = Logic.TEXT.favoritesTab;
       var empty = h("div", { class: "empty" }, [
-        h("p", { class: "lead", text: data.status === "ready" && data.count === 0 ? Logic.TEXT.favoritesEmpty : Logic.TEXT.favoritesPick }),
+        h("p", { class: "lead", text: data.status === "ready" && data.count === 0 ? favoritesEmptyText() : Logic.TEXT.favoritesPick }),
       ]);
       if (data.count > 0) {
         var choose = action("Выбрать рецепт", "btn-primary only-narrow", function () {
@@ -1155,13 +1162,23 @@
     return button;
   }
 
+  // A long answer -- a recipe, usually -- is a block of reading, not a short line: on a wide
+  // window it takes the reading column instead of shrinking to its longest line. A short reply
+  // keeps its bubble. A structured recipe (title, fields and steps) runs to several hundred
+  // characters; a conversational reply is a sentence or two.
+  var LONG_ANSWER_LENGTH = 200;
+
   function messageNode(item, conversationId) {
     var mine = item.role === "user";
     var meta = h("div", { class: "msg-meta" }, [
       item.time ? h("time", { datetime: item.iso || false, text: item.time }) : null,
     ]);
+    var classes = "msg " + (mine ? "msg-user" : "msg-assistant") + (item.status === "failed" ? " msg-failed" : "");
+    if (!mine && String(item.text || "").length >= LONG_ANSWER_LENGTH) {
+      classes += " msg-wide";
+    }
     var node = h("article", {
-      class: "msg " + (mine ? "msg-user" : "msg-assistant") + (item.status === "failed" ? " msg-failed" : ""),
+      class: classes,
       "data-id": item.type === "message" ? String(item.id) : false,
     });
     node.appendChild(h("p", { class: "visually-hidden", text: mine ? "Вы:" : "Помощник:" }));

@@ -314,6 +314,38 @@ scenario("paragraphs_are_kept_and_nothing_else_is_made_of_the_text", async () =>
   assert.deepEqual(paragraphs, ["Борщ", "Инградиенты:\n- свёкла\n- капуста".replace("Инградиенты", "Ингредиенты"), "1. Сварить.\n2. Подать."]);
 });
 
+scenario("a_long_answer_takes_the_reading_width_and_a_short_one_keeps_its_bubble", async () => {
+  const recipe = [
+    "Борщ классический",
+    "4 порции",
+    "",
+    "Ингредиенты:",
+    "- Свекла — 2 шт.",
+    "- Курица — 500 г",
+    "- Капуста — 300 г",
+    "- Картофель — 3 шт.",
+    "",
+    "Приготовление:",
+    "1. Сварите бульон из курицы.",
+    "2. Добавьте свеклу и капусту.",
+    "3. Варите до готовности.",
+  ].join("\n");
+  const page = await open(signedInWith([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [
+      message(1, "user", "Что приготовить?"),
+      message(2, "assistant", recipe),
+      message(3, "assistant", "Готово!"),
+      message(4, "user", recipe),
+    ]),
+  }));
+
+  const [question, answer, short, typed] = page.articles();
+  assert.ok(answer.className.includes("msg-wide"), "a long recipe takes the reading column");
+  assert.ok(!short.className.includes("msg-wide"), "a short reply keeps its bubble");
+  assert.ok(!question.className.includes("msg-wide"), "a short question is unchanged");
+  assert.ok(!typed.className.includes("msg-wide"), "the person's long message is unchanged");
+});
+
 // ============================================================================================
 // Older messages
 // ============================================================================================
@@ -1088,6 +1120,17 @@ scenario("an_empty_list_of_favorites_says_what_to_do", async () => {
   assert.equal(page.el("favorites-status").textContent, Logic.TEXT.favoritesEmpty);
   assert.equal(page.el("favorite-list").childNodes.length, 0);
   assert.ok(page.el("recipe-body").textContent.includes(Logic.TEXT.favoritesEmpty));
+});
+
+scenario("with_structured_recipes_the_empty_favorites_hint_names_the_per_recipe_save", async () => {
+  const page = await open(withFavorites([]), { structured: true });
+
+  page.el("tab-favorites").click();
+  await page.settle();
+
+  assert.equal(page.el("favorites-status").textContent, Logic.TEXT.favoritesEmptyStructured);
+  assert.ok(page.el("recipe-body").textContent.includes(Logic.TEXT.favoritesEmptyStructured));
+  assert.ok(!page.el("recipe-body").textContent.includes(Logic.TEXT.favoritesEmpty));
 });
 
 scenario("a_favorite_that_cannot_be_listed_offers_to_try_again", async () => {

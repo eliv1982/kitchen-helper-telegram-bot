@@ -214,6 +214,10 @@
     favoritesFailed: "Не удалось загрузить избранное.",
     favoritesEmpty:
       "В избранном пока ничего нет. Под ответом помощника нажмите «В избранное», чтобы сохранить рецепт.",
+    // With structured recipes on, an answer is kept one recipe at a time, by a control named
+    // after the recipe, so the hint must not promise one "В избранное" for the whole answer.
+    favoritesEmptyStructured:
+      "В избранном пока ничего нет. Под ответом помощника нажмите «Сохранить» рядом с рецептом, чтобы добавить его в избранное.",
     favoritesPick: "Выберите рецепт в списке.",
     favoriteKeep: "В избранное",
     favoriteKeeping: "Сохраняем…",

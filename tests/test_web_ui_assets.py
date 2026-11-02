@@ -152,6 +152,17 @@ def test_the_script_and_the_style_use_the_same_breakpoint_and_the_script_looks_o
                 assert name in classes_in_css, f"app.js uses .{name}, which the style does not define"
 
 
+def test_a_long_answer_takes_the_reading_column_and_a_short_one_keeps_its_bubble():
+    rules = _merged_rules()
+
+    # app.js marks a long answer (a recipe, usually); the style gives it the reading column.
+    assert 'classes += " msg-wide";' in code_of(APP)
+    assert rules[".msg-wide"]["width"] == "100%"
+    assert rules[".msg-wide"]["max-width"] == "min(46rem, 100%)"
+    # The bubble's own cap is unchanged; only a long answer may fill the 46rem column.
+    assert "max-width: min(46rem, 94%);" in CSS
+
+
 def test_the_viewport_allows_zoom_and_the_markup_asks_for_no_fixed_sizes():
     html = ui.render_shell(telegram=True, email=True)
     viewport = re.search(r'name="viewport" content="([^"]+)"', html).group(1)
