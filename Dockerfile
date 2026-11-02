@@ -60,7 +60,19 @@ COPY house_helper ./house_helper
 COPY alembic.ini ./alembic.ini
 COPY deploy/ops /opt/house-helper/ops
 COPY deploy/logging.json /opt/house-helper/logging.json
-RUN python -m compileall -q /app/house_helper
+
+# The modes above are the modes of the build context: COPY preserves them, it does not set
+# them. A checkout made under the operator's `umask 077` (deploy/upgrade.sh sets it) is
+# root-owned 0600, and the application's user 10001 then cannot read a single module:
+# "PermissionError: /app/house_helper/__init__.py". A permissive umask leaves the same files
+# group- or world-writable, which this image must not be either. So SET the modes instead of
+# inheriting them: files 0644, directories 0755, an executable file stays executable (X adds
+# execute only where some user already has it, so a module does not become one), and nothing
+# is writable by group or other. `=` names both classes explicitly, so no umask has a say.
+# /data and /staging are deliberately not in this list: they are the application's own 0700
+# directories and the only places it may write.
+RUN chmod -R u=rwX,go=rX /app/house_helper /app/alembic.ini /opt/house-helper \
+ && python -m compileall -q /app/house_helper
 
 # No VOLUME instruction: it would leave an anonymous volume behind every `docker run` that
 # does not mount /data (the disposable backup verification). The compose file mounts it.
