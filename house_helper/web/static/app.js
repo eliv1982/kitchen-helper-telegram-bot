@@ -858,14 +858,25 @@
 
       var steps = h("div", { class: "edit-lines" });
       draft.steps.forEach(function (step, index) {
-        var input = keepDraft(h("input", {
-          class: "edit-step",
-          type: "text",
-          value: step,
-          readonly: saving,
-          autocomplete: "off",
-          "aria-label": Logic.TEXT.editStep + " " + (index + 1),
-        }));
+        // A step is one line by the protocol's rule (the server refuses control characters),
+        // but a long instruction must be readable while it is edited: the field wraps it and
+        // can be dragged taller. A line break typed or pasted becomes the space it stands for,
+        // so what is sent is still text the existing validation can store.
+        var input = textArea(step, 3);
+        input.className = "edit-step";
+        input.setAttribute("aria-label", Logic.TEXT.editStep + " " + (index + 1));
+        input.addEventListener("keydown", function (event) {
+          if (event.key === "Enter" && !event.isComposing) {
+            event.preventDefault();
+          }
+        });
+        input.addEventListener("input", function () {
+          var folded = input.value.replace(/\r\n?|\n/g, " ");
+          if (folded !== input.value) {
+            input.value = folded;
+          }
+          controller.syncFavoriteDraft(collect());
+        });
         stepInputs.push(input);
         steps.appendChild(
           h("div", { class: "edit-row edit-row-step" }, [

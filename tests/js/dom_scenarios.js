@@ -1924,6 +1924,29 @@ scenario("structured_the_card_shows_its_fields_and_is_edited_in_the_page", async
   );
 });
 
+scenario("structured_a_step_is_a_wrapping_textarea_and_line_breaks_become_spaces", async () => {
+  const page = await open(structuredCard(), { structured: true });
+  await openEditor(page);
+  const body = () => page.el("recipe-body");
+  const fields = body().byClass("edit-step");
+
+  // A long instruction wraps in a textarea instead of being clipped to one line.
+  assert.deepEqual(fields.map((field) => field.tagName), ["TEXTAREA", "TEXTAREA"]);
+  assert.deepEqual(fields.map((field) => field.getAttribute("rows")), ["3", "3"]);
+  // Enter is a step boundary, not a line break inside a step: the server's rule is one line.
+  assert.equal(
+    fields[0].fire("keydown", { key: "Enter" }).defaultPrevented,
+    true,
+    "Enter does not put a second line into a step"
+  );
+  // A pasted line break becomes the space it stands for; the rest of the text is untouched,
+  // so the draft can still be saved under the existing validation.
+  page.editField(fields[0], "Сварите\nбульон.\n\nДобавьте овощи.");
+  assert.equal(body().byClass("edit-step")[0].value, "Сварите бульон.  Добавьте овощи.");
+  assert.equal(body().byClass("edit-step")[1].value, BORSH.steps[1], "the other steps are untouched");
+  assert.equal(page.env.net.requests("PATCH", `/api/favorites/${H.FAV_1}`).length, 0);
+});
+
 scenario("structured_hostile_recipe_fields_are_only_text", async () => {
   const hostileTitle = '<img src=x onerror=alert(1)>';
   const hostileName = '<script>alert(2)</script>';

@@ -35,10 +35,16 @@
   --radius: 0.75rem;
   --shadow: 0 1px 3px rgba(22, 32, 51, 0.12);
 
-  /* The readable column of the conversation and the recipe. On a wide window the sides are left empty
-     (the percentage is the pane's own width); on a narrow one the side is 1rem. */
+  /* The readable column of the conversation. On a wide window the sides are left empty (the
+     percentage is the pane's own width); on a narrow one the side is 1rem. */
   --column: 48rem;
   --gutter: max(1rem, calc((100% - var(--column)) / 2));
+
+  /* The recipe is read and edited in a wider column of its own (about 1024 px) while the
+     conversation keeps --column. The heading and the body share this gutter, so they stay
+     aligned at every width; a narrow pane falls back to the same 1rem margins as the chat. */
+  --recipe-column: 64rem;
+  --recipe-gutter: max(1rem, calc((100% - var(--recipe-column)) / 2));
 }
 
 *,
@@ -750,20 +756,26 @@ textarea[aria-invalid="true"] {
   font-weight: 600;
 }
 
+/* The recipe heading and its body share the wider recipe column (the conversation keeps --column). */
+.recipe .chat-title {
+  padding-right: var(--recipe-gutter);
+  padding-left: var(--recipe-gutter);
+}
+
 .recipe-body {
   flex: 1;
   min-height: 0;
-  padding: 1rem var(--gutter);
+  padding: 1rem var(--recipe-gutter);
   overflow-y: auto;
 }
 
 .recipe-meta {
-  max-width: 46rem;
+  max-width: var(--recipe-column);
   margin-bottom: 0.75rem;
 }
 
 .recipe-text {
-  max-width: 46rem;
+  max-width: var(--recipe-column);
   padding: 0.9rem 1rem;
   border: 1px solid var(--line);
   border-left: 5px solid var(--green);
@@ -773,13 +785,13 @@ textarea[aria-invalid="true"] {
 }
 
 .recipe-actions {
-  max-width: 46rem;
+  max-width: var(--recipe-column);
   margin-top: 1.1rem;
 }
 
 /* A structured recipe draws its fields; a legacy one keeps its text. */
 .recipe-content {
-  max-width: 46rem;
+  max-width: var(--recipe-column);
 }
 
 .recipe-servings {
@@ -817,7 +829,7 @@ textarea[aria-invalid="true"] {
   display: flex;
   flex-direction: column;
   gap: 0.9rem;
-  max-width: 46rem;
+  max-width: var(--recipe-column);
 }
 
 .edit-field,
@@ -873,6 +885,13 @@ textarea[aria-invalid="true"] {
   line-height: 1.45;
 }
 
+/* A preparation step grows to show the whole instruction where the browser can size a
+   field to its content (the 20rem cap keeps a very long step scrollable); elsewhere the
+   three rows and the scroll bar are the fallback. */
+.recipe-editor textarea.edit-step {
+  field-sizing: content;
+}
+
 .recipe-editor input[readonly],
 .recipe-editor textarea[readonly] {
   background: var(--pale);
@@ -896,7 +915,7 @@ textarea[aria-invalid="true"] {
     min-height: 2.75rem;
   }
 
-  .edit-row-step input[type="text"] {
+  .edit-row-step textarea {
     grid-column: 1 / -1;
   }
 }
