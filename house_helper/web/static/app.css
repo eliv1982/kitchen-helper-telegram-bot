@@ -508,15 +508,6 @@ textarea[aria-invalid="true"] {
   flex: none;
 }
 
-/* One conversation: the button that opens it, and the visible Delete action beside it. The
-   question and the failure are drawn under both, in the list's full width. */
-.conv-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 0.45rem;
-  align-items: stretch;
-}
-
 .conv-item {
   display: flex;
   flex-direction: column;
@@ -542,24 +533,6 @@ textarea[aria-invalid="true"] {
   border-color: var(--blue);
   box-shadow: inset 5px 0 0 var(--blue);
   font-weight: 600;
-}
-
-.conv-delete {
-  padding-right: 0.8rem;
-  padding-left: 0.8rem;
-  white-space: nowrap;
-}
-
-.conv-confirm {
-  grid-column: 1 / -1;
-}
-
-.conv-confirm .confirm-text {
-  margin: 0;
-}
-
-.conv-confirm .msg-actions {
-  margin-top: 0.55rem;
 }
 
 .conv-label {
@@ -620,6 +593,96 @@ textarea[aria-invalid="true"] {
   border-bottom: 1px solid var(--line);
   background: var(--surface);
   font-size: 1.05rem;
+}
+
+/* The title of the open conversation and, at its right, the button of its actions. The title keeps
+   the whole width of the reading column it already had; the button is the only thing beside it. */
+.chat-head {
+  position: relative;
+  z-index: 10;
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.2rem var(--gutter);
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.chat-head .chat-title {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  padding: 0.5rem 0;
+  border-bottom: 0;
+  background: transparent;
+}
+
+.chat-actions {
+  position: relative;
+  flex: none;
+}
+
+.chat-actions-toggle {
+  min-width: 2.75rem;
+  min-height: 2.75rem;
+  padding: 0;
+  color: var(--blue);
+  font-size: 1.35rem;
+  line-height: 1;
+}
+
+.chat-actions-menu {
+  position: absolute;
+  top: calc(100% + 0.25rem);
+  right: 0;
+  z-index: 40;
+  min-width: 13rem;
+  max-width: min(18rem, calc(100vw - 2.5rem));
+  padding: 0.3rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.chat-menu-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 2.75rem;
+  padding: 0.55rem 0.8rem;
+  border: 0;
+  border-radius: calc(var(--radius) - 0.2rem);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.chat-menu-item:hover {
+  background: var(--pale);
+}
+
+.chat-menu-item-danger {
+  color: var(--red-dark);
+}
+
+/* The question "delete this conversation?" and its failure, between the header and the messages. */
+.chat-delete {
+  flex: none;
+  padding: 0.75rem var(--gutter);
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.chat-delete-confirm .confirm-text {
+  margin: 0;
+}
+
+.chat-delete-confirm .msg-actions {
+  margin-top: 0.55rem;
 }
 
 .banner {

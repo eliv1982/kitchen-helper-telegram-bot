@@ -689,20 +689,127 @@ scenario("a_new_conversation_is_a_draft_with_the_box_focused_and_nothing_is_crea
   assert.equal(page.env.net.requests("POST", /.*/).length, 0);
 });
 
+// The menu of the open conversation, and the one action it offers today.
+function openActions(page) {
+  page.el("chat-actions-toggle").click();
+  return page.el("chat-actions-menu");
+}
+
+function chooseDelete(page) {
+  const menu = openActions(page);
+  menu.byTag("button").find((button) => button.textContent === Logic.TEXT.deleteNamed).click();
+}
+
+scenario("the_actions_menu_is_offered_only_for_the_saved_conversation_that_is_open", async () => {
+  const page = await open(oneConversation());
+  const toggle = page.el("chat-actions-toggle");
+
+  assert.equal(page.visible("chat-actions"), true, "a saved conversation has actions");
+  assert.equal(toggle.getAttribute("aria-haspopup"), "menu");
+  assert.equal(toggle.getAttribute("aria-controls"), "chat-actions-menu");
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  assert.equal(toggle.getAttribute("aria-label"), "Действия с разговором");
+  assert.equal(page.visible("chat-actions-menu"), false, "the menu is closed until it is asked for");
+
+  const menu = openActions(page);
+  assert.equal(toggle.getAttribute("aria-expanded"), "true");
+  assert.equal(page.visible("chat-actions-menu"), true);
+  assert.equal(menu.getAttribute("role"), "menu");
+  assert.equal(menu.getAttribute("aria-label"), "Действия с разговором");
+  const items = menu.byTag("button");
+  assert.deepEqual(items.map((button) => button.textContent), [Logic.TEXT.deleteNamed]);
+  assert.equal(items[0].getAttribute("role"), "menuitem");
+  assert.equal(items[0].getAttribute("tabindex"), "-1");
+  assert.equal(page.doc.activeElement, items[0], "the first action is focused when the menu opens");
+
+  page.el("tab-favorites").click();
+  await page.settle();
+  assert.equal(page.visible("chat-actions"), false, "the favorites have no conversation actions");
+  assert.equal(page.visible("chat-actions-menu"), false);
+  page.el("tab-chats").click();
+  await page.settle();
+  assert.equal(page.visible("chat-actions"), true);
+
+  page.el("new-conversation").click();
+  await page.settle();
+  assert.equal(page.visible("chat-actions"), false, "a new draft has no actions");
+  assert.equal(page.visible("chat-actions-menu"), false);
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+});
+
+scenario("opening_another_conversation_closes_the_actions_menu", async () => {
+  const page = await open(
+    signedInWith([conversation(CONV_B, 30, "Суп"), conversation(CONV_A, 0, "Борщ")], {
+      [CONV_B]: historyBody(CONV_B, [message(5, "user", "Про суп")]),
+      [CONV_A]: historyBody(CONV_A, [message(6, "user", "Про борщ")]),
+    })
+  );
+  const toggle = page.el("chat-actions-toggle");
+
+  openActions(page);
+  assert.equal(page.visible("chat-actions-menu"), true);
+  page.el("conversation-list").byTag("button")[1].click();
+  await page.settle();
+
+  assert.equal(page.el("chat-title").textContent, "Борщ");
+  assert.equal(page.visible("chat-actions"), true, "the newly opened conversation has its own actions");
+  assert.equal(page.visible("chat-actions-menu"), false, "the menu of the first one is gone");
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+});
+
+scenario("the_actions_menu_is_operable_from_the_keyboard_and_dismissed_by_an_outside_click", async () => {
+  const page = await open(oneConversation());
+  const toggle = page.el("chat-actions-toggle");
+  const menu = page.el("chat-actions-menu");
+
+  toggle.fire("keydown", { key: "ArrowDown" });
+  assert.equal(page.visible("chat-actions-menu"), true);
+  assert.equal(toggle.getAttribute("aria-expanded"), "true");
+  const item = menu.byTag("button")[0];
+  assert.equal(page.doc.activeElement, item, "ArrowDown opens the menu on its first action");
+
+  item.fire("keydown", { key: "ArrowDown" });
+  assert.equal(page.doc.activeElement, item, "the last action wraps to the first (there is one)");
+  item.fire("keydown", { key: "ArrowUp" });
+  assert.equal(page.doc.activeElement, item);
+  item.fire("keydown", { key: "Home" });
+  assert.equal(page.doc.activeElement, item);
+  item.fire("keydown", { key: "End" });
+  assert.equal(page.doc.activeElement, item);
+  item.fire("keydown", { key: "Escape" });
+  assert.equal(page.visible("chat-actions-menu"), false);
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  assert.equal(page.doc.activeElement, toggle, "Escape gives the focus back to the actions button");
+
+  toggle.click();
+  assert.equal(page.doc.activeElement, item);
+  page.doc.fire("click", { target: page.el("messages") });
+  assert.equal(page.visible("chat-actions-menu"), false, "a click elsewhere calls the menu off");
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+
+  toggle.click();
+  item.fire("keydown", { key: "Tab" });
+  assert.equal(page.visible("chat-actions-menu"), false, "Tab leaves the menu and closes it");
+
+  toggle.click();
+  page.el("chat-actions").fire("focusout", { relatedTarget: page.el("messages") });
+  assert.equal(page.visible("chat-actions-menu"), false, "the focus moving out closes it");
+});
+
 scenario("deleting_the_open_conversation_asks_first_and_returns_to_a_new_empty_one", async () => {
   const page = await open(oneConversation(), { narrow: true });
   page.env.net.route("DELETE", `/api/conversations/${CONV_A}`, H.removedBody());
   // The list the server returns after the deletion: the page reads it again by itself.
   page.env.net.route("GET", "/api/conversations", listBody([]));
-  page.el("drawer-toggle").click();
-  const list = page.el("conversation-list");
+  const toggle = page.el("chat-actions-toggle");
+  const confirmation = page.el("chat-delete");
 
-  const remove = list.byClass("conv-delete")[0];
-  assert.equal(remove.textContent, Logic.TEXT.deleteAction, "the action is visible in the list");
-  assert.equal(remove.getAttribute("aria-label"), Logic.TEXT.deleteNamed);
-  remove.click();
+  chooseDelete(page);
   await page.settle();
-  let question = list.byClass("confirm")[0];
+  let question = confirmation.byClass("confirm")[0];
+  assert.ok(question, "choosing the action asks the same question as before");
+  assert.equal(page.visible("chat-delete"), true);
+  assert.equal(page.visible("chat-actions-menu"), false, "choosing the action closes the menu");
   assert.ok(question.textContent.includes(Logic.TEXT.deleteAsk));
   assert.deepEqual(question.byTag("button").map((button) => button.textContent), [
     Logic.TEXT.deleteConfirm,
@@ -714,17 +821,18 @@ scenario("deleting_the_open_conversation_asks_first_and_returns_to_a_new_empty_o
   question.buttons(Logic.TEXT.deleteCancel)[0].click();
   await page.settle();
   assert.equal(page.env.net.requests("DELETE", /.*/).length, 0);
-  assert.equal(page.doc.activeElement.className, "btn btn-quiet conv-delete", "the focus goes back to the action");
+  assert.equal(page.visible("chat-delete"), false, "cancelling puts the question away");
+  assert.equal(page.doc.activeElement, toggle, "the focus goes back to the actions button");
+  assert.equal(page.visible("chat-actions"), true);
 
-  list.byClass("conv-delete")[0].click();
+  chooseDelete(page);
   await page.settle();
-  question = list.byClass("confirm")[0];
-  question.buttons(Logic.TEXT.deleteConfirm)[0].click();
+  confirmation.byClass("confirm")[0].buttons(Logic.TEXT.deleteConfirm)[0].click();
   await page.settle();
 
   assert.equal(page.env.net.requests("DELETE", /.*/).length, 1);
   assert.equal(page.env.net.requests("GET", "/api/conversations").length, 2, "the list is read again");
-  assert.equal(list.childNodes.length, 0);
+  assert.equal(page.el("conversation-list").childNodes.length, 0);
   assert.equal(page.el("list-status").textContent, "Разговоров пока нет. Начните новый.");
   assert.equal(page.el("chat-title").textContent, "Новый разговор");
   assert.equal(page.el("screen-app").getAttribute("data-drawer"), "closed", "the drawer closes on the new draft");
@@ -732,35 +840,73 @@ scenario("deleting_the_open_conversation_asks_first_and_returns_to_a_new_empty_o
   assert.equal(page.articles().length, 0);
   assert.equal(page.el("banner-text").textContent, Logic.TEXT.deleted);
   assert.equal(page.visible("banner"), true);
+  assert.equal(page.visible("chat-actions"), false, "the new draft has no actions");
+  assert.equal(page.visible("chat-delete"), false);
   assert.equal(page.el("composer-input").readOnly, false, "the new conversation can be written to");
   await page.env.timers.advance(100);
   assert.equal(page.el("announcer").textContent, Logic.TEXT.deleted);
 });
 
-scenario("deleting_another_conversation_leaves_the_open_one_alone", async () => {
+scenario("the_actions_menu_deletes_the_open_conversation_and_the_list_keeps_the_rest", async () => {
   const page = await open(
     signedInWith([conversation(CONV_B, 30, "Суп"), conversation(CONV_A, 0, "Борщ")], {
       [CONV_B]: historyBody(CONV_B, [message(5, "user", "Про суп"), message(6, "assistant", "Суп так")]),
+      [CONV_A]: historyBody(CONV_A, [message(6, "user", "Про борщ")]),
     })
   );
-  page.env.net.route("DELETE", `/api/conversations/${CONV_A}`, H.removedBody());
-  page.env.net.route("GET", "/api/conversations", listBody([conversation(CONV_B, 30, "Суп")]));
+  page.env.net.route("DELETE", `/api/conversations/${CONV_B}`, H.removedBody());
+  page.env.net.route("GET", "/api/conversations", listBody([conversation(CONV_A, 0, "Борщ")]));
   const list = page.el("conversation-list");
-  const borcht = () => list.byClass("conv-row").find((row) => row.textContent.includes("Борщ"));
 
-  borcht().byClass("conv-delete")[0].click();
+  chooseDelete(page);
   await page.settle();
-  borcht().byClass("confirm")[0].buttons(Logic.TEXT.deleteConfirm)[0].click();
+  page.el("chat-delete").byClass("confirm")[0].buttons(Logic.TEXT.deleteConfirm)[0].click();
   await page.settle();
 
   assert.equal(page.env.net.requests("DELETE", /.*/).length, 1);
-  assert.deepEqual(list.byClass("conv-row").map((row) => row.textContent.includes("Борщ")), [false]);
-  assert.ok(list.textContent.includes("Суп"));
-  assert.equal(page.el("chat-title").textContent, "Суп");
-  assert.ok(page.articleTexts()[0].includes("Про суп"));
-  assert.ok(page.articleTexts()[1].includes("Суп так"));
+  assert.equal(page.env.net.requests("DELETE", new RegExp(CONV_A)).length, 0, "nothing but the open conversation was asked for");
+  assert.deepEqual(list.byTag("button").map((button) => button.textContent.includes("Борщ")), [true]);
+  assert.ok(list.textContent.includes("Борщ"));
+  assert.equal(page.el("chat-title").textContent, "Новый разговор");
+  assert.equal(page.visible("chat-actions"), false, "the new draft has no actions");
+  assert.equal(page.doc.activeElement, page.el("chat-title"));
+
+  list.byTag("button")[0].click();
+  await page.settle();
+  assert.equal(page.el("chat-title").textContent, "Борщ");
+  assert.equal(page.visible("chat-actions"), true, "the remaining conversation has its own actions");
+});
+
+scenario("a_failed_deletion_keeps_the_conversation_and_offers_a_retry", async () => {
+  const page = await open(oneConversation());
+  const failure = apiError(503, "service_unavailable");
+  page.env.net.route("DELETE", `/api/conversations/${CONV_A}`, failure, H.removedBody());
+  page.env.net.route("GET", "/api/conversations", listBody([]));
+  const title = page.el("chat-title").textContent;
+
+  chooseDelete(page);
+  await page.settle();
+  page.el("chat-delete").byClass("confirm")[0].buttons(Logic.TEXT.deleteConfirm)[0].click();
+  await page.settle();
+
+  let question = page.el("chat-delete").byClass("confirm")[0];
+  assert.ok(question.textContent.includes(failure.body.message), "the reason is shown where the question was");
+  assert.ok(question.textContent.includes("Номер обращения: " + failure.headers["X-Correlation-ID"]));
+  assert.deepEqual(question.byTag("button").map((button) => button.textContent), [
+    Logic.TEXT.retry,
+    Logic.TEXT.deleteCancel,
+  ]);
+  assert.equal(page.doc.activeElement.textContent, Logic.TEXT.retry, "the retry takes the focus");
+  assert.equal(page.el("chat-title").textContent, title, "the conversation is still open");
   assert.equal(page.visible("banner"), false);
-  assert.equal(page.doc.activeElement, page.el("new-conversation"));
+  assert.equal(page.visible("chat-actions"), true);
+  assert.equal(page.env.net.requests("GET", "/api/conversations").length, 1, "a failed deletion does not refresh the list");
+
+  page.el("chat-delete").byClass("confirm")[0].buttons(Logic.TEXT.retry)[0].click();
+  await page.settle();
+  assert.equal(page.env.net.requests("DELETE", /.*/).length, 2);
+  assert.equal(page.el("chat-title").textContent, "Новый разговор");
+  assert.equal(page.el("banner-text").textContent, Logic.TEXT.deleted);
 });
 
 scenario("a_failed_list_refresh_after_a_deletion_offers_its_retry_and_keeps_it_deleted", async () => {
@@ -769,9 +915,9 @@ scenario("a_failed_list_refresh_after_a_deletion_offers_its_retry_and_keeps_it_d
   page.env.net.route("GET", "/api/conversations", fail(), listBody([]));
   const list = page.el("conversation-list");
 
-  list.byClass("conv-delete")[0].click();
+  chooseDelete(page);
   await page.settle();
-  list.byClass("confirm")[0].buttons(Logic.TEXT.deleteConfirm)[0].click();
+  page.el("chat-delete").byClass("confirm")[0].buttons(Logic.TEXT.deleteConfirm)[0].click();
   await page.settle();
 
   assert.equal(page.el("banner-text").textContent, Logic.TEXT.deleted, "the deletion itself is confirmed");
@@ -785,6 +931,35 @@ scenario("a_failed_list_refresh_after_a_deletion_offers_its_retry_and_keeps_it_d
   assert.equal(page.el("list-status").textContent, "Разговоров пока нет. Начните новый.");
   assert.equal(list.childNodes.length, 0);
   assert.equal(page.env.net.requests("GET", "/api/conversations").length, 3);
+});
+
+scenario("the_actions_menu_works_on_a_narrow_screen_after_the_drawer_closes", async () => {
+  const page = await open(oneConversation(), { narrow: true });
+  page.env.net.route("DELETE", `/api/conversations/${CONV_A}`, H.removedBody());
+  page.env.net.route("GET", "/api/conversations", listBody([]));
+  const toggle = page.el("chat-actions-toggle");
+
+  openActions(page);
+  assert.equal(page.visible("chat-actions-menu"), true);
+  page.el("drawer-toggle").click();
+  assert.equal(page.visible("chat-actions-menu"), false, "opening the drawer closes the menu it covers");
+  assert.equal(page.el("screen-app").getAttribute("data-drawer"), "open");
+
+  page.el("conversation-list").byTag("button")[0].click();
+  await page.settle();
+  assert.equal(page.el("screen-app").getAttribute("data-drawer"), "closed", "choosing a conversation closes the drawer");
+  assert.equal(page.visible("chat-actions"), true);
+
+  chooseDelete(page);
+  await page.settle();
+  assert.equal(page.visible("chat-delete"), true, "the question is in the chat, not in the closed drawer");
+  page.el("chat-delete").byClass("confirm")[0].buttons(Logic.TEXT.deleteConfirm)[0].click();
+  await page.settle();
+
+  assert.equal(page.el("screen-app").getAttribute("data-drawer"), "closed");
+  assert.equal(page.el("chat-title").textContent, "Новый разговор");
+  assert.equal(page.visible("chat-actions"), false);
+  assert.equal(page.doc.activeElement, page.el("chat-title"));
 });
 
 scenario("signing_out_leaves_nothing_of_the_conversation_on_screen_or_in_storage", async () => {
@@ -1099,7 +1274,7 @@ scenario("the_script_never_sets_a_handler_a_style_a_link_or_an_address_on_anythi
   for (const name of names) {
     assert.ok(!/^on/i.test(name) && !["style", "href", "src", "srcdoc", "action", "formaction", "target"].includes(name), name);
   }
-  assert.deepEqual([...names].sort().filter((n) => !["aria-busy", "aria-current", "aria-disabled", "aria-hidden", "aria-invalid", "aria-expanded", "aria-label", "aria-pressed", "data-drawer", "data-id", "datetime", "role", "type"].includes(n)), []);
+  assert.deepEqual([...names].sort().filter((n) => !["aria-busy", "aria-current", "aria-disabled", "aria-hidden", "aria-invalid", "aria-expanded", "aria-label", "aria-pressed", "data-drawer", "data-id", "datetime", "role", "tabindex", "type"].includes(n)), []);
   assert.deepEqual(page.doc.root.byTag("script").length, 2);
 });
 

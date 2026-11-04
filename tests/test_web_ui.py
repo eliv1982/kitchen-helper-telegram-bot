@@ -234,6 +234,22 @@ def test_every_field_has_a_label_every_button_a_type_and_the_live_regions_exist(
     assert {"login-title", "unavailable-title", "chat-title"} <= set(headings)
 
 
+def test_the_conversation_actions_menu_is_a_menu_button_that_starts_closed():
+    page = shell_for(telegram=True, email=True)
+    actions = page.by_id("chat-actions")
+    toggle = page.by_id("chat-actions-toggle")
+    menu = page.by_id("chat-actions-menu")
+
+    # The page decides when a saved conversation is open; the shell starts with nothing to act on.
+    assert "hidden" in actions and "hidden" in menu
+    assert toggle["type"] == "button"
+    assert toggle["aria-haspopup"] == "menu"
+    assert toggle["aria-expanded"] == "false"
+    assert toggle["aria-controls"] == "chat-actions-menu"
+    assert toggle["aria-label"] == "Действия с разговором"
+    assert menu["role"] == "menu" and menu["aria-label"] == "Действия с разговором"
+
+
 def test_all_the_text_a_person_reads_is_russian():
     import re
 

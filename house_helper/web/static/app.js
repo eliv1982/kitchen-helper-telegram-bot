@@ -40,6 +40,10 @@
     app: byId("screen-app"),
     chat: byId("chat"),
     chatTitle: byId("chat-title"),
+    chatActions: byId("chat-actions"),
+    chatActionsToggle: byId("chat-actions-toggle"),
+    chatActionsMenu: byId("chat-actions-menu"),
+    chatDelete: byId("chat-delete"),
     drawerToggle: byId("drawer-toggle"),
     sidebar: byId("sidebar"),
     backdrop: byId("backdrop"),
@@ -269,7 +273,13 @@
     region("telegram", telegramShown ? telegram.getView() : null, drawTelegram);
     if (view.screen === "app") {
       region("section", view.section, drawSection);
-      region("list", view.list, drawList);
+      region("list", {
+        status: view.list.status,
+        error: view.list.error,
+        hasMore: view.list.hasMore,
+        draftCurrent: view.list.draftCurrent,
+        items: view.list.items,
+      }, drawList);
       region("favoriteList", { status: view.favorites.status, error: view.favorites.error, items: view.favorites.items }, drawFavoriteList);
       // (The state of the list matters to the pane only while no recipe is open: it then says what to do.)
       var open = view.favorites.current !== null;
@@ -278,6 +288,23 @@
         { current: view.favorites.current, status: open ? null : view.favorites.status, count: open ? null : view.favorites.items.length },
         drawRecipe
       );
+      // The actions belong to an existing conversation that the list still holds (the logic refuses to
+      // ask about any other), and only while the conversations are in front. The drawing of the recipe
+      // resets focusNodes, so these are drawn after it.
+      var canAct = view.currentId !== null && view.list.items.some(function (item) {
+        return item.id === view.currentId;
+      });
+      region("chatActions", {
+        canAct: canAct,
+        currentId: view.currentId,
+        section: view.section,
+        deleting: view.list.deleting,
+      }, drawChatActions);
+      region("chatDelete", {
+        currentId: view.currentId,
+        section: view.section,
+        deleting: view.list.deleting,
+      }, drawChatDelete);
       region("title", view.chatTitle, function (title) {
         els.chatTitle.textContent = title;
       });
@@ -354,12 +381,11 @@
 
   // What the person's last action wants focused once the page has been drawn: "recipe" (the title of the
   // recipe pane, which is hidden until it is drawn), "keep" (the safe answer of the question "remove it?"),
-  // "remove" (the button that asked the question). The nodes are made by the drawing. It is asked of one
-  // drawing only: if what it wanted is not there, nothing is focused, and nothing is focused later.
+  // "remove" (the button that asked the question), "chat-delete-cancel" (the safe answer of the question
+  // "delete this conversation?"). The nodes are made by the drawing. It is asked of one drawing only: if
+  // what it wanted is not there, nothing is focused, and nothing is focused later.
   var wantFocus = null;
   var focusNodes = {};
-  // The list is drawn before the recipe, which resets focusNodes; its own nodes are kept apart.
-  var listFocusNodes = {};
 
   function applyWantedFocus() {
     var wanted = wantFocus;
@@ -368,11 +394,8 @@
       if (!els.recipe.hidden) {
         els.recipeTitle.focus();
       }
-    } else if (wanted !== null) {
-      var node = focusNodes[wanted] || listFocusNodes[wanted];
-      if (node) {
-        node.focus();
-      }
+    } else if (wanted !== null && focusNodes[wanted]) {
+      focusNodes[wanted].focus();
     }
   }
 
@@ -435,10 +458,15 @@
         // Nothing of the last person stays on screen or in the composer, hidden or not: the
         // conversation, the list, the title, every line the signed-in page wrote about them.
         drawn.thread = drawn.list = drawn.banner = drawn.composer = drawn.title = null;
+        drawn.chatActions = drawn.chatDelete = null;
         clear(els.messages);
         clear(els.list);
         clear(els.favoriteList);
         clear(els.recipeBody);
+        clear(els.chatDelete);
+        closeChatMenu(false);
+        els.chatActions.hidden = true;
+        els.chatDelete.hidden = true;
         drawn.favoriteList = drawn.recipe = null;
         els.recipe.hidden = true;
         els.recipeTitle.textContent = "";
@@ -447,7 +475,6 @@
         lastRecipeId = null;
         wantFocus = null;
         focusNodes = {};
-        listFocusNodes = {};
         els.input.value = "";
         autosize();
         els.chatTitle.textContent = "";
@@ -505,7 +532,6 @@
 
   function drawList(list) {
     var status = "";
-    listFocusNodes = {};
     els.listRetry.hidden = true;
     if (list.status === "loading" && list.items.length === 0) {
       status = "Загружаем разговоры…";
@@ -521,7 +547,6 @@
     els.newConversation.setAttribute("aria-current", list.draftCurrent ? "true" : "false");
     clear(els.list);
     list.items.forEach(function (item) {
-      var row = h("li", { class: "conv-row" });
       var button = h("button", { class: "conv-item", type: "button", "aria-current": item.current ? "true" : false }, [
         h("span", { class: "conv-label", text: item.label }),
         h("span", { class: "conv-meta", text: item.meta }),
@@ -529,28 +554,188 @@
       button.addEventListener("click", function () {
         selectConversation(item.id);
       });
-      row.appendChild(button);
-      var remove = action(Logic.TEXT.deleteAction, "btn-quiet conv-delete", function () {
-        wantFocus = "delete-cancel";
-        controller.askDeleteConversation(item.id);
-      }, Logic.TEXT.deleteNamed);
-      listFocusNodes["delete-" + item.id] = remove;
-      if (list.deleting && list.deleting.id === item.id && list.deleting.phase === "deleting") {
-        remove.setAttribute("aria-disabled", "true");
-      }
-      row.appendChild(remove);
-      if (list.deleting && list.deleting.id === item.id) {
-        row.appendChild(deleteControls(item, list.deleting));
-      }
-      els.list.appendChild(row);
+      els.list.appendChild(h("li", null, [button]));
     });
   }
 
-  // The question "delete it?", in place under the conversation. The safe answer (keep it) is the
-  // one focused when the question appears; calling it off gives the focus back to the delete
-  // button that asked. A failed deletion stays in the question, with the reason and a retry.
-  function deleteControls(item, deleting) {
-    var box = h("div", { class: "confirm conv-confirm", role: "group", "aria-label": Logic.TEXT.deleteAsk });
+  // The actions of the open conversation ---------------------------------------------------------
+
+  // What the menu offers for the conversation that is open. It is one list so that another
+  // action is another entry here (with the confirmation it needs), not another control in the
+  // header; the menu itself is built from it once, and an entry acts on the id it is given.
+  function conversationActions() {
+    return [
+      {
+        label: Logic.TEXT.deleteNamed,
+        danger: true,
+        run: function (id) {
+          if (id === null || !lastView || lastView.currentId !== id) {
+            return;
+          }
+          wantFocus = "chat-delete-cancel";
+          controller.askDeleteConversation(id);
+        },
+      },
+    ];
+  }
+
+  var conversationMenu = [];
+  var menuOpen = false;
+  var menuForId = null;
+
+  function buildConversationMenu() {
+    clear(els.chatActionsMenu);
+    conversationMenu = conversationActions().map(function (entry) {
+      var actionNode = h("button", {
+        class: "chat-menu-item" + (entry.danger ? " chat-menu-item-danger" : ""),
+        type: "button",
+        role: "menuitem",
+        tabindex: "-1",
+        text: entry.label,
+      });
+      actionNode.addEventListener("click", function () {
+        var id = lastView ? lastView.currentId : null;
+        closeChatMenu(false);
+        entry.run(id);
+      });
+      actionNode.addEventListener("keydown", onMenuItemKey);
+      els.chatActionsMenu.appendChild(actionNode);
+      return actionNode;
+    });
+  }
+
+  function openChatMenu() {
+    if (els.chatActions.hidden || els.chatActionsToggle.getAttribute("aria-disabled") === "true") {
+      return;
+    }
+    menuOpen = true;
+    menuForId = lastView ? lastView.currentId : null;
+    els.chatActionsMenu.hidden = false;
+    els.chatActionsToggle.setAttribute("aria-expanded", "true");
+    if (conversationMenu.length) {
+      conversationMenu[0].focus();
+    }
+  }
+
+  // Closing normally gives the focus back to the button that asked (Escape, the button itself);
+  // an outside click leaves the focus where the click put it, and Tab goes on from the menu.
+  function closeChatMenu(restoreFocus) {
+    menuOpen = false;
+    menuForId = null;
+    els.chatActionsMenu.hidden = true;
+    els.chatActionsToggle.setAttribute("aria-expanded", "false");
+    if (restoreFocus) {
+      els.chatActionsToggle.focus();
+    }
+  }
+
+  function within(node, ancestor) {
+    for (var walk = node; walk; walk = walk.parentNode) {
+      if (walk === ancestor) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function onMenuItemKey(event) {
+    var index = conversationMenu.indexOf(this);
+    var count = conversationMenu.length;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeChatMenu(true);
+      return;
+    }
+    if (event.key === "Tab") {
+      closeChatMenu(false);
+      return;
+    }
+    var next = null;
+    if (event.key === "ArrowDown") {
+      next = (index + 1) % count;
+    } else if (event.key === "ArrowUp") {
+      next = (index - 1 + count) % count;
+    } else if (event.key === "Home") {
+      next = 0;
+    } else if (event.key === "End") {
+      next = count - 1;
+    }
+    if (next !== null) {
+      event.preventDefault();
+      conversationMenu[next].focus();
+    }
+  }
+
+  els.chatActionsToggle.addEventListener("click", function () {
+    if (menuOpen) {
+      closeChatMenu(true);
+    } else {
+      openChatMenu();
+    }
+  });
+
+  els.chatActionsToggle.addEventListener("keydown", function (event) {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      if (!menuOpen) {
+        openChatMenu();
+      }
+      if (menuOpen && conversationMenu.length) {
+        conversationMenu[event.key === "ArrowUp" ? conversationMenu.length - 1 : 0].focus();
+      }
+    } else if (event.key === "Escape" && menuOpen) {
+      event.preventDefault();
+      closeChatMenu(true);
+    }
+  });
+
+  // Clicking anything outside the menu and its button calls it off.
+  document.addEventListener("click", function (event) {
+    if (!menuOpen || within(event.target, els.chatActions)) {
+      return;
+    }
+    closeChatMenu(false);
+  });
+
+  // Leaving the menu by keyboard (Tab, or the focus moving on its own) closes it and leaves the
+  // focus where it went.
+  els.chatActions.addEventListener("focusout", function (event) {
+    if (menuOpen && !within(event.relatedTarget, els.chatActions)) {
+      closeChatMenu(false);
+    }
+  });
+
+  function drawChatActions(data) {
+    var canAct = data.canAct && data.section === "chats";
+    var busy = Boolean(data.deleting && data.deleting.id === data.currentId && data.deleting.phase === "deleting");
+    els.chatActions.hidden = !canAct;
+    els.chatActionsToggle.setAttribute("aria-disabled", busy ? "true" : "false");
+    if (!canAct || busy || (menuOpen && menuForId !== data.currentId)) {
+      closeChatMenu(false);
+    }
+  }
+
+  // The question "delete this conversation?", under the header it was asked from. It is the same
+  // confirmation the list used to hold. The safe answer (keep it) is the one focused when the
+  // question appears; calling it off gives the focus back to the actions button. A failed
+  // deletion stays in the question, with the reason and a retry. The list refresh, the return to
+  // a new draft and the favorites are the logic's, here unchanged.
+  function drawChatDelete(data) {
+    var relevant = data.section === "chats" && data.currentId !== null && data.deleting && data.deleting.id === data.currentId;
+    if (!relevant) {
+      if (!els.chatDelete.hidden) {
+        els.chatDelete.hidden = true;
+        clear(els.chatDelete);
+      }
+      return;
+    }
+    els.chatDelete.hidden = false;
+    clear(els.chatDelete);
+    els.chatDelete.appendChild(deleteConversationControls(data.deleting));
+  }
+
+  function deleteConversationControls(deleting) {
+    var box = h("div", { class: "confirm chat-delete-confirm", role: "group", "aria-label": Logic.TEXT.deleteAsk });
     if (deleting.phase === "deleting") {
       box.appendChild(
         h("p", { class: "confirm-text loading" }, [
@@ -568,32 +753,35 @@
       );
     }
     var buttons = h("div", { class: "msg-actions" });
-    buttons.appendChild(
-      action(problem ? Logic.TEXT.retry : Logic.TEXT.deleteConfirm, "btn-danger", function () {
-        controller.deleteConversation().then(function (result) {
-          if (!result || !result.ok) {
-            return;
-          }
-          // The button that asked is gone with its conversation: what was open is now a new
-          // empty draft (its title, and the drawer that held the list closes to show it), or
-          // the list itself is the thing to be back in.
-          if (result.wasCurrent) {
-            setDrawer(false, false);
-            els.chatTitle.focus();
-          } else {
-            els.newConversation.focus();
-          }
-        });
-      })
-    );
-    var keep = action(Logic.TEXT.deleteCancel, "btn-quiet", function () {
-      wantFocus = "delete-" + item.id;
-      controller.cancelDeleteConversation();
+    var decide = action(problem ? Logic.TEXT.retry : Logic.TEXT.deleteConfirm, "btn-danger", function () {
+      controller.deleteConversation().then(function (result) {
+        if (!result || !result.ok) {
+          return;
+        }
+        // The conversation that asked is gone: what was open is now a new empty draft (its
+        // title, and the drawer that held the list closes to show it), or the list itself is
+        // the thing to be back in.
+        if (result.wasCurrent) {
+          setDrawer(false, false);
+          els.chatTitle.focus();
+        } else {
+          els.newConversation.focus();
+        }
+      });
     });
-    listFocusNodes["delete-cancel"] = keep;
+    buttons.appendChild(decide);
+    var keep = action(Logic.TEXT.deleteCancel, "btn-quiet", function () {
+      controller.cancelDeleteConversation();
+      els.chatActionsToggle.focus();
+    });
+    focusNodes["chat-delete-cancel"] = keep;
     buttons.appendChild(keep);
     box.appendChild(buttons);
     if (problem) {
+      // The confirmation changed into the failure with the answer under the cursor gone: the
+      // retry takes the focus, and the reason is announced.
+      focusNodes["chat-delete-retry"] = decide;
+      wantFocus = "chat-delete-retry";
       alertText(problem.text);
     }
     return box;
@@ -1592,6 +1780,9 @@
 
   function setDrawer(open, restoreFocus) {
     var isOpen = Boolean(open) && narrow !== null && narrow.matches;
+    if (isOpen) {
+      closeChatMenu(false); // (the drawer covers the header: its menu is not left open behind it)
+    }
     els.app.setAttribute("data-drawer", isOpen ? "open" : "closed");
     els.drawerToggle.setAttribute("aria-expanded", isOpen ? "true" : "false");
     els.backdrop.hidden = !isOpen;
@@ -1622,12 +1813,14 @@
 
   function selectConversation(id) {
     setDrawer(false, false);
+    closeChatMenu(false);
     controller.selectConversation(id);
     els.chatTitle.focus();
   }
 
   els.newConversation.addEventListener("click", function () {
     setDrawer(false, false);
+    closeChatMenu(false);
     controller.startDraft();
     els.input.focus();
   });
@@ -1751,6 +1944,7 @@
     controller.recheck();
   });
 
+  buildConversationMenu();
   render();
   controller.start();
 })();

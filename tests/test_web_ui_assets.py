@@ -271,6 +271,9 @@ def test_touch_targets_are_at_least_44_css_pixels():
     assert float(rules[".conv-item"]["min-height"][:-3]) * root_size >= 44
     assert float(rules[".telegram-more summary"]["min-height"][:-3]) * root_size >= 44
     assert float(rules[".btn"]["min-width"][:-3]) * root_size >= 44
+    for selector in (".chat-actions-toggle", ".chat-menu-item"):
+        assert float(rules[selector]["min-height"][:-3]) * root_size >= 44, selector
+    assert float(rules[".chat-actions-toggle"]["min-width"][:-3]) * root_size >= 44
 
 
 def test_keyboard_focus_is_visible_and_motion_and_hidden_are_handled():
