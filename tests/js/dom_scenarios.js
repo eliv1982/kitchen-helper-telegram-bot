@@ -253,7 +253,7 @@ scenario("the_application_lists_conversations_and_shows_the_latest_with_who_said
   assert.equal(page.visible("screen-app"), true);
   assert.equal(page.visible("chat"), true);
   assert.equal(page.visible("gate"), false);
-  const items = page.el("conversation-list").byTag("button");
+  const items = page.el("conversation-list").byClass("conv-item");
   assert.equal(items.length, 2);
   assert.deepEqual(items.map((b) => b.getAttribute("aria-current")), ["true", null]);
   assert.match(page.el("chat-title").textContent, /^Разговор от 18 октября, \d\d:\d\d$/);
@@ -687,6 +687,104 @@ scenario("a_new_conversation_is_a_draft_with_the_box_focused_and_nothing_is_crea
   page.messages().byClass("chip")[1].click(); // a suggestion fills the box and sends nothing
   assert.equal(page.el("composer-input").value, "Как приготовить борщ?");
   assert.equal(page.env.net.requests("POST", /.*/).length, 0);
+});
+
+scenario("deleting_the_open_conversation_asks_first_and_returns_to_a_new_empty_one", async () => {
+  const page = await open(oneConversation(), { narrow: true });
+  page.env.net.route("DELETE", `/api/conversations/${CONV_A}`, H.removedBody());
+  // The list the server returns after the deletion: the page reads it again by itself.
+  page.env.net.route("GET", "/api/conversations", listBody([]));
+  page.el("drawer-toggle").click();
+  const list = page.el("conversation-list");
+
+  const remove = list.byClass("conv-delete")[0];
+  assert.equal(remove.textContent, Logic.TEXT.deleteAction, "the action is visible in the list");
+  assert.equal(remove.getAttribute("aria-label"), Logic.TEXT.deleteNamed);
+  remove.click();
+  await page.settle();
+  let question = list.byClass("confirm")[0];
+  assert.ok(question.textContent.includes(Logic.TEXT.deleteAsk));
+  assert.deepEqual(question.byTag("button").map((button) => button.textContent), [
+    Logic.TEXT.deleteConfirm,
+    Logic.TEXT.deleteCancel,
+  ]);
+  assert.equal(page.doc.activeElement.textContent, Logic.TEXT.deleteCancel, "the safe answer is focused");
+  assert.equal(page.env.net.requests("DELETE", /.*/).length, 0, "asking removes nothing");
+
+  question.buttons(Logic.TEXT.deleteCancel)[0].click();
+  await page.settle();
+  assert.equal(page.env.net.requests("DELETE", /.*/).length, 0);
+  assert.equal(page.doc.activeElement.className, "btn btn-quiet conv-delete", "the focus goes back to the action");
+
+  list.byClass("conv-delete")[0].click();
+  await page.settle();
+  question = list.byClass("confirm")[0];
+  question.buttons(Logic.TEXT.deleteConfirm)[0].click();
+  await page.settle();
+
+  assert.equal(page.env.net.requests("DELETE", /.*/).length, 1);
+  assert.equal(page.env.net.requests("GET", "/api/conversations").length, 2, "the list is read again");
+  assert.equal(list.childNodes.length, 0);
+  assert.equal(page.el("list-status").textContent, "Разговоров пока нет. Начните новый.");
+  assert.equal(page.el("chat-title").textContent, "Новый разговор");
+  assert.equal(page.el("screen-app").getAttribute("data-drawer"), "closed", "the drawer closes on the new draft");
+  assert.equal(page.doc.activeElement, page.el("chat-title"));
+  assert.equal(page.articles().length, 0);
+  assert.equal(page.el("banner-text").textContent, Logic.TEXT.deleted);
+  assert.equal(page.visible("banner"), true);
+  assert.equal(page.el("composer-input").readOnly, false, "the new conversation can be written to");
+  await page.env.timers.advance(100);
+  assert.equal(page.el("announcer").textContent, Logic.TEXT.deleted);
+});
+
+scenario("deleting_another_conversation_leaves_the_open_one_alone", async () => {
+  const page = await open(
+    signedInWith([conversation(CONV_B, 30, "Суп"), conversation(CONV_A, 0, "Борщ")], {
+      [CONV_B]: historyBody(CONV_B, [message(5, "user", "Про суп"), message(6, "assistant", "Суп так")]),
+    })
+  );
+  page.env.net.route("DELETE", `/api/conversations/${CONV_A}`, H.removedBody());
+  page.env.net.route("GET", "/api/conversations", listBody([conversation(CONV_B, 30, "Суп")]));
+  const list = page.el("conversation-list");
+  const borcht = () => list.byClass("conv-row").find((row) => row.textContent.includes("Борщ"));
+
+  borcht().byClass("conv-delete")[0].click();
+  await page.settle();
+  borcht().byClass("confirm")[0].buttons(Logic.TEXT.deleteConfirm)[0].click();
+  await page.settle();
+
+  assert.equal(page.env.net.requests("DELETE", /.*/).length, 1);
+  assert.deepEqual(list.byClass("conv-row").map((row) => row.textContent.includes("Борщ")), [false]);
+  assert.ok(list.textContent.includes("Суп"));
+  assert.equal(page.el("chat-title").textContent, "Суп");
+  assert.ok(page.articleTexts()[0].includes("Про суп"));
+  assert.ok(page.articleTexts()[1].includes("Суп так"));
+  assert.equal(page.visible("banner"), false);
+  assert.equal(page.doc.activeElement, page.el("new-conversation"));
+});
+
+scenario("a_failed_list_refresh_after_a_deletion_offers_its_retry_and_keeps_it_deleted", async () => {
+  const page = await open(oneConversation());
+  page.env.net.route("DELETE", `/api/conversations/${CONV_A}`, H.removedBody());
+  page.env.net.route("GET", "/api/conversations", fail(), listBody([]));
+  const list = page.el("conversation-list");
+
+  list.byClass("conv-delete")[0].click();
+  await page.settle();
+  list.byClass("confirm")[0].buttons(Logic.TEXT.deleteConfirm)[0].click();
+  await page.settle();
+
+  assert.equal(page.el("banner-text").textContent, Logic.TEXT.deleted, "the deletion itself is confirmed");
+  assert.equal(page.visible("list-retry"), true, "the failed refresh can be asked for again");
+  assert.equal(page.el("list-status").textContent, Logic.TEXT.network);
+  assert.equal(list.childNodes.length, 0, "the failure does not put the deleted conversation back");
+
+  page.el("list-retry").click();
+  await page.settle();
+  assert.equal(page.visible("list-retry"), false);
+  assert.equal(page.el("list-status").textContent, "Разговоров пока нет. Начните новый.");
+  assert.equal(list.childNodes.length, 0);
+  assert.equal(page.env.net.requests("GET", "/api/conversations").length, 3);
 });
 
 scenario("signing_out_leaves_nothing_of_the_conversation_on_screen_or_in_storage", async () => {

@@ -61,6 +61,10 @@
  *  - A conversation is created only when the first message is sent, and its creation
  *    (which has no idempotency) is never repeated blindly: after an unclear outcome
  *    the list is read again and the person decides.
+ *  - Deleting a conversation is asked first, and only the second answer sends DELETE. A 404
+ *    (already gone, or never this person's) is the outcome that was wanted: everything the page
+ *    held of it is dropped and, when it was open, the page returns to a new empty draft. A
+ *    favorite is the server's copy and is not touched. No bulk deletion, no trash, no undo.
  *  - A minimal record of each unresolved turn (whose it is, conversation id, key, exact
  *    text, the id of the newest message known when it was sent, the time) is kept in
  *    sessionStorage so a reload in the same tab can resolve it. It is removed when the
@@ -161,6 +165,16 @@
     olderFailed: "Не удалось загрузить более ранние сообщения.",
     conversationGone: "Этот разговор больше недоступен.",
     createRejected: "Не удалось начать разговор.",
+    deleteAction: "Удалить",
+    deleteNamed: "Удалить разговор",
+    deleteAsk:
+      "Удалить этот разговор? Все его сообщения будут удалены без возможности восстановления. " +
+      "Сохраненные рецепты в избранном останутся.",
+    deleteConfirm: "Удалить",
+    deleteCancel: "Отмена",
+    deleting: "Удаляем…",
+    deleteFailed: "Не удалось удалить разговор. Попробуйте еще раз.",
+    deleted: "Разговор удален.",
     createUncertain:
       "Не удалось убедиться, что новый разговор создан. Ваше сообщение осталось в поле ввода, " +
       "список разговоров обновлен: проверьте, нет ли в нем нового разговора. " +
@@ -991,6 +1005,29 @@
     return { type: "failed", text: unavailableText(response, error), correlationId: error ? error.correlationId : null };
   }
 
+  // The answer to DELETE /api/conversations/{id}:
+  //   deleted    204: it is gone
+  //   gone       404 conversation_not_found: it is already gone (or was never this person's), which is
+  //              the outcome that was wanted; nothing more is known or needed
+  //   auth       401
+  //   failed     anything else: it may still be there
+  function classifyConversationDelete(response) {
+    if (response.kind === "network") {
+      return { type: "failed", text: unavailableText(response, null), correlationId: null };
+    }
+    if (response.status === 401) {
+      return { type: "auth" };
+    }
+    if (response.status === 204) {
+      return { type: "deleted" };
+    }
+    var error = readApiError(response);
+    if (response.status === 404 && error && error.code === "conversation_not_found") {
+      return { type: "gone" };
+    }
+    return { type: "failed", text: unavailableText(response, error), correlationId: error ? error.correlationId : null };
+  }
+
   var MESSAGE_STATUSES = { completed: true, in_progress: true, failed: true };
 
   // The address of a photo that came with a message: this site's own route and nothing else. The server
@@ -1332,6 +1369,15 @@
     var store = createPendingStore(deps.storage || null, nowFn);
 
     var epoch = 0; // bumped when the session ends: answers that arrive after it are ignored
+    // Bumped when a deletion is confirmed: a list read that began before it is of a list that
+    // still had the conversation, and its answer must not put it back.
+    var listEpoch = 0;
+    // Counts the beginnings of list reads: an answer to an older read never replaces the answer
+    // of a newer one (a deletion starts a fresh read, which a reload may in turn overtake).
+    var listRead = 0;
+    // A deletion was confirmed while the page was held back (the server's answer to who is
+    // signed in was still out): the list is read as soon as the same person is let through.
+    var listRefreshOnUnlock = false;
     var timers = {};
     var timerSeq = 0;
     var inflight = new Set();
@@ -1378,6 +1424,9 @@
         notice: null,
         failure: null,
         list: { items: [], hasMore: false, status: "idle", error: null },
+        // The conversation whose deletion is being asked about or is under way:
+        // { id, phase: "asking" | "deleting" | "error", error }.
+        deleting: null,
         currentId: null,
         threads: {},
         pending: {},
@@ -1546,6 +1595,7 @@
     function resetData() {
       var screen = state.screen;
       state = freshState(screen);
+      listRefreshOnUnlock = false;
     }
 
     // --- the stored record of unresolved turns -----------------------------------------------
@@ -1679,6 +1729,10 @@
     // or for a look at the history goes on.
     function letThrough() {
       state.gate = null;
+      if (listRefreshOnUnlock) {
+        listRefreshOnUnlock = false;
+        track(loadList()); // (a deletion was confirmed while the page was held back)
+      }
       Object.keys(state.pending).forEach(function (id) {
         var turn = state.pending[id];
         if (turn.phase === "waiting") {
@@ -1823,11 +1877,13 @@
         return false; // held back: nothing is asked for the conversations until it is known who is signed in
       }
       var mine = epoch;
+      var listMine = listEpoch;
+      var readMine = ++listRead;
       state.list.status = "loading";
       state.list.error = null;
       emit();
       var response = await http("GET", "/api/conversations?limit=" + PAGE_SIZE, { timeoutMs: READ_TIMEOUT_MS });
-      if (mine !== epoch) {
+      if (mine !== epoch || listMine !== listEpoch || readMine !== listRead) {
         return false;
       }
       var found = classifyRead(response);
@@ -1837,6 +1893,9 @@
           state.list.items = list.items;
           state.list.hasMore = list.hasMore;
           state.list.status = "ready";
+          if (state.deleting && !list.items.some(function (item) { return item.id === state.deleting.id; })) {
+            state.deleting = null; // the question was about a conversation the server no longer lists
+          }
           emit();
           return true;
         }
@@ -1871,6 +1930,9 @@
     async function selectConversation(id) {
       if (state.screen !== "app" || state.creating) {
         return;
+      }
+      if (state.deleting && state.deleting.phase !== "deleting") {
+        state.deleting = null; // opening something else calls off a question about what was there
       }
       state.section = "chats";
       state.currentId = id;
@@ -1954,20 +2016,110 @@
       return false;
     }
 
-    function conversationGone(id) {
-      var turn = state.pending[id];
-      if (turn) {
+    // Everything this page holds of a conversation: the unresolved turn (and its stored record),
+    // the history, the list item and any question about deleting it. It does not decide what the
+    // page says about it, nor what is open: the callers do (conversationGone, deleteConversation).
+    function forgetConversation(id) {
+      if (state.pending[id]) {
         removePending(id);
       }
       delete state.threads[id];
       state.list.items = state.list.items.filter(function (item) {
         return item.id !== id;
       });
-      if (state.currentId === id) {
+      if (state.deleting && state.deleting.id === id) {
+        state.deleting = null;
+      }
+    }
+
+    function conversationGone(id) {
+      var wasCurrent = state.currentId === id;
+      forgetConversation(id);
+      if (wasCurrent) {
         state.currentId = null;
         state.banner = { kind: "error", text: TEXT.conversationGone, correlationId: null };
       }
       emit();
+    }
+
+    // Deleting is asked first, for one conversation, and done only on the second click.
+    function askDeleteConversation(id) {
+      if (state.screen !== "app" || state.gate) {
+        return;
+      }
+      if (!state.list.items.some(function (item) { return item.id === id; })) {
+        return;
+      }
+      if (state.deleting && state.deleting.phase === "deleting") {
+        return;
+      }
+      state.deleting = { id: id, phase: "asking", error: null };
+      emit();
+    }
+
+    function cancelDeleteConversation() {
+      if (state.deleting && state.deleting.phase !== "deleting") {
+        state.deleting = null;
+        emit();
+      }
+    }
+
+    // The second click. A 404 is the outcome that was wanted (it is already gone, or it was never
+    // this person's): the page drops what it held of it and, when it was the open conversation,
+    // returns to a new empty draft. Nothing of the conversation is left in memory, including an
+    // unresolved turn, whose key is no longer of any use. A failed request keeps everything and
+    // shows why, with a retry.
+    async function deleteConversation() {
+      var asked = state.deleting;
+      if (state.screen !== "app" || state.gate || !asked || asked.phase === "deleting") {
+        return { ok: false, reason: "not_asked" };
+      }
+      var mine = epoch;
+      var id = asked.id;
+      asked.phase = "deleting";
+      asked.error = null;
+      emit();
+      var response = await http("DELETE", "/api/conversations/" + id, { timeoutMs: READ_TIMEOUT_MS });
+      if (mine !== epoch) {
+        return { ok: false, reason: "stale" };
+      }
+      var outcome = classifyConversationDelete(response);
+      if (outcome.type === "auth") {
+        handleAuthLost();
+        return { ok: false, reason: "auth" };
+      }
+      if (outcome.type === "deleted" || outcome.type === "gone") {
+        var wasCurrent = state.currentId === id;
+        listEpoch++; // a list read begun before this answer has the conversation and is not waited for
+        forgetConversation(id);
+        if (wasCurrent) {
+          state.currentId = null; // a new empty draft: the next message makes its conversation
+          state.banner = { kind: "info", text: TEXT.deleted, correlationId: null };
+        }
+        if (state.deleting === asked) {
+          state.deleting = null;
+        }
+        announce(TEXT.deleted);
+        emit();
+        // The page held the list as it was before this deletion, one conversation short (and
+        // perhaps with an older one still beyond its edge): read the list again from the server,
+        // which fills it back up to its limit. A read begun before the deletion is ignored
+        // (listEpoch); a failed read leaves the list in its error state, with its retry, and
+        // still without the conversation that is confirmed gone. While the page is held back
+        // nothing may be asked for the conversations, so the read waits for letThrough.
+        if (state.gate) {
+          listRefreshOnUnlock = true;
+        } else {
+          track(loadList());
+        }
+        return { ok: true, wasCurrent: wasCurrent };
+      }
+      if (state.deleting === asked) {
+        asked.phase = "error";
+        asked.error = { text: outcome.text || TEXT.deleteFailed, correlationId: outcome.correlationId || null };
+        emit();
+      }
+      return { ok: false, reason: "failed" };
     }
 
     async function loadOlder() {
@@ -3596,7 +3748,7 @@
         busy: false,
         maxLength: maxLength,
         chatTitle: "",
-        list: { status: "idle", error: null, hasMore: false, draftCurrent: false, items: [] },
+        list: { status: "idle", error: null, hasMore: false, draftCurrent: false, deleting: null, items: [] },
         thread: {
           id: null,
           status: "ready",
@@ -3636,6 +3788,7 @@
         error: state.list.error,
         hasMore: state.list.hasMore,
         draftCurrent: current === null,
+        deleting: state.deleting,
         items: state.list.items.map(function (item) {
           var turn = state.pending[item.id];
           var meta = item.updatedAt === null ? "" : formatMoment(item.updatedAt, now);
@@ -3728,6 +3881,11 @@
       clearComposerError: clearComposerError,
       reloadList: reloadList,
       reloadThread: reloadThread,
+      askDeleteConversation: askDeleteConversation,
+      cancelDeleteConversation: cancelDeleteConversation,
+      deleteConversation: function () {
+        return track(deleteConversation());
+      },
       showSection: showSection,
       openFavorite: function (id) {
         return track(openFavorite(id));

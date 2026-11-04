@@ -1,18 +1,29 @@
 """The web chat API: conversations and their messages.
 
-Four routes, all under /api, all answering JSON:
+Five routes, all under /api, all answering JSON:
 
-  POST /api/conversations                       a new, empty conversation (body: {})
-  GET  /api/conversations                       the user's conversations, newest activity first,
+  POST   /api/conversations                     a new, empty conversation (body: {})
+  GET    /api/conversations                     the user's conversations, newest activity first,
                                                 each named by its first unexpired message
-  GET  /api/conversations/{id}/messages         the history (?limit=1..100, ?before=<message id>)
-  POST /api/conversations/{id}/messages         send a message, get the assistant's answer
+  DELETE /api/conversations/{id}                delete the user's conversation and its history
+  GET    /api/conversations/{id}/messages       the history (?limit=1..100, ?before=<message id>)
+  POST   /api/conversations/{id}/messages       send a message, get the assistant's answer
 
 Who. The user is whoever the session cookie resolves to on the server
 (auth.require_user); a user id, a conversation owner or a role in the request is never
 read. A conversation id that does not exist, belongs to somebody else or is not even a
 UUID is the same 404 "conversation_not_found" for every route: nothing tells the caller
 which of them it was.
+
+Deleting a conversation (DELETE .../{id}). The conversation and every message, turn
+request, stored message recipe and attachment beneath it are deleted in one transaction,
+by the database's cascades (persistence.conversations.delete_conversation). Ownership is
+the DELETE's WHERE, not a separate check. 204 when it was deleted; 404
+conversation_not_found for a conversation that is unknown, somebody else's, already
+deleted or not a UUID, all the same answer. A favourite is a copy with no key to the
+conversation it came from (persistence.favorites), so it is untouched, as are all other
+users' rows. There is no bulk deletion, no trash and no undo. A turn still being answered
+for the deleted conversation stores nothing when it completes.
 
 Sending a message (POST .../messages). The header `Idempotency-Key` (1 to 128 printable
 ASCII characters, chosen by the client, one per message; not starting with "tg-", which is
@@ -451,6 +462,28 @@ async def list_conversations(
             "has_more": page.has_more,
         }
     )
+
+
+@router.delete("/conversations/{conversation_id}")
+async def delete_conversation(
+    conversation_id: str,
+    current: AuthenticatedSession = Depends(authenticated_mutation),
+    database: WebDatabase = Depends(get_database),
+) -> Response:
+    """Delete the signed-in person's conversation, with everything the database cascades
+    from it. The id is read exactly as the reads read it: unknown, somebody else's,
+    already deleted and malformed are the same 404. Favourites kept from its answers are
+    copies and stay."""
+    wanted = _conversation_id(conversation_id)
+    try:
+        await database.run(
+            lambda session: conversations.delete_conversation(
+                session, current.user_id, wanted
+            )
+        )
+    except ConversationNotFound:
+        raise ApiError("conversation_not_found") from None
+    return Response(status_code=204)
 
 
 @router.get("/conversations/{conversation_id}/messages")

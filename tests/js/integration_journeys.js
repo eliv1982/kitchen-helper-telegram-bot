@@ -612,6 +612,38 @@ journeys.favorites_belong_to_the_person_who_kept_them = async ({ base, cookie, o
   assert.deepEqual(back.favorites.items.map((item) => item.id), [id], "nothing of hers was taken or removed");
 };
 
+journeys.deleting_a_conversation_keeps_its_favorite_and_returns_to_a_new_draft = async ({ base, cookie }) => {
+  const first = page(base, cookie);
+  await first.boot();
+  await (await first.ctl.send("Удалить это?")).done;
+  const conversation = first.view().currentId;
+  const answer = assistantOf(first);
+  await first.ctl.keepFavorite(conversation, answer.id);
+  const favoriteId = first.view().favorites.items[0].id;
+
+  first.ctl.askDeleteConversation(conversation);
+  await first.ctl.idle();
+  assert.deepEqual(first.view().list.deleting.phase, "asking");
+  assert.equal(first.net.log.filter((request) => request.method === "DELETE").length, 0, "asking removes nothing");
+
+  const result = await first.ctl.deleteConversation();
+  await first.ctl.idle();
+  let view = first.view();
+  assert.deepEqual([result.ok, result.wasCurrent], [true, true]);
+  assert.deepEqual([view.currentId, view.list.items.length, view.thread.items.length], [null, 0, 0]);
+  assert.equal(view.chatTitle, "Новый разговор");
+  assert.deepEqual(view.banner, { kind: "info", text: Logic.TEXT.deleted, correlationId: null });
+  assert.deepEqual(view.favorites.items.map((item) => item.id), [favoriteId], "the copy is not the history");
+
+  const second = page(base, cookie); // a new tab: the conversation is gone, the favorite is not
+  view = await second.boot();
+  assert.deepEqual([view.currentId, view.list.items.length], [null, 0]);
+  assert.deepEqual([view.favorites.status, view.favorites.items.map((item) => item.id)], ["ready", [favoriteId]]);
+  const history = await second.net.raw("GET", `/api/conversations/${conversation}/messages`);
+  assert.deepEqual([history.status, history.json.detail], [404, "conversation_not_found"]);
+  return { favorite: favoriteId };
+};
+
 // --- run -------------------------------------------------------------------------------------------------------
 
 (async () => {

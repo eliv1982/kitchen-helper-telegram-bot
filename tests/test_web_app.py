@@ -146,6 +146,7 @@ def test_the_application_exposes_health_sign_in_chat_the_page_and_nothing_else(t
         "/auth/invite/start": ["post"],
         "/auth/invite/done": ["get"],
         "/api/conversations": ["get", "post"],
+        "/api/conversations/{conversation_id}": ["delete"],
         "/api/conversations/{conversation_id}/messages": ["get", "post"],
         "/api/favorites": ["get", "post"],
         "/api/favorites/{favorite_id}": ["delete", "get", "patch"],

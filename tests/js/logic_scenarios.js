@@ -4564,4 +4564,415 @@ scenario("a_photo_address_that_is_not_the_servers_own_route_is_not_a_photo", asy
   }
 });
 
+// ============================================================================================
+// Deleting a conversation
+// ============================================================================================
+
+scenario("deleting_a_conversation_is_asked_first_and_the_open_one_becomes_a_new_draft", async () => {
+  const env = await withConversation();
+  // An unresolved turn, so its stored record can be seen to go with the conversation.
+  env.net.route("POST", URL_A, apiError(502, "provider_error", { retryable: true }));
+  const sent = await env.ctl.send("Не потеряй");
+  await sent.done;
+  await env.settle();
+  assert.equal(env.storage.record.turns.length, 1);
+  env.net.route("DELETE", `/api/conversations/${CONV_A}`, H.removedBody());
+  // What the server lists after the deletion: the list is read again, and it is empty.
+  env.net.route("GET", "/api/conversations", listBody([]));
+
+  env.ctl.askDeleteConversation(CONV_A);
+  await env.settle();
+  let view = env.view();
+  assert.deepEqual([view.list.deleting.id, view.list.deleting.phase], [CONV_A, "asking"]);
+  assert.equal(env.net.requests("DELETE", /.*/).length, 0, "asking removes nothing");
+
+  env.ctl.cancelDeleteConversation();
+  await env.settle();
+  assert.equal(env.view().list.deleting, null);
+  assert.equal(env.net.requests("DELETE", /.*/).length, 0);
+
+  env.ctl.askDeleteConversation(CONV_A);
+  const result = await env.ctl.deleteConversation();
+  await env.settle();
+  view = env.view();
+
+  assert.deepEqual([result.ok, result.wasCurrent], [true, true]);
+  assert.equal(env.net.requests("DELETE", /.*/).length, 1);
+  assert.equal(env.net.requests("GET", "/api/conversations").length, 2, "the list is read again after the deletion");
+  assert.deepEqual([view.currentId, view.list.items.length, view.thread.items.length], [null, 0, 0]);
+  assert.equal(view.list.status, "ready");
+  assert.equal(view.chatTitle, "Новый разговор");
+  assert.deepEqual(view.banner, { kind: "info", text: Logic.TEXT.deleted, correlationId: null });
+  assert.deepEqual(env.ctl._state().pending, {}, "the unresolved turn goes with the conversation");
+  assert.equal(env.storage.record, null);
+  assert.deepEqual(env.announced, [Logic.TEXT.deleted]);
+});
+
+scenario("deleting_another_conversation_keeps_the_open_one_and_removes_only_it", async () => {
+  const env = makeEnv().signedIn([conversation(CONV_B, 30), conversation(CONV_A, 0)], {
+    [CONV_B]: historyBody(CONV_B, [message(5, "user", "Про суп"), message(6, "assistant", "Суп так")]),
+  });
+  await env.boot();
+  assert.equal(env.view().currentId, CONV_B);
+  env.net.route("DELETE", `/api/conversations/${CONV_A}`, H.removedBody());
+  env.net.route("GET", "/api/conversations", listBody([conversation(CONV_B, 30)]));
+
+  env.ctl.askDeleteConversation(CONV_A);
+  const result = await env.ctl.deleteConversation();
+  await env.settle();
+  const view = env.view();
+
+  assert.deepEqual([result.ok, result.wasCurrent], [true, false]);
+  assert.equal(view.currentId, CONV_B);
+  assert.deepEqual(view.list.items.map((item) => item.id), [CONV_B]);
+  assert.equal(view.list.status, "ready");
+  assert.deepEqual(view.thread.items.map((item) => item.text), ["Про суп", "Суп так"]);
+  assert.equal(view.banner, null);
+  assert.equal(view.list.deleting, null);
+});
+
+scenario("a_conversation_deleted_elsewhere_is_dropped_as_the_outcome_that_was_wanted", async () => {
+  const env = await withConversation();
+  env.net.route("DELETE", `/api/conversations/${CONV_A}`, apiError(404, "conversation_not_found"));
+  env.net.route("GET", "/api/conversations", listBody([]));
+
+  env.ctl.askDeleteConversation(CONV_A);
+  const result = await env.ctl.deleteConversation();
+  await env.settle();
+  const view = env.view();
+
+  assert.deepEqual([result.ok, result.wasCurrent], [true, true]);
+  assert.deepEqual([view.currentId, view.list.items.length], [null, 0]);
+  assert.equal(view.list.status, "ready");
+  assert.equal(env.net.requests("GET", "/api/conversations").length, 2, "a 404 is a confirmed deletion too");
+  assert.deepEqual(view.banner, { kind: "info", text: Logic.TEXT.deleted, correlationId: null });
+});
+
+scenario("a_failed_deletion_keeps_the_conversation_and_can_be_retried", async () => {
+  const env = await withConversation();
+  const failure = apiError(503, "service_unavailable", { retryable: true });
+  env.net.route("DELETE", `/api/conversations/${CONV_A}`, failure, H.removedBody());
+
+  env.ctl.askDeleteConversation(CONV_A);
+  const failed = await env.ctl.deleteConversation();
+  await env.settle();
+  let view = env.view();
+
+  assert.equal(failed.ok, false);
+  assert.equal(view.currentId, CONV_A);
+  assert.equal(view.list.items.length, 1);
+  assert.equal(view.list.deleting.phase, "error");
+  assert.equal(view.list.deleting.error.text, Logic.CODE_MESSAGES.service_unavailable);
+  assert.equal(view.list.deleting.error.correlationId, failure.headers["X-Correlation-ID"]);
+  assert.equal(view.banner, null);
+  assert.equal(env.net.requests("GET", "/api/conversations").length, 1, "a failed deletion refreshes nothing");
+
+  env.net.route("GET", "/api/conversations", listBody([]));
+  const retried = await env.ctl.deleteConversation();
+  await env.settle();
+  view = env.view();
+  assert.equal(retried.ok, true);
+  assert.deepEqual([view.currentId, view.list.items.length], [null, 0]);
+  assert.equal(view.list.status, "ready");
+  assert.equal(env.net.requests("GET", "/api/conversations").length, 2);
+});
+
+scenario("deleting_while_the_list_is_loading_ignores_the_held_pre_deletion_answer", async () => {
+  const env = await withConversation();
+  const staleReached = deferred();
+  const releaseStale = deferred();
+  const freshReached = deferred();
+  const releaseFresh = deferred();
+  // The list is read (this answer still has the conversation), then, after the deletion, read
+  // again. Both answers are held, so their order can be controlled.
+  env.net.route(
+    "GET",
+    "/api/conversations",
+    async () => {
+      staleReached.resolve();
+      await releaseStale.promise;
+      return listBody([conversation(CONV_A, 0)]);
+    },
+    async () => {
+      freshReached.resolve();
+      await releaseFresh.promise;
+      return listBody([]);
+    }
+  );
+  const listing = env.ctl.reloadList();
+  await staleReached.promise;
+  assert.equal(env.view().list.status, "loading");
+
+  env.net.route("DELETE", `/api/conversations/${CONV_A}`, H.removedBody());
+  env.ctl.askDeleteConversation(CONV_A);
+  const result = await env.ctl.deleteConversation();
+  await freshReached.promise;
+
+  assert.deepEqual([result.ok, result.wasCurrent], [true, true]);
+  assert.equal(
+    env.net.requests("GET", "/api/conversations").length,
+    3,
+    "the boot read, the held one, and the fresh one the deletion starts"
+  );
+  assert.deepEqual(env.view().list.items, [], "the conversation is gone from the list at once");
+  assert.equal(env.view().list.status, "loading", "an invalidated list is not called ready");
+  assert.equal(env.view().currentId, null);
+
+  releaseFresh.resolve();
+  await flush();
+  assert.equal(env.view().list.status, "ready", "the fresh answer makes the list authoritative");
+  assert.deepEqual(env.view().list.items, []);
+
+  releaseStale.resolve();
+  await listing;
+  await env.settle();
+
+  const view = env.view();
+  assert.deepEqual(view.list.items.map((item) => item.id), [], "the held answer must not restore it");
+  assert.equal(view.list.status, "ready");
+  assert.equal(view.currentId, null);
+  assert.deepEqual(view.banner, { kind: "info", text: Logic.TEXT.deleted, correlationId: null });
+});
+
+scenario("a_successful_deletion_reads_the_list_again_from_the_server", async () => {
+  const env = await withConversation();
+  const freshReached = deferred();
+  const releaseFresh = deferred();
+  env.net.route("DELETE", `/api/conversations/${CONV_A}`, H.removedBody());
+  env.net.route("GET", "/api/conversations", async () => {
+    freshReached.resolve();
+    await releaseFresh.promise;
+    return listBody([conversation(CONV_B, 10)]);
+  });
+  env.ctl.askDeleteConversation(CONV_A);
+  const result = await env.ctl.deleteConversation();
+  await freshReached.promise;
+
+  assert.equal(result.ok, true);
+  assert.equal(env.net.requests("GET", "/api/conversations").length, 2, "a fresh read follows the DELETE");
+  assert.equal(env.view().list.status, "loading");
+  assert.deepEqual(env.view().list.items, []);
+
+  releaseFresh.resolve();
+  await env.settle();
+
+  const view = env.view();
+  assert.deepEqual(view.list.items.map((item) => item.id), [CONV_B]);
+  assert.equal(view.list.status, "ready");
+  assert.equal(view.currentId, null, "deleting the open conversation leaves a new draft");
+});
+
+scenario("a_deletion_confirmed_while_held_back_reads_the_list_once_the_person_is_confirmed", async () => {
+  const env = await withConversation();
+  const deleteReached = deferred();
+  const releaseDelete = deferred();
+  const verifyReached = deferred();
+  const releaseVerify = deferred();
+  env.net.route("DELETE", `/api/conversations/${CONV_A}`, async () => {
+    deleteReached.resolve();
+    await releaseDelete.promise;
+    return H.removedBody();
+  });
+  env.net.route("GET", "/api/conversations", listBody([]));
+
+  env.ctl.askDeleteConversation(CONV_A);
+  const deleting = env.ctl.deleteConversation();
+  await deleteReached.promise;
+
+  // The page is held back while the deletion is being confirmed.
+  env.net.route("GET", "/auth/me", async () => {
+    verifyReached.resolve();
+    await releaseVerify.promise;
+    return me();
+  });
+  env.ctl.recheck();
+  await verifyReached.promise;
+  assert.equal(env.ctl._state().gate.phase, "checking");
+
+  releaseDelete.resolve();
+  const result = await deleting;
+  assert.equal(result.ok, true);
+  assert.equal(env.net.requests("GET", "/api/conversations").length, 1, "nothing is read while the page is held back");
+  assert.deepEqual(env.ctl._state().list.items, [], "the conversation is gone from memory at once");
+
+  releaseVerify.resolve(); // the same person: the page is let through, and the list is read
+  await env.settle();
+
+  assert.equal(env.net.requests("GET", "/api/conversations").length, 2);
+  const view = env.view();
+  assert.equal(view.list.status, "ready");
+  assert.deepEqual(view.list.items, []);
+  assert.equal(view.currentId, null);
+});
+
+scenario("deleting_a_visible_conversation_reveals_the_one_beyond_the_page", async () => {
+  // 51 conversations, of which the page shows the newest 50. Deleting one of the visible ones
+  // must let the server fill the page back up: the 51st appears, without a manual reload.
+  const ids = Array.from(
+    { length: 51 },
+    (_, i) => `dddddddd-dddd-4ddd-8ddd-${String(i).padStart(12, "0")}`
+  );
+  const all = ids.map((id, i) => conversation(id, 100 - i)); // newest first
+  const histories = {};
+  for (const item of all.slice(0, Logic.PAGE_SIZE)) {
+    histories[item.id] = historyBody(item.id, []);
+  }
+  const env = makeEnv().signedIn(all.slice(0, Logic.PAGE_SIZE), histories);
+  env.net.route("GET", "/api/conversations", listBody(all.slice(0, Logic.PAGE_SIZE), true));
+  await env.boot();
+  assert.deepEqual(
+    [env.view().list.items.length, env.view().list.hasMore],
+    [Logic.PAGE_SIZE, true],
+    "the page shows the newest 50 and knows there are more"
+  );
+
+  const deleted = all[0];
+  assert.equal(env.view().currentId, deleted.id);
+  env.net.route("DELETE", `/api/conversations/${deleted.id}`, H.removedBody());
+  env.net.route("GET", "/api/conversations", listBody(all.slice(1), false));
+
+  env.ctl.askDeleteConversation(deleted.id);
+  const result = await env.ctl.deleteConversation();
+  await env.settle();
+
+  const view = env.view();
+  assert.deepEqual([result.ok, result.wasCurrent], [true, true]);
+  assert.equal(
+    env.net.requests("GET", "/api/conversations").length,
+    2,
+    "the refreshed page needed no manual reload"
+  );
+  assert.equal(view.list.status, "ready");
+  assert.equal(view.list.items.length, Logic.PAGE_SIZE);
+  assert.equal(view.list.items.some((item) => item.id === deleted.id), false, "the deleted one is not back");
+  assert.equal(view.list.items[Logic.PAGE_SIZE - 1].id, all[50].id, "the previously hidden conversation is shown");
+  assert.equal(view.list.hasMore, false);
+  assert.equal(view.currentId, null);
+});
+
+scenario("a_failed_post_deletion_refresh_is_recoverable_and_never_restores_the_conversation", async () => {
+  const env = await withConversation();
+  env.net.route("DELETE", `/api/conversations/${CONV_A}`, H.removedBody());
+  // The fresh read fails; the retry (the list's own retry) succeeds with the server's list.
+  env.net.route("GET", "/api/conversations", fail(), listBody([]));
+
+  env.ctl.askDeleteConversation(CONV_A);
+  const result = await env.ctl.deleteConversation();
+  await env.settle();
+  let view = env.view();
+
+  assert.equal(result.ok, true, "the deletion itself succeeded");
+  assert.equal(view.list.status, "error");
+  assert.equal(view.list.error.text, Logic.TEXT.network);
+  assert.deepEqual(view.list.items, [], "the confirmed-deleted conversation is not put back by the failure");
+  assert.equal(view.currentId, null);
+  assert.deepEqual(view.banner, { kind: "info", text: Logic.TEXT.deleted, correlationId: null });
+
+  await env.ctl.reloadList();
+  await env.settle();
+  view = env.view();
+  assert.equal(view.list.status, "ready");
+  assert.deepEqual(view.list.items, []);
+  assert.equal(env.net.requests("GET", "/api/conversations").length, 3);
+});
+
+scenario("a_deletion_rejected_as_signed_out_keeps_the_session_flow_and_reads_no_list", async () => {
+  const env = await withConversation();
+  env.net.route("DELETE", `/api/conversations/${CONV_A}`, notAuthenticated());
+
+  env.ctl.askDeleteConversation(CONV_A);
+  const result = await env.ctl.deleteConversation();
+  await env.settle();
+
+  assert.deepEqual([result.ok, result.reason], [false, "auth"]);
+  assert.equal(env.view().screen, "login");
+  assert.equal(env.net.requests("GET", "/api/conversations").length, 1, "a rejected deletion refreshes nothing");
+});
+
+scenario("an_older_post_deletion_list_answer_does_not_replace_a_newer_one", async () => {
+  const env = await withConversation();
+  const olderReached = deferred();
+  const releaseOlder = deferred();
+  env.net.route(
+    "GET",
+    "/api/conversations",
+    async () => {
+      olderReached.resolve();
+      await releaseOlder.promise;
+      return listBody([conversation(CONV_A, 0)]); // the state before the deletion
+    },
+    listBody([conversation(CONV_B, 10)])
+  );
+  env.net.route("DELETE", `/api/conversations/${CONV_A}`, H.removedBody());
+  env.ctl.askDeleteConversation(CONV_A);
+  const result = await env.ctl.deleteConversation();
+  await olderReached.promise;
+  assert.equal(result.ok, true);
+
+  const newer = env.ctl.reloadList(); // started after the deletion's own read, and answered first
+  await newer;
+  await flush();
+  assert.deepEqual(env.view().list.items.map((item) => item.id), [CONV_B]);
+
+  releaseOlder.resolve();
+  await env.settle();
+
+  const view = env.view();
+  assert.deepEqual(view.list.items.map((item) => item.id), [CONV_B], "the older answer is ignored");
+  assert.equal(view.list.items.some((item) => item.id === CONV_A), false);
+  assert.equal(view.list.status, "ready");
+});
+
+scenario("calling_off_a_deletion_does_not_discard_a_list_answer_on_its_way", async () => {
+  const env = await withConversation();
+  const reached = deferred();
+  const release = deferred();
+  env.net.route("GET", "/api/conversations", async () => {
+    reached.resolve();
+    await release.promise;
+    return listBody([conversation(CONV_A, 5, "Новое имя")]);
+  });
+  const listing = env.ctl.reloadList();
+  await reached.promise;
+
+  env.ctl.askDeleteConversation(CONV_A);
+  env.ctl.cancelDeleteConversation();
+  release.resolve();
+  await listing;
+  await env.settle();
+
+  const view = env.view();
+  assert.deepEqual(view.list.items.map((item) => item.label), ["Новое имя"]);
+  assert.equal(view.list.status, "ready");
+  assert.equal(view.currentId, CONV_A);
+});
+
+scenario("a_failed_deletion_does_not_discard_a_list_answer_on_its_way", async () => {
+  const env = await withConversation();
+  const reached = deferred();
+  const release = deferred();
+  env.net.route("GET", "/api/conversations", async () => {
+    reached.resolve();
+    await release.promise;
+    return listBody([conversation(CONV_A, 5, "Новое имя")]);
+  });
+  const listing = env.ctl.reloadList();
+  await reached.promise;
+
+  env.net.route("DELETE", `/api/conversations/${CONV_A}`, apiError(503, "service_unavailable", { retryable: true }));
+  env.ctl.askDeleteConversation(CONV_A);
+  const result = await env.ctl.deleteConversation();
+  assert.equal(result.ok, false);
+
+  release.resolve();
+  await listing;
+  await env.settle();
+
+  const view = env.view();
+  assert.deepEqual(view.list.items.map((item) => item.label), ["Новое имя"]);
+  assert.equal(view.list.status, "ready");
+  assert.equal(view.currentId, CONV_A);
+  assert.equal(view.list.deleting.phase, "error", "the failed deletion is still there with its retry");
+});
+
 module.exports = scenarios;

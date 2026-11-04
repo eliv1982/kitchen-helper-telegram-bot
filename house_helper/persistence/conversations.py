@@ -9,9 +9,17 @@ anywhere else, and a conversation's owner is never changed.
 Reads write nothing. list_conversations, list_messages and build_context are plain
 SELECTs: they take no write lock (a reader never waits for a writer, nor the writer for
 it), never move conversations.updated_at (the time of the last activity, which orders
-the user's list) and never touch a row. The writers (create_conversation here,
-turns.begin_turn, complete_turn and fail_turn) make a WRITE their first statement, the
-repository's rule for SQLite's deferred BEGIN (see persistence.database).
+the user's list) and never touch a row. The writers (create_conversation and
+delete_conversation here, turns.begin_turn, complete_turn and fail_turn) make a WRITE
+their first statement, the repository's rule for SQLite's deferred BEGIN (see
+persistence.database).
+
+Deletion. delete_conversation deletes the owner's conversation in one statement of its
+own; the database's ON DELETE CASCADE removes its messages, turn requests, stored
+message recipes and attachments. Favourites are copies with no foreign key to a
+conversation or a message (models.FavoriteRecipe), so they are not touched. A turn
+whose conversation is deleted while it is being answered finds nothing to complete in,
+stores no answer, and leaves no row behind.
 
 Retention. A message is "there" only while its expires_at is in the future: every read
 below takes `now` from the caller (the application's clock) and leaves an expired
@@ -126,6 +134,29 @@ def create_conversation(session: OrmSession, user_id: UUID, *, now: datetime) ->
     session.add(conversation)
     session.flush()
     return _summary(conversation)
+
+
+def delete_conversation(session: OrmSession, user_id: UUID, conversation_id: UUID) -> None:
+    """Delete the user's conversation and everything the database cascades from it.
+
+    Ownership is the DELETE's own WHERE: a conversation that does not exist, belongs to
+    somebody else or is not even a UUID (the route refuses that shape before this) is the
+    same ConversationNotFound, so nothing tells the caller which of them it was. The
+    statement is the transaction's first: it takes the write lock (SQLite) or the row lock
+    (PostgreSQL) that a turn being answered also takes, so the two see one order.
+
+    Messages, turn requests, message recipes and attachments go with it through their
+    ON DELETE CASCADE foreign keys. Favourite recipes do not: they are copies with no key
+    to this conversation (models.FavoriteRecipe), and nothing here touches them. A turn
+    that was claimed and is still generating finds no conversation when it completes and
+    stores nothing (turns.complete_turn, LeaseLost)."""
+    deleted = session.execute(
+        sa.delete(Conversation)
+        .where(Conversation.id == conversation_id, Conversation.user_id == user_id)
+        .execution_options(synchronize_session=False)
+    ).rowcount
+    if deleted != 1:
+        raise ConversationNotFound
 
 
 def list_conversations(

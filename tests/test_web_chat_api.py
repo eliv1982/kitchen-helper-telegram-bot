@@ -51,6 +51,7 @@ def count(harness, model) -> int:
 ROUTES = [
     pytest.param("get", "/api/conversations", None, id="list"),
     pytest.param("post", "/api/conversations", {}, id="create"),
+    pytest.param("delete", "/api/conversations/{id}", None, id="delete"),
     pytest.param("get", "/api/conversations/{id}/messages", None, id="history"),
     pytest.param("post", "/api/conversations/{id}/messages", {"text": "привет"}, id="send"),
 ]
@@ -61,6 +62,8 @@ async def call(harness, method, path, body, *, client=None, conversation_id=None
     client = client or harness.client
     if method == "get":
         return await client.get(path, headers=headers)
+    if method == "delete":
+        return await client.delete(path, headers=headers)
     return await client.post(path, json=body, headers=post_headers("key-1", **headers))
 
 

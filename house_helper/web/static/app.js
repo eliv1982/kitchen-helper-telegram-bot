@@ -358,6 +358,8 @@
   // drawing only: if what it wanted is not there, nothing is focused, and nothing is focused later.
   var wantFocus = null;
   var focusNodes = {};
+  // The list is drawn before the recipe, which resets focusNodes; its own nodes are kept apart.
+  var listFocusNodes = {};
 
   function applyWantedFocus() {
     var wanted = wantFocus;
@@ -366,8 +368,11 @@
       if (!els.recipe.hidden) {
         els.recipeTitle.focus();
       }
-    } else if (wanted !== null && focusNodes[wanted]) {
-      focusNodes[wanted].focus();
+    } else if (wanted !== null) {
+      var node = focusNodes[wanted] || listFocusNodes[wanted];
+      if (node) {
+        node.focus();
+      }
     }
   }
 
@@ -442,6 +447,7 @@
         lastRecipeId = null;
         wantFocus = null;
         focusNodes = {};
+        listFocusNodes = {};
         els.input.value = "";
         autosize();
         els.chatTitle.textContent = "";
@@ -499,6 +505,7 @@
 
   function drawList(list) {
     var status = "";
+    listFocusNodes = {};
     els.listRetry.hidden = true;
     if (list.status === "loading" && list.items.length === 0) {
       status = "Загружаем разговоры…";
@@ -514,6 +521,7 @@
     els.newConversation.setAttribute("aria-current", list.draftCurrent ? "true" : "false");
     clear(els.list);
     list.items.forEach(function (item) {
+      var row = h("li", { class: "conv-row" });
       var button = h("button", { class: "conv-item", type: "button", "aria-current": item.current ? "true" : false }, [
         h("span", { class: "conv-label", text: item.label }),
         h("span", { class: "conv-meta", text: item.meta }),
@@ -521,8 +529,74 @@
       button.addEventListener("click", function () {
         selectConversation(item.id);
       });
-      els.list.appendChild(h("li", null, [button]));
+      row.appendChild(button);
+      var remove = action(Logic.TEXT.deleteAction, "btn-quiet conv-delete", function () {
+        wantFocus = "delete-cancel";
+        controller.askDeleteConversation(item.id);
+      }, Logic.TEXT.deleteNamed);
+      listFocusNodes["delete-" + item.id] = remove;
+      if (list.deleting && list.deleting.id === item.id && list.deleting.phase === "deleting") {
+        remove.setAttribute("aria-disabled", "true");
+      }
+      row.appendChild(remove);
+      if (list.deleting && list.deleting.id === item.id) {
+        row.appendChild(deleteControls(item, list.deleting));
+      }
+      els.list.appendChild(row);
     });
+  }
+
+  // The question "delete it?", in place under the conversation. The safe answer (keep it) is the
+  // one focused when the question appears; calling it off gives the focus back to the delete
+  // button that asked. A failed deletion stays in the question, with the reason and a retry.
+  function deleteControls(item, deleting) {
+    var box = h("div", { class: "confirm conv-confirm", role: "group", "aria-label": Logic.TEXT.deleteAsk });
+    if (deleting.phase === "deleting") {
+      box.appendChild(
+        h("p", { class: "confirm-text loading" }, [
+          h("span", { class: "spinner", "aria-hidden": "true" }),
+          h("span", { text: Logic.TEXT.deleting }),
+        ])
+      );
+      return box;
+    }
+    var problem = deleting.phase === "error" ? deleting.error : null;
+    box.appendChild(h("p", { class: "confirm-text", text: problem ? problem.text : Logic.TEXT.deleteAsk }));
+    if (problem && problem.correlationId) {
+      box.appendChild(
+        h("p", { class: "hint", text: Logic.TEXT.correlation.replace("{id}", problem.correlationId) })
+      );
+    }
+    var buttons = h("div", { class: "msg-actions" });
+    buttons.appendChild(
+      action(problem ? Logic.TEXT.retry : Logic.TEXT.deleteConfirm, "btn-danger", function () {
+        controller.deleteConversation().then(function (result) {
+          if (!result || !result.ok) {
+            return;
+          }
+          // The button that asked is gone with its conversation: what was open is now a new
+          // empty draft (its title, and the drawer that held the list closes to show it), or
+          // the list itself is the thing to be back in.
+          if (result.wasCurrent) {
+            setDrawer(false, false);
+            els.chatTitle.focus();
+          } else {
+            els.newConversation.focus();
+          }
+        });
+      })
+    );
+    var keep = action(Logic.TEXT.deleteCancel, "btn-quiet", function () {
+      wantFocus = "delete-" + item.id;
+      controller.cancelDeleteConversation();
+    });
+    listFocusNodes["delete-cancel"] = keep;
+    buttons.appendChild(keep);
+    box.appendChild(buttons);
+    if (problem) {
+      alertText(problem.text);
+    }
+    return box;
   }
 
   // The favorites ------------------------------------------------------------------------------------------

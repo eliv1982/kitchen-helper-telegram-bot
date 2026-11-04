@@ -221,6 +221,9 @@ EXPECTED = {
     ),
     "favorites_are_kept_reopened_after_a_reload_and_removed": (Counter({"Как варить борщ?": 1}), (1, 1)),
     "favorites_belong_to_the_person_who_kept_them": (Counter({"секрет рецепт Анны": 1}), (1, 1)),
+    "deleting_a_conversation_keeps_its_favorite_and_returns_to_a_new_draft": (
+        Counter({"Удалить это?": 1}), (0, 0)
+    ),
 }
 
 # The database after a journey, for the ones about signing out: whose session is revoked and whose is not.
