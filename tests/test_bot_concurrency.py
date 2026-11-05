@@ -319,14 +319,14 @@ async def test_unexpected_exception_rolls_back_pending_message_and_propagates(mo
     ]
 
 
-# --- History-trimming transaction safety at the 20-message capacity boundary ---
+# --- History-trimming transaction safety at the 40-message capacity boundary ---
 
 
 @pytest.mark.asyncio
 async def test_failure_at_full_capacity_preserves_all_prior_history(monkeypatch):
     user_id = 201
     original = seams.seed_exchanges(user_id)
-    assert len(original) == seams.history_capacity() == 20
+    assert len(original) == seams.history_capacity() == 40
 
     async def fake_ai(messages, user_id):
         raise make_rate_limit_error()
@@ -339,10 +339,10 @@ async def test_failure_at_full_capacity_preserves_all_prior_history(monkeypatch)
     await seams.process_text(msg, fake_bot)
 
     final = seams.history(user_id)
-    # Byte-for-byte/logically equivalent to the original 20-message history:
+    # Byte-for-byte/logically equivalent to the original 40-message history:
     # the failed pending user turn is gone and nothing else changed.
     assert final == original
-    assert len(final) == 20
+    assert len(final) == 40
     assert final[0] == {"role": "user", "content": "seed-user-1"}
     assert final[1] == {"role": "assistant", "content": "seed-assistant-1"}
 
@@ -351,7 +351,7 @@ async def test_failure_at_full_capacity_preserves_all_prior_history(monkeypatch)
 async def test_cancellation_at_full_capacity_preserves_all_prior_history(monkeypatch):
     user_id = 202
     original = seams.seed_exchanges(user_id)
-    assert len(original) == 20
+    assert len(original) == 40
 
     entered_openai = asyncio.Event()
     never_released = asyncio.Event()
@@ -373,7 +373,7 @@ async def test_cancellation_at_full_capacity_preserves_all_prior_history(monkeyp
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    # CancelledError propagated; the pending turn is rolled back and all 20
+    # CancelledError propagated; the pending turn is rolled back and all 40
     # previously completed messages remain, untouched.
     assert seams.history(user_id) == original
 
@@ -389,7 +389,7 @@ async def test_cancellation_at_full_capacity_preserves_all_prior_history(monkeyp
     await seams.process_text(FakeMessage(user_id=user_id, text="after"), fake_bot)
 
     final = seams.history(user_id)
-    assert len(final) == 20
+    assert len(final) == 40
     assert final[-2:] == [
         {"role": "user", "content": "after"},
         {"role": "assistant", "content": "ok-after-cancel"},
@@ -400,7 +400,7 @@ async def test_cancellation_at_full_capacity_preserves_all_prior_history(monkeyp
 async def test_unexpected_exception_at_full_capacity_preserves_all_prior_history(monkeypatch):
     user_id = 205
     original = seams.seed_exchanges(user_id)
-    assert len(original) == seams.history_capacity() == 20
+    assert len(original) == seams.history_capacity() == 40
 
     async def fake_raise(messages, user_id):
         raise RuntimeError("synthetic unexpected failure")
@@ -417,7 +417,7 @@ async def test_unexpected_exception_at_full_capacity_preserves_all_prior_history
     # No trimming/loss of prior completed history: byte-for-byte the same as
     # before the unexpected failure, with the failed pending turn gone.
     assert final == original
-    assert len(final) == 20
+    assert len(final) == 40
     msg.answer.assert_not_awaited()
 
 
@@ -435,7 +435,7 @@ async def test_success_at_full_capacity_trims_oldest_pair_after_response(monkeyp
     await seams.process_text(FakeMessage(user_id=user_id, text="new-message"), fake_bot)
 
     final = seams.history(user_id)
-    assert len(final) == 20
+    assert len(final) == 40
 
     # Oldest completed exchange is gone.
     assert {"role": "user", "content": "seed-user-1"} not in final
@@ -479,7 +479,7 @@ async def test_repeated_successful_trimming_never_exceeds_capacity(monkeypatch):
             assert entry["role"] == expected_role
 
     final = seams.history(user_id)
-    assert len(final) == 20
+    assert len(final) == 40
     assert final[-2:] == [
         {"role": "user", "content": "msg-15"},
         {"role": "assistant", "content": "reply-15"},

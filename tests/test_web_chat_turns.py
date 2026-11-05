@@ -71,26 +71,30 @@ async def test_a_follow_up_is_answered_with_the_conversation_so_far(tmp_path):
         assert [call[2] for call in backend.requests] == [len(first[0]), len(second[0])]
 
 
-async def test_the_context_is_bounded_to_20_including_the_current_message(tmp_path):
+async def test_the_context_is_bounded_to_40_including_the_current_message(tmp_path):
     backend = ScriptedBackend(default="ответ")
     async with chat_app(tmp_path, backend) as chat:
         conversation = await chat.create()
-        for index in range(15):
+        for index in range(25):
             assert (await chat.send(conversation, f"вопрос {index}", f"k-{index}")).status_code == 201
 
         sizes = [len(request[0]) for request in backend.requests]
         last = backend.requests[-1][0]
 
-        assert max(sizes) <= MAX_HISTORY_MESSAGES == 20
-        assert sizes[:10] == [1, 3, 5, 7, 9, 11, 13, 15, 17, 19]
-        assert sizes[10:] == [19] * 5  # whole exchanges: the window never starts on an answer
-        assert last[0]["role"] == "user" and last[-1] == {"role": "user", "content": "вопрос 14"}
-        # the newest nine exchanges and the question
-        assert [m["content"] for m in last if m["role"] == "user"] == [f"вопрос {i}" for i in range(5, 15)]
-        assert [m["role"] for m in last] == ["user", "assistant"] * 9 + ["user"]
+        assert max(sizes) <= MAX_HISTORY_MESSAGES == 40
+        # 1, 3, ... 39: the twentieth request already carries the full window.
+        assert sizes[:20] == list(range(1, 40, 2))
+        # At exactly 40 stored messages and beyond, the window stays at 39: it holds
+        # the newest whole exchanges and the question, never a leading answer.
+        assert sizes[19] == 39  # 38 earlier messages and the current one
+        assert sizes[20:] == [39] * 5
+        assert last[0]["role"] == "user" and last[-1] == {"role": "user", "content": "вопрос 24"}
+        # the newest nineteen exchanges and the question
+        assert [m["content"] for m in last if m["role"] == "user"] == [f"вопрос {i}" for i in range(5, 25)]
+        assert [m["role"] for m in last] == ["user", "assistant"] * 19 + ["user"]
         # the history itself is not bounded
         history = (await chat.history(conversation, limit=100)).json()["messages"]
-        assert len(history) == 30
+        assert len(history) == 50
 
 
 async def test_what_is_sent_to_the_assistant_is_user_and_assistant_turns_only(tmp_path):

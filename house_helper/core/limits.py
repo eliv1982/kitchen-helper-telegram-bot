@@ -11,12 +11,15 @@ kept and re-export these.
 # adds, predictable whatever a user sends.
 MAX_INPUT_LENGTH = 2000
 
-# How many messages of a conversation the AI is shown at most. Telegram keeps this
-# many completed messages and sends them with the pending one on top (so up to one
-# more); the web chat sends this many INCLUDING the message being answered (see
-# house_helper.persistence.conversations.build_context). Must stay even for the
-# Telegram trimming: it drops whole user/assistant pairs from the front.
-MAX_HISTORY_MESSAGES = 20
+# How many messages of a conversation the AI is shown at most, the message being
+# answered included. The web chat enforces it in
+# house_helper.persistence.conversations.build_context; the Telegram service sends
+# the same bound through context_manager.model_context (see KH-F07A). Telegram
+# keeps this many completed messages and trims them whole pairs at a time, so the
+# stored history is always an exchange boundary; the per-request view may drop one
+# leading assistant message when the window starts mid-exchange. Must stay even for
+# the Telegram trimming: it drops whole user/assistant pairs from the front.
+MAX_HISTORY_MESSAGES = 40
 
 # The default cap on the length of one answer, in tokens (MAX_TOKENS in the
 # environment overrides it for both channels). It was 600, which cuts a complete

@@ -24,15 +24,15 @@ from tests.chat_support import ScriptedBackend, chat_app
 
 def test_the_shared_limits_have_their_values():
     assert limits.MAX_INPUT_LENGTH == 2000
-    assert limits.MAX_HISTORY_MESSAGES == 20
+    assert limits.MAX_HISTORY_MESSAGES == 40  # KH-F07A: was 20
     assert limits.DEFAULT_MAX_OUTPUT_TOKENS == 1000
 
 
 def test_the_old_names_still_hold_the_shared_values():
-    assert context_manager.MAX_HISTORY_MESSAGES == 20
+    assert context_manager.MAX_HISTORY_MESSAGES == 40
     assert chat_service.DEFAULT_MAX_INPUT_LENGTH == 2000
     assert seams.max_input_length() == 2000  # what the bot's service really enforces
-    assert seams.history_capacity() == 20
+    assert seams.history_capacity() == 40
 
 
 def test_the_web_chat_reads_the_same_limits_as_the_bot():
@@ -64,7 +64,9 @@ def test_the_telegram_provider_layer_uses_the_shared_prompt():
 
 def test_the_prompt_is_russian_and_bounded():
     assert PROMPT == PROMPT.strip()
-    assert 500 < len(PROMPT) < 4200  # it is sent with every request: it costs tokens (4200: the photo section)
+    # It is sent with every request: it costs tokens. 4713 characters now (the photo
+    # section and KH-F07A's ingredient block); 5200 is the ceiling this test allows.
+    assert 500 < len(PROMPT) < 5200
     assert "по-русски" in PROMPT
     cyrillic = sum("а" <= c.lower() <= "я" or c.lower() == "ё" for c in PROMPT)
     assert cyrillic > 0.7 * sum(c.isalpha() for c in PROMPT)
@@ -157,6 +159,60 @@ def test_the_prompt_does_not_promise_what_the_chat_cannot_do():
 )
 def test_the_prompt_tells_how_to_treat_a_photo(scenario, clause):
     assert clause in PROMPT, scenario
+
+
+# --- KH-F07A: the ingredients named in the conversation ----------------------------------------------------
+
+
+INGREDIENT_RULES = [
+    ("a working set", "рабочий набор"),
+    ("new ingredients add to the earlier ones", "добавляй новые к уже названным"),
+    ("an earlier ingredient is not dropped", "не теряй прежние"),
+    ("an explicit removal removes", "«Лука больше нет» — убери лук из набора"),
+    ("a substitution replaces for this request", "«рис вместо картофеля» — картофель заменён рисом"),
+    ("a substitution is recalculated", "количества пересчитай"),
+    ("quantities are limits", "Названное количество — предел"),
+    ("confirmed differs from hypothetical", "Отличай подтверждённое от предположений"),
+    ("a hypothetical ingredient is not available", "предполагаемое не считай имеющимся"),
+    ("the latest correction wins", "Последнее явное уточнение человека важнее прежних слов"),
+    ("a suggested recipe consumes nothing", "не считай их съеденными оттого, что ты предложил рецепт"),
+    (
+        "a recipe's ingredients are not evidence of availability",
+        "в рецепте — то, что нужно для блюда, а не подтверждение, что оно есть",
+    ),
+    ("missing information is asked for, not pretended", "а не делай вид, что помнишь"),
+    ("temporary context is not a long-term preference", "это не долговременные предпочтения"),
+    ("availability is never invented", "Не выдумывай наличие продуктов"),
+]
+
+
+@pytest.mark.parametrize(("rule", "clause"), INGREDIENT_RULES)
+def test_the_prompt_covers_ingredients_named_in_the_conversation(rule, clause):
+    assert clause in PROMPT, rule
+
+
+def test_the_ingredient_block_appears_once_and_stays_compact():
+    header = "Продукты, которые уже назывались:"
+    assert PROMPT.count(header) == 1
+    start = PROMPT.index(header)
+    end = PROMPT.index("Как отвечать:", start)
+    assert 500 < end - start < 1200  # it is sent with every request: it stays short
+
+
+def test_the_ingredient_block_does_not_weaken_the_safety_or_recipe_rules():
+    # The block is an addition; the sections that were there stay there.
+    assert "Границы:" in PROMPT and "Не давай опасных советов" in PROMPT
+    assert "Рецепт давай целиком" in PROMPT and "без Markdown" in PROMPT
+
+
+def test_the_ingredient_rules_are_in_the_one_prompt_both_channels_send():
+    from house_helper.core import openai_chat
+
+    assert openai_chat.KITCHEN_SYSTEM_PROMPT is PROMPT  # the web backend
+    assert api_client.SYSTEM_MESSAGE is PROMPT  # the Telegram adapter
+    start = PROMPT.index("Продукты, которые уже назывались:")
+    block = PROMPT[start : PROMPT.index("Как отвечать:", start)]
+    assert "не теряй прежние" in block and "Лука больше нет" in block
 
 
 # --- Telegram is unchanged ---------------------------------------------------------------------------------

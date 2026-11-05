@@ -95,9 +95,9 @@ def stored_conversation_keys() -> set[ConversationKey]:
     return set(context_manager._contexts)
 
 
-def seed_exchanges(user_id: int, pairs: int = 10) -> list[ChatTurn]:
+def seed_exchanges(user_id: int, pairs: int = 20) -> list[ChatTurn]:
     """Directly seed `pairs` completed user/assistant exchanges (2*pairs
-    messages), landing exactly at the history capacity (20) by default.
+    messages), landing exactly at the history capacity (40) by default.
     Returns a snapshot of the seeded history for later comparison."""
     messages: list[tuple[str, str]] = []
     for i in range(1, pairs + 1):

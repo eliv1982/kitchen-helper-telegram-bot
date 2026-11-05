@@ -18,9 +18,9 @@ MessageDict = TypedDict("MessageDict", {"role": str, "content": str})
 # failed or cancelled request can roll it back without having already
 # discarded a previously completed pair to make room for it.
 #
-# MAX_HISTORY_MESSAGES (20) is defined in house_helper.core.limits, shared with the web
-# chat, and imported above. It stays a name of this module: trim_history() reads it at
-# call time, which is what lets a test replace it.
+# MAX_HISTORY_MESSAGES (40) is defined in house_helper.core.limits, shared with the web
+# chat, and imported above. It stays a name of this module: trim_history() and
+# model_context() read it at call time, which is what lets a test replace it.
 
 # conversation key -> list of chat messages (user/assistant only)
 _contexts: dict[ConversationKey, list[MessageDict]] = {}
@@ -77,6 +77,26 @@ def trim_history(key: ConversationKey) -> None:
     ctx = get_context(key)
     while len(ctx) > MAX_HISTORY_MESSAGES:
         del ctx[0:2]
+
+
+def model_context(key: ConversationKey) -> list[MessageDict]:
+    """The history as one request sends it: at most MAX_HISTORY_MESSAGES messages,
+    the pending user message last, in chronological order.
+
+    A copy, never the stored list: retention belongs to trim_history(), so a
+    failed turn still leaves the stored history exactly as it was. The bound is
+    applied at request time because a pending message may sit on top of a full
+    history (Telegram trims only after a completed exchange), and the product
+    promises the model sees no more than the window. As in the web chat's
+    build_context, a leading assistant message is dropped when the window starts
+    in the middle of an exchange: the model is never shown an answer without the
+    question before it.
+    """
+    bounded = MAX_HISTORY_MESSAGES > 0  # a zero bound would make [-0:] mean "all"
+    window = get_context(key)[-MAX_HISTORY_MESSAGES:] if bounded else []
+    while window and window[0]["role"] != "user":
+        window.pop(0)
+    return window
 
 
 def clear_context(key: ConversationKey) -> None:

@@ -181,7 +181,11 @@ class Turn:
                 )
 
             context_manager.add_message(key, "user", text)
-            ctx_len = context_manager.context_length(key)
+            # The request's own bounded view (the pending message included): the
+            # stored history keeps its deferred trim, so a failed turn can roll
+            # back without having lost a completed exchange.
+            messages = context_manager.model_context(key)
+            ctx_len = len(messages)
 
             try:
                 # Single rollback point for the whole transaction: any
@@ -194,7 +198,7 @@ class Turn:
                     working = while_working() if while_working is not None else nullcontext()
                     async with working:
                         backend_reply = await self._backend.complete(
-                            context_manager.get_context(key),
+                            messages,
                             conversation=key,
                             context_len=ctx_len,
                         )

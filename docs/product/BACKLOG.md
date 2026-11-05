@@ -27,7 +27,7 @@ Not part of the accepted baseline and not implemented: voice/STT/TTS, long-term 
 | ID | Title | Priority | Status | Implementation state |
 |---|---|---|---|---|
 | **KH-F06** | Structured Recipe Favorites | **P1 — FIRST** | Proposed | Partially exists: flat text favorites are deployed; structured recipes, editing and recipe cards are not built |
-| **KH-F07** | Ingredient Context Continuity | **P1 — SECOND** | Proposed | Not built; conversation context is bounded and not a persistent ingredient store |
+| **KH-F07** | Ingredient Context Continuity | **P1 — SECOND** | Proposed | KH-F07A (40-message window and prompt rules) implemented in the repository on 2026-11-05; not released or deployed. No persistent ingredient state |
 | **HH-ALPHA-01** | Long-term Preferences Memory | **P1 — THIRD** | Proposed | Not built; there is no preference table, CRUD or context injection |
 | **KH-F01** | Household Measures and Recipe Unit Conversions | P2 (provisional; owner has not ranked) | Proposed | Not built |
 | **KH-F02** | Concentration and Dilution Calculations | P2 (provisional; owner has not ranked) | Proposed | Not built |
@@ -77,8 +77,8 @@ ID check: `KH-F06`, `KH-F07` and `HH-ALPHA-01` had **no prior use** in this repo
 ## KH-F07 — Ingredient Context Continuity
 
 **Priority:** P1 — **SECOND**.
-**Status:** Proposed.
-**Owner-approved direction?** The owner named this as the second post-alpha item; no design or implementation exists.
+**Status:** Proposed, with **KH-F07A implemented in the repository on 2026-11-05** (not committed, released or deployed).
+**Owner-approved direction?** The owner named this as the second post-alpha item. After the read-only preflight the owner approved implementation of **Option A** (prompt correction plus an expanded 40-message window) as **KH-F07A**; no persistent ingredient state was approved.
 
 **Acceptance scope**
 
@@ -91,15 +91,31 @@ ID check: `KH-F06`, `KH-F07` and `HH-ALPHA-01` had **no prior use** in this repo
 
 **Dependencies and constraints**
 
-- The existing conversation context is bounded (20 messages) and is not a durable ingredient store; any promise must state that bound.
-- The turn runner and shared Kitchen prompt are the likely points for a prompt correction; that assessment comes first and may be sufficient without new state.
-- Persistent ingredient state, if later justified, needs its own product decision, schema design and retention rule. It must not silently create a second source of truth beside conversation history.
+- The existing conversation context is bounded (**40 messages since KH-F07A**, 20 before it) and is not a durable ingredient store; any promise must state that bound.
+- The turn runner and shared Kitchen prompt are the points of the KH-F07A correction; no new state was introduced.
+- Persistent ingredient state, if ever justified, needs its own product decision, schema design and retention rule. It must not silently create a second source of truth beside conversation history.
 - Must not conflict with KH-F06 or HH-ALPHA-01: ingredient availability is not the same thing as a long-term preference.
+
+### KH-F07A — 40-message window and prompt-only ingredient continuity (implementation scope, 2026-11-05)
+
+**Owner-approved scope, implemented in the repository at baseline `9b71713`; not committed, released or deployed.**
+
+- `MAX_HISTORY_MESSAGES` raised from 20 to 40 in `house_helper/core/limits.py`, shared by the web chat and the in-process Telegram bot.
+- One request carries at most 40 messages including the one being answered. The web path already did this (`build_context`); the standalone Telegram service now bounds its request view (`context_manager.model_context`) while keeping its deferred post-success trim, so a failed turn still loses nothing.
+- Chronological order, the rule that a window never opens on an assistant answer, conversation/account isolation, message expiry (365 days), the reset boundary and failed-turn exclusion are unchanged. No retention or persistence change.
+- The shared Russian `KITCHEN_SYSTEM_PROMPT` gains a compact ingredient block: the working set grows, explicit removals and substitutions apply, quantities are limits, confirmed differs from hypothetical, the latest explicit correction wins, a suggested recipe neither consumes ingredients nor proves availability, missing information is asked for rather than pretended, and this set is not a long-term preference.
+- Deterministic tests cover the window boundary (exactly 40 and more than 40), add/correct/substitute/quantity visibility, new-conversation and second-account isolation, shared Web/Telegram conversations, failed-turn exclusion, and the presence of every prompt rule. They do **not** prove that a real model follows the rules; that needs a separately approved real-provider evaluation.
+- **Future Help copy (draft, NOT implemented — there is no Help interface yet):** «House Helper учитывает до 40 последних сообщений текущего разговора. Вы можете дополнять список продуктов, уточнять количества и сообщать, каких ингредиентов больше нет. В длинных разговорах ранняя информация может перестать учитываться. При необходимости напомните помощнику важные детали.»
+
+### KH-F07B — Long-conversation continuity (optional, future, NOT approved)
+
+If real use shows that ingredient information falls out of the 40-message window often enough to matter, KH-F07B would need its own scoped proposal and owner approval. Candidate directions — none chosen or designed — are summarization of older turns, an explicit structured ingredient state, or a user-visible way to restate the working set. Any of them must define correction, deletion and retention semantics and must not silently become a second source of truth beside conversation history. This item is recorded as a possibility only; it is not part of KH-F07A.
 
 **Implementation state**
 
-- Not built. There is no ingredient table, no confirmed/hypothetical distinction and no persistent ingredient state.
-- Required first step: a scoped assessment of a minimal prompt correction, with evaluation of clarification behavior and refusal to over-promise.
+- KH-F07A implemented and tested in the working tree; no release, deployment or real-provider evaluation.
+- Not built: any persistent ingredient state, pantry, automatic stock deduction, long-term preference extraction or cross-conversation memory.
+- The test suite pins the prompt rules' presence and the window's deterministic behavior, not the model's semantic compliance.
 
 ---
 

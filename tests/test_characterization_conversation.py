@@ -42,8 +42,8 @@ def test_input_limit_is_2000_characters():
     assert seams.max_input_length() == 2000
 
 
-def test_history_capacity_is_20_messages():
-    assert seams.history_capacity() == 20
+def test_history_capacity_is_40_messages():
+    assert seams.history_capacity() == 40
 
 
 @pytest.mark.asyncio

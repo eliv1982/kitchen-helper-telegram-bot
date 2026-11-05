@@ -21,7 +21,7 @@
 - `user_id` is not `conversation_id`. `ConversationKey("web", conversation_id)` identifies a single dialog, not an account.
 - Server checks owner authorization on every operation that reads or changes a user-owned resource.
 - Do not automatically unify Telegram and Web conversation histories merely because logins share one User. A person's own Web and Telegram conversations become **one store only after an explicit Telegram pairing** (KHD-35, KHD-36); nobody's conversations are unified with anyone else's, and an unlinked Telegram account is answered with one fixed notice and stores nothing.
-- Durable history and LLM context are different abstractions. LLM context is bounded to 20 messages and must respect resets, deletions and retention.
+- Durable history and LLM context are different abstractions. LLM context is bounded to 40 messages (20 before KH-F07A, 2026-11-05) and must respect resets, deletions and retention.
 
 ## Reported implemented foundation
 
