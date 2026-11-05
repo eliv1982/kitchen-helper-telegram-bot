@@ -58,6 +58,7 @@ from tests.retention_support import (
     ago,
     count,
     dump,
+    from_now,
     integrity,
     seeded,
 )
@@ -83,13 +84,19 @@ def purge_engine(url, listeners=None, **options):
         engine.dispose()
 
 
-def expired_world(s: Seed, sessions=3, messages=4):
-    """Some of everything that has expired, and a few things that have not."""
+def expired_world(s: Seed, sessions=3, messages=4, *, active_expires=None):
+    """Some of everything that has expired, and a few things that have not.
+
+    `active_expires` overrides the live session's deadline. Defaults to NOW + 13 days for
+    clock-frozen tests; real-CLI tests pass a wall-clock future so the session stays live.
+    """
     user = s.user()
     link = s.telegram(user)
     for _ in range(sessions):
         s.login_session(user, link, created=ago(days=20), expires=ago(days=6))
-    s.login_session(user, link, created=ago(days=1), expires=NOW + timedelta(days=13))
+    s.login_session(
+        user, link, created=ago(days=1), expires=active_expires or (NOW + timedelta(days=13))
+    )
     s.login_state(created=ago(hours=2), expires=ago(hours=1))
     conversation = s.conversation(user, created=ago(days=500), updated=ago(days=2))
     exchange = s.exchange(conversation, created=ago(days=400))
@@ -690,7 +697,8 @@ def tool_purge(*extra):
 
 @posix_only
 def test_it_runs_beside_the_web_service_through_the_shared_lock(db_url, db_path):
-    seeded(db_url, expired_world)
+    # Real CLI uses wall-clock time: keep the live session safely in the future.
+    seeded(db_url, lambda s: expired_world(s, active_expires=from_now(days=13)))
     with start_web_service(db_path):
         assert lock_is_taken(db_path)  # the web service holds the directory (shared)
         # An exclusive command (a migration, a restore) is refused while it runs...
@@ -706,7 +714,7 @@ def test_it_runs_beside_the_web_service_through_the_shared_lock(db_url, db_path)
 
 @posix_only
 def test_while_it_runs_a_migration_or_a_restore_is_refused_and_when_it_ends_they_are_not(db_url, db_path):
-    seeded(db_url, expired_world)
+    seeded(db_url, lambda s: expired_world(s, active_expires=from_now(days=13)))
     with start_python(UNCOMMITTED_WRITER, db_path) as writer:  # holds SQLite's write lock: the cleanup waits
         purge = subprocess.Popen(
             [sys.executable, str(DBTOOL_PATH), *tool_purge()],

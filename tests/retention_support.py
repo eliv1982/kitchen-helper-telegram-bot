@@ -39,6 +39,11 @@ def ago(**delta: float) -> datetime:
     return NOW - timedelta(**delta)
 
 
+def from_now(**delta: float) -> datetime:
+    """Like ago(), but from the real UTC clock — for real-CLI tests that cannot freeze time."""
+    return datetime.now(timezone.utc) + timedelta(**delta)
+
+
 def digest(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
