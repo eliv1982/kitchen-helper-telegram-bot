@@ -35,15 +35,16 @@
   --radius: 0.75rem;
   --shadow: 0 1px 3px rgba(22, 32, 51, 0.12);
 
-  /* The readable column of the conversation. On a wide window the sides are left empty (the
-     percentage is the pane's own width); on a narrow one the side is 1rem. */
-  --column: 48rem;
+  /* The readable column of the conversation fills most of the main pane. On a wide desktop
+     the sides keep about 50 px each (6.25rem total), capped near 1500 px so recipes use the
+     available width without edge-to-edge prose. Below the sidebar breakpoint the column is
+     the full pane and --gutter falls back to 1rem (see that media query). */
+  --column: min(1500px, calc(100% - 6.25rem));
   --gutter: max(1rem, calc((100% - var(--column)) / 2));
 
-  /* The recipe is read and edited in a wider column of its own (about 1024 px) while the
-     conversation keeps --column. The heading and the body share this gutter, so they stay
-     aligned at every width; a narrow pane falls back to the same 1rem margins as the chat. */
-  --recipe-column: 64rem;
+  /* The recipe is read and edited in the same reading width as the conversation. The heading
+     and the body share this gutter, so they stay aligned at every width. */
+  --recipe-column: min(1500px, calc(100% - 6.25rem));
   --recipe-gutter: max(1rem, calc((100% - var(--recipe-column)) / 2));
 }
 
@@ -788,7 +789,7 @@ textarea[aria-invalid="true"] {
    of its longest line; a short reply keeps a bubble that fits its text (app.js adds the class). */
 .msg-wide {
   width: 100%;
-  max-width: min(46rem, 100%);
+  max-width: 100%;
 }
 
 .msg-failed {
@@ -847,7 +848,7 @@ textarea[aria-invalid="true"] {
   font-weight: 600;
 }
 
-/* The recipe heading and its body share the wider recipe column (the conversation keeps --column). */
+/* The recipe heading and its body share the reading column with the conversation. */
 .recipe .chat-title {
   padding-right: var(--recipe-gutter);
   padding-left: var(--recipe-gutter);
@@ -1072,6 +1073,12 @@ textarea[aria-invalid="true"] {
 }
 
 @media (max-width: 52rem) {
+  /* Accepted mobile/tablet drawer layout: full-pane reading column, 1rem side gutters. */
+  :root {
+    --column: 100%;
+    --recipe-column: 100%;
+  }
+
   .drawer-toggle {
     display: inline-flex;
   }

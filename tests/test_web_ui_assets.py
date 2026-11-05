@@ -158,8 +158,8 @@ def test_a_long_answer_takes_the_reading_column_and_a_short_one_keeps_its_bubble
     # app.js marks a long answer (a recipe, usually); the style gives it the reading column.
     assert 'classes += " msg-wide";' in code_of(APP)
     assert rules[".msg-wide"]["width"] == "100%"
-    assert rules[".msg-wide"]["max-width"] == "min(46rem, 100%)"
-    # The bubble's own cap is unchanged; only a long answer may fill the 46rem column.
+    assert rules[".msg-wide"]["max-width"] == "100%"
+    # Short bubbles keep a comfortable cap; only a long answer may fill the reading column.
     assert "max-width: min(46rem, 94%);" in CSS
 
 
