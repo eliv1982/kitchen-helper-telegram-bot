@@ -53,12 +53,43 @@ only the recipe's origin -- (assistant message id, position) -- never a user, a 
 a title. A click is resolved the way a message is: the account comes from the update, the user
 from the current Telegram link (asked again inside the saving transaction, with the link held),
 and the recipe from that user's own conversation, so a crafted callback cannot reach somebody
-else's favorite. Saving copies the validated structured recipe through the same
+else's favorite. The user the click was authorized for is carried into that transaction and must
+be the user the link resolves to there; a tie that changed in between (unlinked, or linked to
+somebody else, even if it came back) makes the save refuse, reading nothing and writing nothing,
+so the recipe a confirmation would name always belongs to the owner that confirmation is sent
+for. Saving copies the validated structured recipe through the same
 persistence.favorites.save_favorite as the Web API: no provider call, no parsing of the
 rendered text, no second favorites store. (user_id, source_message_id, source_recipe_index) is
 unique, so a repeated click answers "already saved" and writes nothing. The keyboard is created
 from the validated recipes the turn runner stored beside the answer; the callback is answered
-from the database, so a button keeps working after a restart until its answer expires.
+from the database, so a button keeps working after a restart until its answer expires. A
+newly saved recipe is followed by one short message naming it and carrying an "Открыть
+избранное" button: the callback's toast disappears, and a persistent confirmation must not
+rewrite the answer's keyboard (with several recipes its other save buttons have to keep
+working, and rebuilding a multi-button markup from what Telegram sends back would make the
+confirmation depend on a structure this layer does not trust). A repeated click adds no
+message; it answers "already saved".
+
+Reading them back. `/favorites` opens the person's own favorites in the chat: their titles as
+buttons (newest first, the total order persistence.favorites.list_favorites gives), one page
+at a time, and the complete saved text of the chosen one -- the same content the website
+serves -- with a "Назад к избранному" button that returns to the page it was opened from. The
+callback data of a list or a recipe names only a page number, or a favorite's id and the page
+to return to. It is not a capability: the sender comes from the update, the user from the
+current Telegram link, and the favorite is read with that user's id through
+favorites.get_favorite, so a button from somebody else's list, a favorite deleted since, and a
+made-up id are all one "not found". The list is read again on every open and every page click;
+a page that no longer exists because favorites were removed is clamped to the last one.
+Nothing here writes: Telegram cannot edit or remove a favorite in this stage, and no provider
+is called. A recipe longer than one message is sent in pieces, with the way back under the
+last piece.
+
+The command menu. At start the bot registers the commands it wants in Telegram's own menu
+(setMyCommands): /start, /favorites and /help, with Russian descriptions. That call replaces
+the whole list for the default scope, and the list is fixed, so every start applies the same
+menu and a restart adds nothing and removes nothing. A failure is one warning, never a stop
+of polling, and the next restart tries again. No BotFather command list is needed or changed:
+the runtime call is the native mechanism, and BotFather remains the owner's to change.
 
 Photos. A photograph with an optional caption is a message like any other, with the picture
 attached: the bot takes the largest size Telegram offers that is within the limit, downloads it
@@ -190,14 +221,29 @@ PRIVACY = (
 HELP = (
     "Я помогаю с домашней кухней: напишите, какие продукты есть дома или какое блюдо "
     "хочется приготовить. Можно прислать и фото: продуктов, блюда или кухонной техники.\n\n"
+    "Сохранять рецепты в избранное можно кнопкой под ответом помощника (когда она есть) "
+    "или на сайте House Helper, а открыть сохраненное — командой /favorites. Редактировать "
+    "рецепты и заметки можно на сайте House Helper.\n\n"
     "Этот разговор общий с сайтом House Helper: начатое там можно продолжить здесь, "
     "и наоборот. Все, что вы пишете помощнику на сайте, вместе с его ответом я пересылаю сюда; "
     "чтобы это прекратить, отключите Telegram командой /unlink или на сайте.\n\n"
     "Команды:\n"
     "/new — начать новый разговор\n"
+    "/favorites — избранное\n"
     "/unlink — отключить Telegram от аккаунта\n"
     "/help — эта подсказка\n\n" + PRIVACY
 )
+
+# The native command menu (setMyCommands), the whole list, in this order. The descriptions
+# are what Telegram shows under the menu button, so they say what the command is for without
+# repeating the command. The list is deliberately the three a person needs to find their way;
+# /new and /unlink remain available and are listed in HELP. No BotFather configuration is
+# needed for this call, and none is made or read.
+BOT_COMMANDS = [
+    {"command": "favorites", "description": "📚 Избранное"},
+    {"command": "start", "description": "🏠 Начало"},
+    {"command": "help", "description": "ℹ️ Помощь"},
+]
 
 GREETING = "Здравствуйте! Я House Helper — помощник по домашней кухне.\n\n" + HELP
 
@@ -270,6 +316,35 @@ FAVORITES_FULL = (
 )
 CALLBACK_NOT_LINKED = "Этот помощник работает только для подключенных аккаунтов House Helper."
 
+# --- reading favorites from a button ------------------------------------------------------
+
+# The favorites list: how many titles one page shows, and the callback shapes. A page is
+# small enough that the titles stay readable on a phone and the keyboard stays a list rather
+# than a wall; 100 favorites (persistence.favorites.FAVORITES_LIMIT) make at most 13 pages.
+# A page callback is "fl:<page>"; a recipe callback is "fo:<32 hex digits of the id>:<page it
+# was opened from>". Both fit Telegram's 64-byte callback_data limit.
+FAVORITES_PAGE_SIZE = 8
+FAVORITES_LIST_PREFIX = "fl"
+FAVORITES_OPEN_PREFIX = "fo"
+MAX_FAVORITE_PAGES = (
+    favorites.FAVORITES_LIMIT + FAVORITES_PAGE_SIZE - 1
+) // FAVORITES_PAGE_SIZE
+
+FAVORITES_HEADER = "📚 Ваше избранное."
+FAVORITES_HINT = "Нажмите на рецепт, чтобы открыть его."
+FAVORITES_EMPTY = (
+    "В избранном пока пусто.\n\n"
+    "Сохранить рецепт можно кнопкой под ответом помощника, если она есть, "
+    "или на сайте House Helper."
+)
+FAVORITES_UNAVAILABLE = "Не удалось открыть избранное. Попробуйте еще раз чуть позже."
+FAVORITE_UNAVAILABLE = "Этот рецепт не найден в избранном. Возможно, он был удален."
+FAVORITES_BACK = "◀ Назад к избранному"
+FAVORITES_OPEN = "Открыть избранное"
+
+_FAVORITES_LIST_CALLBACK = re.compile(r"fl:([0-9]{1,2})")
+_FAVORITE_OPEN_CALLBACK = re.compile(r"fo:([0-9a-f]{32}):([0-9]{1,2})")
+
 _SAVE_CALLBACK = re.compile(r"fav:([1-9][0-9]{0,18}):([0-9]{1,2})")
 
 
@@ -290,15 +365,131 @@ def _save_target(data: Any) -> Optional[tuple[int, int]]:
     return message_id, position
 
 
-def _save_button_label(title: str, *, multiple: bool) -> str:
-    """The text of one save button: the fixed words for a single recipe, and the recipe's
-    own title when one answer carries several (so the buttons can be told apart)."""
-    label = f"Сохранить «{title}»" if multiple else SAVE_BUTTON
+def _bounded_label(label: str) -> str:
+    """A button label no longer than SAVE_BUTTON_BYTES in UTF-8, cut at a character boundary
+    with an ellipsis when it does not fit. Telegram bounds a button's text; measuring bytes
+    keeps the bound true whatever the alphabet (Cyrillic is two bytes a character)."""
     encoded = label.encode("utf-8")
     if len(encoded) <= SAVE_BUTTON_BYTES:
         return label
     head = encoded[: SAVE_BUTTON_BYTES - len(BUTTON_ELLIPSIS.encode("utf-8"))]
     return head.decode("utf-8", "ignore").rstrip() + BUTTON_ELLIPSIS
+
+
+def _save_button_label(title: str, *, multiple: bool) -> str:
+    """The text of one save button: the fixed words for a single recipe, and the recipe's
+    own title when one answer carries several (so the buttons can be told apart)."""
+    return _bounded_label(f"Сохранить «{title}»" if multiple else SAVE_BUTTON)
+
+
+def _favorite_label(title: str) -> str:
+    """The text of one favorites-list button: the recipe's own title, on one line and within
+    the button bound. The stored title is already one line; whitespace is normalised again
+    because this is a display string built from data."""
+    return _bounded_label(" ".join(title.split()) or favorites.UNTITLED)
+
+
+def _favorites_page(data: Any) -> Optional[int]:
+    """The page number named by a favorites-list button, or None when the callback is not
+    one this bot writes. Only the exact shape is accepted; a page beyond the largest possible
+    list is not a page."""
+    if not isinstance(data, str):
+        return None
+    found = _FAVORITES_LIST_CALLBACK.fullmatch(data)
+    if found is None:
+        return None
+    page = int(found.group(1))
+    return page if page < MAX_FAVORITE_PAGES else None
+
+
+def _favorite_target(data: Any) -> Optional[tuple[UUID, int]]:
+    """(favorite id, page to return to) named by a recipe button, or None.
+
+    The id is only a name to look up for the sender's user; it is never an authorization.
+    Only the exact shape this bot writes is accepted, and the page is bounded like a list
+    page."""
+    if not isinstance(data, str):
+        return None
+    found = _FAVORITE_OPEN_CALLBACK.fullmatch(data)
+    if found is None:
+        return None
+    page = int(found.group(2))
+    if page >= MAX_FAVORITE_PAGES:
+        return None
+    try:
+        return UUID(hex=found.group(1)), page
+    except ValueError:  # not reachable with the 32 hex digits the pattern requires
+        return None
+
+
+def _favorites_view(
+    kept: list[favorites.FavoriteSummary], page: int
+) -> tuple[str, Optional[dict[str, Any]]]:
+    """The message and keyboard for one page of the user's favorites.
+
+    The order is the one list_favorites returns (newest first, ties by id): the page is a
+    window on that list, so the same list always gives the same buttons in the same order. A
+    page that no longer exists (favorites were removed since its button was sent) falls back
+    to the last page; an empty list is the friendly empty state with no keyboard.
+    """
+    if not kept:
+        return FAVORITES_EMPTY, None
+    pages = (len(kept) + FAVORITES_PAGE_SIZE - 1) // FAVORITES_PAGE_SIZE
+    page = max(0, min(page, pages - 1))
+    start = page * FAVORITES_PAGE_SIZE
+    lines = [FAVORITES_HEADER]
+    if pages > 1:
+        lines.append(f"Страница {page + 1} из {pages}.")
+    lines.extend(["", FAVORITES_HINT])
+    rows = [
+        [
+            {
+                "text": _favorite_label(item.title),
+                "callback_data": f"{FAVORITES_OPEN_PREFIX}:{item.id.hex}:{page}",
+            }
+        ]
+        for item in kept[start : start + FAVORITES_PAGE_SIZE]
+    ]
+    navigation = []
+    if page > 0:
+        navigation.append(
+            {"text": "◀ Назад", "callback_data": f"{FAVORITES_LIST_PREFIX}:{page - 1}"}
+        )
+    if page < pages - 1:
+        navigation.append(
+            {"text": "Далее ▶", "callback_data": f"{FAVORITES_LIST_PREFIX}:{page + 1}"}
+        )
+    if navigation:
+        rows.append(navigation)
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def _favorite_back(page: int) -> dict[str, Any]:
+    """The keyboard under a saved recipe: one way back to the page it was opened from."""
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": FAVORITES_BACK,
+                    "callback_data": f"{FAVORITES_LIST_PREFIX}:{page}",
+                }
+            ]
+        ]
+    }
+
+
+def _open_favorites(page: int = 0) -> dict[str, Any]:
+    """The keyboard of the saved-recipe confirmation: one way to the list."""
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": FAVORITES_OPEN,
+                    "callback_data": f"{FAVORITES_LIST_PREFIX}:{page}",
+                }
+            ]
+        ]
+    }
 
 
 def _save_keyboard(recipes: tuple[StoredRecipe, ...]) -> Optional[dict[str, Any]]:
@@ -425,6 +616,30 @@ class TelegramChat:
         if self._poller is None and not self._closing:
             self._poller = asyncio.ensure_future(self._poll())
             self._poller.add_done_callback(self._poller_ended)
+            # The menu is registered once per start, beside polling (never inside it): a
+            # failed menu call must not delay or stop reading updates, and a restart simply
+            # applies the same whole list again. It is tracked like a handler so that
+            # closing waits for it in the same way.
+            self._spawn(self._register_commands())
+
+    async def _register_commands(self) -> None:
+        """Set the bot's native command menu. Best effort: a refusal or a network failure is
+        one warning (the error's category only), the previous menu stays, and polling is not
+        affected. The list is fixed, so every call has the same result."""
+        try:
+            await self._api.set_my_commands(BOT_COMMANDS)
+        except asyncio.CancelledError:
+            raise
+        except BotApiError as error:
+            logger.warning(
+                "The Telegram command menu was not set: category=%s", error.category
+            )
+        except Exception as exc:
+            logger.error(
+                "The Telegram command menu was not set: category=%s", type(exc).__name__
+            )
+        else:
+            logger.info("The Telegram command menu is set")
 
     def _poller_ended(self, task: asyncio.Task) -> None:
         """A polling loop that dies of a bug must not leave the bot looking healthy: its end is a
@@ -586,17 +801,26 @@ class TelegramChat:
 
     # --- a click on a save button ---------------------------------------------------------------
 
-    async def _handle_callback(self, query: Any) -> None:
-        """One callback query: save the recipe its button names, into the favorites of the
-        user its SENDER is tied to, and acknowledge the click in every case.
+    @staticmethod
+    def _favorites_callback(data: Any) -> bool:
+        """True when `data` names a favorites action (a list page or a recipe), whether or not
+        its shape is valid. Used only to choose the fixed notice for a click this bot cannot
+        use, never to decide anything about identity."""
+        return isinstance(data, str) and (
+            data.startswith(FAVORITES_LIST_PREFIX + ":")
+            or data.startswith(FAVORITES_OPEN_PREFIX + ":")
+        )
 
-        The callback data is only an origin -- (message id, recipe position). It is not
-        trusted for identity: the account comes from the update, the user from the current
-        Telegram link, and the message from that user's own conversation inside the saving
-        transaction (persistence.favorites.save_recipe_for_telegram). A click on somebody
-        else's button, a button whose answer has expired, an account with no link and a
-        malformed payload all save nothing and are answered with fixed Russian words. The
-        recipe was parsed and stored with the answer, so nothing here calls the assistant.
+    async def _handle_callback(self, query: Any) -> None:
+        """One callback query: save a recipe, open the favorites list or open one favorite,
+        always for the user its SENDER is tied to, and acknowledge the click in every case.
+
+        The callback data is only a name -- (message id, recipe position), a page number, or
+        (favorite id, page to return to). It is not trusted for identity: the account comes
+        from the update, the user from the current Telegram link, and everything read from
+        the database is found through that user. A click on somebody else's button, a recipe
+        deleted since, an account with no link and a malformed payload are all answered with
+        fixed Russian words and change nothing. None of these paths calls the assistant.
 
         Never raises (cancellation excepted). A callback is answered even when nothing was
         done, so a client's button never spins forever."""
@@ -605,9 +829,13 @@ class TelegramChat:
         callback_id = query.get("id")
         if not isinstance(callback_id, str) or not 0 < len(callback_id) <= 256:
             return  # there is nothing to answer with
+        data = query.get("data")
+        favorites_callback = self._favorites_callback(data)
         account, usable = self._callback_sender(query)
         if account is None or not usable:
-            await self._answer_callback(callback_id, RECIPE_UNAVAILABLE)
+            await self._answer_callback(
+                callback_id, FAVORITES_UNAVAILABLE if favorites_callback else RECIPE_UNAVAILABLE
+            )
             return
         try:
             bound = await self._bound_user(account)
@@ -615,12 +843,127 @@ class TelegramChat:
             raise
         except Exception as exc:
             logger.error("A Telegram callback could not be authorized: category=%s", type(exc).__name__)
-            await self._answer_callback(callback_id, SAVE_FAILED)
+            await self._answer_callback(
+                callback_id, FAVORITES_UNAVAILABLE if favorites_callback else SAVE_FAILED
+            )
             return
         if bound is None:
             await self._answer_callback(callback_id, CALLBACK_NOT_LINKED)
             return
-        target = _save_target(query.get("data"))
+
+        if isinstance(data, str) and data.startswith(FAVORITES_LIST_PREFIX + ":"):
+            page = _favorites_page(data)
+            if page is None:
+                await self._answer_callback(callback_id, FAVORITES_UNAVAILABLE)
+                return
+            try:
+                kept = await self._read_favorites(bound)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "The Telegram favorites list could not be read: category=%s",
+                    type(exc).__name__,
+                )
+                await self._answer_callback(callback_id, FAVORITES_UNAVAILABLE)
+                return
+            text, markup = _favorites_view(kept, page)
+            # Acknowledge before waiting for the chat's turn: an answer being prepared holds
+            # that lock for the provider call, and the client's button must not spin meanwhile.
+            await self._answer_callback(callback_id, "")
+            try:
+                await self._send_favorites(account, bound, text, markup)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "A Telegram favorites list could not be sent: category=%s",
+                    type(exc).__name__,
+                )
+            return
+        if isinstance(data, str) and data.startswith(FAVORITES_OPEN_PREFIX + ":"):
+            target = _favorite_target(data)
+            if target is None:
+                await self._answer_callback(callback_id, FAVORITE_UNAVAILABLE)
+                return
+            favorite_id, page = target
+            try:
+                found = await self._read_favorite(bound, favorite_id)
+            except favorites.FavoriteNotFound:
+                await self._answer_callback(callback_id, FAVORITE_UNAVAILABLE)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "A Telegram favorite could not be read: category=%s", type(exc).__name__
+                )
+                await self._answer_callback(callback_id, FAVORITES_UNAVAILABLE)
+                return
+            if not found.text.strip():
+                await self._answer_callback(callback_id, FAVORITE_UNAVAILABLE)
+                return
+            await self._answer_callback(callback_id, "")
+            try:
+                await self._send_favorite(account, bound, found.text, page)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "A Telegram favorite could not be sent: category=%s", type(exc).__name__
+                )
+            return
+        await self._save_from_callback(callback_id, account, bound, data)
+
+    async def _read_favorites(self, user_id: UUID) -> list[favorites.FavoriteSummary]:
+        """The user's favorites through the website's own read service. A snapshot read;
+        writes nothing and calls no provider."""
+        return await self._database.run(
+            lambda session: favorites.list_favorites(session, user_id)
+        )
+
+    async def _read_favorite(self, user_id: UUID, favorite_id: UUID) -> favorites.FavoriteDetail:
+        """One favorite through the website's own read service. FavoriteNotFound when it is
+        not this user's (unknown, foreign, removed)."""
+        return await self._database.run(
+            lambda session: favorites.get_favorite(session, user_id, favorite_id)
+        )
+
+    async def _send_favorites(
+        self,
+        account: int,
+        user_id: UUID,
+        text: str,
+        markup: Optional[dict[str, Any]],
+    ) -> None:
+        """Send one page of the list to the user's chat, under the chat lock and the binding
+        check all owned sends use. A tie that is gone is refused and said."""
+        async with self._chat_lock(account):
+            if await self._deliver(account, user_id, text, reply_markup=markup) is Delivery.REFUSED:
+                await self._refuse_stale(account)
+
+    async def _send_favorite(
+        self, account: int, user_id: UUID, text: str, page: int
+    ) -> None:
+        """Send one favorite's complete saved text, with the way back to `page`."""
+        async with self._chat_lock(account):
+            if await self._deliver(
+                account, user_id, text, reply_markup=_favorite_back(page)
+            ) is Delivery.REFUSED:
+                await self._refuse_stale(account)
+
+    async def _save_from_callback(
+        self, callback_id: str, account: int, user_id: UUID, data: Any
+    ) -> None:
+        """Save the recipe the callback names, then acknowledge it and, for a recipe that was
+        not already a favorite, send the persistent confirmation.
+
+        `user_id` is the owner this click was authorized for. The saving transaction resolves
+        the tie again and must find that same owner; a tie that changed in between refuses the
+        save (favorites.BindingChanged) instead of saving under the new owner and confirming
+        under the old one. The owner the transaction validated comes back with the result and
+        is the identity the confirmation is sent under. This method changes nothing itself."""
+        target = _save_target(data)
         if target is None:
             await self._answer_callback(callback_id, RECIPE_UNAVAILABLE)
             return
@@ -629,11 +972,23 @@ class TelegramChat:
         try:
             saved = await self._database.run(
                 lambda session: favorites.save_recipe_for_telegram(
-                    session, account, message_id, recipe_index=position, now=now
+                    session,
+                    account,
+                    message_id,
+                    expected_user_id=user_id,
+                    recipe_index=position,
+                    now=now,
                 )
             )
         except favorites.NotBound:
             await self._answer_callback(callback_id, CALLBACK_NOT_LINKED)
+            return
+        except favorites.BindingChanged:
+            # The click was authorized as one user and the tie inside the saving transaction
+            # is another's. Nothing was saved or read; the fixed words carry nothing of either
+            # account, and no confirmation follows.
+            logger.info("A Telegram recipe save was refused: the tie changed under the click")
+            await self._answer_callback(callback_id, RECIPE_UNAVAILABLE)
             return
         except (MessageNotFound, RecipeNotFound, ConversationNotFound):
             await self._answer_callback(callback_id, RECIPE_UNAVAILABLE)
@@ -651,6 +1006,36 @@ class TelegramChat:
             "Telegram recipe save: outcome=%s", "created" if saved.created else "already"
         )
         await self._answer_callback(callback_id, SAVED if saved.created else ALREADY_SAVED)
+        if saved.created:
+            # saved.user_id is the owner the saving transaction resolved and validated against
+            # the click's; the confirmation is sent on that identity, not on one looked up
+            # before the save.
+            await self._confirm_saved(account, saved.user_id, saved.favorite.title)
+
+    async def _confirm_saved(self, account: int, user_id: UUID, title: str) -> None:
+        """One short, persistent confirmation after a new favorite: the recipe's own title and
+        a button that opens the list. `user_id` is the owner the save was made for. The answer's
+        keyboard is deliberately not rewritten (see the module docstring); the tie is checked
+        again by _deliver before the message goes out, so a title is never sent to whoever the
+        account belongs to after a change."""
+        text = f"Рецепт «{title}» сохранен в избранное."
+        try:
+            async with self._chat_lock(account):
+                outcome = await self._deliver(
+                    account, user_id, text, reply_markup=_open_favorites()
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # The favorite is already saved and acknowledged: a confirmation that could not
+            # be sent is a warning, not a failure of the click.
+            logger.error(
+                "A saved-recipe confirmation could not be sent: category=%s",
+                type(exc).__name__,
+            )
+            return
+        if outcome is Delivery.REFUSED:
+            logger.info("A saved-recipe confirmation was not sent: the chat is no longer the user's")
 
     @staticmethod
     def _callback_sender(query: dict[str, Any]) -> tuple[Optional[int], bool]:
@@ -716,6 +1101,20 @@ class TelegramChat:
     async def _on_command(self, account: int, user_id: UUID, name: str) -> None:
         if name == "help":
             await self._say(account, HELP)
+        elif name == "favorites":
+            try:
+                kept = await self._read_favorites(user_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "The Telegram favorites list could not be read: category=%s",
+                    type(exc).__name__,
+                )
+                await self._say(account, FAVORITES_UNAVAILABLE)
+                return
+            text, markup = _favorites_view(kept, 0)
+            await self._send_favorites(account, user_id, text, markup)
         elif name == "new":
             now = self._clock()
             started = await self._database.run(

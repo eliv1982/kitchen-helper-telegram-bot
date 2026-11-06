@@ -1,7 +1,8 @@
 """The Telegram Bot API, as much of it as the bot needs, over httpx.
 
-Six calls: getUpdates (long polling), sendMessage, answerCallbackQuery, sendChatAction,
-getFile and the download of a file, and getMe. Nothing else, and no library of Telegram's own:
+Seven calls: getUpdates (long polling), sendMessage, answerCallbackQuery, sendChatAction,
+getFile and the download of a file, getMe, and setMyCommands (the bot's own command menu,
+a whole-list replacement). Nothing else, and no library of Telegram's own:
 the web package does not import the Telegram transport (aiogram) and this module is not an
 exception to that. It is the same kind of thing as telegram_oidc.py: a small client over an
 injected httpx client, so a test puts a MockTransport in the place of the network.
@@ -128,6 +129,23 @@ class BotApi:
         if not isinstance(result, dict):
             raise BotApiError("getMe", "malformed")
         return result
+
+    async def set_my_commands(self, commands: list[dict[str, str]]) -> None:
+        """Set the bot's command menu: the whole list, replacing whatever was there.
+
+        Telegram keeps one list per scope and language, and this call sets the default scope
+        with no language override, so sending the same list again on every start changes
+        nothing that is visible. The list is the caller's fixed one; it is copied so that a
+        caller's later change cannot alter a payload already in flight. A refusal is a
+        BotApiError like any other and leaves the previous menu in place.
+        """
+        result = await self._call(
+            "setMyCommands",
+            {"commands": [dict(item) for item in commands]},
+            timeout=10.0,
+        )
+        if result is not True:
+            raise BotApiError("setMyCommands", "malformed")
 
     async def get_updates(self, offset: Optional[int], poll_seconds: int) -> list[Any]:
         """Updates after `offset` (None: all that are waiting). Waits up to `poll_seconds`

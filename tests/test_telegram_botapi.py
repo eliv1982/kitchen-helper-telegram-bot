@@ -179,6 +179,37 @@ async def test_a_callback_is_acknowledged_with_its_notice():
     ]
 
 
+@pytest.mark.asyncio
+async def test_the_command_menu_is_sent_as_one_whole_list():
+    import json
+
+    seen = []
+
+    def handler(request):
+        seen.append((request.url.path.rsplit("/", 1)[-1], json.loads(request.content)))
+        return httpx.Response(200, json={"ok": True, "result": True})
+
+    commands = [
+        {"command": "favorites", "description": "📚 Избранное"},
+        {"command": "start", "description": "🏠 Начало"},
+    ]
+    async with client_for(handler) as http:
+        await BotApi(BOT_TOKEN, http).set_my_commands(commands)
+
+    assert seen == [("setMyCommands", {"commands": commands})]
+
+
+@pytest.mark.asyncio
+async def test_a_command_menu_answer_that_is_not_true_is_malformed():
+    async with client_for(lambda request: httpx.Response(200, json={"ok": True, "result": []})) as http:
+        with pytest.raises(BotApiError) as raised:
+            await BotApi(BOT_TOKEN, http).set_my_commands(
+                [{"command": "help", "description": "ℹ️ Помощь"}]
+            )
+
+    assert raised.value.kind == "malformed" and raised.value.method == "setMyCommands"
+
+
 @pytest.mark.parametrize("token", ["", "abc", "123:short", "x" * 40, "123456789:" + "!" * 35, BOT_TOKEN + " "])
 @pytest.mark.asyncio
 async def test_a_string_that_is_not_a_token_is_not_accepted(token):

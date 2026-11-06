@@ -127,8 +127,14 @@ async def test_a_second_consumer_or_a_webhook_at_start_is_said_at_once_and_nothi
     assert len(lines(caplog, logging.ERROR)) == 1  # one error line for the whole run of failures
     assert len([m for m in lines(caplog, logging.WARNING) if "category=api:409" in m]) == 2
     assert "The Telegram bot is polling" in lines(caplog, logging.INFO)
-    # The application never sets, reads or deletes a webhook, and never calls anything but getUpdates here.
-    assert {request.url.path.rsplit("/", 1)[-1] for request in bot.requests} <= {"getUpdates", "sendMessage", "sendChatAction"}
+    # The application never sets, reads or deletes a webhook, and never calls anything but
+    # getUpdates (and the one setMyCommands registration made at start) here.
+    assert {request.url.path.rsplit("/", 1)[-1] for request in bot.requests} <= {
+        "getUpdates",
+        "sendMessage",
+        "sendChatAction",
+        "setMyCommands",
+    }
     assert all("ebhook" not in request.url.path for request in bot.requests)
 
 

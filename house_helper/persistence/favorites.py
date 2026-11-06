@@ -40,8 +40,9 @@ of that message is copied instead; it is read from message_recipes and must stil
 (RecipeNotFound). Saving the same message again (the same kind at the same position) is
 not an error and not a second row: it answers the favorite that exists
 (SavedFavorite.created is False). A user keeps at most FAVORITES_LIMIT favorites, both
-kinds together. A Telegram save button goes through save_recipe_for_telegram, which
-resolves the sender's account to that user inside the same transaction and then calls
+kinds together. A Telegram save button goes through save_recipe_for_telegram: it is told
+the user the click was authorized for (expected_user_id), resolves the sender's account to
+a user inside the same transaction, refuses when the two are not the same, and then calls
 save_favorite; it is not a second saving rule. Everything else the user creates expires, and this does not, so it needs a
 bound of its own; the count is taken under the conversation's lock, and two saves from two
 conversations at the same instant may overshoot it by one, which is harmless.
@@ -165,6 +166,11 @@ class NotBound(Exception):
     """The Telegram sender is no longer tied to an enrolled user: nothing was written."""
 
 
+class BindingChanged(Exception):
+    """The Telegram sender is tied to somebody other than the user the click was authorized
+    for (the tie changed between the two looks): nothing was read and nothing was written."""
+
+
 @dataclass(frozen=True)
 class FavoriteSummary:
     id: UUID
@@ -197,6 +203,13 @@ class FavoriteDetail:
 class SavedFavorite:
     favorite: FavoriteSummary
     created: bool  # False: this answer (or this recipe of it) was already a favorite
+
+
+@dataclass(frozen=True)
+class TelegramSavedFavorite:
+    favorite: FavoriteSummary
+    created: bool
+    user_id: UUID  # the owner the saving transaction resolved and saved for
 
 
 def favorite_title(text: str) -> str:
@@ -500,28 +513,40 @@ def save_recipe_for_telegram(
     telegram_user_id: int,
     message_id: int,
     *,
+    expected_user_id: UUID,
     recipe_index: int,
     now: datetime,
-) -> SavedFavorite:
-    """Save one structured recipe of a Telegram button, for the user the sender is tied to.
+) -> TelegramSavedFavorite:
+    """Save one structured recipe of a Telegram button, for the user the click was authorized
+    for.
 
-    The caller names the Telegram account (the Bot API's sender id) and the recipe's origin
-    (message_id, recipe_index) -- never a user id, a conversation or a title: those are read
-    from the database. The account is resolved by the same binding every Telegram message
-    uses (telegram.enrolled_user_for_telegram), inside this transaction and with the link
-    held until it ends, so an unlink or a re-link that races the click is decided before or
-    after this save rather than in its middle. The message is then found through that
-    user's conversation by save_favorite, which is the same ownership rule the Web API
-    uses: a callback that names somebody else's message, or a message that has expired,
-    saves nothing and is told so by the caller.
+    The caller names the Telegram account (the Bot API's sender id), the user the account
+    was resolved to when the click was authorized (`expected_user_id`), and the recipe's
+    origin (message_id, recipe_index) -- never a conversation or a title: those are read
+    from the database. The account is resolved again by the same binding every Telegram
+    message uses (telegram.enrolled_user_for_telegram), inside this transaction and with the
+    link held until it ends, so an unlink or a re-link that races the click is decided before
+    or after this save rather than in its middle. The user that resolution finds must be
+    `expected_user_id`: a tie that changed since the click was authorized (A to B, or A to B
+    and back) makes the two disagree and the save is refused with BindingChanged, so nothing
+    of the named recipe is read or written. That equality is what keeps the owner that was
+    authorized, the owner the favorite is saved for and the owner the confirmation is sent on
+    behalf of one identity, instead of two independent looks at the tie that may disagree.
+
+    The message is then found through that user's conversation by save_favorite, which is
+    the same ownership rule the Web API uses: a callback that names somebody else's message,
+    or a message that has expired, saves nothing and is told so by the caller.
 
     Writers write first: the first statement is the UPDATE that locks the conversation of
     the named message (it is also what establishes that the message exists and has not
-    expired). NotBound when the account is not tied to an enrolled user; MessageNotFound
-    when the message is not there or has expired; otherwise the exceptions and the result
-    of save_favorite (RecipeNotFound, FavoritesFull, SavedFavorite with created False for
-    a repeated click). This function makes no provider call: the recipe was already parsed
-    and stored with the answer. The caller owns the transaction.
+    expired). NotBound when the account is not tied to an enrolled user; BindingChanged when
+    it is tied to somebody other than `expected_user_id`; MessageNotFound when the message is
+    not there or has expired; otherwise the exceptions and the result of save_favorite
+    (RecipeNotFound, FavoritesFull; created False for a repeated click). The result carries the
+    user the transaction resolved -- always `expected_user_id` -- so that the caller's
+    confirmation is sent under the identity the save was made with. This function makes no
+    provider call: the recipe was already parsed and stored with the answer. The caller owns
+    the transaction.
     """
     if (
         isinstance(message_id, bool)
@@ -554,19 +579,27 @@ def save_recipe_for_telegram(
     user_id = telegram_store.enrolled_user_for_telegram(session, telegram_user_id, hold=True)
     if user_id is None:
         raise NotBound
+    if user_id != expected_user_id:
+        # The tie is not the one the click was authorized for. Fail closed before anything of
+        # the named recipe is read: the row this transaction would save (and whose title a
+        # later confirmation would carry) is not this click's.
+        raise BindingChanged
 
     conversation_id = session.scalar(
         sa.select(Message.conversation_id).where(Message.id == message_id)
     )
     if conversation_id is None:  # removed between the lock and this read
         raise MessageNotFound
-    return save_favorite(
+    saved = save_favorite(
         session,
         user_id,
         conversation_id,
         message_id,
         now=now,
         recipe_index=position,
+    )
+    return TelegramSavedFavorite(
+        favorite=saved.favorite, created=saved.created, user_id=user_id
     )
 
 

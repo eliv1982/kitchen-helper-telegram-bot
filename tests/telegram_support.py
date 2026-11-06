@@ -49,6 +49,8 @@ class FakeBot:
         self.sent: list[dict[str, Any]] = []  # sendMessage calls, in order
         self.actions: list[dict[str, Any]] = []  # sendChatAction calls
         self.answered: list[dict[str, Any]] = []  # answerCallbackQuery calls, in order
+        self.command_calls: list[list[dict[str, Any]]] = []  # every setMyCommands payload
+        self.commands: list[dict[str, Any]] = []  # the menu Telegram holds now, last call wins
         self.requests: list[httpx.Request] = []  # every call, URLs included
         self.files: dict[str, tuple[str, bytes]] = {}  # file_id -> (file_path, content)
         self.failures: dict[str, list[Any]] = {}  # method -> error codes to answer, one per call
@@ -146,6 +148,13 @@ class FakeBot:
             )
         if method == "getMe":
             return httpx.Response(200, json={"ok": True, "result": {"id": 123456789, "is_bot": True, "username": BOT_NAME}})
+        if method == "setMyCommands":
+            commands = body.get("commands")
+            if not isinstance(commands, list):
+                return self._error(400, "Bad Request: commands must be a list")
+            self.command_calls.append(commands)
+            self.commands = commands  # a whole-list replacement, as Telegram treats it
+            return httpx.Response(200, json={"ok": True, "result": True})
         return self._error(404, "Not Found")
 
     async def _get_updates(self, body: dict[str, Any]) -> httpx.Response:
