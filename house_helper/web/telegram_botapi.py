@@ -1,10 +1,10 @@
 """The Telegram Bot API, as much of it as the bot needs, over httpx.
 
-Five calls: getUpdates (long polling), sendMessage, sendChatAction, getFile and the download
-of a file, and getMe. Nothing else, and no library of Telegram's own: the web package does not
-import the Telegram transport (aiogram) and this module is not an exception to that. It is the
-same kind of thing as telegram_oidc.py: a small client over an injected httpx client, so a test
-puts a MockTransport in the place of the network.
+Six calls: getUpdates (long polling), sendMessage, answerCallbackQuery, sendChatAction,
+getFile and the download of a file, and getMe. Nothing else, and no library of Telegram's own:
+the web package does not import the Telegram transport (aiogram) and this module is not an
+exception to that. It is the same kind of thing as telegram_oidc.py: a small client over an
+injected httpx client, so a test puts a MockTransport in the place of the network.
 
 The token is in the URL (that is how the Bot API is addressed), so this module takes care that
 it goes nowhere else:
@@ -131,8 +131,12 @@ class BotApi:
 
     async def get_updates(self, offset: Optional[int], poll_seconds: int) -> list[Any]:
         """Updates after `offset` (None: all that are waiting). Waits up to `poll_seconds`
-        for one; the HTTP call is allowed ten more."""
-        payload: dict[str, Any] = {"timeout": poll_seconds, "allowed_updates": ["message"]}
+        for one; the HTTP call is allowed ten more. Both kinds the bot serves are asked for:
+        messages, and the clicks on the save buttons under a recipe (callback_query)."""
+        payload: dict[str, Any] = {
+            "timeout": poll_seconds,
+            "allowed_updates": ["message", "callback_query"],
+        }
         if offset is not None:
             payload["offset"] = offset
         result = await self._call("getUpdates", payload, timeout=poll_seconds + 10.0)
@@ -140,14 +144,34 @@ class BotApi:
             raise BotApiError("getUpdates", "malformed")
         return result
 
-    async def send_message(self, chat_id: int, text: str) -> None:
+    async def send_message(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        reply_markup: Optional[dict[str, Any]] = None,
+    ) -> None:
         """Plain text, no parse mode (the assistant writes plain text, and a parse mode would
         make a stray "<" or "_" a delivery failure). Text over MAX_MESSAGE_LENGTH is the
-        caller's to split."""
+        caller's to split. `reply_markup` is the inline keyboard that belongs under this
+        piece; the caller attaches it to the last piece of a long answer."""
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": text,
+            "link_preview_options": {"is_disabled": True},
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        await self._call("sendMessage", payload, timeout=15.0)
+
+    async def answer_callback_query(self, callback_query_id: str, text: str) -> None:
+        """Acknowledge a button click and show `text` as its short notice. Every click is
+        acknowledged, including one that changes nothing: an unanswered callback leaves the
+        client's button spinning."""
         await self._call(
-            "sendMessage",
-            {"chat_id": chat_id, "text": text, "link_preview_options": {"is_disabled": True}},
-            timeout=15.0,
+            "answerCallbackQuery",
+            {"callback_query_id": callback_query_id, "text": text},
+            timeout=10.0,
         )
 
     async def send_chat_action(self, chat_id: int, action: str = "typing") -> None:

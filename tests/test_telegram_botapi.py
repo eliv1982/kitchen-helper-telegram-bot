@@ -94,7 +94,7 @@ async def test_a_network_failure_is_a_kind_and_does_not_keep_the_exception_that_
 
 
 @pytest.mark.asyncio
-async def test_the_updates_request_asks_for_messages_only_and_for_what_comes_after_the_offset():
+async def test_the_updates_request_asks_for_messages_and_button_clicks_after_the_offset():
     seen = []
 
     def handler(request):
@@ -109,8 +109,8 @@ async def test_the_updates_request_asks_for_messages_only_and_for_what_comes_aft
         await api.get_updates(41, 25)
 
     assert seen == [
-        {"timeout": 25, "allowed_updates": ["message"]},
-        {"timeout": 25, "allowed_updates": ["message"], "offset": 41},
+        {"timeout": 25, "allowed_updates": ["message", "callback_query"]},
+        {"timeout": 25, "allowed_updates": ["message", "callback_query"], "offset": 41},
     ]
 
 
@@ -131,6 +131,51 @@ async def test_a_message_is_plain_text_with_the_link_preview_switched_off_the_cu
     # one it replaced, and there is no parse mode (a stray "_" or "<" in a recipe must not fail a delivery).
     assert seen == [
         {"chat_id": 42, "text": "https://example.test/рецепт", "link_preview_options": {"is_disabled": True}}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_reply_markup_goes_with_the_message_it_belongs_to():
+    import json
+
+    seen = []
+
+    def handler(request):
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+
+    keyboard = {"inline_keyboard": [[{"text": "Сохранить рецепт", "callback_data": "fav:7:0"}]]}
+    async with client_for(handler) as http:
+        await BotApi(BOT_TOKEN, http).send_message(42, "Борщ", reply_markup=keyboard)
+
+    assert seen == [
+        {
+            "chat_id": 42,
+            "text": "Борщ",
+            "link_preview_options": {"is_disabled": True},
+            "reply_markup": keyboard,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_callback_is_acknowledged_with_its_notice():
+    import json
+
+    seen = []
+
+    def handler(request):
+        seen.append((request.url.path.rsplit("/", 1)[-1], json.loads(request.content)))
+        return httpx.Response(200, json={"ok": True, "result": True})
+
+    async with client_for(handler) as http:
+        await BotApi(BOT_TOKEN, http).answer_callback_query("cb-1", "Рецепт сохранен в избранное.")
+
+    assert seen == [
+        (
+            "answerCallbackQuery",
+            {"callback_query_id": "cb-1", "text": "Рецепт сохранен в избранное."},
+        )
     ]
 
 

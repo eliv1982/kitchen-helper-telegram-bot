@@ -40,7 +40,9 @@ of that message is copied instead; it is read from message_recipes and must stil
 (RecipeNotFound). Saving the same message again (the same kind at the same position) is
 not an error and not a second row: it answers the favorite that exists
 (SavedFavorite.created is False). A user keeps at most FAVORITES_LIMIT favorites, both
-kinds together. Everything else the user creates expires, and this does not, so it needs a
+kinds together. A Telegram save button goes through save_recipe_for_telegram, which
+resolves the sender's account to that user inside the same transaction and then calls
+save_favorite; it is not a second saving rule. Everything else the user creates expires, and this does not, so it needs a
 bound of its own; the count is taken under the conversation's lock, and two saves from two
 conversations at the same instant may overshoot it by one, which is harmless.
 
@@ -86,6 +88,7 @@ from house_helper.core.recipes import (
     validate_recipe,
 )
 from house_helper.persistence import message_recipes
+from house_helper.persistence import telegram as telegram_store
 from house_helper.persistence.conversations import ConversationNotFound
 from house_helper.persistence.message_recipes import MessageNotFound, RecipeNotFound
 from house_helper.persistence.models import (
@@ -115,6 +118,10 @@ MAX_FAVORITE_TEXT_LENGTH = 100_000
 # keeps a huge JSON integer from reaching the driver (SQLite raises an overflow, which
 # would be a server error, not a bad request).
 MAX_FAVORITE_VERSION = 2**31 - 2
+
+# The largest message id a Telegram button may name (the same bound as the history's
+# ?before= and the favorites API's message_id). A larger number cannot be a message.
+MAX_MESSAGE_ID = 2**62
 
 # What a structured favorite's content calls the personal note (the rendering contract).
 NOTES_HEADING = "Мои заметки:"
@@ -152,6 +159,10 @@ class InvalidFavorite(ValueError):
 
 class FavoriteConflict(Exception):
     """The edit started from a version that is no longer current. Nothing was written."""
+
+
+class NotBound(Exception):
+    """The Telegram sender is no longer tied to an enrolled user: nothing was written."""
 
 
 @dataclass(frozen=True)
@@ -482,6 +493,81 @@ def save_favorite(
             raise
         return SavedFavorite(_summary(existing), created=False)
     return SavedFavorite(_summary(row), created=True)
+
+
+def save_recipe_for_telegram(
+    session: OrmSession,
+    telegram_user_id: int,
+    message_id: int,
+    *,
+    recipe_index: int,
+    now: datetime,
+) -> SavedFavorite:
+    """Save one structured recipe of a Telegram button, for the user the sender is tied to.
+
+    The caller names the Telegram account (the Bot API's sender id) and the recipe's origin
+    (message_id, recipe_index) -- never a user id, a conversation or a title: those are read
+    from the database. The account is resolved by the same binding every Telegram message
+    uses (telegram.enrolled_user_for_telegram), inside this transaction and with the link
+    held until it ends, so an unlink or a re-link that races the click is decided before or
+    after this save rather than in its middle. The message is then found through that
+    user's conversation by save_favorite, which is the same ownership rule the Web API
+    uses: a callback that names somebody else's message, or a message that has expired,
+    saves nothing and is told so by the caller.
+
+    Writers write first: the first statement is the UPDATE that locks the conversation of
+    the named message (it is also what establishes that the message exists and has not
+    expired). NotBound when the account is not tied to an enrolled user; MessageNotFound
+    when the message is not there or has expired; otherwise the exceptions and the result
+    of save_favorite (RecipeNotFound, FavoritesFull, SavedFavorite with created False for
+    a repeated click). This function makes no provider call: the recipe was already parsed
+    and stored with the answer. The caller owns the transaction.
+    """
+    if (
+        isinstance(message_id, bool)
+        or not isinstance(message_id, int)
+        or not 1 <= message_id <= MAX_MESSAGE_ID
+    ):
+        raise MessageNotFound
+    position = _validated_recipe_index(recipe_index)
+
+    # The write that locks the conversation of the named message, and the only statement
+    # that decides whether it is there at all.
+    located = (
+        sa.select(Message.conversation_id)
+        .where(
+            Message.id == message_id,
+            Message.role == MessageRole.ASSISTANT.value,
+            Message.expires_at > now,
+        )
+        .scalar_subquery()
+    )
+    locked = session.execute(
+        sa.update(Conversation)
+        .where(Conversation.id == located)
+        .values(updated_at=Conversation.updated_at)
+        .execution_options(synchronize_session=False)
+    ).rowcount
+    if locked != 1:
+        raise MessageNotFound
+
+    user_id = telegram_store.enrolled_user_for_telegram(session, telegram_user_id, hold=True)
+    if user_id is None:
+        raise NotBound
+
+    conversation_id = session.scalar(
+        sa.select(Message.conversation_id).where(Message.id == message_id)
+    )
+    if conversation_id is None:  # removed between the lock and this read
+        raise MessageNotFound
+    return save_favorite(
+        session,
+        user_id,
+        conversation_id,
+        message_id,
+        now=now,
+        recipe_index=position,
+    )
 
 
 def list_favorites(session: OrmSession, user_id: UUID) -> list[FavoriteSummary]:

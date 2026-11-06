@@ -48,6 +48,7 @@ class FakeBot:
     def __init__(self) -> None:
         self.sent: list[dict[str, Any]] = []  # sendMessage calls, in order
         self.actions: list[dict[str, Any]] = []  # sendChatAction calls
+        self.answered: list[dict[str, Any]] = []  # answerCallbackQuery calls, in order
         self.requests: list[httpx.Request] = []  # every call, URLs included
         self.files: dict[str, tuple[str, bytes]] = {}  # file_id -> (file_path, content)
         self.failures: dict[str, list[Any]] = {}  # method -> error codes to answer, one per call
@@ -132,6 +133,9 @@ class FakeBot:
         if method == "sendChatAction":
             self.actions.append(body)
             return httpx.Response(200, json={"ok": True, "result": True})
+        if method == "answerCallbackQuery":
+            self.answered.append(body)
+            return httpx.Response(200, json={"ok": True, "result": True})
         if method == "getFile":
             entry = self.files.get(body.get("file_id"))
             if entry is None:
@@ -185,6 +189,49 @@ def private_message(
         message["text"] = text
     message.update(extra)
     return {"update_id": update_id, "message": message}
+
+
+def callback_query(
+    update_id: int,
+    account: int,
+    data: Any,
+    *,
+    query_id: Optional[str] = None,
+    message_id: Optional[int] = None,
+    chat_type: str = "private",
+    chat_id: Optional[int] = None,
+    with_message: bool = True,
+    is_bot: bool = False,
+    **extra: Any,
+) -> dict[str, Any]:
+    """A button click, as the Bot API reports it. The bot message the button is attached to
+    is present unless `with_message` is false (Telegram omits it for an old message)."""
+    query: dict[str, Any] = {
+        "id": query_id if query_id is not None else f"cb-{update_id}",
+        "from": {"id": account, "is_bot": is_bot, "first_name": "Елена"},
+        "chat_instance": "chat-instance",
+        "data": data,
+    }
+    if with_message:
+        query["message"] = {
+            "message_id": message_id if message_id is not None else update_id * 10,
+            "from": {"id": 123456789, "is_bot": True, "first_name": "House Helper"},
+            "chat": {
+                "id": account if chat_id is None else chat_id,
+                "type": chat_type,
+                "first_name": "Елена",
+            },
+            "date": 1790000000,
+            "text": "Ответ помощника",
+        }
+    query.update(extra)
+    return {"update_id": update_id, "callback_query": query}
+
+
+def save_buttons(call: dict[str, Any]) -> list[dict[str, Any]]:
+    """The buttons of one sendMessage call, in inline-keyboard order."""
+    markup = call.get("reply_markup") or {}
+    return [button for row in markup.get("inline_keyboard", []) for button in row]
 
 
 def photo_message(
@@ -272,6 +319,12 @@ class TelegramHarness:
 
     async def deliver_update(self, update: dict[str, Any]) -> None:
         await self.service.handle_update(update)
+
+    async def click(self, account: int, data: Any, **kwargs: Any) -> dict[str, Any]:
+        """Press one inline button as `account` and wait for the click to be handled."""
+        update = callback_query(self.next_id(), account, data, **kwargs)
+        await self.service.handle_update(update)
+        return update
 
     async def pair(self, account: int = MOTHER, *, client: Optional[httpx.AsyncClient] = None) -> str:
         """The honest pairing: ask the website for a code, present it to the bot from

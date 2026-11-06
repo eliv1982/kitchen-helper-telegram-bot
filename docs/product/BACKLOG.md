@@ -26,7 +26,7 @@ Not part of the accepted baseline and not implemented: voice/STT/TTS, long-term 
 
 | ID | Title | Priority | Status | Implementation state |
 |---|---|---|---|---|
-| **KH-F06** | Structured Recipe Favorites | **P1 — FIRST** | Proposed | Partially exists: flat text favorites are deployed; structured recipes, editing and recipe cards are not built |
+| **KH-F06** | Structured Recipe Favorites | **P1 — FIRST** | Implemented | Structured recipes, per-recipe favorites, recipe cards and editing are deployed (migration `0010_structured_recipe_favorites`). Telegram per-recipe save (KH-FAV-TG-01) is implemented in the working tree on 2026-11-06, not released or deployed. |
 | **KH-F07** | Ingredient Context Continuity | **P1 — SECOND** | Proposed | KH-F07A (40-message window and prompt rules) implemented in the repository on 2026-11-05; not released or deployed. No persistent ingredient state |
 | **HH-ALPHA-01** | Long-term Preferences Memory | **P1 — THIRD** | Proposed | Not built; there is no preference table, CRUD or context injection |
 | **KH-F01** | Household Measures and Recipe Unit Conversions | P2 (provisional; owner has not ranked) | Proposed | Not built |
@@ -69,8 +69,9 @@ ID check: `KH-F06`, `KH-F07` and `HH-ALPHA-01` had **no prior use** in this repo
 **Implementation state**
 
 - Deployed: flat-text favorites, derived title, list/detail/delete, 100-per-user limit, no expiry.
-- Not built: structured recipe extraction, multi-recipe save, recipe cards, editing, notes, categories/filtering.
-- Not designed: schema change and compatibility plan for the `UNIQUE(user_id, source_message_id)` constraint.
+- Deployed in a later increment: structured recipes, per-recipe favorites, recipe cards and editing (migration `0010_structured_recipe_favorites`; the `UNIQUE(user_id, source_message_id)` constraint was replaced by `UNIQUE(user_id, source_message_id, source_recipe_index)`).
+- **KH-FAV-TG-01 (Telegram per-recipe save) implemented in the working tree on 2026-11-06, NOT committed, released or deployed:** inline `Сохранить рецепт` buttons under answers that carry structured recipes, saving through the existing favorites storage; no schema change and no provider call. See `docs/STATUS.md`, "Working tree — KH-FAV-TG-01 Telegram recipe favorites (IMPLEMENTED, NOT RELEASED)".
+- Not built: categories/filtering.
 
 ---
 

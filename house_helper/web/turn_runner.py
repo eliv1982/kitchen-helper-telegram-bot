@@ -121,7 +121,7 @@ from house_helper.core.limits import MAX_HISTORY_MESSAGES
 from house_helper.core.orthography import replace_yo
 from house_helper.core.outcomes import OutcomeStatus
 from house_helper.core.recipes import Recipe
-from house_helper.persistence import attachments, turns
+from house_helper.persistence import attachments, message_recipes, turns
 from house_helper.persistence.conversations import ConversationNotFound
 from house_helper.persistence.turns import CompletedTurn
 from house_helper.web.database import DatabaseClosed, WebDatabase
@@ -225,6 +225,11 @@ class TurnCompletion:
     origin: str  # WEB_CHANNEL or TELEGRAM_CHANNEL
     user_text: str
     reply_text: str
+    # The validated structured recipes stored with the answer, in answer order (empty when
+    # it carried none). They let the Telegram bot put a save control under a recipe without
+    # parsing the rendered text or asking the assistant again. The default keeps the hook
+    # usable by a caller that only has the texts.
+    recipes: tuple[message_recipes.StoredRecipe, ...] = ()
 
 
 # Called, on the event loop, once for every turn that completed. It must return at once
@@ -439,6 +444,7 @@ class WebTurnRunner:
             origin=origin,
             user_text=done.user_message.text,
             reply_text=done.assistant_message.text,
+            recipes=done.recipes,
         )
         for hook in self._completion_hooks:
             try:

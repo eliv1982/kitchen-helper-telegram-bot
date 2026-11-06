@@ -46,6 +46,20 @@ and cannot take an in-process lock, so for them the window between the last chec
 Telegram's taking the message is the length of that one request; an answer that is already
 sent cannot be recalled.
 
+Saving a recipe. An answer that carries structured recipes gets an inline keyboard under it:
+one "Сохранить рецепт" button when it carries one, one "Сохранить «<title>»" button per recipe
+when it carries several. An ordinary answer gets no controls. The button's callback data names
+only the recipe's origin -- (assistant message id, position) -- never a user, a conversation or
+a title. A click is resolved the way a message is: the account comes from the update, the user
+from the current Telegram link (asked again inside the saving transaction, with the link held),
+and the recipe from that user's own conversation, so a crafted callback cannot reach somebody
+else's favorite. Saving copies the validated structured recipe through the same
+persistence.favorites.save_favorite as the Web API: no provider call, no parsing of the
+rendered text, no second favorites store. (user_id, source_message_id, source_recipe_index) is
+unique, so a repeated click answers "already saved" and writes nothing. The keyboard is created
+from the validated recipes the turn runner stored beside the answer; the callback is answered
+from the database, so a button keeps working after a restart until its answer expires.
+
 Photos. A photograph with an optional caption is a message like any other, with the picture
 attached: the bot takes the largest size Telegram offers that is within the limit, downloads it
 (through the bot's own file endpoint, so no file address or token ever leaves this process),
@@ -119,17 +133,22 @@ error codes. Never a Telegram id, a name, a message or an answer.
 import asyncio
 import enum
 import logging
+import re
 from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable, Optional
 from uuid import UUID
 
+from house_helper.core.recipes import MAX_RECIPES_PER_REPLY
 from house_helper.persistence import attachments as photos
 from house_helper.persistence import conversations
+from house_helper.persistence import favorites
 from house_helper.persistence import telegram as store
 from house_helper.persistence import turns
+from house_helper.persistence.conversations import ConversationNotFound
 from house_helper.persistence.identifiers import MAX_ATTACHMENT_BYTES
+from house_helper.persistence.message_recipes import MessageNotFound, RecipeNotFound, StoredRecipe
 from house_helper.web.chat_api import clean_message_text
 from house_helper.web.database import WebDatabase
 from house_helper.web.diagnostics import ApiError, new_correlation_id
@@ -165,7 +184,7 @@ UNLINK_ATTEMPTS = 3
 PRIVACY = (
     "Обратите внимание: текст ваших сообщений и фотографии передаются во внешний сервис OpenAI "
     "для обработки и подготовки ответа. История разговоров хранится 365 дней и затем удаляется; "
-    "рецепты, сохраненные в избранное на сайте, остаются, пока вы сами их не уберете."
+    "рецепты, сохраненные в избранное, остаются, пока вы сами их не уберете."
 )
 
 HELP = (
@@ -226,6 +245,81 @@ NOT_RUN_AGAIN = (
     "Ответ на это сообщение уже начинали готовить, но он не был получен, и повторно я его не запрашиваю. "
     "Если сообщение еще нужно, напишите его заново."
 )
+
+# --- saving a recipe from a button --------------------------------------------------------
+
+# The callback payload names the recipe's origin and nothing else. It is not a capability:
+# the sender is resolved from the update, the owner from the database, and the recipe is
+# only ever saved into that owner's favorites. 4 + 19 + 1 + 2 bytes at most, far within
+# Telegram's 64-byte callback_data limit.
+SAVE_CALLBACK_PREFIX = "fav"
+SAVE_BUTTON = "Сохранить рецепт"
+# Telegram shows a button's text in one line and bounds it. The bound is measured on the
+# UTF-8 form (Cyrillic is two bytes a character) and left under 64 for every client; the
+# ellipsis is three bytes.
+SAVE_BUTTON_BYTES = 60
+BUTTON_ELLIPSIS = "…"
+
+SAVED = "Рецепт сохранен в избранное."
+ALREADY_SAVED = "Рецепт уже сохранен в избранном."
+RECIPE_UNAVAILABLE = "Этот рецепт больше недоступен. Попросите помощника показать его снова."
+SAVE_FAILED = "Не удалось сохранить рецепт. Попробуйте еще раз чуть позже."
+FAVORITES_FULL = (
+    "В избранном набралось максимальное число рецептов. "
+    "Уберите ненужные, чтобы добавить новый."
+)
+CALLBACK_NOT_LINKED = "Этот помощник работает только для подключенных аккаунтов House Helper."
+
+_SAVE_CALLBACK = re.compile(r"fav:([1-9][0-9]{0,18}):([0-9]{1,2})")
+
+
+def _save_target(data: Any) -> Optional[tuple[int, int]]:
+    """(message id, recipe position) named by a save button's callback data, or None.
+
+    Only the exact shape this bot writes is accepted, and the numbers are bounded the way
+    the rest of the layer bounds them. Anything else is an invalid or foreign callback and
+    is answered as an unavailable recipe; nothing is looked up."""
+    if not isinstance(data, str):
+        return None
+    found = _SAVE_CALLBACK.fullmatch(data)
+    if found is None:
+        return None
+    message_id, position = int(found.group(1)), int(found.group(2))
+    if message_id > favorites.MAX_MESSAGE_ID or position >= MAX_RECIPES_PER_REPLY:
+        return None
+    return message_id, position
+
+
+def _save_button_label(title: str, *, multiple: bool) -> str:
+    """The text of one save button: the fixed words for a single recipe, and the recipe's
+    own title when one answer carries several (so the buttons can be told apart)."""
+    label = f"Сохранить «{title}»" if multiple else SAVE_BUTTON
+    encoded = label.encode("utf-8")
+    if len(encoded) <= SAVE_BUTTON_BYTES:
+        return label
+    head = encoded[: SAVE_BUTTON_BYTES - len(BUTTON_ELLIPSIS.encode("utf-8"))]
+    return head.decode("utf-8", "ignore").rstrip() + BUTTON_ELLIPSIS
+
+
+def _save_keyboard(recipes: tuple[StoredRecipe, ...]) -> Optional[dict[str, Any]]:
+    """The inline keyboard under an answer that carries recipes: one button per recipe, in
+    answer order. None when there are none, so an ordinary answer has no controls at all."""
+    if not recipes:
+        return None
+    multiple = len(recipes) > 1
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": _save_button_label(recipe.title, multiple=multiple),
+                    "callback_data": (
+                        f"{SAVE_CALLBACK_PREFIX}:{recipe.message_id}:{recipe.position}"
+                    ),
+                }
+            ]
+            for recipe in recipes
+        ]
+    }
 
 
 def _count(value: Any) -> Optional[int]:
@@ -449,6 +543,9 @@ class TelegramChat:
         the class of its exception and, if the sender is known, answered with a plain notice."""
         account: Optional[int] = None
         try:
+            if isinstance(update, dict) and "callback_query" in update:
+                await self._handle_callback(update.get("callback_query"))
+                return
             parsed = self._parse(update)
             if parsed is None:
                 return
@@ -486,6 +583,101 @@ class TelegramChat:
         ):
             return None
         return account, update_id, message
+
+    # --- a click on a save button ---------------------------------------------------------------
+
+    async def _handle_callback(self, query: Any) -> None:
+        """One callback query: save the recipe its button names, into the favorites of the
+        user its SENDER is tied to, and acknowledge the click in every case.
+
+        The callback data is only an origin -- (message id, recipe position). It is not
+        trusted for identity: the account comes from the update, the user from the current
+        Telegram link, and the message from that user's own conversation inside the saving
+        transaction (persistence.favorites.save_recipe_for_telegram). A click on somebody
+        else's button, a button whose answer has expired, an account with no link and a
+        malformed payload all save nothing and are answered with fixed Russian words. The
+        recipe was parsed and stored with the answer, so nothing here calls the assistant.
+
+        Never raises (cancellation excepted). A callback is answered even when nothing was
+        done, so a client's button never spins forever."""
+        if not isinstance(query, dict):
+            return
+        callback_id = query.get("id")
+        if not isinstance(callback_id, str) or not 0 < len(callback_id) <= 256:
+            return  # there is nothing to answer with
+        account, usable = self._callback_sender(query)
+        if account is None or not usable:
+            await self._answer_callback(callback_id, RECIPE_UNAVAILABLE)
+            return
+        try:
+            bound = await self._bound_user(account)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("A Telegram callback could not be authorized: category=%s", type(exc).__name__)
+            await self._answer_callback(callback_id, SAVE_FAILED)
+            return
+        if bound is None:
+            await self._answer_callback(callback_id, CALLBACK_NOT_LINKED)
+            return
+        target = _save_target(query.get("data"))
+        if target is None:
+            await self._answer_callback(callback_id, RECIPE_UNAVAILABLE)
+            return
+        message_id, position = target
+        now = self._clock()
+        try:
+            saved = await self._database.run(
+                lambda session: favorites.save_recipe_for_telegram(
+                    session, account, message_id, recipe_index=position, now=now
+                )
+            )
+        except favorites.NotBound:
+            await self._answer_callback(callback_id, CALLBACK_NOT_LINKED)
+            return
+        except (MessageNotFound, RecipeNotFound, ConversationNotFound):
+            await self._answer_callback(callback_id, RECIPE_UNAVAILABLE)
+            return
+        except favorites.FavoritesFull:
+            await self._answer_callback(callback_id, FAVORITES_FULL)
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("A Telegram recipe could not be saved: category=%s", type(exc).__name__)
+            await self._answer_callback(callback_id, SAVE_FAILED)
+            return
+        logger.info(
+            "Telegram recipe save: outcome=%s", "created" if saved.created else "already"
+        )
+        await self._answer_callback(callback_id, SAVED if saved.created else ALREADY_SAVED)
+
+    @staticmethod
+    def _callback_sender(query: dict[str, Any]) -> tuple[Optional[int], bool]:
+        """(account, usable) for a callback query. The account is the Bot API's sender id.
+        `usable` is false for anything that is not a private chat of that same sender: the
+        bot serves people only there, and a click that did not come from such a chat is
+        answered without being used."""
+        sender, message = query.get("from"), query.get("message")
+        if not isinstance(sender, dict) or not isinstance(message, dict):
+            return None, False
+        account = _count(sender.get("id"))
+        chat = message.get("chat")
+        if account is None or sender.get("is_bot") is True:
+            return account, False
+        if not isinstance(chat, dict) or chat.get("type") != "private" or chat.get("id") != account:
+            return account, False
+        return account, True
+
+    async def _answer_callback(self, callback_id: str, text: str) -> None:
+        """Acknowledge one callback, showing `text` as its short notice. A failure to reach
+        Telegram is logged by category and changes nothing else; it never raises."""
+        try:
+            await self._api.answer_callback_query(callback_id, text)
+        except BotApiError as error:
+            logger.warning("Telegram did not take a callback answer: category=%s", error.category)
+        except Exception as exc:  # a bug; the click's outcome has already been decided
+            logger.error("A callback answer could not be sent: category=%s", type(exc).__name__)
 
     async def _serve(self, account: int, update_id: int, message: dict[str, Any]) -> None:
         text = message.get("text")
@@ -685,7 +877,12 @@ class TelegramChat:
                         await self._discard_photo(user_id, attachment_id)
                     await self._say(account, self._failure_text(error, correlation_id))
                     return
-            if await self._deliver(account, user_id, result.completed.assistant_message.text) is Delivery.REFUSED:
+            if await self._deliver(
+                account,
+                user_id,
+                result.completed.assistant_message.text,
+                reply_markup=_save_keyboard(result.completed.recipes),
+            ) is Delivery.REFUSED:
                 await self._refuse_stale(account)  # the answer is stored for its owner; it is not sent on
 
     async def _discard_photo(self, user_id: UUID, attachment_id: UUID) -> None:
@@ -771,7 +968,11 @@ class TelegramChat:
                 return
             async with self._chat_lock(account):
                 outcome = await self._deliver(
-                    account, completion.user_id, FROM_WEBSITE + completion.user_text, completion.reply_text
+                    account,
+                    completion.user_id,
+                    FROM_WEBSITE + completion.user_text,
+                    completion.reply_text,
+                    reply_markup=_save_keyboard(completion.recipes),
                 )
             if outcome is Delivery.REFUSED:
                 logger.info("A turn was not copied to Telegram: the chat is no longer the user's")
@@ -788,17 +989,25 @@ class TelegramChat:
             lambda session: store.enrolled_user_for_telegram(session, account)
         )
 
-    async def _deliver(self, account: int, user_id: UUID, *texts: str) -> Delivery:
+    async def _deliver(
+        self,
+        account: int,
+        user_id: UUID,
+        *texts: str,
+        reply_markup: Optional[dict[str, Any]] = None,
+    ) -> Delivery:
         """Send `texts`, which belong to `user_id`, to the chat of `account`, but only while that
         account is still the enrolled sender of that user. The question and the sends are made
         under the binding lock, which unlinking takes too: the tie cannot be taken apart (and the
         account given to somebody else) between the check and the send. Nothing is sent, and
-        REFUSED returned, when the tie is gone."""
+        REFUSED returned, when the tie is gone. `reply_markup` (an inline keyboard) goes under
+        the last text, which is the answer the buttons belong to."""
         async with self._binding(account):
             if await self._bound_user(account) != user_id:
                 return Delivery.REFUSED
-            for text in texts:
-                if not await self._say(account, text):
+            for number, text in enumerate(texts):
+                markup = reply_markup if number == len(texts) - 1 else None
+                if not await self._say(account, text, reply_markup=markup):
                     return Delivery.NOT_TAKEN
         return Delivery.SENT
 
@@ -854,12 +1063,20 @@ class TelegramChat:
 
     # --- talking to Telegram -----------------------------------------------------------------------
 
-    async def _say(self, account: int, text: str) -> bool:
+    async def _say(
+        self, account: int, text: str, *, reply_markup: Optional[dict[str, Any]] = None
+    ) -> bool:
         """Send `text` (in pieces if it is long). False, with the reason logged, when
-        Telegram refused or could not be reached; never raises a Bot API error."""
-        for piece in split_text(text):
+        Telegram refused or could not be reached; never raises a Bot API error. `reply_markup`
+        is attached to the last piece, so the controls sit under the end of the text."""
+        pieces = split_text(text)
+        for number, piece in enumerate(pieces):
             try:
-                await self._api.send_message(account, piece)
+                await self._api.send_message(
+                    account,
+                    piece,
+                    reply_markup=reply_markup if number == len(pieces) - 1 else None,
+                )
             except BotApiError as error:
                 logger.warning("Telegram did not take a message: category=%s", error.category)
                 return False
