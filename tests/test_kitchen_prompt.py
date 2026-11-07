@@ -64,9 +64,11 @@ def test_the_telegram_provider_layer_uses_the_shared_prompt():
 
 def test_the_prompt_is_russian_and_bounded():
     assert PROMPT == PROMPT.strip()
-    # It is sent with every request: it costs tokens. 4713 characters now (the photo
-    # section and KH-F07A's ingredient block); 5200 is the ceiling this test allows.
-    assert 500 < len(PROMPT) < 5200
+    # It is sent with every request: it costs tokens. 6960 characters now (the photo
+    # section, KH-F07A's ingredient block and KH-MENU-01A's occasion/budget block,
+    # including the three-state availability and scoped-restriction rules the Codex
+    # audit required); 7050 is the ceiling this test allows.
+    assert 500 < len(PROMPT) < 7050
     assert "по-русски" in PROMPT
     cyrillic = sum("а" <= c.lower() <= "я" or c.lower() == "ё" for c in PROMPT)
     assert cyrillic > 0.7 * sum(c.isalpha() for c in PROMPT)
@@ -76,10 +78,11 @@ def test_the_prompt_is_russian_and_bounded():
     ("scenario", "clause"),
     [
         ("cooking with the ingredients a person has", "продукты, которые у него есть"),
-        ("not inventing ingredients", "Не выдумывай продуктов"),
+        ("not inventing ingredients", "Не приписывай ему продукты, которых он не называл"),
         ("cooking a dish a person names", "называет блюдо"),
         ("a person who does not know what to cook", "не знает, что приготовить"),
-        ("offering a few options and one question", "2–3 простых варианта и задай один уточняющий вопрос"),
+        ("offering a few options and one question", "2–3 подходящих варианта и задай один короткий уточняющий вопрос"),
+        ("different tasks do not share a frame", "рамка одной не переносится на другую"),
         ("follow-ups within the conversation", "по ходу разговора"),
         ("what was discussed counts", "с учётом того, что уже обсуждалось"),
         ("adjacent subjects: substitutions", "замена продуктов"),
@@ -168,12 +171,32 @@ INGREDIENT_RULES = [
     ("a working set", "рабочий набор"),
     ("new ingredients add to the earlier ones", "добавляй новые к уже названным"),
     ("an earlier ingredient is not dropped", "не теряй прежние"),
+    ("availability has three states", "подтверждено, что продукт есть; подтверждено, что его нет"),
+    (
+        "an unmentioned ingredient is unknown, not missing",
+        "о продукте не говорили — тогда он неизвестен, не считай его ни имеющимся, ни отсутствующим",
+    ),
+    ("an exhaustive inventory is taken at its word", "это все продукты у меня есть"),
+    (
+        "confirmed missing ingredients go on the shopping list",
+        "подтверждённо отсутствующее — в список покупок",
+    ),
+    (
+        "unknown items are checked, not assumed missing",
+        "проверьте, есть ли у вас это; купите, если нужно",
+    ),
+    (
+        "a purchase is not needed merely because an ingredient was unmentioned",
+        "только потому, что продукт не называли",
+    ),
     ("an explicit removal removes", "«Лука больше нет» — убери лук из набора"),
     ("a substitution replaces for this request", "«рис вместо картофеля» — картофель заменён рисом"),
     ("a substitution is recalculated", "количества пересчитай"),
     ("quantities are limits", "Названное количество — предел"),
-    ("confirmed differs from hypothetical", "Отличай подтверждённое от предположений"),
-    ("a hypothetical ingredient is not available", "предполагаемое не считай имеющимся"),
+    (
+        "a hypothetical ingredient is not available",
+        "Предполагаемое («если бы был», «что если купить») не считай имеющимся",
+    ),
     ("the latest correction wins", "Последнее явное уточнение человека важнее прежних слов"),
     ("a suggested recipe consumes nothing", "не считай их съеденными оттого, что ты предложил рецепт"),
     (
@@ -181,7 +204,15 @@ INGREDIENT_RULES = [
         "в рецепте — то, что нужно для блюда, а не подтверждение, что оно есть",
     ),
     ("missing information is asked for, not pretended", "а не делай вид, что помнишь"),
-    ("temporary context is not a long-term preference", "это не долговременные предпочтения"),
+    (
+        "preferences stated in this conversation are kept",
+        "Сказанное о предпочтениях учитывай в этом разговоре",
+    ),
+    (
+        "only persistent culinary preferences are missing",
+        "постоянных кулинарных предпочтений приложение пока не хранит",
+    ),
+    ("no future memory is promised", "не обещай помнить это после него"),
     ("availability is never invented", "Не выдумывай наличие продуктов"),
 ]
 
@@ -195,8 +226,11 @@ def test_the_ingredient_block_appears_once_and_stays_compact():
     header = "Продукты, которые уже назывались:"
     assert PROMPT.count(header) == 1
     start = PROMPT.index(header)
-    end = PROMPT.index("Как отвечать:", start)
-    assert 500 < end - start < 1200  # it is sent with every request: it stays short
+    end = PROMPT.index("Праздник, гости и бюджет:", start)
+    # It is sent with every request: it stays short. It grew with KH-MENU-01A's
+    # three-state availability rule (R2), which replaced the unmentioned-means-missing
+    # wording; the bound moved from 1200 to 1500.
+    assert 500 < end - start < 1500
 
 
 def test_the_ingredient_block_does_not_weaken_the_safety_or_recipe_rules():
@@ -211,8 +245,89 @@ def test_the_ingredient_rules_are_in_the_one_prompt_both_channels_send():
     assert openai_chat.KITCHEN_SYSTEM_PROMPT is PROMPT  # the web backend
     assert api_client.SYSTEM_MESSAGE is PROMPT  # the Telegram adapter
     start = PROMPT.index("Продукты, которые уже назывались:")
-    block = PROMPT[start : PROMPT.index("Как отвечать:", start)]
+    block = PROMPT[start : PROMPT.index("Праздник, гости и бюджет:", start)]
     assert "не теряй прежние" in block and "Лука больше нет" in block
+
+
+# --- KH-MENU-01A: festive and special-occasion recommendations ---------------------------------------------
+
+
+MENU_RULES = [
+    (
+        "a festive request is a choice of dishes, not a restriction to what was named",
+        "выбор блюд, а не «только из перечисленного»",
+    ),
+    ("the named products are a base, not a boundary", "названные продукты — основа"),
+    ("missing products may be suggested for purchase", "недостающее можно предложить докупить"),
+    ("an explicit restriction to what is available is honoured", "только из этого"),
+    ("budget requests get real dishes from inexpensive products", "реальные блюда из недорогих продуктов"),
+    ("cheaper substitutes are offered", "более дешёвые замены"),
+    ("no current or exact prices are invented", "Цены не выдумывай"),
+    ("recommendations are 2-4 concrete different dishes", "2–4 конкретных разных блюда"),
+    ("generic dish categories are ruled out", "общие категории"),
+    ("a full recipe follows the choice of a dish", "Полный рецепт — когда человек выбрал блюдо"),
+    ("an explicit no-shopping condition is binding", "«Ничего не покупать»"),
+    ("a no-shopping restriction is limited to its stated frame", "запрет покупок в названных рамках"),
+    ("a task-scoped restriction does not outlive its task", "Вне их он не действует"),
+    ("a period restriction lasts until the period ends", "на срок — до его конца"),
+    (
+        "an indefinite restriction lasts until changed",
+        "бессрочный — пока человек его не отменит или не заменит",
+    ),
+    (
+        "a change of task does not cancel an ongoing restriction",
+        "смена задачи не отменяет запрет на срок или бессрочный",
+    ),
+    (
+        "explicit permission supersedes within its scope",
+        "Разрешение докупить для текущей задачи снимает прежний запрет",
+    ),
+    ("materially ambiguous scope gets one short question", "Если рамки непонятны, задай один короткий вопрос"),
+    (
+        "a later occasion request does not turn an inventory into a restriction",
+        "Не сужай выбор до имеющегося, если человек прямо не ограничил покупки",
+    ),
+    ("a shopping-list follow-up names what is missing", "список покупок — недостающее"),
+    ("a question is asked only when it is necessary", "только если без него нельзя ответить по делу"),
+    ("what the person already said is not asked again", "не спрашивай то, что уже сказано"),
+    (
+        "only persistent preferences are missing",
+        "постоянных кулинарных предпочтений приложение пока не хранит",
+    ),
+    ("no future memory is promised", "не обещай помнить это после него"),
+    ("ordinary cooking from what is available still uses it", "предложи, что из них можно приготовить"),
+]
+
+
+@pytest.mark.parametrize(("rule", "clause"), MENU_RULES)
+def test_the_prompt_covers_festive_and_budget_recommendations(rule, clause):
+    assert clause in PROMPT, rule
+
+
+def test_the_prompt_does_not_restore_the_audited_wording():
+    # R1: the restriction must not be made conversation-wide again.
+    assert "пока человек сам не отменит это" not in PROMPT
+    assert "Явное «ничего не покупать» при этом остаётся в силе" not in PROMPT
+    # R2: an unmentioned ingredient must not be called a required purchase, and the
+    # purchase permission must not be duplicated in the ingredient block.
+    assert "скажи, что его нужно купить" not in PROMPT
+    assert "не запрещает предлагать докупить" not in PROMPT
+    # R3: the account exists; only persistent culinary preferences are missing.
+    assert "у тебя нет профиля" not in PROMPT
+
+
+def test_the_occasion_block_appears_once_and_is_in_the_one_shared_prompt():
+    from house_helper.core import openai_chat
+
+    header = "Праздник, гости и бюджет:"
+    assert PROMPT.count(header) == 1
+    assert openai_chat.KITCHEN_SYSTEM_PROMPT is PROMPT
+    assert api_client.SYSTEM_MESSAGE is PROMPT
+    start = PROMPT.index(header)
+    block = PROMPT[start : PROMPT.index("Как отвечать:", start)]
+    assert 500 < len(block) < 1600  # sent with every request: it stays compact
+    assert "2–4 конкретных разных блюда" in block
+    assert "никаких текущих цен и точных сумм" in block
 
 
 # --- Telegram is unchanged ---------------------------------------------------------------------------------

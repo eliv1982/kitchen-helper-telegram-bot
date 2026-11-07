@@ -28,6 +28,7 @@ Not part of the accepted baseline and not implemented: voice/STT/TTS, long-term 
 |---|---|---|---|---|
 | **KH-F06** | Structured Recipe Favorites | **P1 — FIRST** | Implemented | Structured recipes, per-recipe favorites, recipe cards and editing are deployed (migration `0010_structured_recipe_favorites`). Telegram per-recipe save (KH-FAV-TG-01) is implemented in the working tree on 2026-11-06, not released or deployed. |
 | **KH-F07** | Ingredient Context Continuity | **P1 — SECOND** | Proposed | KH-F07A (40-message window and prompt rules) implemented in the repository on 2026-11-05; not released or deployed. No persistent ingredient state |
+| **KH-MENU-01A** | Smart Meal Recommendations | **P1** — from real-user feedback (owner-reported) | Implemented in the working tree (2026-11-07) | Shared-prompt correction only; no new mode, state, table or migration. Not released or deployed |
 | **HH-ALPHA-01** | Long-term Preferences Memory | **P1 — THIRD** | Proposed | Not built; there is no preference table, CRUD or context injection |
 | **KH-F01** | Household Measures and Recipe Unit Conversions | P2 (provisional; owner has not ranked) | Proposed | Not built |
 | **KH-F02** | Concentration and Dilution Calculations | P2 (provisional; owner has not ranked) | Proposed | Not built |
@@ -117,6 +118,44 @@ If real use shows that ingredient information falls out of the 40-message window
 - KH-F07A implemented and tested in the working tree; no release, deployment or real-provider evaluation.
 - Not built: any persistent ingredient state, pantry, automatic stock deduction, long-term preference extraction or cross-conversation memory.
 - The test suite pins the prompt rules' presence and the window's deterministic behavior, not the model's semantic compliance.
+
+---
+
+## KH-MENU-01A — Smart Meal Recommendations
+
+**Priority:** P1 — from real-user feedback (owner-reported, 2026-11-07).
+**Status:** Implemented and tested in the working tree on 2026-11-07, on baseline `8a6a770`, including a Codex-audit remediation (R1–R3: three-state availability, scoped no-shopping restrictions and five scenario tests); **not committed, pushed, reviewed, released or deployed**, and no owner acceptance is claimed.
+
+**User feedback.** A user asked for New Year dishes and supplied the ingredients she had. The suggestions she received were limited to those ingredients. She expected festive, interesting, budget-conscious options, including additional ingredients to buy.
+
+**Acceptance scope (the task brief's criteria)**
+
+- General requests for festive or special-occasion meals are not constrained to previously mentioned ingredients unless the person explicitly asks for that restriction.
+- "Special but budget-friendly" produces realistic named dishes, modest-cost ingredient choices and cheaper substitutes where appropriate; no invented current prices.
+- Available ingredients are reused when helpful; missing ingredients may be suggested for purchase.
+- Explicit no-shopping instructions remain binding within the scope they name.
+- Multi-turn changes of intent work: inventory → holiday suggestions → budget refinement → recipe → shopping list.
+- Concrete, varied recommendations, not generic dish-category placeholders.
+- Never invent known inventory; ask one concise clarification only when necessary.
+- Respect explicit dietary restrictions and allergies; do not claim that persistent culinary preferences are stored.
+- Identical recommendation semantics in the shared Web and Telegram flow.
+- Preserve KH-F07A ingredient-context continuity, KH-TG-DLG-01 dialog selection, favorites and account isolation.
+
+**Implementation**
+
+- The correction is in the one shared `KITCHEN_SYSTEM_PROMPT` (`house_helper/core/kitchen_prompt.py`), which the web backend (`StandaloneOpenAIBackend`) and the Telegram adapter (`api_client.SYSTEM_MESSAGE`) already send byte-for-byte. No new mode, persistent inventory, database table, migration, authentication feature or price API.
+- The prompt now states that "cook from what I have", "cook a named dish" and "choose dishes (including for a holiday)" are different tasks whose frames do not carry over unless the person set a common restriction; that ingredient availability has three states — confirmed present, confirmed absent, and unknown because the conversation did not mention it — with unknown never treated as missing, an exhaustive inventory taken at its word, only confirmed-absent items on the shopping list, and unknown items introduced as "проверьте, есть ли у вас это; купите, если нужно"; that named ingredients are a base, not a boundary, and missing ones may be suggested for purchase; that a festive/menu request gets 2–4 concrete, varied named dishes rather than generic categories and a full recipe only after a dish is chosen; that budget requests get inexpensive products and cheaper substitutions without invented current or exact prices; that an explicit no-shopping ban is scoped to the frame it names (a dish, a meal, an occasion or a period), with a task-scoped ban not outliving its task, a period ban lasting until the period ends, an indefinite ban lasting until lifted or replaced, a change of task not cancelling an ongoing ban, explicit permission within the task superseding it, and one short question for a materially ambiguous scope; that a shopping-list follow-up names what is missing for the chosen dish; and that preferences stated in the conversation are kept while persistent culinary preferences are not stored and no memory after the conversation is promised.
+- Conversation assembly is unchanged: both channels already pass the ordered history (40 messages including the pending one, KH-F07A), so the model is given the inventory turn, the holiday request and the later refinements.
+- Tests: `tests/test_kitchen_prompt.py` and the new `tests/test_menu_recommendations.py` pin the prompt contract, the ordered multi-turn history on both channels, the verbatim no-shopping message, the shared prompt actually sent by both adapters, and the five Codex-audit scenarios (a task-scoped restriction, an ongoing restriction, permission after a prohibition, a partial inventory, and allergy/diet continuity).
+
+**Limitations**
+
+- Prompt-only. The deterministic tests do not prove that a real model obeys the rules; that needs a separately approved real-provider evaluation.
+- No price data is fetched or stored; the assistant is instructed to avoid current and exact prices, and any cost language remains qualitative.
+- Continuity is bounded by the 40-message context window (KH-F07A); there is no persistent inventory or long-term culinary preference store. The prompt says that persistent culinary preferences are not stored and that no memory after the conversation is promised; a future HH-ALPHA-01 preference store would have to revise that clause.
+- The no-shopping restriction, its scope, and the dietary/allergy conditions are prompt commitments, not application-enforced state or filters. The application stores no restriction or inventory; the model infers the frame from the conversation and is told to ask one short question when the scope is materially ambiguous.
+- A real-provider evaluation (not run) should repeat the reported sequence — inventory, New Year request, "cheaper", recipe choice, "what to buy" — plus the explicit no-shopping and dietary-restriction variants, and judge the answers for concrete named dishes, permitted purchase suggestions and no invented prices.
+- No production deployment, no real-user validation and no owner acceptance.
 
 ---
 
