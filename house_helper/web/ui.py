@@ -201,6 +201,8 @@ _SHELL = """\
     <main id="chat" class="chat" aria-labelledby="chat-title" hidden>
       <div class="chat-head">
         <h1 id="chat-title" class="chat-title" tabindex="-1"></h1>
+        <button id="help-toggle" class="btn btn-quiet chat-help-toggle" type="button"
+                aria-expanded="false" aria-controls="help-panel" aria-label="Помощь">Помощь</button>
         <div id="chat-actions" class="chat-actions" hidden>
           <button id="chat-actions-toggle" class="btn btn-quiet chat-actions-toggle" type="button"
                   aria-haspopup="menu" aria-expanded="false" aria-controls="chat-actions-menu"
@@ -208,6 +210,11 @@ _SHELL = """\
           <div id="chat-actions-menu" class="chat-actions-menu" role="menu"
                aria-label="Действия с разговором" hidden></div>
         </div>
+      </div>
+      <div id="help-panel" class="help-panel" role="region" aria-labelledby="help-title" hidden>
+        <h2 id="help-title" class="help-title"></h2>
+        <p id="help-text" class="hint"></p>
+        <button id="help-close" class="btn btn-quiet" type="button">Закрыть</button>
       </div>
       <div id="chat-delete" class="chat-delete" hidden></div>
       <div id="banner" class="banner" hidden>

@@ -127,6 +127,14 @@
 
   // --- the words ----------------------------------------------------------------------
 
+  // The one explanation of the ideas -> chosen dish -> full recipe -> favorites workflow.
+  // It is the empty-conversation hint, and the help panel reuses it word for word so the
+  // two cannot drift apart.
+  var HELP_EXPLANATION =
+    "Спросите, что приготовить из имеющихся продуктов, или как приготовить блюдо. " +
+    "Помощник может предложить идеи блюд: выберите понравившееся — он даст полный рецепт, " +
+    "который можно сохранить в избранное кнопкой рядом с рецептом.";
+
   var TEXT = {
     authExpired: "Сессия закончилась или была прекращена. Войдите снова.",
     unavailable: "Сервис временно недоступен. Попробуйте еще раз чуть позже.",
@@ -218,8 +226,10 @@
     historyUnavailable: "Не удалось загрузить историю разговора, поэтому отправка пока недоступна. Загрузите ее еще раз.",
     failedGeneric: "Не удалось получить ответ. Попробуйте еще раз.",
     correlation: "Номер обращения: {id}",
-    emptyThread:
-      "Спросите, что приготовить из имеющихся продуктов, или как приготовить блюдо.",
+    emptyThread: HELP_EXPLANATION,
+    // The help panel: the same explanation, reachable while a conversation is active.
+    helpTitle: "Как пользоваться помощником",
+    help: HELP_EXPLANATION,
     // The favorites: the recipes the person kept.
     chatsTab: "Разговоры",
     favoritesTab: "Избранное",

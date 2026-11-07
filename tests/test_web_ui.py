@@ -250,6 +250,22 @@ def test_the_conversation_actions_menu_is_a_menu_button_that_starts_closed():
     assert menu["role"] == "menu" and menu["aria-label"] == "Действия с разговором"
 
 
+def test_the_help_entry_is_a_disclosure_beside_the_conversation_title_that_starts_closed():
+    page = shell_for(telegram=True, email=True)
+    toggle = page.by_id("help-toggle")
+    panel = page.by_id("help-panel")
+
+    # It is in the conversation header, so it is reachable while the conversation is empty
+    # and while it is active; the interaction itself is exercised in tests/test_web_ui_dom.py.
+    assert toggle["type"] == "button"
+    assert toggle["aria-expanded"] == "false"
+    assert toggle["aria-controls"] == "help-panel"
+    assert toggle["aria-label"] == "Помощь"
+    assert "hidden" in panel
+    assert panel["role"] == "region" and panel["aria-labelledby"] == "help-title"
+    assert page.by_id("help-close")["type"] == "button"
+
+
 def test_all_the_text_a_person_reads_is_russian():
     import re
 

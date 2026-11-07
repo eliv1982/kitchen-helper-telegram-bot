@@ -64,11 +64,15 @@ def test_the_telegram_provider_layer_uses_the_shared_prompt():
 
 def test_the_prompt_is_russian_and_bounded():
     assert PROMPT == PROMPT.strip()
-    # It is sent with every request: it costs tokens. 6960 characters now (the photo
+    # It is sent with every request: it costs tokens. 8462 characters now (the photo
     # section, KH-F07A's ingredient block and KH-MENU-01A's occasion/budget block,
     # including the three-state availability and scoped-restriction rules the Codex
-    # audit required); 7050 is the ceiling this test allows.
-    assert 500 < len(PROMPT) < 7050
+    # audit required, KH-MENU-01A-FIX-01's optional-inventory, two-section shopping-list
+    # and recipe/favorites workflow correction, and the Codex-FAIL remediation's removal
+    # of the staple exception and separation of necessity from availability); 8550 is
+    # the ceiling this test allows. The FIX-01 correction added 1089 characters
+    # (+15.6%); the Codex-FAIL remediation added 413 (+5.1%).
+    assert 500 < len(PROMPT) < 8550
     assert "по-русски" in PROMPT
     cyrillic = sum("а" <= c.lower() <= "я" or c.lower() == "ё" for c in PROMPT)
     assert cyrillic > 0.7 * sum(c.isalpha() for c in PROMPT)
@@ -138,13 +142,19 @@ def test_the_prompt_does_not_route_to_domains_that_do_not_exist():
         assert word not in lowered, word
 
 
-def test_the_prompt_does_not_promise_what_the_chat_cannot_do():
-    # (A photo can be attached since the Telegram bot and the photo storage: the prompt says how to treat
-    # one, below. A voice message, a reminder, a favorite and a saved preference still do not exist for the
-    # assistant to offer.)
+def test_the_prompt_promises_only_the_favorites_the_workflow_can_keep():
+    # A photo can be attached, so the prompt says how to treat one. A voice message, a
+    # reminder and a remembered preference still do not exist for the assistant to offer.
+    # Favorites do exist, and KH-MENU-01A-FIX-01 sanctions exactly one mention: after a
+    # list of dishes, the person is told that a full recipe can be saved to favorites.
     lowered = PROMPT.lower()
-    for word in ("голос", "напомин", "избранн", "сохран"):
+    for word in ("голос", "напомин", "запомн"):
         assert word not in lowered, word
+    assert lowered.count("избранн") == 1
+    assert "его можно будет сохранить в избранное" in lowered
+    # The assistant itself neither saves nor keeps anything.
+    for phrase in ("я сохраню", "сохраню в избранное", "сохранит в избранное"):
+        assert phrase not in lowered, phrase
 
 
 @pytest.mark.parametrize(
@@ -178,16 +188,64 @@ INGREDIENT_RULES = [
     ),
     ("an exhaustive inventory is taken at its word", "это все продукты у меня есть"),
     (
-        "confirmed missing ingredients go on the shopping list",
-        "подтверждённо отсутствующее — в список покупок",
+        "the working set is scoped to cooking from what is available",
+        "пока задача — готовить из имеющегося",
+    ),
+    (
+        "only confirmed missing ingredients are definite purchases",
+        "«точно купить» — только подтверждённо отсутствующее",
+    ),
+    (
+        "required items of unknown availability are in their own check section",
+        "«проверить» — нужное, но с неизвестным наличием",
     ),
     (
         "unknown items are checked, not assumed missing",
         "проверьте, есть ли у вас это; купите, если нужно",
     ),
     (
-        "a purchase is not needed merely because an ingredient was unmentioned",
-        "только потому, что продукт не называли",
+        "necessity and availability are independent",
+        "Нужность и наличие — разные вещи",
+    ),
+    (
+        "a dish may require an ingredient the person never mentioned",
+        "блюдо может требовать продукт, которого человек не называл",
+    ),
+    (
+        "unknown availability does not make a required ingredient optional",
+        "неизвестное наличие не делает обязательный продукт необязательным",
+    ),
+    (
+        "a required item of unknown availability is checked, not optional",
+        "Обязательный продукт с неизвестным наличием — в «проверить»",
+    ),
+    (
+        "only optional ingredients are offered conditionally",
+        "«если есть» и «можно добавить» — только для необязательных продуктов",
+    ),
+    (
+        "an optional item is not a definite purchase",
+        "Необязательное в «точно купить» не попадает",
+    ),
+    (
+        "basic staples are not an exception",
+        "Соль, масло, вода и другие базовые запасы — не исключение",
+    ),
+    (
+        "unnamed staples stay unknown",
+        "если человек их не называл, их наличие тоже неизвестно",
+    ),
+    (
+        "basic ingredients are not interrogated one by one",
+        "Неизвестность не повод допрашивать про каждый базовый продукт",
+    ),
+    (
+        "unknown ingredients are spoken of conditionally",
+        "говори о таком условно",
+    ),
+    (
+        "an optional item is not bought merely because it was unmentioned",
+        "даже если продукт не называли",
     ),
     ("an explicit removal removes", "«Лука больше нет» — убери лук из набора"),
     ("a substitution replaces for this request", "«рис вместо картофеля» — картофель заменён рисом"),
@@ -229,8 +287,10 @@ def test_the_ingredient_block_appears_once_and_stays_compact():
     end = PROMPT.index("Праздник, гости и бюджет:", start)
     # It is sent with every request: it stays short. It grew with KH-MENU-01A's
     # three-state availability rule (R2), which replaced the unmentioned-means-missing
-    # wording; the bound moved from 1200 to 1500.
-    assert 500 < end - start < 1500
+    # wording, with KH-MENU-01A-FIX-01's two-section shopping list, and with the
+    # Codex-FAIL remediation's necessity/availability split and removal of the staple
+    # exception; the bound moved from 1500 to 1700 and then to 2050.
+    assert 500 < end - start < 2050
 
 
 def test_the_ingredient_block_does_not_weaken_the_safety_or_recipe_rules():
@@ -257,7 +317,10 @@ MENU_RULES = [
         "a festive request is a choice of dishes, not a restriction to what was named",
         "выбор блюд, а не «только из перечисленного»",
     ),
-    ("the named products are a base, not a boundary", "названные продукты — основа"),
+    (
+        "the named products are an optional resource, not a base or a boundary",
+        "необязательный ресурс, а не основа и не граница",
+    ),
     ("missing products may be suggested for purchase", "недостающее можно предложить докупить"),
     ("an explicit restriction to what is available is honoured", "только из этого"),
     ("budget requests get real dishes from inexpensive products", "реальные блюда из недорогих продуктов"),
@@ -285,7 +348,39 @@ MENU_RULES = [
     ("materially ambiguous scope gets one short question", "Если рамки непонятны, задай один короткий вопрос"),
     (
         "a later occasion request does not turn an inventory into a restriction",
-        "Не сужай выбор до имеющегося, если человек прямо не ограничил покупки",
+        "не сужай выбор до имеющегося",
+    ),
+    (
+        "the non-inventory variety applies only when shopping is not prohibited",
+        "Если покупки не запрещены, не сужай выбор до имеющегося",
+    ),
+    (
+        "at least one dish is not built on the previous inventory",
+        "минимум один вариант должен быть не из прежних продуктов",
+    ),
+    (
+        "an explicit opt-out removes the inventory anchoring",
+        "Если человек прямо сказал, что имеющееся использовать необязательно",
+    ),
+    (
+        "an explicit opt-out keeps the inventory out of every dish",
+        "не подставляй его в каждый вариант",
+    ),
+    (
+        "useful available products are not artificially excluded",
+        "не исключай прежние продукты нарочно",
+    ),
+    (
+        "varied dishes are not variations of one dish",
+        "не вариации одного блюда",
+    ),
+    (
+        "the recipe and favorites offer follows the recommendations",
+        "Выберите понравившееся блюдо, и я дам полный рецепт",
+    ),
+    (
+        "the shopping-list follow-up has the two sections",
+        "с разделами «точно купить» и «проверить»",
     ),
     ("a shopping-list follow-up names what is missing", "список покупок — недостающее"),
     ("a question is asked only when it is necessary", "только если без него нельзя ответить по делу"),
@@ -314,6 +409,35 @@ def test_the_prompt_does_not_restore_the_audited_wording():
     assert "не запрещает предлагать докупить" not in PROMPT
     # R3: the account exists; only persistent culinary preferences are missing.
     assert "у тебя нет профиля" not in PROMPT
+    # The Codex-FAIL remediation (R1): the staple exception must not return in any
+    # form -- neither as availability nor as a stated assumption.
+    assert "можно исходить" not in PROMPT
+    assert "назови это допущением" not in PROMPT
+    assert "допущения (порции, базовые запасы)" not in PROMPT
+    # The Codex-FAIL remediation (R3): an unmentioned ingredient is not automatically
+    # an optional addition, and the old necessity/availability collapse must not return.
+    assert "а не обязательный ингредиент" not in PROMPT
+    assert "Продукт, о котором не говорили, в предложении блюда" not in PROMPT
+
+
+def test_the_live_inventory_anchoring_wording_is_gone():
+    # KH-MENU-01A-FIX-01: the live failure built every festive dish on the inventory
+    # because the prompt called the named products a base. The anchoring wording must
+    # not return; they are an optional resource when shopping is allowed.
+    assert "названные продукты — основа" not in PROMPT
+    assert "названные продукты — необязательный ресурс" in PROMPT
+    assert "минимум один вариант должен быть не из прежних продуктов" in PROMPT
+
+
+def test_the_recipe_choice_and_favorites_offer_is_one_exact_line():
+    # KH-MENU-01A-FIX-01's UX correction: after a list of dishes, the assistant invites
+    # the person to choose one for a full recipe that can be saved to favorites.
+    offer = (
+        "Выберите понравившееся блюдо, и я дам полный рецепт. "
+        "Его можно будет сохранить в избранное"
+    )
+    assert PROMPT.count(offer) == 1
+    assert "Когда предлагаешь несколько блюд на выбор, после списка добавь" in PROMPT
 
 
 def test_the_occasion_block_appears_once_and_is_in_the_one_shared_prompt():
@@ -325,7 +449,10 @@ def test_the_occasion_block_appears_once_and_is_in_the_one_shared_prompt():
     assert api_client.SYSTEM_MESSAGE is PROMPT
     start = PROMPT.index(header)
     block = PROMPT[start : PROMPT.index("Как отвечать:", start)]
-    assert 500 < len(block) < 1600  # sent with every request: it stays compact
+    # Sent with every request: it stays compact. KH-MENU-01A-FIX-01 moved the bound
+    # from 1600 to 1800 for the optional-inventory and variety correction; the
+    # Codex-FAIL remediation moved it to 1950 for the new-main-ingredient rule.
+    assert 500 < len(block) < 1950
     assert "2–4 конкретных разных блюда" in block
     assert "никаких текущих цен и точных сумм" in block
 

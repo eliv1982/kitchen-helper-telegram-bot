@@ -757,6 +757,60 @@ scenario("opening_another_conversation_closes_the_actions_menu", async () => {
   assert.equal(toggle.getAttribute("aria-expanded"), "false");
 });
 
+scenario("the_help_explanation_opens_in_an_active_conversation_and_changes_nothing", async () => {
+  const page = await open(oneConversation());
+  const toggle = page.el("help-toggle");
+
+  // An active conversation (two messages), and the explanation closed until asked for.
+  assert.equal(page.articles().length, 2);
+  const before = page.articleTexts();
+  assert.ok(before.some((text) => text.includes("Старый вопрос")));
+  assert.equal(page.visible("help-panel"), false);
+  assert.equal(toggle.parentNode.className, "chat-head", "the entry is in the conversation header");
+  assert.equal(toggle.getAttribute("type"), "button");
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  assert.equal(toggle.getAttribute("aria-controls"), "help-panel");
+  assert.equal(toggle.getAttribute("aria-label"), "Помощь");
+
+  toggle.click();
+  assert.equal(page.visible("help-panel"), true);
+  assert.equal(toggle.getAttribute("aria-expanded"), "true");
+  assert.equal(page.el("help-title").textContent, Logic.TEXT.helpTitle);
+  const text = page.el("help-text").textContent;
+  assert.equal(text, Logic.TEXT.help);
+  for (const phrase of ["идеи блюд", "полный рецепт", "избранное"]) {
+    assert.ok(text.includes(phrase), "the help explains " + phrase);
+  }
+  // The conversation is neither cleared nor changed, and no request is made.
+  assert.deepEqual(page.articleTexts(), before);
+  assert.equal(page.env.net.requests("POST", /.*/).length, 0);
+
+  // Escape closes it, leaving the conversation as it was.
+  toggle.fire("keydown", { key: "Escape" });
+  assert.equal(page.visible("help-panel"), false);
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  assert.deepEqual(page.articleTexts(), before);
+});
+
+scenario("the_help_explanation_is_reachable_in_an_empty_conversation_on_a_narrow_screen", async () => {
+  const page = await open(oneConversation(), { narrow: true });
+  page.el("new-conversation").click();
+  await page.settle();
+
+  // A new draft is an empty conversation, and the entry is still there.
+  assert.equal(page.articles().length, 0);
+  assert.equal(page.visible("help-toggle"), true);
+  page.el("help-toggle").click();
+  assert.equal(page.visible("help-panel"), true);
+  assert.equal(page.el("help-text").textContent, Logic.TEXT.help);
+  assert.equal(page.articles().length, 0, "the explanation did not create a message");
+
+  // Closing gives the focus back to the entry.
+  page.el("help-close").click();
+  assert.equal(page.visible("help-panel"), false);
+  assert.equal(page.doc.activeElement, page.el("help-toggle"));
+});
+
 scenario("the_actions_menu_is_operable_from_the_keyboard_and_dismissed_by_an_outside_click", async () => {
   const page = await open(oneConversation());
   const toggle = page.el("chat-actions-toggle");

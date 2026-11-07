@@ -619,6 +619,35 @@ textarea[aria-invalid="true"] {
   background: transparent;
 }
 
+/* The help entry of the open conversation: beside the title, so it is in reach whether the
+   conversation is empty or active, on a wide screen and in the narrow layout. It opens the
+   explanation in the flow under the header; nothing of the conversation is touched. */
+.chat-help-toggle {
+  flex: none;
+  min-width: 2.75rem;
+  min-height: 2.75rem;
+  padding: 0 0.6rem;
+  color: var(--blue);
+  font-size: 0.95rem;
+}
+
+.help-panel {
+  flex: none;
+  padding: 0.75rem var(--gutter);
+  border-bottom: 1px solid var(--line);
+  background: var(--pale);
+}
+
+.help-title {
+  margin: 0 0 0.4rem;
+  font-size: 1rem;
+}
+
+.help-panel .hint {
+  margin: 0 0 0.6rem;
+  color: var(--text);
+}
+
 .chat-actions {
   position: relative;
   flex: none;

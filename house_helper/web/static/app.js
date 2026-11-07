@@ -40,6 +40,11 @@
     app: byId("screen-app"),
     chat: byId("chat"),
     chatTitle: byId("chat-title"),
+    helpToggle: byId("help-toggle"),
+    helpPanel: byId("help-panel"),
+    helpTitle: byId("help-title"),
+    helpText: byId("help-text"),
+    helpClose: byId("help-close"),
     chatActions: byId("chat-actions"),
     chatActionsToggle: byId("chat-actions-toggle"),
     chatActionsMenu: byId("chat-actions-menu"),
@@ -465,6 +470,7 @@
         clear(els.recipeBody);
         clear(els.chatDelete);
         closeChatMenu(false);
+        setHelp(false, false);
         els.chatActions.hidden = true;
         els.chatDelete.hidden = true;
         drawn.favoriteList = drawn.recipe = null;
@@ -704,6 +710,40 @@
       closeChatMenu(false);
     }
   });
+
+  // The help explanation of the ideas -> chosen dish -> full recipe -> favorites workflow. It
+  // is a disclosure beside the conversation title, so it is reachable while the conversation
+  // is empty and while it is active; it only shows text and never sends, clears or changes
+  // anything of the conversation.
+  var helpOpen = false;
+  function setHelp(open, focusToggle) {
+    helpOpen = open;
+    els.helpPanel.hidden = !open;
+    els.helpToggle.setAttribute("aria-expanded", open ? "true" : "false");
+    if (focusToggle) {
+      els.helpToggle.focus();
+    }
+  }
+  els.helpToggle.addEventListener("click", function () {
+    setHelp(!helpOpen, false);
+  });
+  els.helpClose.addEventListener("click", function () {
+    setHelp(false, true);
+  });
+  els.helpToggle.addEventListener("keydown", function (event) {
+    if (event.key === "Escape" && helpOpen) {
+      event.preventDefault();
+      setHelp(false, false);
+    }
+  });
+  els.helpPanel.addEventListener("keydown", function (event) {
+    if (event.key === "Escape" && helpOpen) {
+      event.preventDefault();
+      setHelp(false, true);
+    }
+  });
+  els.helpTitle.textContent = Logic.TEXT.helpTitle;
+  els.helpText.textContent = Logic.TEXT.help;
 
   function drawChatActions(data) {
     var canAct = data.canAct && data.section === "chats";
