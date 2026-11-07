@@ -26,6 +26,8 @@ TABLES = {
     "favorite_recipes",
     "telegram_links",
     "telegram_link_codes",
+    "telegram_active_conversations",
+    "telegram_update_admissions",
     "message_attachments",
     "message_recipes",
     "conversations",
@@ -36,7 +38,7 @@ TABLES = {
 POSTGRESQL_IDENTIFIER_LIMIT = 63
 
 
-def test_the_schema_has_exactly_the_fifteen_tables():
+def test_the_schema_has_exactly_the_seventeen_tables():
     assert set(Base.metadata.tables) == TABLES
 
 
@@ -282,6 +284,7 @@ def test_lists_of_values_fit_their_columns():
         FailureKind,
         FavoriteKind,
         MessageRole,
+        TelegramUpdateAdmissionKind,
         TurnStatus,
     )
 
@@ -289,12 +292,14 @@ def test_lists_of_values_fit_their_columns():
     turns = Base.metadata.tables["turn_requests"]
     allowlist = Base.metadata.tables["allowlist_entries"]
     favorites = Base.metadata.tables["favorite_recipes"]
+    admissions = Base.metadata.tables["telegram_update_admissions"]
 
     assert max(len(r.value) for r in MessageRole) <= messages.c.role.type.length
     assert max(len(r.value) for r in TurnStatus) <= turns.c.status.type.length
     assert max(len(r.value) for r in FailureKind) <= turns.c.failure_kind.type.length
     assert max(len(r.value) for r in AllowlistProvider) <= allowlist.c.provider.type.length
     assert max(len(r.value) for r in FavoriteKind) <= favorites.c.kind.type.length
+    assert max(len(r.value) for r in TelegramUpdateAdmissionKind) <= admissions.c.kind.type.length
 
 
 # --- the shape of the references ---------------------------------------------------

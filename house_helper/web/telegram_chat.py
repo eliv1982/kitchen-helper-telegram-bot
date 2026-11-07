@@ -84,12 +84,45 @@ Nothing here writes: Telegram cannot edit or remove a favorite in this stage, an
 is called. A recipe longer than one message is sent in pieces, with the way back under the
 last piece.
 
-The command menu. At start the bot registers the commands it wants in Telegram's own menu
-(setMyCommands): /start, /favorites and /help, with Russian descriptions. That call replaces
-the whole list for the default scope, and the list is fixed, so every start applies the same
-menu and a restart adds nothing and removes nothing. A failure is one warning, never a stop
-of polling, and the next restart tries again. No BotFather command list is needed or changed:
-the runtime call is the native mechanism, and BotFather remains the owner's to change.
+Choosing the conversation. `/dialogs` shows the person's conversations as buttons, the same
+list the website shows (newest activity first, each named by its first unexpired user
+message) with its timestamps in Moscow time, explicitly labelled МСК. Eight fit a page,
+and the pages reach every conversation the person has: a page is judged against the list
+actually read, so a stale or made-up page number opens the last page rather than a fixed
+ceiling. The conversation a message would go to is marked,
+and it is the explicit selection, or -- before one is made -- the latest conversation. A button's callback
+data names only (conversation id, page), never a user: the sender comes from the update, the
+user from the current Telegram link, and persistence.select_conversation checks that the
+conversation is that user's (unknown, foreign and deleted are one answer). The selection is
+written under the chat lock, the same lock a message to the assistant holds across its whole
+turn, so a switch falls entirely before or entirely after one message and its answer; the
+callback is acknowledged first, so a long answer does not leave the button spinning. Every
+cursor-changing write protected by that lock is a database unit the caller does not leave
+until it has ended (WebDatabase.run_to_completion): a cancelled selection or `/new` cannot
+release the lock while its transaction is still running and then have a later choice
+overwritten by it. A selection that fails in the database keeps the previous one and says
+so in fixed words; a target conversation deleted between the button and the click is "this
+conversation is no longer available", never a success. The
+confirmation is short: the stored history is not replayed into the chat, because the context
+is restored where it already is. A selected conversation that is deleted leaves the explicit
+NULL state: the list says so, and the next message creates and selects a new conversation
+instead of silently continuing some other one. Selecting writes no conversation activity
+time, so it does not reorder the website's list; the website keeps opening whatever it
+opened before, because this cursor is Telegram's own. `/new` makes (or reuses, while it is
+still empty) a conversation and selects it, so asking twice does not litter the list. The
+list itself is read and rendered under the same chat lock as its delivery, so it shows the
+selections that were completed before it, and a page click waits for an answer being
+prepared just as a selection does.
+
+The command menu. At start the bot registers exactly four commands in Telegram's own menu
+(setMyCommands), in this order: /dialogs, /new, /favorites and /help, with Russian
+descriptions. That call replaces the whole list for the default scope, and the list is
+fixed, so every start applies the same menu and a restart adds nothing and removes nothing.
+/start stays functional (a greeting, and the payload of the pairing link) but is not in the
+visible list; /unlink stays functional and is listed in /help. A failure is one warning,
+never a stop of polling, and the next restart tries again. No BotFather command list is
+needed or changed: the runtime call is the native mechanism, and BotFather remains the
+owner's to change.
 
 Photos. A photograph with an optional caption is a message like any other, with the picture
 attached: the bot takes the largest size Telegram offers that is within the limit, downloads it
@@ -98,8 +131,9 @@ checks by its bytes that it is a JPEG, a PNG or a WebP, keeps it as a photo of t
 (persistence.attachments) and hands the message to the same turn runner with the photo
 attached. The assistant is shown it; the website shows it in the history, served only to its
 owner; it expires with the message. A photo costs no download when its update is a redelivery
-(the first delivery already attached it). A stranger's photo is never downloaded. An album
-arrives as one update per picture and is answered one picture at a time.
+(the first delivery already attached it), nor when the admission ledger refuses the update as a
+duplicate, stale or pre-migration one: those checks come first. A stranger's photo is never
+downloaded. An album arrives as one update per picture and is answered one picture at a time.
 
 Order and duplicates. Messages of one chat are handled one at a time, in the order they came
 (a lock per chat), as the old bot did. The idempotency key of a turn is "tg-<update id>", and
@@ -107,24 +141,89 @@ the assistant is not run a second time for an update once an attempt at it has b
 that Telegram delivers again is, by what the first delivery left in the database:
 
   * completed: answered from the first completion (turn_runner: the key is replayed, nothing is
-    generated), in the conversation the first delivery used. The answer may reach the person a
-    second time;
+    generated), in the conversation the first delivery used, even if the person has selected
+    another conversation since. The answer may reach the person a second time;
+  * previously admitted, but its conversation was deleted: it is NOT run again elsewhere. Two
+    records say "admitted": the turn request (which lets a completed answer be replayed) and the
+    durable marker of telegram_update_admissions, written in the very transaction that claimed
+    the turn. The marker has no conversation or user key and survives the cascading delete of
+    the conversation and its turn request, so a redelivery whose conversation is gone is
+    recognised before anything is fetched, selected, stored or asked (the person gets one fixed
+    Russian sentence and nothing of the first delivery). The same is true after the account was
+    unlinked and linked to another person: the marker is the bot's, so the update is refused and
+    nothing of the first owner's is read or sent. A resolution that finds the marker but no turn
+    request refuses to create a conversation at all; if the claim is what discovers it (a
+    concurrent duplicate, or a deletion in between), the resolution's new, still empty
+    conversation is deleted again. The provenance the first look saw is carried through the
+    whole attempt: if it saw the update's own turn request (ADMITTED_HERE) and that request
+    disappears before the resolution -- its conversation deleted, its marker perhaps already
+    purged -- the resolution refuses too, instead of resolving the update afresh. Only an
+    update that was never admitted may be resolved again after a conversation deletion, and
+    only while it is fresh; there is nothing to repeat;
   * claimed and not completed (the provider failed or timed out, the lease ran out, the process
     was restarted): NOT run again, whatever it failed with. The claim of an attempt is committed
     before the provider is called, so that fact is in the database and survives a restart; what
     cannot be known is whether the first request reached the provider. The person is told, in
     fixed words, that the message was not answered and to write it again (a new message is a new
     update, which is the person's choice and not an automatic repeat). Nothing is fabricated;
-  * never claimed: handled as a new message;
+  * never claimed: handled as a new message, if it is fresh enough (see the two policies below);
   * claimed for ANOTHER user (the account was unlinked from them and tied to somebody else since,
     and Telegram brings the update again): dropped, whatever state the first delivery is in. An
     update id belongs to the bot, not to whoever the account is tied to this week, so it is
     looked up across owners (persistence.telegram.update_admitted_for_another), before anything
-    is fetched, and again inside the transaction that claims the turn (admit_update). The
-    person behind the account gets the fixed "the connection changed" notice and nothing of
-    the first owner's message, photo or answer is read, stored, sent to the assistant or sent
-    on; the first owner's rows are not touched. The record is the turn request the claim wrote;
-    an update that never reached a claim left none, and cannot be told from a new message.
+    is fetched, and the ledger is asked in the same first look. The person behind the account
+    gets the fixed "the connection changed" notice and nothing of the first owner's message,
+    photo or answer is read, stored, sent to the assistant or sent on; the first owner's rows are
+    not touched.
+
+The timestamp policy judges EVERY message to the assistant, before the ledger look and again
+inside the claim's own transaction, independently of whether a surviving turn request or a
+marker knows the update. Telegram keeps updates for 24 hours (the Bot API's getUpdates
+contract); a message dated more than UPDATE_RETENTION (24 hours) plus UPDATE_CLOCK_SKEW (5
+minutes) before the server's clock, a message dated more than UPDATE_FUTURE_SKEW (5 minutes)
+after it, or one with no usable `date`, is refused with a fixed request-to-resend sentence. The
+future bound exists because the marker ages from the admission while the message's date does
+not move: without it, a message dated days ahead would be replayable again after the marker's
+window. Independence is what closes the case in which the marker has been purged and the
+original conversation is then deleted before the resolution: the update must not become "new"
+again merely because both records are gone. The extra 48-hour marker window still makes the
+ledger the first line while it exists. The check is repeated at the claim because a message may
+have been fresh when it arrived and stale by the time its attempt is prepared (a photo download,
+a queue); the replay of a completed turn is refused by the same policy.
+
+The cutover policy is asked only when neither a surviving turn request nor a marker knows the
+update: the ledger's first start writes a cutover instant per bot
+(persistence.telegram.initialize_update_admissions), and the 48 hours of turn requests that
+survive are backfilled into markers at the same time. An update dated before the cutover that
+neither a marker nor a turn request knows is a pre-migration update whose provenance cannot be
+reconstructed (its conversation, and with it its turn request, was deleted before the upgrade).
+It is refused with its own fixed request-to-resend sentence instead of being guessed at or
+processed again. The price is exact and documented in the RUNBOOK: a message that was sent
+before the upgrade and never processed at all is refused too, because nothing can tell it apart
+from one that was processed and whose history is gone.
+
+Admission readiness. The cutover row and the backfill are prepared once per process, before
+anything is admitted. Until that preparation has committed (it has not run, is running, or
+failed and was not retried successfully), no new message to the assistant is admitted: the
+person gets a fixed "temporarily unavailable" notice and nothing is fetched, downloaded,
+selected, stored or asked of the assistant. A failed preparation commits nothing -- its
+cutover row and every recovered marker are in one transaction -- so the next attempt starts
+from a clean ledger; the handler retries on the next message and the poller retries with a
+backoff. The poller reads NO updates until the ledger is ready: the acknowledgement of an
+update is the next getUpdates call, and the offset lives in memory only, so polling while the
+ledger cannot admit would acknowledge messages this process is not able to process and lose
+them. Telegram keeps them for the retry. The cutover written by a first successful preparation
+is the process start, not the retry's instant, so a message that arrived during the failure is
+not later refused as a pre-migration one. The website is not held back by any of this: only the
+bot's own admission and polling wait.
+
+The limit of the timestamp policy is the clock: Telegram's `date` is its server's time, and a
+server clock (either side's) wrong by more than the margin can refuse a fresh message or, in
+principle, let an old one through once its marker has been purged. The window is 48 hours of
+marker against 24 hours of Telegram retention, so both would have to be wrong together. Missing
+or malformed dates fail closed, and so does a date that is not a finite moment. The policies
+judge messages to the assistant only: commands, button clicks and other updates do not create a
+turn and are not admitted.
 
 This is a promise about the assistant, not "exactly once" delivery. An answer can reach Telegram
 twice (the first send may have been lost on the way), and an acknowledged message that was being
@@ -133,7 +232,8 @@ as one that was not answered). Updates are acknowledged to Telegram by the next 
 which the loop makes as soon as the updates are handed to handlers; the offset lives in memory
 only and has nothing to do with answering. So an unfinished handler is not delivered again after
 a restart (it was acknowledged); a redelivery is the rare case in which the acknowledging call
-itself did not reach Telegram.
+itself did not reach Telegram. While the ledger is not ready no updates are read at all, so
+there is nothing to acknowledge and nothing is lost.
 
 From the website to Telegram. The runner tells this class when a turn has completed
 (on_completion). A turn that came from the website is copied to the person's Telegram chat,
@@ -143,6 +243,13 @@ loop prevention (the bot also never receives its own messages). A replayed turn 
 completion, so a retry of a web request does not copy it twice. The copy is sent from a task of
 its own: the website's answer does not wait for Telegram and is not affected by it.
 
+Which website turns are copied. While the person has made no Telegram conversation selection,
+every completed website turn is copied, as before (KHD-36). Once a selection row exists --
+made by /dialogs or /new -- only turns of the selected conversation are copied; a turn in any
+other conversation is dropped, and so is every one while the selected conversation is in its
+deleted (NULL) state. The question is asked under the chat lock, which a selection also takes,
+so the copy is judged by the selection either entirely before or entirely after a switch.
+
 One consumer, one instance. Telegram lets exactly one getUpdates consumer read a token, and none
 while a webhook is set; a second reader (another copy of this application, the old bot.py, an n8n
 Telegram trigger) answers 409 to whichever asks second. The bot never sets, reads or deletes a
@@ -151,10 +258,11 @@ webhook and never takes the token over: it reads nothing, says so (below) and tr
 When it is not working, it says so. The first getUpdates after start asks for no wait, so a
 refused token (401) or a second consumer (409) shows within a second, not after a long poll. While
 the last getUpdates failed, `failure` is the category of the failure ("api:409", "api:401",
-"network"...) and None otherwise; the pairing routes read it (telegram_api.py), so the website
-neither offers to connect a bot that is not reading nor shows a connected one as working. The log
-has a line for the start ("The Telegram bot is polling"), one error line when polling is blocked or
-refused, and one for the recovery. That is the whole signal: no metric, no probe, and /healthz
+"network"...); while the admission ledger cannot be prepared it is "ledger"; and it is None
+otherwise. The pairing routes read it (telegram_api.py), so the website neither offers to connect
+a bot that is not reading nor shows a connected one as working. The log has a line for the start
+("The Telegram bot is polling"), one error line when polling is blocked, refused or held back by
+the ledger, and one for the recovery. That is the whole signal: no metric, no probe, and /healthz
 stays a liveness check of the process.
 
 What is logged: fixed words and the names of exception classes, and the Bot API's numeric
@@ -167,9 +275,13 @@ import logging
 import re
 from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from sqlalchemy.exc import IntegrityError
 
 from house_helper.core.recipes import MAX_RECIPES_PER_REPLY
 from house_helper.persistence import attachments as photos
@@ -199,6 +311,21 @@ logger = logging.getLogger("house_helper.web.telegram")
 # the bound is for a flood from somebody who is not one of them (each of those is cheap).
 MAX_IN_FLIGHT = 64
 
+# Telegram's documented update retention: getUpdates returns updates from the last 24 hours.
+# An update dated further in the past cannot arrive from Telegram legitimately, so it is
+# refused rather than admitted as new after its ledger marker has been purged (the marker
+# lives 48 hours, twice this). The margin absorbs a difference between Telegram's clock and
+# the server's. An update dated in the future is refused beyond its own margin: Telegram's
+# server clock cannot be ahead of ours by more than that, and an unbounded future date would
+# stay "fresh" after its marker expires (the marker ages from admission, the message date
+# does not move). Without a valid date the update is refused (fail closed). This policy is
+# about the assistant's turn: commands and button clicks are not admitted and are not judged
+# by it. See "Order and duplicates" in the module docstring for the exact guarantee.
+UPDATE_RETENTION = timedelta(hours=24)
+UPDATE_CLOCK_SKEW = timedelta(minutes=5)
+UPDATE_REPLAY_HORIZON = UPDATE_RETENTION + UPDATE_CLOCK_SKEW
+UPDATE_FUTURE_SKEW = timedelta(minutes=5)
+
 # A stranger gets the notice at most this often, and the table of who was told is bounded.
 NOTICE_INTERVAL = timedelta(minutes=10)
 # A sender may present this many unusable pairing codes in the window, and then is not
@@ -224,10 +351,15 @@ HELP = (
     "Сохранять рецепты в избранное можно кнопкой под ответом помощника (когда она есть) "
     "или на сайте House Helper, а открыть сохраненное — командой /favorites. Редактировать "
     "рецепты и заметки можно на сайте House Helper.\n\n"
-    "Этот разговор общий с сайтом House Helper: начатое там можно продолжить здесь, "
-    "и наоборот. Все, что вы пишете помощнику на сайте, вместе с его ответом я пересылаю сюда; "
-    "чтобы это прекратить, отключите Telegram командой /unlink или на сайте.\n\n"
+    "Разговоры общие с сайтом House Helper. Пока в Telegram не выбран разговор, я отвечаю "
+    "в самом свежем, и все, что вы пишете помощнику на сайте, вместе с его ответом пересылаю "
+    "сюда; после выбора — только из выбранного разговора. Чтобы это прекратить, отключите "
+    "Telegram командой /unlink или на сайте.\n\n"
+    "Команда /dialogs показывает все ваши разговоры (время — по Москве, МСК) и позволяет "
+    "продолжить любой из них здесь; /new начинает новый. Выбор в Telegram не меняет "
+    "разговор, который открывает сайт.\n\n"
     "Команды:\n"
+    "/dialogs — выбрать разговор\n"
     "/new — начать новый разговор\n"
     "/favorites — избранное\n"
     "/unlink — отключить Telegram от аккаунта\n"
@@ -236,12 +368,14 @@ HELP = (
 
 # The native command menu (setMyCommands), the whole list, in this order. The descriptions
 # are what Telegram shows under the menu button, so they say what the command is for without
-# repeating the command. The list is deliberately the three a person needs to find their way;
-# /new and /unlink remain available and are listed in HELP. No BotFather configuration is
+# repeating the command. The list is deliberately the four a person needs to find their way;
+# /start stays functional (a greeting, and the payload of a pairing link) but is not in the
+# menu, and /unlink remains available and is listed in HELP. No BotFather configuration is
 # needed for this call, and none is made or read.
 BOT_COMMANDS = [
+    {"command": "dialogs", "description": "🗂 Диалоги"},
+    {"command": "new", "description": "✏️ Новый диалог"},
     {"command": "favorites", "description": "📚 Избранное"},
-    {"command": "start", "description": "🏠 Начало"},
     {"command": "help", "description": "ℹ️ Помощь"},
 ]
 
@@ -255,8 +389,9 @@ NOT_LINKED = (
 
 LINKED = (
     "Готово! Telegram подключен к вашему аккаунту House Helper.\n\n"
-    "Пишите мне сюда: разговор общий с сайтом. С этого момента все, что вы пишете помощнику "
-    "на сайте, и его ответы будут приходить и сюда. Подсказка — /help.\n\n" + PRIVACY
+    "Пишите мне сюда: разговор общий с сайтом. Пока в Telegram не выбран разговор, все, что "
+    "вы пишете помощнику на сайте, и его ответы будут приходить и сюда; после выбора — только "
+    "из выбранного разговора. Подсказка — /help.\n\n" + PRIVACY
 )
 ALREADY_LINKED = "Этот Telegram уже подключен к вашему аккаунту. Можно писать, подсказка — /help."
 BAD_CODE = (
@@ -290,6 +425,31 @@ BINDING_CHANGED = (
 NOT_RUN_AGAIN = (
     "Ответ на это сообщение уже начинали готовить, но он не был получен, и повторно я его не запрашиваю. "
     "Если сообщение еще нужно, напишите его заново."
+)
+REDELIVERY_GONE = (
+    "Диалог, к которому относилось это сообщение, был удален. "
+    "Если сообщение еще нужно, напишите его заново."
+)
+# Fixed refusals with nothing of the message in them. The first is said when the admission
+# ledger proves the update was admitted before and its record is gone: the same words go to
+# the first owner and to whoever the account belongs to now, so they reveal neither. The
+# others are the timestamp policy (too old, too far in the future, or no usable date) and the
+# cutover policy (UPDATE_RETENTION, below).
+ALREADY_PROCESSED = (
+    "Это сообщение уже было принято раньше, поэтому повторно я его не обрабатываю. "
+    "Если оно еще нужно, напишите его заново."
+)
+STALE_UPDATE = (
+    "Это сообщение отправлено слишком давно, поэтому я не могу его обработать. "
+    "Напишите его, пожалуйста, еще раз."
+)
+FUTURE_UPDATE = (
+    "Время отправки этого сообщения находится в будущем, поэтому я не могу его обработать. "
+    "Напишите его, пожалуйста, еще раз."
+)
+PRE_MIGRATION_UPDATE = (
+    "Это сообщение было отправлено до обновления сервиса, поэтому я не могу его обработать. "
+    "Напишите его, пожалуйста, еще раз."
 )
 
 # --- saving a recipe from a button --------------------------------------------------------
@@ -492,6 +652,170 @@ def _open_favorites(page: int = 0) -> dict[str, Any]:
     }
 
 
+# --- choosing a conversation ----------------------------------------------------------------
+
+# The dialogs list: how many conversations one page shows, and the callback shapes. A page
+# is a window on the same ordering the website uses (newest activity first, ties by id).
+# A page callback is "dl:<page>"; a selection callback is "ds:<32 hex digits of the id>:<the
+# page it was opened from>", so the confirmation can lead back to that page. Both fit
+# Telegram's 64-byte callback_data limit: a page of at most 18 digits is 21 bytes after the
+# longest prefix ("dl:"), and 10^18 pages of eight are far past any list this product can
+# hold. There is no fixed page ceiling: a page is clamped to the list actually read, so
+# every conversation is reachable. A number with more than 18 digits is not a page this bot
+# writes, and is answered without reading the database.
+DIALOGS_PAGE_SIZE = 8
+DIALOGS_LIST_PREFIX = "dl"
+DIALOGS_SELECT_PREFIX = "ds"
+PAGE_DIGITS = 18
+
+DIALOGS_HEADER = "🗂 Ваши диалоги."
+DIALOGS_HINT = (
+    "Нажмите на диалог, чтобы продолжить его в Telegram. "
+    "Время — последнего сообщения, по Москве (МСК)."
+)
+DIALOGS_EMPTY = "Диалогов пока нет. Напишите сообщение, и я начну первый."
+DIALOGS_DELETED_NOTE = "Выбранный диалог был удален. Следующее сообщение начнет новый."
+DIALOGS_UNAVAILABLE = "Не удалось открыть список диалогов. Попробуйте еще раз чуть позже."
+DIALOG_UNAVAILABLE = "Этот диалог больше недоступен. Откройте /dialogs и выберите другой."
+DIALOG_SELECT_FAILED = "Не удалось выбрать диалог. Попробуйте еще раз чуть позже."
+DIALOG_SELECTED = (
+    "🗂 Выбран диалог: «{title}».\n\n"
+    "Продолжайте писать — помощник учтет его контекст."
+)
+DIALOG_SELECTED_UNTITLED = (
+    "🗂 Диалог выбран.\n\nПродолжайте писать — помощник учтет его контекст."
+)
+DIALOG_DELETED = (
+    "Этот диалог был удален, поэтому ответ сохранить не удалось. "
+    "Напишите сообщение еще раз."
+)
+DIALOG_UNTITLED = "Без названия"
+DIALOGS_BACK = "🗂 К диалогам"
+
+# The product shows conversation times in Moscow time and says so. Europe/Moscow is UTC+3
+# and has no daylight saving since 2014; a host (or an image) without the tz database
+# falls back to that fixed offset, which gives the same wall time for the data this
+# product keeps. The label is always the product's own, never a locale's.
+try:
+    _MOSCOW = ZoneInfo("Europe/Moscow")
+except ZoneInfoNotFoundError:  # pragma: no cover - depends on the host's tz database
+    _MOSCOW = timezone(timedelta(hours=3), "МСК")
+MOSCOW_LABEL = "МСК"
+
+_DIALOGS_LIST_CALLBACK = re.compile(rf"dl:([0-9]{{1,{PAGE_DIGITS}}})")
+_DIALOG_SELECT_CALLBACK = re.compile(rf"ds:([0-9a-f]{{32}}):([0-9]{{1,{PAGE_DIGITS}}})")
+
+
+def _moscow_time(moment: datetime) -> str:
+    """The instant as the dialogs list shows it: date, time and the explicit МСК label."""
+    if moment.tzinfo is None:  # (the database's timestamps are timezone-aware UTC)
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(_MOSCOW).strftime("%d.%m.%Y %H:%M") + " " + MOSCOW_LABEL
+
+
+def _dialog_page(data: Any) -> Optional[int]:
+    """The page number named by a dialogs-list button, or None when the callback is not
+    one this bot writes. Only the exact shape is accepted (including at most PAGE_DIGITS
+    digits); whether the page exists is decided against the list actually read, so a stale
+    or made-up page opens the last page instead of a fixed ceiling."""
+    if not isinstance(data, str):
+        return None
+    found = _DIALOGS_LIST_CALLBACK.fullmatch(data)
+    if found is None:
+        return None
+    return int(found.group(1))
+
+
+def _dialog_target(data: Any) -> Optional[tuple[UUID, int]]:
+    """(conversation id, page to return to) named by a selection button, or None.
+
+    The id is only a name to look up for the sender's user; it is never an authorization.
+    Only the exact shape this bot writes is accepted (including at most PAGE_DIGITS
+    digits); the page is clamped against the list actually read when it is used."""
+    if not isinstance(data, str):
+        return None
+    found = _DIALOG_SELECT_CALLBACK.fullmatch(data)
+    if found is None:
+        return None
+    try:
+        return UUID(hex=found.group(1)), int(found.group(2))
+    except ValueError:  # not reachable with the 32 hex digits the pattern requires
+        return None
+
+
+@dataclass(frozen=True)
+class _DialogsPage:
+    """One page of the user's conversations, with the page it settled on (a page that no
+    longer exists falls back to the last one) and the conversation the chat would use now."""
+
+    conversations: list[conversations.ConversationSummary]
+    page: int
+    pages: int
+    total: int
+    active_id: Optional[UUID]  # what a Telegram message would go to, when there is one
+    selected_deleted: bool  # the explicit selection points at a conversation that is gone
+
+
+def _dialog_label(item: conversations.ConversationSummary, *, active: bool) -> str:
+    """One conversation's button: the product's Moscow time, then the derived title, with
+    a check mark for the conversation the chat is working in. The label is bounded the way
+    every button of this bot is; the bound cuts the title, never the time."""
+    title = " ".join(item.title.split()) if item.title else DIALOG_UNTITLED
+    prefix = "✓ " if active else ""
+    return _bounded_label(f"{prefix}{_moscow_time(item.updated_at)} — {title}")
+
+
+def _dialogs_view(page: _DialogsPage) -> tuple[str, Optional[dict[str, Any]]]:
+    """The message and keyboard for one page of the user's conversations.
+
+    The order is the one list_conversations returns (newest activity first, ties by id):
+    the page is a window on that list, so the same list always gives the same buttons in
+    the same order. An empty list is the friendly empty state with no keyboard; a
+    selection whose conversation was deleted is said in words, and no button pretends to
+    be that conversation."""
+    if page.total == 0:
+        text = DIALOGS_EMPTY
+        if page.selected_deleted:
+            text += "\n\n" + DIALOGS_DELETED_NOTE
+        return text, None
+    lines = [DIALOGS_HEADER]
+    if page.pages > 1:
+        lines.append(f"Страница {page.page + 1} из {page.pages}.")
+    if page.selected_deleted:
+        lines.append(DIALOGS_DELETED_NOTE)
+    lines.extend(["", DIALOGS_HINT])
+    rows = [
+        [
+            {
+                "text": _dialog_label(item, active=item.id == page.active_id),
+                "callback_data": f"{DIALOGS_SELECT_PREFIX}:{item.id.hex}:{page.page}",
+            }
+        ]
+        for item in page.conversations
+    ]
+    navigation = []
+    if page.page > 0:
+        navigation.append(
+            {"text": "◀ Назад", "callback_data": f"{DIALOGS_LIST_PREFIX}:{page.page - 1}"}
+        )
+    if page.page < page.pages - 1:
+        navigation.append(
+            {"text": "Далее ▶", "callback_data": f"{DIALOGS_LIST_PREFIX}:{page.page + 1}"}
+        )
+    if navigation:
+        rows.append(navigation)
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def _dialogs_back(page: int) -> dict[str, Any]:
+    """The keyboard under a selection confirmation: one way back to the page it was made from."""
+    return {
+        "inline_keyboard": [
+            [{"text": DIALOGS_BACK, "callback_data": f"{DIALOGS_LIST_PREFIX}:{page}"}]
+        ]
+    }
+
+
 def _save_keyboard(recipes: tuple[StoredRecipe, ...]) -> Optional[dict[str, Any]]:
     """The inline keyboard under an answer that carries recipes: one button per recipe, in
     answer order. None when there are none, so an ordinary answer has no controls at all."""
@@ -516,6 +840,41 @@ def _save_keyboard(recipes: tuple[StoredRecipe, ...]) -> Optional[dict[str, Any]
 def _count(value: Any) -> Optional[int]:
     """A non-negative integer the Bot API sent, or None (a bool is not one)."""
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _message_moment(message: dict[str, Any]) -> Optional[datetime]:
+    """When Telegram says the message was sent (its `date`, Unix seconds), as UTC; None
+    when the field is missing, not a positive integer or not a representable moment. The
+    date is Telegram's server time, not the sender's device clock."""
+    date = message.get("date")
+    if not isinstance(date, int) or isinstance(date, bool) or date <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(date, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _update_timestamp_problem(message: dict[str, Any], now: datetime) -> Optional[str]:
+    """Why the message's own `date` cannot be admitted, or None when it can.
+
+    "invalid"  missing, not a positive integer or not a representable moment;
+    "past"     more than UPDATE_REPLAY_HORIZON before `now`;
+    "future"   more than UPDATE_FUTURE_SKEW after `now`.
+
+    The policy judges the update Telegram delivered, independently of whether a surviving
+    turn request or an admission marker knows it: once its own date is outside the window,
+    no ledger record can make it a message this process may run. A missing or malformed
+    date is refused (fail closed): Telegram always sends one, so the safe answer is "do not
+    admit it". The date is Telegram's server time, not the sender's device clock."""
+    moment = _message_moment(message)
+    if moment is None:
+        return "invalid"
+    if now - moment > UPDATE_REPLAY_HORIZON:
+        return "past"
+    if moment - now > UPDATE_FUTURE_SKEW:
+        return "future"
+    return None
 
 
 def _display_name(sender: dict[str, Any]) -> Optional[str]:
@@ -566,6 +925,23 @@ class Delivery(enum.Enum):
     REFUSED = "refused"  # the account is no longer the enrolled sender of that user: nothing sent
 
 
+class LedgerState(enum.Enum):
+    """Whether the update admission ledger may admit new messages yet (KHD-42).
+
+    PENDING  nothing has been attempted in this process;
+    PREPARING the cutover row and the backfill are being written; no admission may begin
+              while this is true, because a failure leaves the cutover unknown;
+    READY    the cutover and the recovered markers are committed: admissions may proceed;
+    FAILED   the last preparation raised. Nothing was committed; admissions are refused
+              and polling acknowledges nothing until a retry succeeds.
+    """
+
+    PENDING = "pending"
+    PREPARING = "preparing"
+    READY = "ready"
+    FAILED = "failed"
+
+
 class TelegramChat:
     """The bot. start() begins polling, aclose() stops it and lets what it is doing finish.
 
@@ -603,13 +979,30 @@ class TelegramChat:
         self._binding_locks: dict[int, list] = {}  # chat id -> [lock, users]: tie vs. delivery
         self._told: "OrderedDict[int, datetime]" = OrderedDict()
         self._bad_codes: "OrderedDict[int, deque[datetime]]" = OrderedDict()
+        # The update admission ledger's readiness (KHD-42). New messages are admitted only
+        # while it is READY: PENDING/PREPARING/FAILED all refuse, and polling does not even
+        # read updates until a preparation has committed. The lock makes preparation
+        # single-flight (the poller and a handler may both ask at the same moment).
+        self._ledger = LedgerState.PENDING
+        self._ledger_lock = asyncio.Lock()
+        # When the update admission ledger began for this bot (persistence.telegram's cutover
+        # row), None until a preparation has committed. An update dated before it is a
+        # pre-migration update (see _chat_turn).
+        self._cutover_at: Optional[datetime] = None
+        # The instant this process started: the cutover a first preparation writes. A retry
+        # after a failed preparation must not move the cutover forward, or the updates that
+        # arrived during the failure (not acknowledged, still Telegram's to redeliver) would
+        # be refused as pre-migration ones.
+        self._started_at = clock()
 
     # --- lifecycle ------------------------------------------------------------------------
 
     @property
     def failure(self) -> Optional[str]:
         """None while polling works (and before the first failure); otherwise the category of
-        the failure of the last getUpdates ("api:409", "api:401", "network", ...)."""
+        the failure of the last getUpdates ("api:409", "api:401", "network", ...), or "ledger"
+        while the update admission ledger cannot be prepared (polling has not started, so no
+        update is acknowledged or lost)."""
         return self._failure
 
     def start(self) -> None:
@@ -698,7 +1091,75 @@ class TelegramChat:
         self._announced = True
         self._failure = None
 
+    async def _prepare_admissions(self) -> bool:
+        """Prepare the update admission ledger: the cutover row (written once per bot) and the
+        markers recoverable from the last 48 hours of turn requests. True when the ledger is
+        READY.
+
+        This is fail-closed. A failed preparation leaves the ledger FAILED and commits
+        NOTHING (its transaction rolls back the cutover row and every recovered marker), so
+        no message is admitted until a retry has succeeded: an unknown cutover must never
+        silently weaken the pre-migration rule, and a half-recovered ledger must not claim
+        markers it does not have. The poller retries with a backoff and acknowledges nothing
+        meanwhile; a handler retries too, and refuses the message if the retry fails as well.
+        The error line names the exception's class only (never a token, id or message).
+
+        The cutover written by a retry is the instant this process started, not the retry's
+        own instant: the updates that arrived during the failure were not acknowledged and
+        are still Telegram's to redeliver, so they must not be refused as pre-migration ones.
+        """
+        async with self._ledger_lock:
+            if self._ledger is LedgerState.READY:
+                return True
+            retrying = self._ledger is LedgerState.FAILED
+            self._ledger = LedgerState.PREPARING
+            try:
+                ledger = await self._database.run(
+                    lambda session: store.initialize_update_admissions(
+                        session,
+                        self._settings.bot_id,
+                        now=self._clock(),
+                        cutover_at=self._started_at,
+                    )
+                )
+            except asyncio.CancelledError:
+                # (The unit may still be finishing on its thread; nothing was marked ready.)
+                self._ledger = LedgerState.PENDING
+                raise
+            except Exception as exc:
+                self._ledger = LedgerState.FAILED
+                self._failure = "ledger"
+                if retrying:
+                    logger.warning(
+                        "The Telegram update ledger is still not ready: category=%s",
+                        type(exc).__name__,
+                    )
+                else:
+                    logger.error(
+                        "The Telegram update ledger could not be prepared: category=%s. "
+                        "No update is admitted or acknowledged until it can be; retrying.",
+                        type(exc).__name__,
+                    )
+                return False
+            self._cutover_at = ledger.cutover_at
+            self._ledger = LedgerState.READY
+            logger.info(
+                "The Telegram update ledger is ready: backfilled=%d", ledger.backfilled
+            )
+            return True
+
     async def _poll(self) -> None:
+        # Nothing is read before the ledger is ready: the next getUpdates call is what
+        # acknowledges the updates of the previous one, so polling while a preparation is
+        # not committed would acknowledge updates this process cannot admit and lose them
+        # (the offset lives in memory only). A failure is retried here with a backoff;
+        # Telegram keeps the updates meanwhile.
+        delay = 1.0
+        while not self._closing and not await self._prepare_admissions():
+            await self._sleep(delay)
+            delay = min(delay * 2, 60.0)
+        if self._closing:
+            return
         offset: Optional[int] = None
         delay = 1.0
         started = False
@@ -784,7 +1245,9 @@ class TelegramChat:
             return None
         update_id = _count(update.get("update_id"))
         message = update.get("message")
-        if update_id is None or not isinstance(message, dict):
+        # `not update_id`: 0 is not an update id either (Telegram's start positive), and the
+        # admission ledger's shapes reserve 0 for the bot's cutover row.
+        if not update_id or not isinstance(message, dict):
             return None
         sender, chat = message.get("from"), message.get("chat")
         if not isinstance(sender, dict) or not isinstance(chat, dict):
@@ -811,31 +1274,53 @@ class TelegramChat:
             or data.startswith(FAVORITES_OPEN_PREFIX + ":")
         )
 
-    async def _handle_callback(self, query: Any) -> None:
-        """One callback query: save a recipe, open the favorites list or open one favorite,
-        always for the user its SENDER is tied to, and acknowledge the click in every case.
+    @staticmethod
+    def _dialogs_callback(data: Any) -> bool:
+        """True when `data` names a dialogs action (a list page or a conversation),
+        whether or not its shape is valid. As _favorites_callback: only the notice."""
+        return isinstance(data, str) and (
+            data.startswith(DIALOGS_LIST_PREFIX + ":")
+            or data.startswith(DIALOGS_SELECT_PREFIX + ":")
+        )
 
-        The callback data is only a name -- (message id, recipe position), a page number, or
-        (favorite id, page to return to). It is not trusted for identity: the account comes
-        from the update, the user from the current Telegram link, and everything read from
-        the database is found through that user. A click on somebody else's button, a recipe
-        deleted since, an account with no link and a malformed payload are all answered with
-        fixed Russian words and change nothing. None of these paths calls the assistant.
+    @staticmethod
+    def _callback_notice(data: Any, *, save_failure: bool = False) -> str:
+        """The fixed notice a click this bot cannot use is answered with. It depends on
+        the kind the payload says it is, never on anything read from the database."""
+        if isinstance(data, str) and data.startswith(DIALOGS_SELECT_PREFIX + ":"):
+            return DIALOG_UNAVAILABLE
+        if isinstance(data, str) and data.startswith(DIALOGS_LIST_PREFIX + ":"):
+            return DIALOGS_UNAVAILABLE
+        if TelegramChat._favorites_callback(data):
+            return FAVORITES_UNAVAILABLE
+        return SAVE_FAILED if save_failure else RECIPE_UNAVAILABLE
+
+    async def _handle_callback(self, query: Any) -> None:
+        """One callback query: choose a conversation, save a recipe, open the favorites
+        list or open one favorite, always for the user its SENDER is tied to, and
+        acknowledge the click in every case.
+
+        The callback data is only a name -- (message id, recipe position), a page number,
+        (conversation id, page to return to) or (favorite id, page to return to). It is
+        not trusted for identity: the account comes from the update, the user from the
+        current Telegram link, and everything read from the database is found through that
+        user. A click on somebody else's button, a conversation or recipe deleted since, an
+        account with no link and a malformed payload are all answered with fixed Russian
+        words and change nothing. None of these paths calls the assistant.
 
         Never raises (cancellation excepted). A callback is answered even when nothing was
-        done, so a client's button never spins forever."""
+        done, so a client's button never spins forever. A selection is acknowledged before
+        it waits for the chat's turn: an answer being prepared holds that lock for the
+        provider call, and the client's button must not spin meanwhile."""
         if not isinstance(query, dict):
             return
         callback_id = query.get("id")
         if not isinstance(callback_id, str) or not 0 < len(callback_id) <= 256:
             return  # there is nothing to answer with
         data = query.get("data")
-        favorites_callback = self._favorites_callback(data)
         account, usable = self._callback_sender(query)
         if account is None or not usable:
-            await self._answer_callback(
-                callback_id, FAVORITES_UNAVAILABLE if favorites_callback else RECIPE_UNAVAILABLE
-            )
+            await self._answer_callback(callback_id, self._callback_notice(data))
             return
         try:
             bound = await self._bound_user(account)
@@ -844,13 +1329,48 @@ class TelegramChat:
         except Exception as exc:
             logger.error("A Telegram callback could not be authorized: category=%s", type(exc).__name__)
             await self._answer_callback(
-                callback_id, FAVORITES_UNAVAILABLE if favorites_callback else SAVE_FAILED
+                callback_id, self._callback_notice(data, save_failure=True)
             )
             return
         if bound is None:
             await self._answer_callback(callback_id, CALLBACK_NOT_LINKED)
             return
 
+        if isinstance(data, str) and data.startswith(DIALOGS_LIST_PREFIX + ":"):
+            page = _dialog_page(data)
+            if page is None:
+                await self._answer_callback(callback_id, DIALOGS_UNAVAILABLE)
+                return
+            # Acknowledge before the read waits for the chat's turn: an answer being
+            # prepared holds that lock, and the client's button must not spin meanwhile.
+            await self._answer_callback(callback_id, "")
+            try:
+                await self._show_dialogs(account, bound, page)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "A Telegram dialogs list could not be sent: category=%s",
+                    type(exc).__name__,
+                )
+            return
+        if isinstance(data, str) and data.startswith(DIALOGS_SELECT_PREFIX + ":"):
+            target = _dialog_target(data)
+            if target is None:
+                await self._answer_callback(callback_id, DIALOG_UNAVAILABLE)
+                return
+            conversation_id, page = target
+            await self._answer_callback(callback_id, "")
+            try:
+                await self._select_from_callback(account, bound, conversation_id, page)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "A Telegram conversation could not be selected: category=%s",
+                    type(exc).__name__,
+                )
+            return
         if isinstance(data, str) and data.startswith(FAVORITES_LIST_PREFIX + ":"):
             page = _favorites_page(data)
             if page is None:
@@ -914,6 +1434,133 @@ class TelegramChat:
                 )
             return
         await self._save_from_callback(callback_id, account, bound, data)
+
+    # --- choosing a conversation ---------------------------------------------------------------
+
+    async def _read_dialogs(self, user_id: UUID, page: int) -> _DialogsPage:
+        """One page of the user's conversations, with the page it settled on and the
+        conversation the chat would use now. A snapshot read in one transaction: nothing is
+        written, no provider is called, and the conversation's activity time is not moved.
+
+        A page beyond the last one falls back to the last page, so a stale "Далее" button
+        cannot open an empty page, and every conversation is reachable however many pages
+        there are. The active conversation is the explicit selection; while there is no
+        selection row it is the latest conversation, which is where a message would go (the
+        legacy behaviour)."""
+        now = self._clock()
+
+        def read(session: Any) -> _DialogsPage:
+            total = conversations.count_conversations(session, user_id)
+            pages = max(1, (total + DIALOGS_PAGE_SIZE - 1) // DIALOGS_PAGE_SIZE)
+            settled = max(0, min(page, pages - 1))
+            listing = conversations.list_conversations(
+                session,
+                user_id,
+                now=now,
+                limit=DIALOGS_PAGE_SIZE,
+                offset=settled * DIALOGS_PAGE_SIZE,
+            )
+            selection = store.active_conversation(session, user_id)
+            if selection is None:
+                active = store.latest_conversation_id(session, user_id)
+                deleted = False
+            else:
+                active = selection.conversation_id
+                deleted = selection.conversation_id is None
+            return _DialogsPage(
+                listing.conversations, settled, pages, total, active, deleted
+            )
+
+        return await self._database.run(read)
+
+    async def _show_dialogs(self, account: int, user_id: UUID, page: int) -> None:
+        """Read, render and send one page of the list, all under the chat lock and the
+        binding check all owned sends use.
+
+        The read is under the same lock as the delivery, so the list reflects every
+        selection whose turn came before this one: a selection queued first writes (and its
+        run_to_completion unit ends) before this lock is taken, and a click on a page waits
+        for an answer being prepared exactly as a selection does. A read that fails is said
+        in fixed words; a tie that is gone is refused and said."""
+        async with self._chat_lock(account):
+            try:
+                view = await self._read_dialogs(user_id, page)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "The Telegram dialogs list could not be read: category=%s",
+                    type(exc).__name__,
+                )
+                text, markup = DIALOGS_UNAVAILABLE, None
+            else:
+                text, markup = _dialogs_view(view)
+            if await self._deliver(account, user_id, text, reply_markup=markup) is Delivery.REFUSED:
+                await self._refuse_stale(account)
+
+    async def _select_from_callback(
+        self, account: int, user_id: UUID, conversation_id: UUID, page: int
+    ) -> None:
+        """Select the conversation the click names, for the user the click was authorized
+        for, then send one short confirmation with the way back to `page`.
+
+        The chat lock is taken for the write and the send: it is the lock a message to the
+        assistant holds from its first check to the delivery of its answer, so a selection
+        falls entirely before or entirely after one message's turn, never into the middle
+        of it. The write is a run_to_completion unit, so a cancelled selection keeps the
+        lock until its transaction has ended and cannot be overwritten by a later one that
+        commits first. The persistence function checks ownership and the tie itself; a
+        conversation deleted between the button and the click -- including one deleted
+        inside this very transaction, which the foreign key refuses -- is one fixed
+        "unavailable" notice, any other database failure is a fixed failure notice, and
+        the previous selection is left in place. The tie is checked again by _deliver
+        before anything is sent. The context itself is not replayed: the conversation is
+        restored where it is stored, and the next message continues it."""
+        now = self._clock()
+        async with self._chat_lock(account):
+            if await self._bound_user(account) != user_id:
+                await self._refuse_stale(account)
+                return
+            try:
+                summary = await self._database.run_to_completion(
+                    lambda session: store.select_conversation(
+                        session,
+                        user_id,
+                        conversation_id,
+                        now=now,
+                        telegram_user_id=account,
+                    )
+                )
+            except asyncio.CancelledError:
+                raise
+            except IntegrityError as exc:
+                # The target conversation was deleted between the ownership read and the
+                # cursor write, and the foreign key refused the row. Nothing was written:
+                # the previous selection stands, and the person is told the conversation is
+                # unavailable rather than that the selection failed for an unknown reason.
+                logger.warning(
+                    "A Telegram conversation selection was refused by the database: category=%s",
+                    type(exc).__name__,
+                )
+                text = DIALOG_UNAVAILABLE
+            except Exception as exc:
+                logger.error(
+                    "A Telegram conversation could not be selected: category=%s",
+                    type(exc).__name__,
+                )
+                text = DIALOG_SELECT_FAILED
+            else:
+                if summary is None:
+                    text = DIALOG_UNAVAILABLE
+                elif summary.title:
+                    text = DIALOG_SELECTED.format(title=" ".join(summary.title.split()))
+                else:
+                    text = DIALOG_SELECTED_UNTITLED
+            outcome = await self._deliver(
+                account, user_id, text, reply_markup=_dialogs_back(page)
+            )
+            if outcome is Delivery.REFUSED:
+                await self._refuse_stale(account)
 
     async def _read_favorites(self, user_id: UUID) -> list[favorites.FavoriteSummary]:
         """The user's favorites through the website's own read service. A snapshot read;
@@ -1079,10 +1726,17 @@ class TelegramChat:
             await self._on_command(account, user_id, command[0])
             return
         if isinstance(message.get("photo"), list) and message["photo"]:
-            await self._chat_turn(account, user_id, update_id, message.get("caption"), message["photo"])
+            await self._chat_turn(
+                account,
+                user_id,
+                update_id,
+                message.get("caption"),
+                message["photo"],
+                message=message,
+            )
             return
         if isinstance(text, str):
-            await self._chat_turn(account, user_id, update_id, text)
+            await self._chat_turn(account, user_id, update_id, text, message=message)
             return
         await self._say(account, UNSUPPORTED)
 
@@ -1115,15 +1769,10 @@ class TelegramChat:
                 return
             text, markup = _favorites_view(kept, 0)
             await self._send_favorites(account, user_id, text, markup)
+        elif name == "dialogs":
+            await self._on_dialogs(account, user_id)
         elif name == "new":
-            now = self._clock()
-            started = await self._database.run(
-                lambda session: store.start_conversation_for(session, account, user_id, now=now)
-            )
-            if started is None:  # the tie was gone by the time it was this message's turn
-                await self._refuse_stale(account)
-            else:
-                await self._say(account, NEW_CONVERSATION)
+            await self._on_new(account, user_id)
         elif name == "unlink":
             if await self.unlink(user_id, account=account):
                 await self._say(account, UNLINKED)
@@ -1131,6 +1780,31 @@ class TelegramChat:
                 await self._refuse_stale(account)
         else:
             await self._say(account, UNKNOWN_COMMAND)
+
+    async def _on_dialogs(self, account: int, user_id: UUID) -> None:
+        """The /dialogs command: the first page of the user's conversations, newest
+        activity first, with the active one marked. A read; no assistant call, no write.
+        The read and the send are under the chat lock, so the list shows a selection that
+        was queued before it (see _show_dialogs)."""
+        await self._show_dialogs(account, user_id, 0)
+
+    async def _on_new(self, account: int, user_id: UUID) -> None:
+        """The /new command: make (or reuse, while it is still empty) a conversation and
+        select it, then confirm. The chat lock serializes the selection with a message
+        being processed and with the delivery of a completed turn, the same way a click on
+        a dialogs button is serialized, and the write is a run_to_completion unit so a
+        cancellation cannot release the lock before the transaction has ended. The
+        confirmation is sent with the tie checked again under the binding lock."""
+        now = self._clock()
+        async with self._chat_lock(account):
+            started = await self._database.run_to_completion(
+                lambda session: store.start_conversation_for(session, account, user_id, now=now)
+            )
+            if started is None:  # the tie was gone by the time it was this message's turn
+                await self._refuse_stale(account)
+                return
+            if await self._deliver(account, user_id, NEW_CONVERSATION) is Delivery.REFUSED:
+                await self._refuse_stale(account)
 
     async def _pair(self, account: int, message: dict[str, Any], code: str) -> None:
         now = self._clock()
@@ -1197,15 +1871,53 @@ class TelegramChat:
         update_id: int,
         raw: Any,
         sizes: Optional[list] = None,
+        *,
+        message: dict[str, Any],
     ) -> None:
         """One message to the assistant: `raw` is its text, or, with `sizes` (the sizes of a
-        photo that Telegram offers), its caption. `user_id` is who the sender was when the
-        update arrived; whether they still are is asked again once it is this message's turn."""
+        photo that Telegram offers), its caption; `message` is the update's message, whose
+        `date` the timestamp and cutover policies judge. `user_id` is who the sender was when
+        the update arrived; whether they still are is asked again once it is this message's
+        turn.
+
+        Before anything is fetched, selected, stored or asked of the assistant, four
+        questions are answered: is this account still the person's; is the admission ledger
+        ready (nothing may be admitted while its cutover and recovery are not committed); is
+        the message's own timestamp within the policy (independently of the ledger); and what
+        do the surviving turn requests and the marker say about this update. A duplicate, a
+        stale, future-dated, malformed or pre-migration update is answered with a fixed
+        Russian sentence and nothing else happens. See the module docstring, "Order and
+        duplicates"."""
         async with self._chat_lock(account):
             if await self._bound_user(account) != user_id:
                 await self._refuse_stale(account)  # before anything is fetched or asked of the assistant
                 return
-            if await self._database.run(lambda session: store.update_admitted_for_another(session, user_id, update_id)):
+            if not await self._prepare_admissions():
+                # Fail closed: without a committed cutover and recovery no new message may be
+                # admitted at all (an unknown cutover must not silently switch the pre-migration
+                # rule off). The handler asks again on the next message; polling is held back.
+                logger.error("A Telegram message was not admitted: the update ledger is not ready")
+                await self._say(account, TROUBLE)
+                return
+            problem = _update_timestamp_problem(message, self._clock())
+            if problem is not None:
+                # Its own `date`, before and independently of the ledger look: an update whose
+                # marker and conversation are gone must not become admissible again merely
+                # because no record of its admission survives, and no future date may stay
+                # replayable past the marker's window.
+                logger.warning(
+                    "A Telegram update was not processed: its timestamp is outside the policy (%s)",
+                    problem,
+                )
+                await self._say(account, FUTURE_UPDATE if problem == "future" else STALE_UPDATE)
+                return
+            key = store.update_key(update_id)
+            status = await self._database.run(
+                lambda session: store.update_admission_status(
+                    session, self._settings.bot_id, user_id, update_id, key
+                )
+            )
+            if status is store.AdmissionStatus.ADMITTED_ELSEWHERE:
                 # Telegram brought back an update that was admitted while this account was tied to
                 # somebody else. It is not this person's: nothing is read, fetched, stored or asked
                 # of the assistant, and what the first owner wrote or was answered goes nowhere.
@@ -1214,6 +1926,30 @@ class TelegramChat:
                 logger.warning("A redelivered Telegram update was dropped: it was admitted for another account")
                 await self._refuse_stale(account)
                 return
+            if status is store.AdmissionStatus.ADMITTED_GONE:
+                # Its own conversation (and the turn request in it) is gone, and the ledger
+                # proves it was admitted. Never run it again in another conversation, and never
+                # let the answer reach whoever the account belongs to now.
+                logger.warning(
+                    "A redelivered Telegram update was not run again: its conversation is gone and its admission is recorded"
+                )
+                await self._say(account, ALREADY_PROCESSED)
+                return
+            known_admitted = status is store.AdmissionStatus.ADMITTED_HERE
+            if status is store.AdmissionStatus.NEW:
+                # A message the ledger and the turn requests know nothing about: it is new only
+                # if it could have come from Telegram at all. The timestamp policy above has
+                # already refused one that could not; one dated before the ledger's cutover is a
+                # pre-migration update whose provenance is gone. Refused, before anything is
+                # done.
+                moment = _message_moment(message)
+                cutover = self._cutover_at
+                if cutover is not None and moment is not None and moment < cutover:
+                    logger.warning(
+                        "A Telegram update was not processed: it predates the admission ledger"
+                    )
+                    await self._say(account, PRE_MIGRATION_UPDATE)
+                    return
             try:
                 if sizes is not None and not (isinstance(raw, str) and raw.strip()):
                     text = photos.PHOTO_PLACEHOLDER
@@ -1226,7 +1962,6 @@ class TelegramChat:
             if runner is None:
                 await self._say(account, "Помощник сейчас недоступен. Попробуйте позже.")
                 return
-            key = store.update_key(update_id)
             async with self._typing(account):
                 attachment_id = None
                 if sizes is not None:
@@ -1238,43 +1973,175 @@ class TelegramChat:
                         attachment_id = await self._take_photo(account, user_id, sizes)
                         if attachment_id is None:
                             return
-                conversation_id = await self._conversation_for(user_id, key)
-                correlation_id = new_correlation_id()
                 try:
-                    result = await runner.submit(
-                        user_id=user_id,
-                        conversation_id=conversation_id,
-                        idempotency_key=key,
-                        text=text,
-                        correlation_id=correlation_id,
-                        route="telegram",
-                        origin=TELEGRAM_CHANNEL,
-                        attachment_id=attachment_id,
-                        reclaim=False,  # nobody chose to send this again: Telegram did, by itself
-                        # The tie, and whose update this is, are asked once more in the claim's
-                        # own transaction: "still this person's", "not another owner's update"
-                        # and "claimed" are one step, so the assistant is never asked for a tie
-                        # that went away, or for an update that belongs to somebody else, in the
-                        # moments since the checks above.
-                        authorize=lambda session: store.admit_update(session, account, user_id, update_id),
+                    resolution = await self._conversation_for(
+                        account,
+                        user_id,
+                        key,
+                        update_id,
+                        # The provenance the first look saw: if the request has disappeared
+                        # since (the conversation was deleted in between), the resolution
+                        # refuses instead of treating the update as a new message.
+                        admitted_here=known_admitted,
                     )
-                except TurnNotAuthorized:
+                except store.UpdateAlreadyAdmitted:
+                    # Its admission was recorded and its original conversation is gone: the
+                    # resolution refused to create or select one.
+                    if attachment_id is not None:
+                        await self._discard_photo(user_id, attachment_id)
+                    logger.warning(
+                        "A redelivered Telegram update was not run again: its conversation is gone and its admission is recorded"
+                    )
+                    await self._say(account, ALREADY_PROCESSED)
+                    return
+                if resolution is None:  # the tie went away while this message waited
                     if attachment_id is not None:
                         await self._discard_photo(user_id, attachment_id)
                     await self._refuse_stale(account)
                     return
-                except turns.TurnAttempted:
-                    # An attempt at this very update began before and did not complete. The
-                    # provider is not asked again; the person is told so (nothing is invented).
-                    logger.warning("A redelivered Telegram update was not run again: an attempt had begun")
-                    if attachment_id is not None:
-                        await self._discard_photo(user_id, attachment_id)
-                    await self._say(account, NOT_RUN_AGAIN)
-                    return
-                except ApiError as error:
-                    if attachment_id is not None:
-                        await self._discard_photo(user_id, attachment_id)
-                    await self._say(account, self._failure_text(error, correlation_id))
+                conversation_id = resolution.conversation_id
+                # Admission provenance, once seen, survives the rest of this attempt: the first
+                # look's ADMITTED_HERE is carried forward, so a deletion after it can never
+                # turn this update into a fresh message (a resolution told so refuses rather
+                # than resolve afresh; this OR states the promise in one place).
+                admitted = resolution.admitted or known_admitted
+                result = None
+                for attempt in range(2):
+                    correlation_id = new_correlation_id()
+                    # What the claim's own admission check decided. The authorize closure runs on
+                    # a worker thread, inside the claim's transaction, and the refusal travels
+                    # back as TurnNotAuthorized; this is how the refusals are told apart.
+                    admission: dict[str, Any] = {}
+                    try:
+                        result = await runner.submit(
+                            user_id=user_id,
+                            conversation_id=conversation_id,
+                            idempotency_key=key,
+                            text=text,
+                            correlation_id=correlation_id,
+                            route="telegram",
+                            origin=TELEGRAM_CHANNEL,
+                            attachment_id=attachment_id,
+                            reclaim=False,  # nobody chose to send this again: Telegram did, by itself
+                            # The tie, whose update this is, and whether it was already admitted
+                            # are one step with the claim: persistence.telegram.admit_update
+                            # checks them and writes the ledger marker in this very transaction,
+                            # so a claim that rolls back leaves no marker and a redelivery whose
+                            # original conversation is gone cannot be admitted again.
+                            authorize=lambda session, started: self._authorize_update(
+                                admission, session, started, account, user_id, update_id, message
+                            ),
+                        )
+                    except TurnNotAuthorized:
+                        if attachment_id is not None:
+                            await self._discard_photo(user_id, attachment_id)
+                        if admission.get("timestamp") is not None:
+                            # The message's own date left the policy while this attempt was
+                            # being prepared (a delayed claim). The claim was rolled back
+                            # whole, before the provider was reached. A conversation this
+                            # resolution made for it is taken back, as for a duplicate.
+                            logger.warning(
+                                "A Telegram update was not admitted: its timestamp left the policy during processing"
+                            )
+                            if resolution.created:
+                                await self._discard_created_conversation(user_id, conversation_id)
+                            await self._say(
+                                account,
+                                FUTURE_UPDATE
+                                if admission.get("timestamp") == "future"
+                                else STALE_UPDATE,
+                            )
+                            return
+                        if admission.get("decision") is store.AdmissionOutcome.ALREADY_ADMITTED:
+                            # The ledger says this update was admitted before and its original
+                            # request is gone; the claim was rolled back whole. If this
+                            # resolution made the conversation (a race the early look could not
+                            # see), take that empty conversation back: a refused duplicate must
+                            # not leave one behind.
+                            logger.warning(
+                                "A redelivered Telegram update was not run again: its conversation is gone and its admission is recorded"
+                            )
+                            if resolution.created:
+                                await self._discard_created_conversation(user_id, conversation_id)
+                            await self._say(account, ALREADY_PROCESSED)
+                            return
+                        await self._refuse_stale(account)
+                        return
+                    except turns.TurnAttempted:
+                        # An attempt at this very update began before and did not complete. The
+                        # provider is not asked again; the person is told so (nothing is invented).
+                        logger.warning("A redelivered Telegram update was not run again: an attempt had begun")
+                        if attachment_id is not None:
+                            await self._discard_photo(user_id, attachment_id)
+                        await self._say(account, NOT_RUN_AGAIN)
+                        return
+                    except ApiError as error:
+                        if error.code == "conversation_not_found" and attempt == 0:
+                            # The conversation was deleted between the resolution and the
+                            # claim (the website can delete one at any moment). The claim's
+                            # own transaction is what refused it, before storing anything:
+                            # the message, its photo (still unattached) and the turn were
+                            # rolled back together.
+                            if admitted:
+                                # This update was admitted before: the resolution found its
+                                # own earlier turn request, so its first delivery may have
+                                # run the assistant. Running it again in another
+                                # conversation would be a second request nobody made. The
+                                # person is told the conversation is gone and nothing else
+                                # is tried.
+                                logger.warning(
+                                    "A redelivered Telegram update was not run again: its conversation was deleted"
+                                )
+                                if attachment_id is not None:
+                                    await self._discard_photo(user_id, attachment_id)
+                                await self._say(account, REDELIVERY_GONE)
+                                return
+                            # Never admitted: there is no earlier request to repeat.
+                            # Resolve once more with the same key -- a selected
+                            # conversation that is gone makes a new one -- and submit the
+                            # same message again. Nothing is lost or duplicated.
+                            try:
+                                resolution = await self._conversation_for(
+                                    account,
+                                    user_id,
+                                    key,
+                                    update_id,
+                                    admitted_here=admitted,
+                                )
+                            except store.UpdateAlreadyAdmitted:
+                                if attachment_id is not None:
+                                    await self._discard_photo(user_id, attachment_id)
+                                logger.warning(
+                                    "A redelivered Telegram update was not run again: its conversation is gone and its admission is recorded"
+                                )
+                                await self._say(account, ALREADY_PROCESSED)
+                                return
+                            if resolution is None:
+                                if attachment_id is not None:
+                                    await self._discard_photo(user_id, attachment_id)
+                                await self._refuse_stale(account)
+                                return
+                            conversation_id = resolution.conversation_id
+                            admitted = resolution.admitted
+                            continue
+                        if error.code == "turn_in_progress" and not await self._conversation_exists(
+                            user_id, conversation_id
+                        ):
+                            # The conversation was deleted while the answer was being
+                            # prepared; its stored message and the reply went with it. The
+                            # next message starts a new conversation (the selection row is
+                            # in its NULL state). Nothing is retried automatically: the
+                            # assistant may already have been asked.
+                            if attachment_id is not None:
+                                await self._discard_photo(user_id, attachment_id)
+                            await self._say(account, DIALOG_DELETED)
+                            return
+                        if attachment_id is not None:
+                            await self._discard_photo(user_id, attachment_id)
+                        await self._say(account, self._failure_text(error, correlation_id))
+                        return
+                    break
+                if result is None:  # pragma: no cover - the loop returns or sets it
                     return
             if await self._deliver(
                 account,
@@ -1283,6 +2150,69 @@ class TelegramChat:
                 reply_markup=_save_keyboard(result.completed.recipes),
             ) is Delivery.REFUSED:
                 await self._refuse_stale(account)  # the answer is stored for its owner; it is not sent on
+
+    def _authorize_update(
+        self,
+        admission: dict[str, Any],
+        session: Any,
+        started: Any,
+        account: int,
+        user_id: UUID,
+        update_id: int,
+        message: dict[str, Any],
+    ) -> bool:
+        """The claim's admission check and marker write (persistence.telegram.admit_update),
+        together with the second reading of the message's timestamp policy.
+
+        The timestamp is asked again here, inside the claim's own transaction, because the
+        attempt may have been delayed since the first reading (a photo download, a queue):
+        a message that was fresh then must not be admitted after it has left the window.
+        The refusal travels back as TurnNotAuthorized and rolls the whole claim back; it is
+        recorded in `admission` so the caller can say the right fixed sentence and take back
+        a conversation it created. This is independent of `existing`: a replay of a completed
+        turn is refused too, because the policy is about the update Telegram delivered.
+
+        `started` is the Claim or the CompletedTurn begin_turn returned. `existing` is True
+        when the update already has a turn request of this user's -- a replay of a completed
+        turn, or a retry -- in which case a marker that is already there is expected and
+        stands. A brand-new claim that meets a marker is refused: the update was admitted
+        before and its request is gone."""
+        problem = _update_timestamp_problem(message, self._clock())
+        if problem is not None:
+            admission["timestamp"] = problem
+            return False
+        existing = isinstance(started, turns.CompletedTurn) or bool(started.retry)
+        decision = store.admit_update(
+            session,
+            account,
+            user_id,
+            update_id,
+            bot_id=self._settings.bot_id,
+            now=self._clock(),
+            existing=existing,
+        )
+        admission["decision"] = decision
+        return decision is store.AdmissionOutcome.ADMITTED
+
+    async def _discard_created_conversation(self, user_id: UUID, conversation_id: UUID) -> None:
+        """Delete an empty conversation this delivery created but must not keep (its update
+        turned out to be a duplicate). It holds nothing: the claim that would have written
+        into it was rolled back, and nobody else knows its id. Best effort, with a log line
+        that carries no id. The selection row that may point at it becomes the table's NULL
+        state, exactly as if the conversation had been deleted by its owner."""
+        try:
+            await self._database.run_to_completion(
+                lambda session: conversations.delete_conversation(
+                    session, user_id, conversation_id
+                )
+            )
+        except ConversationNotFound:
+            pass
+        except Exception as exc:
+            logger.warning(
+                "An empty conversation of a refused redelivery could not be removed: category=%s",
+                type(exc).__name__,
+            )
 
     async def _discard_photo(self, user_id: UUID, attachment_id: UUID) -> None:
         """A turn that was refused leaves its photo unattached: delete it now instead of letting
@@ -1329,20 +2259,51 @@ class TelegramChat:
             text += f"\n\nКод для поддержки: {correlation_id}"
         return text
 
-    async def _conversation_for(self, user_id: UUID, key: str) -> UUID:
-        """The conversation this message belongs to: the one its first delivery used, or the
-        person's most recently active one (the one the website opens), or a new one."""
-        found = await self._database.run(
-            lambda session: store.conversation_of_request(session, user_id, key)
-            or store.latest_conversation_id(session, user_id)
-        )
-        if found is not None:
-            return found
+    async def _conversation_for(
+        self,
+        account: int,
+        user_id: UUID,
+        key: str,
+        update_id: int,
+        *,
+        admitted_here: bool = False,
+    ) -> Optional[store.ConversationResolution]:
+        """The conversation this message belongs to, in one transaction: the one its
+        first delivery used (a redelivery always goes back there), otherwise the
+        conversation explicitly selected in Telegram, otherwise a new conversation (which
+        is selected when a selection row exists but its conversation was deleted), and
+        otherwise -- while there is no selection row -- the person's most recently active
+        conversation or a new one. None when the account is no longer this user's
+        enrolled sender (the check is inside the transaction, with the link held).
+
+        The resolution may create and select a conversation, so it is a write protected by
+        the chat lock the caller holds; it is a run_to_completion unit, so a cancellation
+        cannot release that lock before the transaction has ended. The bot's ledger identity
+        is passed too, so the resolution refuses (UpdateAlreadyAdmitted) before creating
+        anything when the update was admitted and its own conversation is gone; and
+        `admitted_here` (the caller's own earlier look saw the update's turn request) makes
+        it refuse in exactly the same way when that request has disappeared since, even if
+        the marker has already been purged. See
+        persistence.telegram.conversation_for_message."""
         now = self._clock()
-        created = await self._database.run(
-            lambda session: conversations.create_conversation(session, user_id, now=now)
+        return await self._database.run_to_completion(
+            lambda session: store.conversation_for_message(
+                session,
+                user_id,
+                key,
+                now=now,
+                telegram_user_id=account,
+                bot_id=self._settings.bot_id,
+                update_id=update_id,
+                admitted_here=admitted_here,
+            )
         )
-        return created.id
+
+    async def _conversation_exists(self, user_id: UUID, conversation_id: UUID) -> bool:
+        """Whether the conversation is still one of the user's (a plain read)."""
+        return await self._database.run(
+            lambda session: conversations.owns_conversation(session, user_id, conversation_id)
+        )
 
     # --- from the website ------------------------------------------------------------------------
 
@@ -1354,11 +2315,17 @@ class TelegramChat:
         self._spawn(self._mirror(completion))
 
     async def _mirror(self, completion: TurnCompletion) -> None:
-        """Copy a website turn to its user's chat. The chat is looked up first only to know
-        whose turn in the line to wait for. By the time the line reaches this copy the account
-        may no longer be the user's (unlinked, linked to somebody else, access withdrawn), so
-        _deliver asks again, under the binding lock, and a copy that has lost its tie is
-        dropped: it is not sent to whoever the account belongs to now."""
+        """Copy a website turn to its user's chat.
+
+        The chat is looked up first only to know whose turn in the line to wait for. The
+        chat lock is then held across the selection question and the delivery: a selection
+        made in Telegram takes the same lock, so a copy is judged by the selection either
+        entirely before or entirely after that change. Once a selection row exists only
+        the selected conversation is copied; with no row every conversation is, as before
+        (KHD-36, narrowed by KH-TG-DLG-01). By the time the line reaches this copy the
+        account may no longer be the user's (unlinked, linked to somebody else, access
+        withdrawn), so _deliver asks again, under the binding lock, and a copy that has
+        lost its tie is dropped: it is not sent to whoever the account belongs to now."""
         try:
             account = await self._database.run(
                 lambda session: store.chat_of_user(session, completion.user_id)
@@ -1366,6 +2333,16 @@ class TelegramChat:
             if account is None:
                 return
             async with self._chat_lock(account):
+                if not await self._database.run(
+                    lambda session: store.mirrors_to_telegram(
+                        session, completion.user_id, completion.conversation_id
+                    )
+                ):
+                    logger.info(
+                        "A turn was not copied to Telegram: its conversation is not the one "
+                        "selected in the chat"
+                    )
+                    return
                 outcome = await self._deliver(
                     account,
                     completion.user_id,

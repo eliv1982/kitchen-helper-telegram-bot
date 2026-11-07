@@ -388,8 +388,8 @@ bash deploy/new-env-file.sh "$HOUSE_HELPER_ENV_FILE"   # refuses if it exists; t
 dc config -q && echo "compose file valid"        # prints nothing secret; a missing env file fails here
 dc build                                         # the image, from this checkout
 hhops check-config                               # URL absolute, /data writable by uid 10001
-hhops exec --exclusive -- alembic upgrade head   # 0001 ... 0009_message_attachments (the repository head); creates the database
-hhops check-schema                               # "the database schema is at revision 0009_message_attachments"
+hhops exec --exclusive -- alembic upgrade head   # 0001 ... 0011_telegram_active_selection (the repository head); creates the database
+hhops check-schema                               # "the database schema is at revision 0011_telegram_active_selection"
 ```
 
 DNS (section 4) must resolve now. BotFather (section 8, step 2) does not need the site to be live,
@@ -602,6 +602,27 @@ whole table with every saved recipe, so neither is a casual step.
 updated for it, but they were not run. Not exercised: the image built with `0007`, `deploy/upgrade.sh` against a `0006`
 database, and real PostgreSQL. If the owner wants more assurance, the upgrade can be rehearsed first on a restored copy of
 a backup in a disposable volume (section 10).
+
+### 9.2 The next upgrade: `0010_structured_recipe_favorites` -> `0011_telegram_active_selection` (Telegram conversation navigation and the update admission ledger) **[OWNER]**
+
+**State (2026-11-07).** This revision is implemented and tested **in the working tree only** (`docs/STATUS.md`, KH-TG-DLG-01): it is not committed, pushed, released or deployed, and the task brief records production at `0010_structured_recipe_favorites`. This subsection is written so the procedure is ready when the owner authorises the release; nothing below has been run against a production database (the migration cycle has run on a disposable PostgreSQL 16.15 and on SQLite test files only). `0011` is extended in place (it has never been applied to a real database), so there is no upgrade path from an older copy of `0011`: a database that already carried it must be restored from its pre-upgrade backup instead.
+
+**What the migration does.** It creates two new, empty tables and changes nothing that exists.
+
+  * `telegram_active_conversations`: the conversation a person's Telegram chat is explicitly working in, one row per user. `user_id` is the primary key with `ON DELETE CASCADE`; `conversation_id` is nullable and `ON DELETE SET NULL`, so deleting the selected conversation leaves the row as the explicit "it is gone" state the next message acts on; `selected_at` is informational. With no row the bot keeps the legacy "latest conversation" rule and the legacy Web-to-Telegram copy of every conversation; a row is created only when a person uses `/dialogs` or `/new`.
+  * `telegram_update_admissions`: the durable record that a Telegram update of this bot was admitted. Its primary key is `(bot_id, update_id)` (the numeric part of the bot token and Telegram's per-bot update id); it also holds `kind` ('update' or 'cutover'), `admitted_at` and `expires_at` (NULL for the one cutover row per bot). It stores no user, conversation, message, photo, answer or credential, and it has NO foreign key to users, conversations, turn requests or Telegram links, deliberately: deleting any of those must not erase the admission. The application writes a marker in the same transaction that claims the turn, and the retention command deletes it 48 hours after admission or at its stored deadline. The cutover row is kept.
+
+It changes no existing table, row, index or constraint and revokes nothing. There is no new environment variable, route or secret. The migration itself resets no update offset, calls no `drop_pending_updates` and deletes no pending update.
+
+**What changes at the first start of the new image.** The bot writes the bot's cutover row (once) and backfills admission markers from the `tg-<id>` turn requests of the last 48 hours; nothing that was cascaded away with a deleted conversation is invented. From then on, an update that neither a marker nor a turn request knows is refused with a fixed Russian request-to-resend sentence when (a) its Telegram `date` is more than 24 hours plus 5 minutes in the past or missing, or (b) it was sent before the cutover. **Expected impact:** a message that was sent before the upgrade and never processed at all, or whose conversation was deleted before the upgrade, must be written again; it is not silently discarded, it gets the request-to-resend notice. Messages sent after the cutover are unaffected. The bot must therefore be stopped for the migration and restarted with the new image as one maintenance step, as section 9 already describes.
+
+**The procedure is the one above, unchanged.** Use `deploy/upgrade.sh` as section 9 describes, a dry run first, with the tag read from the running container; stop the cleanup timer first and start it afterwards with the new tag (14.4). The schema guard requires the exact repository head, so the image carrying `0011` and the migration move together: an older image refuses a `0011` database and the new image refuses a `0010` one until it is migrated.
+
+**After it** (by hand): `check-schema` names `0011_telegram_active_selection`; `GET /healthz` is 200; the log has one "The Telegram update ledger is ready: backfilled=N" line (N is a count, never an id); the bot's `/help` lists `/dialogs`, `/new`, `/favorites`, `/unlink`, `/help`; the Telegram command menu shows the four commands (Dialogs, New dialog, Favorites, Help, in Russian) and no `/start`; `/dialogs` lists the person's own conversations with times in Moscow (MSK), marks the active one, and selecting an older one answers with a short confirmation; the next message continues that conversation and its context; `/new` starts another and asking it twice on an empty conversation creates nothing extra; a turn typed on the website in the selected conversation is copied to Telegram, and one in another conversation is not; after unlinking, a new link starts in the legacy state. For the ledger: send one message and check by hand that `telegram_update_admissions` gained one `kind='update'` row and that the one `kind='cutover'` row exists (`SELECT kind, count(*) ... GROUP BY kind`; no message content is stored). Do not delete a conversation to test the refusal on production data; the refusal path is covered by the tests and belongs in a disposable rehearsal, not on live history.
+
+**Rollback.** As section 11 says for every migration: restore the pre-upgrade backup with the old image. Selections and markers made after the backup are lost by a restore; `alembic downgrade 0010_structured_recipe_favorites` drops both tables and touches no conversation, message, turn, favorite or link. Neither is a casual step.
+
+**Not shown yet.** The migration up, down and up again on SQLite, the schema fingerprint against the models, the offline PostgreSQL rendering and a populated `0010 -> 0011 -> 0010 -> 0011` cycle on a disposable PostgreSQL 16.15 are in the tests (the real-PostgreSQL tests are opt-in and CI does not run them). The image, `deploy/upgrade.sh` against a real `0010` database, the real Telegram menu and list rendering, and Codex/CI are not.
 
 ## 10. Backup and restore
 
@@ -936,12 +957,13 @@ something outside the repository and needs the owner's explicit approval first. 
 
 ### 14.1 What is deleted, and what never is
 
-One command deletes two kinds of rows, for real (an SQL `DELETE`; hiding expired rows from reads, which the
+One command deletes three kinds of rows, for real (an SQL `DELETE`; hiding expired rows from reads, which the
 application already does, is not deletion). **A sign-in artifact goes when its own `expires_at` has passed**, whether it
 was used, withdrawn or never touched: a used or revoked row stays until its own deadline (so no revocation or
 replay evidence disappears early and no new retention period exists), and after it is gone every reader sees
 "unknown", which each already treats exactly like "expired". **History is judged row by row**, 365 x 24 hours after
-the row's own creation.
+the row's own creation. **A Telegram update admission marker goes 48 hours after admission**, twice Telegram's
+documented 24-hour update retention, or at its stored deadline if that is earlier.
 
 | Data (table) | Deadline | Deleted when | Kept, and why |
 |---|---|---|---|
@@ -950,13 +972,20 @@ the row's own creation.
 | Emailed sign-in links (`email_login_challenges`) | 10 minutes | `expires_at` <= now | live and used-but-unexpired links; the 60-second request cooldown looks only at the last 60 seconds, well inside the 10 minutes |
 | Telegram invitations (`identity_invitations`) | 2 hours | `expires_at` <= now **and** no login state is still bound to it | active, used-but-unexpired and withdrawn-but-unexpired ones. The identity an invitation linked (`allowlist_entries`, `identity_links`) is not an artifact and is never touched |
 | Telegram pairing codes (`telegram_link_codes`) | 10 minutes | `expires_at` <= now | live ones; a used code stays until its own deadline. The link a code made (`telegram_links`) is a person's choice, not an artifact, and is never touched (section 16) |
+| Telegram update admission markers (`telegram_update_admissions`, `kind='update'`) | 48 hours after admission | `expires_at` <= now **or** `admitted_at` <= now - 48 h | the bot's `kind='cutover'` row (one per bot, no deadline; see "Never touched") |
 | Turn requests (`turn_requests`; `result_payload` is a copy of an answer) | 365 days after creation | `expires_at` <= now **or** `created_at` <= now - 365 x 24 h, and not in flight under a live lease. A request still in flight whose lease is over (its worker is gone) is first set to `cancelled`, then deleted | a request whose lease is still live, and its messages, until the lease ends |
 | Photos that came with messages (`message_attachments`; bytes in the database) | the message's, or 1 hour for an upload that was never sent | the same rule as a message (`expires_at` <= now **or** `created_at` <= now - 365 x 24 h); deleted before the messages so that they are counted | a photo of a message that is still kept (section 16) |
 | Messages (`messages`) | 365 days after creation | the same rule, **and** no request that links the message still exists (the database refuses otherwise) | recent messages of an old conversation; an expired message a request still links waits for the next run (reported as *held back*) |
 | Conversations (`conversations`) | none of their own | no message and no request left **and** no activity for 365 days (`updated_at` and `created_at` both at or before the cutoff) | any conversation with a message; a conversation created minutes ago and still empty |
 
-**Never touched:** `users`, `allowlist_entries`, `identity_links`, `telegram_links`, `alembic_version`, and every table the command does
-not name. The favourites and long-term preferences of the product requirements (KHD-05) are independent tables owned by a
+**Never touched:** `users`, `allowlist_entries`, `identity_links`, `telegram_links`, `telegram_active_conversations`, the
+`kind='cutover'` row of `telegram_update_admissions`, `alembic_version`, and every table the command does
+not name. `telegram_active_conversations` (migration `0011`, KH-TG-DLG-01) is the per-user Telegram conversation cursor: it has no
+deadline, unlinking or deleting the user removes it, and deleting the conversation it names only nulls it (the next Telegram
+message starts a new conversation, section 16.9). The cutover row of `telegram_update_admissions` (migration `0011`, KHD-42)
+records when the update admission ledger began for the bot; it is durable state, not an update, so it has no deadline and is
+kept. The `kind='update'` markers in the same table are deleted at 48 hours (table above); they hold no user, message or
+answer, so nothing of a person's is left behind by keeping the cutover row. The favourites and long-term preferences of the product requirements (KHD-05) are independent tables owned by a
 user, and this command, which names its tables one by one, does not know them. The favourites exist since migration `0007`
 (History & Favorites): `favorite_recipes` holds the answers a person chose to keep, copied out of the history, with no
 deadline and no key to the history, and a test with a real favourite shows it untouched when the history it came from is
@@ -2417,3 +2446,17 @@ NOT done: PostgreSQL (the share lock that keeps an unlink away from a claim is r
 single message through the real Telegram, a real photo through the real OpenAI model (whether `gpt-6-luna` accepts the image
 parts of this request as built is unverified), a real phone or browser, Docker with the new image, the upgrade on a copy of the production
 database, PostgreSQL, and Python 3.10 at run time on the development machine (CI covers it).
+
+### 16.9 Conversation navigation (KH-TG-DLG-01, working tree)
+
+**State (2026-11-07).** Implemented and tested in the working tree only; not released, not deployed and not in any image. The migration is `0011_telegram_active_selection`; the upgrade procedure is 9.2. Production is reported at `0010_structured_recipe_favorites` by the task brief.
+
+**The update admission ledger (KHD-42, final deduplication remediation; readiness and timestamp policy corrected by KHD-43).** The same revision adds `telegram_update_admissions`: one marker per update Telegram delivered to this bot, keyed by `(bot_id, update_id)`, with timestamps only and no foreign key to any user, conversation or turn. It is written in the transaction that claims the turn, so an update that was admitted once can never be admitted again -- not in another conversation of the same person, and not in another person's history after an unlink/re-pairing -- even after the conversation and its turn request are deleted. Markers expire after 48 hours and the cleanup command deletes them (14.1); the bot's cutover row is kept. At the first start of the new image the bot writes that cutover and backfills markers from the last 48 hours of surviving turn requests. The preparation is fail-closed: until it has committed, the bot reads no updates at all (so it acknowledges none: the offset lives in memory and Telegram keeps whatever is pending) and refuses new messages with the fixed "temporarily unavailable" notice; a failure is retried with a backoff and a restart simply tries again. If the preparation fails during the upgrade, do not "fix" it by deleting the table or the database: read the log line (the exception class only) and correct the schema or the storage; pending messages are delivered after the retry, and the cutover is pinned to the process start so they are not refused as pre-migration ones. The timestamp policy judges every message to the assistant, independently of the ledger: a message dated more than 24 hours and 5 minutes in the past, more than 5 minutes in the future, or without a usable date is refused with a clear Russian request-to-resend sentence, and the check is repeated when the turn is claimed. The cutover rule applies only to an update neither a marker nor a turn request knows: one dated before the cutover is a pre-migration update. The expected one-off cost of the upgrade is described in 9.2: a message sent before it that was never processed, or whose conversation was deleted before it, must be written again. Nothing is silently discarded and no update offset is reset.
+
+**What changes for the person.** `/dialogs` lists all their conversations, newest activity first, eight per page, with timestamps in Europe/Moscow (labelled with the Russian abbreviation for Moscow time, MSK), and marks the one a message would go to. A conversation is selected by tapping it; the confirmation is short and the history is not replayed. `/new` starts (or, while it is still empty, reuses) a conversation and selects it. The native menu is exactly `/dialogs`, `/new`, `/favorites`, `/help`; `/start` still works but is not listed, and `/unlink` is listed in `/help`. No reply keyboard is introduced.
+
+**What changes on the website.** Nothing in its UI: it keeps opening the conversation it listed first, and the Telegram cursor does not move any conversation's activity time. One behaviour does change once a selection has been made: a Web turn is copied to Telegram only when it belongs to the selected conversation. Before any selection row exists, every Web turn is copied, as 16.1 describes.
+
+**What to tell the users.** While no conversation has been chosen in Telegram, the bot answers in the latest one and copies every Web conversation there. After `/dialogs` or `/new`, it answers in the chosen one and copies only that one. If the chosen conversation is deleted on the website, the Telegram side says so and the next message starts a new conversation rather than continuing another one. A message Telegram delivers again after its conversation was deleted is answered with a request-to-resend sentence and is never run elsewhere; the same is true of a message older than Telegram's 24-hour delivery window. Unlinking Telegram ends the copies and forgets the choice; a new link starts in the latest-conversation mode. The Russian `/help` and the link panel say this.
+
+**Not verified.** The real Telegram rendering of the four-command menu and the list, a real device tap, Codex, CI and real PostgreSQL. The list reaches every conversation (eight per page, no fixed page ceiling); a title too long for a button is shortened but the time and its Moscow label are kept.

@@ -40,6 +40,7 @@ from house_helper.persistence.database import (
     create_db_engine,
     create_session_factory,
 )
+from house_helper.persistence.models import TELEGRAM_CUTOVER_UPDATE_ID
 from tests.admin_support import db_path, db_url, migrated_template, snapshot  # noqa: F401  (fixtures)
 from tests.persistence_support import stored
 from tests.retention_support import (
@@ -777,6 +778,7 @@ def test_every_table_of_the_schema_has_a_retention_decision():
         "favorite_recipes": "answers a person chose to keep: copies with no deadline and no link to the history",
         "message_recipes": "structured recipes of an answer: the foreign key deletes them with their message at 365 days",
         "telegram_links": "the tie between a person and their Telegram account: removed by unlinking and with the user",
+        "telegram_active_conversations": "the Telegram conversation cursor: no deadline, removed by unlinking and with the user; its deleted conversation merely nulls it",
     }
     assert set(Base.metadata.tables) == purged | set(kept), (
         "a table was added or removed: decide its retention (RUNBOOK section 14.1)"
@@ -785,14 +787,46 @@ def test_every_table_of_the_schema_has_a_retention_decision():
 
 def test_the_purge_names_exactly_the_tables_it_may_delete_from():
     tables = {t.name for t in (retention._sessions, retention._oidc_states, retention._challenges,
-                               retention._invitations, retention._link_codes, retention._requests,
-                               retention._attachments, retention._messages, retention._conversations)}
+                               retention._invitations, retention._link_codes, retention._admissions,
+                               retention._requests, retention._attachments, retention._messages,
+                               retention._conversations)}
     assert tables == {c.value for c in Category}
     untouchable = {
         "users", "allowlist_entries", "identity_links", "favorite_recipes", "message_recipes",
-        "telegram_links", "alembic_version",
+        "telegram_links", "telegram_active_conversations", "alembic_version",
     }
     assert not tables & untouchable
+
+
+def test_telegram_update_markers_expire_after_their_window_and_the_cutover_row_is_kept(db_url):
+    def seed(s):
+        s.admission(update_id=1, admitted=ago(hours=49))  # past the policy ceiling
+        s.admission(
+            update_id=2, admitted=ago(hours=48), expires=ago(hours=48) + MICROSECOND
+        )  # at both ends: its deadline has passed and so has the policy ceiling
+        s.admission(update_id=3, admitted=ago(hours=47))  # inside the window: stays
+        s.admission(
+            update_id=4, admitted=ago(hours=49), expires=NOW + timedelta(days=10)
+        )  # a wrong deadline cannot extend a marker past 48 hours
+        s.admission(
+            update_id=5, admitted=ago(hours=1), expires=NOW
+        )  # a stored deadline earlier than the ceiling ends it early
+        s.admission(
+            update_id=TELEGRAM_CUTOVER_UPDATE_ID, admitted=ago(days=400)
+        )  # the bot's cutover row: durable state, never an update
+
+    seeded(db_url, seed)
+
+    preview = purge(db_url, dry_run=True)
+    report = purge(db_url)
+
+    assert preview.deleted["telegram_update_admissions"] == 4
+    assert report.deleted["telegram_update_admissions"] == 4
+    assert {
+        row[0] for row in read(db_url, "SELECT update_id FROM telegram_update_admissions")
+    } == {3, TELEGRAM_CUTOVER_UPDATE_ID}
+    integrity(db_url)
+    assert purge(db_url).total == 0  # a second run changes nothing
 
 
 # --- repeated and dry runs --------------------------------------------------------------------

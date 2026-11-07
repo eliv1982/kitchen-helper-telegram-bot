@@ -302,6 +302,16 @@ class BotSettings:
             raise WebConfigError("the bot's polling wait must be between 1 and 50 seconds")
 
     @property
+    def bot_id(self) -> int:
+        """The bot's numeric id, the part of the token before the colon.
+
+        Telegram's update ids are unique for one bot, so this is what scopes the update
+        admission ledger (persistence.models.TelegramUpdateAdmission): a replacement bot
+        starts with an empty id space of its own. TOKEN_PATTERN has already made the
+        prefix a positive number of at most 16 digits."""
+        return int(self.token.partition(":")[0])
+
+    @property
     def link_base(self) -> str:
         """Where a pairing link starts: the code is appended as ?start=<code>."""
         return f"https://t.me/{self.username}"

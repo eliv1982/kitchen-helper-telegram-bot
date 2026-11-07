@@ -588,18 +588,26 @@ async def test_a_repeated_save_sends_no_second_confirmation(tmp_path):
 # --- the native command menu -----------------------------------------------------------------
 
 
-async def test_the_bot_registers_the_minimal_russian_command_menu(tmp_path):
+async def test_the_bot_registers_the_russian_command_menu_in_its_fixed_order(tmp_path):
     async with telegram_app(tmp_path) as t:
         await t.settle()
 
     assert t.bot.commands == tc.BOT_COMMANDS
-    assert [item["command"] for item in t.bot.commands] == ["favorites", "start", "help"]
+    assert [item["command"] for item in t.bot.commands] == [
+        "dialogs",
+        "new",
+        "favorites",
+        "help",
+    ]
     descriptions = {item["command"]: item["description"] for item in t.bot.commands}
     assert descriptions == {
+        "dialogs": "🗂 Диалоги",
+        "new": "✏️ Новый диалог",
         "favorites": "📚 Избранное",
-        "start": "🏠 Начало",
         "help": "ℹ️ Помощь",
     }
+    # /start stays functional but is not in the visible menu; /unlink is in /help only.
+    assert "start" not in descriptions and "unlink" not in descriptions
     for description in descriptions.values():
         assert 0 < len(description) <= 256
 
@@ -638,3 +646,10 @@ async def test_a_failed_menu_registration_is_one_warning_and_polling_keeps_worki
 async def test_help_names_favorites_and_says_where_editing_is_available():
     assert "/favorites" in tc.HELP
     assert "Редактировать" in tc.HELP and "на сайте" in tc.HELP
+
+
+async def test_help_documents_dialogs_new_and_unlink_and_the_mirroring_rule():
+    assert "/dialogs" in tc.HELP and "/new" in tc.HELP and "/unlink" in tc.HELP
+    assert "МСК" in tc.HELP  # the dialogs list's time zone is explained where commands are
+    assert "не меняет" in tc.HELP and "разговор, который открывает сайт" in tc.HELP
+    assert "только из выбранного разговора" in tc.HELP

@@ -1,6 +1,6 @@
 """Deleting what has expired: the work of `python -m house_helper.admin purge-expired`.
 
-Two kinds of rows are deleted, for real (a DELETE, not a filter on reads):
+Three kinds of rows are deleted, for real (a DELETE, not a filter on reads):
 
   * authentication artifacts past THEIR OWN expiry: sessions, OIDC login states, emailed
     sign-in links, Telegram invitations and Telegram pairing codes. The rule is one for all of them: a row goes
@@ -12,6 +12,13 @@ Two kinds of rows are deleted, for real (a DELETE, not a filter on reads):
     "expired". An invitation also waits until no login state is bound to it any more (the
     state's foreign key cascades, and a half-finished login must not lose its invitation
     row under it);
+  * Telegram update admission markers (telegram_update_admissions, kind 'update'): 48
+    hours after they were admitted (Telegram's documented 24-hour update retention plus a
+    day of processing margin), or at their stored deadline when that is earlier. The
+    admitted_at ceiling is what bounds a marker whose stored deadline is wrong: an early
+    stored deadline ends it early, and a late one cannot carry it past 48 hours. The bot's
+    cutover row (kind 'cutover') is not an update and is never deleted: it is one row per
+    bot that says when the ledger began;
   * conversation history: messages, and the turn requests that hold a copy of an answer
     (result_payload), at most 365 x 24 hours after their own creation: a row is old when
     expires_at <= now OR created_at <= now - 365 days. The second clause is the policy
@@ -27,14 +34,19 @@ Two kinds of rows are deleted, for real (a DELETE, not a filter on reads):
 
 Never touched: users, allowlist entries, identity links, the Telegram links (telegram_links:
 the tie between a person and their Telegram account, removed by unlinking and with the user),
-anything alembic owns, and any
-table that is not named here (the favourites are one: favorite_recipes holds copies of answers
-that a person chose to keep, with no deadline and no key to the history, and this module does not
-know it; the long-term preferences of the product requirements are not in this schema yet, and
-when they arrive they will be independent tables too). A new table is therefore safe by default.
+the Telegram conversation cursor (telegram_active_conversations: which conversation the
+person's chat is working in, with no deadline; unlinking or deleting the user removes it, and
+deleting the conversation it names only nulls it, by that table's own foreign key), the bot's
+cutover row in the admission ledger (a record of when the ledger began, not an update), anything
+alembic owns, and any table that is not named here (the favourites are one: favorite_recipes
+holds copies of answers that a person chose to keep, with no deadline and no key to the
+history, and this module does not know it; the long-term preferences of the product
+requirements are not in this schema yet, and when they arrive they will be independent tables
+too). A new table is therefore safe by default.
 
 Order, which is what the foreign keys demand: sessions, login states, emailed links,
-invitations (after the states bound to them), pairing codes, turn requests, photos, messages,
+invitations (after the states bound to them), pairing codes, update admission markers (which
+have no foreign key and depend on nothing), turn requests, photos, messages,
 conversations. A
 message that a turn request links cannot be deleted, so requests go first (models.TurnRequest
 explains), and a message that a request still links is kept for the next run (it
@@ -60,7 +72,8 @@ shape of the work:
     for it (the persistence layer's rule, see persistence.database), so there is no
     read-then-write snapshot to go stale, and the lock is held for the time of at most
     `batch_size` deletions, not of the whole purge;
-  * a batch is `DELETE ... WHERE id IN (SELECT id ... LIMIT n)`: it decides and deletes in
+  * a batch is `DELETE ... WHERE <primary key> IN (SELECT <primary key> ... LIMIT n)` (a
+    row value for the one table with a composite key): it decides and deletes in
     one statement, so two runs at the same time never delete a row twice, never miss one
     that stays eligible, and never see each other half done;
   * a pause between batches lets the web service's own writers in, and the busy timeout is
@@ -104,7 +117,7 @@ from sqlalchemy.engine import Connection, Engine
 from house_helper.admin.target import check_schema_at_head
 from house_helper.persistence import models
 from house_helper.persistence.base import RETENTION
-from house_helper.persistence.models import TurnStatus
+from house_helper.persistence.models import TELEGRAM_ADMISSION_RETENTION, TurnStatus
 
 # Rows per statement, and so per transaction. The write lock is held for this many
 # deletions at a time; small enough that the web service's writers wait for milliseconds.
@@ -131,6 +144,7 @@ _oidc_states = _table(models.OidcState)
 _challenges = _table(models.EmailLoginChallenge)
 _invitations = _table(models.IdentityInvitation)
 _link_codes = _table(models.TelegramLinkCode)
+_admissions = _table(models.TelegramUpdateAdmission)
 _requests = _table(models.TurnRequest)
 _attachments = _table(models.MessageAttachment)
 _messages = _table(models.Message)
@@ -145,6 +159,7 @@ class Category(str, enum.Enum):
     EMAIL_LOGIN_CHALLENGES = "email_login_challenges"
     IDENTITY_INVITATIONS = "identity_invitations"
     TELEGRAM_LINK_CODES = "telegram_link_codes"
+    TELEGRAM_UPDATE_ADMISSIONS = "telegram_update_admissions"
     TURN_REQUESTS = "turn_requests"
     MESSAGE_ATTACHMENTS = "message_attachments"
     MESSAGES = "messages"
@@ -239,6 +254,17 @@ class _Conditions:
         two clauses as for a message. Nothing depends on it."""
         return sa.or_(row.c.expires_at <= self.now, row.c.created_at <= self.cutoff)
 
+    def update_admission(self, row) -> sa.ColumnElement:
+        """A Telegram update marker goes 48 hours after admission: at its stored deadline, or
+        at the policy ceiling when the stored deadline is wrong (the same two clauses as for
+        history, with the ledger's own window). The bot's cutover row (kind 'cutover', no
+        deadline) is durable state, not an update, and is kept."""
+        cutoff = self.now - TELEGRAM_ADMISSION_RETENTION
+        return sa.and_(
+            row.c.kind == models.TelegramUpdateAdmissionKind.UPDATE.value,
+            sa.or_(row.c.expires_at <= self.now, row.c.admitted_at <= cutoff),
+        )
+
     def request_expired(self, row) -> sa.ColumnElement:
         return sa.or_(row.c.expires_at <= self.now, row.c.created_at <= self.cutoff)
 
@@ -308,6 +334,7 @@ def _stages(conditions: _Conditions):
         (Category.EMAIL_LOGIN_CHALLENGES, _challenges, conditions.over),
         (Category.IDENTITY_INVITATIONS, _invitations, conditions.invitation),
         (Category.TELEGRAM_LINK_CODES, _link_codes, conditions.over),
+        (Category.TELEGRAM_UPDATE_ADMISSIONS, _admissions, conditions.update_admission),
         (Category.TURN_REQUESTS, _requests, conditions.request),
         (Category.MESSAGE_ATTACHMENTS, _attachments, conditions.attachment),
         (Category.MESSAGES, _messages, conditions.message),
@@ -317,11 +344,21 @@ def _stages(conditions: _Conditions):
 
 def _delete_batch(table, condition: Callable, size: int) -> sa.Delete:
     chosen = table.alias()
+    key_names = [column.name for column in table.primary_key.columns]
+    keys = [chosen.c[name] for name in key_names]
     # FOR UPDATE SKIP LOCKED: on PostgreSQL a second run takes other rows instead of waiting for
     # (and colliding with) the first one's; SQLite has no row locks, and SQLAlchemy leaves the
     # clause out of its SQL.
-    ids = sa.select(chosen.c.id).where(condition(chosen)).limit(size).with_for_update(skip_locked=True)
-    return sa.delete(table).where(table.c.id.in_(ids))
+    keys_of_batch = (
+        sa.select(*keys).where(condition(chosen)).limit(size).with_for_update(skip_locked=True)
+    )
+    if len(keys) == 1:
+        return sa.delete(table).where(table.primary_key.columns[0].in_(keys_of_batch))
+    # A composite key (the Telegram update admission ledger): the row value is what names the
+    # row. SQLite and PostgreSQL both read this form.
+    return sa.delete(table).where(
+        sa.tuple_(*[table.c[name] for name in key_names]).in_(keys_of_batch)
+    )
 
 
 def _cancel_batch(conditions: _Conditions, size: int) -> sa.Update:

@@ -19,6 +19,8 @@ from house_helper.persistence.allowlist import allow
 from house_helper.persistence.base import RETENTION
 from house_helper.persistence.database import create_db_engine, create_session_factory
 from house_helper.persistence.models import (
+    TELEGRAM_ADMISSION_RETENTION,
+    TELEGRAM_CUTOVER_UPDATE_ID,
     Conversation,
     EmailLoginChallenge,
     IdentityInvitation,
@@ -26,6 +28,8 @@ from house_helper.persistence.models import (
     Message,
     OidcState,
     Session,
+    TelegramUpdateAdmission,
+    TelegramUpdateAdmissionKind,
     TurnRequest,
     User,
 )
@@ -142,6 +146,39 @@ class Seed:
                 expires_at=expires,
                 consumed_at=consumed_at,
                 revoked_at=revoked_at,
+            )
+        )
+
+    # --- Telegram update admission markers ----------------------------------------------------
+
+    def admission(
+        self,
+        *,
+        bot_id: int = 123456789,
+        update_id: Optional[int] = None,
+        admitted: datetime,
+        expires: Optional[datetime] = None,
+    ) -> TelegramUpdateAdmission:
+        """One update marker, or the bot's cutover row when `update_id` is the reserved 0."""
+        if update_id is None:
+            self._counter += 1
+            update_id = 1000 + self._counter
+        kind = (
+            TelegramUpdateAdmissionKind.CUTOVER
+            if update_id == TELEGRAM_CUTOVER_UPDATE_ID
+            else TelegramUpdateAdmissionKind.UPDATE
+        )
+        return self._add(
+            TelegramUpdateAdmission(
+                bot_id=bot_id,
+                update_id=update_id,
+                kind=kind.value,
+                admitted_at=admitted,
+                expires_at=(
+                    None
+                    if update_id == TELEGRAM_CUTOVER_UPDATE_ID
+                    else (expires or admitted + TELEGRAM_ADMISSION_RETENTION)
+                ),
             )
         )
 

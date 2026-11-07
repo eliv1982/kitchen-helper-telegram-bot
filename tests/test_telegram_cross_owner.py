@@ -344,7 +344,7 @@ async def test_two_claims_for_one_update_by_two_owners_are_serialised_and_the_se
         second = second_person(t)
         entered, proceed = threading.Event(), threading.Event()
 
-        def hold_the_claim_open(session):
+        def hold_the_claim_open(session, started):
             entered.set()
             assert proceed.wait(TIMEOUT), "the test never let the first claim go on"
             return True
@@ -367,7 +367,13 @@ async def test_two_claims_for_one_update_by_two_owners_are_serialised_and_the_se
         try:
             first = submit(t.user_id, uuid_of(first_conversation), hold_the_claim_open)
             await reached(entered)
-            rival = submit(second, uuid_of(second_conversation), lambda session: not store.update_admitted_for_another(session, second, UPDATE))
+            rival = submit(
+                second,
+                uuid_of(second_conversation),
+                lambda session, started: not store.update_admitted_for_another(
+                    session, second, UPDATE
+                ),
+            )
             await asyncio.sleep(NOTHING_STARTS_WITHIN)  # (the absence of an event can only be given time)
             assert not rival.done()  # it cannot even claim while the first claim is open
         finally:

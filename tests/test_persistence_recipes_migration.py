@@ -26,6 +26,7 @@ from tests.persistence_support import CREATED, new_conversation, new_message, ne
 from tests.test_persistence_migrations import (
     ATTACHMENTS,
     HEAD,
+    RECIPES,
     _fingerprint,
     _offline_sql,
     _snapshot_of,
@@ -39,7 +40,12 @@ STRUCTURED_COLUMNS = (
     "id, user_id, title, content, source_message_id, created_at, kind, source_recipe_index, "
     "servings, ingredients, steps, notes, version, updated_at"
 )
-OTHER_TABLES = TABLES - {"favorite_recipes", "message_recipes"}
+OTHER_TABLES = TABLES - {
+    "favorite_recipes",
+    "message_recipes",
+    "telegram_active_conversations",
+    "telegram_update_admissions",
+}
 
 BORSH = {"name": "свёкла", "amount": "2 шт."}
 
@@ -331,7 +337,7 @@ def test_the_way_back_restores_0009_and_keeps_every_text_favorite(tmp_path):
         downgrade_database(migrated, ATTACHMENTS)
 
         assert _version(migrated) == [ATTACHMENTS]
-        assert _tables(migrated) == TABLES - {"message_recipes"} | {"alembic_version"}
+        assert _tables(migrated) == TABLES - {"message_recipes", "telegram_active_conversations", "telegram_update_admissions"} | {"alembic_version"}
         assert _fingerprint(migrated) == _fingerprint(pristine)  # the 0009 schema, exactly
         assert _favorite_rows(migrated) == old_rows
         assert _snapshot_of(migrated, OTHER_TABLES) == others_before
@@ -361,8 +367,8 @@ def test_the_way_back_restores_0009_and_keeps_every_text_favorite(tmp_path):
 
 
 def test_the_recipes_revision_renders_as_postgresql_sql():
-    up, down = _offline_sql("up"), _offline_sql("down_from_head")
-    revision = up.split(f"Running upgrade {ATTACHMENTS} -> {HEAD}")[1].split("-- Running")[0]
+    up, down = _offline_sql("up"), _offline_sql("down_from_recipes")
+    revision = up.split(f"Running upgrade {ATTACHMENTS} -> {RECIPES}")[1].split("-- Running")[0]
 
     statements = [re.sub(r"\s+", " ", part.strip()) for part in revision.split(";")]
     statements = [part for part in statements if part not in ("", "COMMIT")]
@@ -395,7 +401,7 @@ def test_the_recipes_revision_renders_as_postgresql_sql():
         "UNIQUE (user_id, source_message_id, source_recipe_index)"
     ) in statements
     assert "UPDATE favorite_recipes SET updated_at=favorite_recipes.created_at" in statements
-    assert statements[-1].startswith("UPDATE alembic_version SET version_num='" + HEAD + "'")
+    assert statements[-1].startswith("UPDATE alembic_version SET version_num='" + RECIPES + "'")
     assert "DROP TABLE" not in revision and "DELETE FROM" not in revision and "ALTER COLUMN" not in revision
 
     uncommented = re.sub(r"^--.*$", "", down, flags=re.MULTILINE)

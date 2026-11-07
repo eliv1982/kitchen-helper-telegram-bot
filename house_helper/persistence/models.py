@@ -73,7 +73,7 @@ sqlalchemy.orm.Session as long as the two are not imported under one name.
 
 import enum
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import sqlalchemy as sa
@@ -95,6 +95,16 @@ from house_helper.persistence.sqlchecks import EmailSubjectNormalized, Printable
 
 MESSAGE_RETENTION_DAYS = RETENTION_DAYS
 MESSAGE_RETENTION = RETENTION
+
+# How long a Telegram update admission marker is kept: Telegram's documented 24-hour
+# update retention plus a day of processing margin. A marker outlives every update the
+# Bot API can deliver again, so a redelivery can never look new while its marker exists.
+TELEGRAM_ADMISSION_RETENTION = timedelta(hours=48)
+
+# The update id of a bot's cutover row. Telegram update ids start from a positive number
+# and increase sequentially, so 0 can never be one; the row records when the ledger was
+# first created for a bot (telegram.initialize_update_admissions).
+TELEGRAM_CUTOVER_UPDATE_ID = 0
 
 # The position of a favourite that was made from a whole answer (the legacy, text kind).
 # A structured favourite carries the position of its recipe among the accepted recipes of
@@ -1158,6 +1168,137 @@ class TelegramLink(Base):
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
+class TelegramActiveConversation(Base):
+    """The conversation one user's Telegram chat is explicitly working in.
+
+    The website opens the person's most recently active conversation; a Telegram
+    conversation needs a cursor of its own, because a person on a phone may want to
+    continue an older one and that choice must not be remade by every message. This
+    table is that cursor: one row per user (user_id is the primary key), with the
+    three states the product's rule is written in:
+
+      * no row: the legacy behaviour, "follow the latest conversation". Before this
+        table existed every Telegram message went to the user's most recently active
+        conversation, and it still does until the person selects one (or asks for a
+        new one).
+      * a row whose conversation_id names a conversation of the same user: the
+        explicit selection. Telegram messages go there, and while the row exists only
+        turns of that conversation are copied from the website to the Telegram chat.
+      * a row whose conversation_id is NULL: the selected conversation was deleted.
+        The next Telegram message creates a new conversation and selects it; the bot
+        never falls back to an unrelated conversation on its own.
+
+    Deletion is the database's: conversation_id is a foreign key with ON DELETE SET
+    NULL and user_id one with ON DELETE CASCADE. Deleting the conversation therefore
+    leaves the row as the explicit "it is gone" state, and deleting the user removes
+    the row. That SET NULL is why conversation_id alone is the foreign key and the
+    owner is not part of a composite key: a composite (user_id, conversation_id)
+    foreign key would null both columns together, and user_id is the row's key and
+    cannot be NULL. Ownership is enforced by persistence instead: every write and
+    every resolution finds the conversation through the user
+    (telegram.select_conversation, telegram.conversation_for_message), and no read
+    trusts the id without that check.
+
+    selected_at is informational: when the selection last changed. It is not an
+    activity time, and nothing here touches conversations.updated_at, so selecting a
+    conversation does not move it in the website's list.
+
+    Unlinking deletes the row (telegram.unlink): the cursor belongs to the tie
+    between the user and the Telegram account, and a new link starts in the legacy
+    state.
+    """
+
+    __tablename__ = "telegram_active_conversations"
+    __table_args__ = (sa.Index(None, "conversation_id"),)
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        sa.ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    conversation_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        sa.ForeignKey("conversations.id", ondelete="SET NULL")
+    )
+    selected_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class TelegramUpdateAdmissionKind(str, enum.Enum):
+    """What one row of the admission ledger records.
+
+    UPDATE  an update id of this bot was admitted: a turn request for it was claimed, and
+            the marker keeps that fact after the conversation and the request are gone.
+    CUTOVER the reserved row (update id 0) that says when the ledger was first created for
+            the bot. Updates dated before it are pre-migration updates: if no surviving turn
+            request or marker proves what became of one, it is refused instead of being
+            admitted as new (telegram_chat's cutover policy).
+    """
+
+    UPDATE = "update"
+    CUTOVER = "cutover"
+
+
+class TelegramUpdateAdmission(Base):
+    """The durable record that a Telegram update was admitted, independent of every user
+    and conversation.
+
+    Why it exists. The idempotency key of a Telegram turn ("tg-<update id>") lives in one
+    conversation, and its turn request is deleted with that conversation. So a redelivery
+    that arrived after the conversation was deleted found nothing, looked like a new
+    message, and could be run again -- in another conversation of the same person, or,
+    after the account was unlinked and linked to somebody else, in another person's
+    history. This table is that missing record, and nothing else: it stores a bot id, an
+    update id and timestamps, never a message, a photo, an answer, a token or a user id. It has no
+    foreign key to users, conversations, turn requests or Telegram links, deliberately:
+    deleting any of those must not be able to erase the fact that the update was admitted.
+
+    The identity is the bot's, not a person's. (bot_id, update_id) is the primary key:
+    `update_id` is Telegram's own identifier, unique for one bot and increasing, and
+    `bot_id` is the numeric prefix of that bot's token (settings.BotSettings.bot_id), so a
+    replacement bot starts with an empty space of its own instead of colliding with the
+    old one. A row says "this update was admitted", never to whom.
+
+    Two shapes, fixed by the `shape_valid` CHECK (`kind_valid` and `bot_id_positive`
+    stand beside it):
+
+      * kind = 'update': update_id > 0, expires_at NOT NULL and after admitted_at. The
+        application writes exactly TELEGRAM_ADMISSION_RETENTION (48 hours: Telegram keeps
+        updates for 24 hours, plus a day of processing margin) after admitted_at. The
+        purge deletes such a row 48 hours after admitted_at even if expires_at is wrong
+        (admin.retention), so a marker cannot outlive its window through a bad deadline.
+      * kind = 'cutover': update_id = 0 (reserved; Telegram never uses it), expires_at
+        NULL. One row per bot, written the first time the ledger is used and kept: it is
+        durable state, not an update marker, so it has no deadline.
+
+    Append-only. Rows are written in the transaction that claims the turn (so a claim that
+    rolls back leaves no marker) and are removed only by the retention purge; the ORM
+    refuses to rewrite any of their columns. Uniqueness is the database's, so two claims
+    racing for one update cannot both stand, whatever the application does.
+    """
+
+    __tablename__ = "telegram_update_admissions"
+    __table_args__ = (
+        # The purge finds what to delete by deadline; the cutover row has none (NULLs do
+        # not enter a SQLite/PostgreSQL index).
+        sa.Index(None, "expires_at"),
+        sa.CheckConstraint(_in_list("kind", TelegramUpdateAdmissionKind), name="kind_valid"),
+        sa.CheckConstraint("bot_id > 0", name="bot_id_positive"),
+        sa.CheckConstraint(
+            "(kind = 'update' AND update_id > 0 AND expires_at IS NOT NULL "
+            "AND expires_at > admitted_at) OR "
+            "(kind = 'cutover' AND update_id = 0 AND expires_at IS NULL)",
+            name="shape_valid",
+        ),
+    )
+
+    bot_id: Mapped[int] = mapped_column(_BIGINT_ID, primary_key=True)
+    update_id: Mapped[int] = mapped_column(_BIGINT_ID, primary_key=True)
+    kind: Mapped[str] = mapped_column(
+        sa.String(16),
+        default=TelegramUpdateAdmissionKind.UPDATE.value,
+        server_default=sa.text("'update'"),
+    )
+    admitted_at: Mapped[datetime] = mapped_column(default=utcnow)
+    expires_at: Mapped[Optional[datetime]]
+
+
 class TelegramLinkCode(Base):
     """A one-time pairing code: what a signed-in person asks for on the website and
     presents to the bot (as the payload of /start) to link their Telegram account.
@@ -1296,6 +1437,13 @@ def _guard_telegram_code_on_update(mapper: Any, connection: Any, target: Any) ->
     _forbid_changes(target, "user_id", "code_hash", "created_at", "expires_at")
 
 
+def _guard_update_admission_on_update(mapper: Any, connection: Any, target: Any) -> None:
+    """A marker records what happened; it is deleted when it expires, never rewritten."""
+    _forbid_changes(
+        target, "bot_id", "update_id", "kind", "admitted_at", "expires_at"
+    )
+
+
 def _guard_favorite_on_update(mapper: Any, connection: Any, target: Any) -> None:
     """A favorite's identity, kind and creation time never change. What it holds may
     (favorites.update_favorite): that is the edit the version guards."""
@@ -1316,6 +1464,9 @@ sa.event.listen(IdentityInvitation, "before_update", _guard_invitation_on_update
 sa.event.listen(MessageAttachment, "before_update", _guard_attachment_on_update)
 sa.event.listen(TelegramLink, "before_update", _guard_telegram_link_on_update)
 sa.event.listen(TelegramLinkCode, "before_update", _guard_telegram_code_on_update)
+sa.event.listen(
+    TelegramUpdateAdmission, "before_update", _guard_update_admission_on_update
+)
 sa.event.listen(FavoriteRecipe, "before_update", _guard_favorite_on_update)
 sa.event.listen(MessageRecipe, "before_update", _guard_message_recipe_on_update)
 sa.event.listen(Message, "before_insert", _guard_retention_on_insert)

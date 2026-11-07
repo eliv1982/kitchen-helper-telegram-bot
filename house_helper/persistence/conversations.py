@@ -159,13 +159,9 @@ def delete_conversation(session: OrmSession, user_id: UUID, conversation_id: UUI
         raise ConversationNotFound
 
 
-def list_conversations(
-    session: OrmSession, user_id: UUID, *, now: datetime, limit: int
-) -> ConversationPage:
-    """The user's conversations, most recently active first (ties by id, so the order
-    is total), at most `limit` of them, each named (see "Titles", above) by its first
-    user message that has not expired at `now`."""
-    first_question = (
+def _first_question_subquery(now: datetime) -> sa.ScalarSelect:
+    """The text naming a conversation: its first user message that has not expired."""
+    return (
         sa.select(Message.content)
         .where(
             Message.conversation_id == Conversation.id,
@@ -177,15 +173,55 @@ def list_conversations(
         .correlate(Conversation)
         .scalar_subquery()
     )
+
+
+def list_conversations(
+    session: OrmSession,
+    user_id: UUID,
+    *,
+    now: datetime,
+    limit: int,
+    offset: int = 0,
+) -> ConversationPage:
+    """The user's conversations, most recently active first (ties by id, so the order
+    is total), at most `limit` of them after skipping `offset`, each named (see
+    "Titles", above) by its first user message that has not expired at `now`.
+
+    `has_more` says whether a conversation follows the page; with an offset it is the
+    same question about the page, so paging through the list never reports a next page
+    that is empty. The Telegram dialogs list uses the offset; the website uses 0."""
+    if offset < 0:
+        raise ValueError("offset must not be negative")
     rows = session.execute(
-        sa.select(Conversation, first_question)
+        sa.select(Conversation, _first_question_subquery(now))
         .where(Conversation.user_id == user_id)
         .order_by(Conversation.updated_at.desc(), Conversation.id.desc())
         .limit(limit + 1)
+        .offset(offset)
     ).all()
     return ConversationPage(
         [_summary(row[0], row[1]) for row in rows[:limit]], has_more=len(rows) > limit
     )
+
+
+def count_conversations(session: OrmSession, user_id: UUID) -> int:
+    """How many conversations the user has (empty ones included)."""
+    return session.scalar(
+        sa.select(sa.func.count()).select_from(Conversation).where(Conversation.user_id == user_id)
+    ) or 0
+
+
+def conversation_summary(
+    session: OrmSession, user_id: UUID, conversation_id: UUID, *, now: datetime
+) -> Optional[ConversationSummary]:
+    """One of the user's conversations as the list shows it (title included), or None
+    when it is unknown or belongs to somebody else: the two are not told apart."""
+    row = session.execute(
+        sa.select(Conversation, _first_question_subquery(now)).where(
+            Conversation.id == conversation_id, Conversation.user_id == user_id
+        )
+    ).one_or_none()
+    return None if row is None else _summary(row[0], row[1])
 
 
 def _summary(conversation: Conversation, first_question: Optional[str] = None) -> ConversationSummary:

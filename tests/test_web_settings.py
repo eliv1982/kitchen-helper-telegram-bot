@@ -59,6 +59,19 @@ def test_malformed_bot_settings_do_not_break_the_web_process():
     assert load_web_settings(bot_only).database_url == DEFAULT_DATABASE_URL
 
 
+def test_the_bot_id_is_the_numeric_prefix_of_the_token():
+    """The update admission ledger is scoped to the bot by this id; a replacement bot starts
+    with an id space of its own. The token's shape is already validated by BotSettings."""
+    from house_helper.web.settings import BotSettings
+
+    settings = BotSettings(
+        token="123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw",
+        username="house_helper_app_bot",
+    )
+
+    assert settings.bot_id == 123456789
+
+
 # --- validation ----------------------------------------------------------------------
 
 

@@ -285,7 +285,7 @@ class WebTurnRunner:
         origin: str = WEB_CHANNEL,
         attachment_id: Optional[UUID] = None,
         reclaim: bool = True,
-        authorize: Optional[Callable[[Any], bool]] = None,
+        authorize: Optional[Callable[[Any, Any], bool]] = None,
     ) -> TurnResult:
         """Answer `text` in the user's conversation. Raises ApiError (always one of the
         catalogue's; its `logged` flag says whether the log has it already). `origin` is the
@@ -300,13 +300,16 @@ class WebTurnRunner:
         turns.TurnAttempted, which is NOT an ApiError and is not logged here, and the provider
         is not asked again. A completed key is replayed either way.
 
-        `authorize`, if given, is called with the session of the claim's transaction, after the
-        conversation has been locked and the claim made, and must return True for the claim to
-        stand; otherwise the whole transaction is rolled back and TurnNotAuthorized is raised
-        (not an ApiError; the backend is not called and nothing is stored). It is how a caller
-        whose right to ask can be withdrawn while it waits (the Telegram bot: the account may
-        be unlinked, the person's access revoked) makes "still allowed" and "claimed" one
-        atomic step instead of two with a gap."""
+        `authorize`, if given, is called with the session of the claim's transaction and what
+        begin_turn returned (a Claim, or a CompletedTurn for a replay), after the conversation
+        has been locked and the claim made, and must return True for the claim to stand;
+        otherwise the whole transaction is rolled back and TurnNotAuthorized is raised (not an
+        ApiError; the backend is not called and nothing is stored). It is how a caller whose
+        right to ask can be withdrawn while it waits (the Telegram bot: the account may be
+        unlinked, the person's access revoked) makes "still allowed" and "claimed" one atomic
+        step instead of two with a gap, and how it records the update's admission in the same
+        step (persistence.telegram.admit_update; the returned value lets the bot tell a new
+        claim from the replay of a key that already exists)."""
         if self._closed:
             error = ApiError("service_unavailable", category="RunnerClosed")
             log_error(error, correlation_id, route)
@@ -414,7 +417,7 @@ class WebTurnRunner:
         origin: str,
         attachment_id: Optional[UUID] = None,
         reclaim: bool = True,
-        authorize: Optional[Callable[[Any], bool]] = None,
+        authorize: Optional[Callable[[Any, Any], bool]] = None,
     ) -> TurnResult:
         try:
             result = await self._run(
@@ -473,7 +476,7 @@ class WebTurnRunner:
         correlation_id: str,
         attachment_id: Optional[UUID] = None,
         reclaim: bool = True,
-        authorize: Optional[Callable[[Any], bool]] = None,
+        authorize: Optional[Callable[[Any, Any], bool]] = None,
     ) -> TurnResult:
         # 1. The claim. The clock is read by begin_turn itself, under the conversation
         # lock, so the lease is measured from the claim and not from here.
@@ -490,7 +493,7 @@ class WebTurnRunner:
                 attachment_id=attachment_id,
                 reclaim=reclaim,
             )
-            if authorize is not None and not authorize(session):
+            if authorize is not None and not authorize(session, started):
                 raise TurnNotAuthorized  # (the exception rolls the claim back with its transaction)
             return started
 

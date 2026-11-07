@@ -26,12 +26,19 @@ import httpx
 from house_helper.persistence.models import Conversation, Message, TelegramLink, TelegramLinkCode, TurnRequest
 from house_helper.web.settings import BotSettings
 from tests.chat_support import ChatHarness, ScriptedBackend, post_headers
-from tests.auth_support import auth_app, sign_in
+from tests.auth_support import START, auth_app, sign_in
 from tests.web_support import TIMEOUT
 
 # Shaped like a real token (the library checks the shape) and nothing else.
 BOT_TOKEN = "123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw"
 BOT_NAME = "house_helper_app_bot"
+
+# The `date` of a message built by hand. It must be after the harness's START (the update
+# admission ledger's cutover is written at the application's start, and a message dated
+# before it is refused as a pre-migration update) and within the replay horizon. Tests that
+# advance the fake clock far before delivering use TelegramHarness.deliver, which dates the
+# message from the clock; a test about staleness passes its own `date`.
+DEFAULT_MESSAGE_DATE = int(START.timestamp()) + 60
 
 MOTHER = 555000111  # what the Bot API says a sender's id is; never equal to a sign-in `sub`
 SISTER = 555000222
@@ -61,12 +68,32 @@ class FakeBot:
         self._sent_changed = asyncio.Event()
         self.poll_wait = 0.02  # how long a getUpdates with nothing to return waits
         self._send_gate: Optional[asyncio.Event] = None
+        self._ack_gate: Optional[asyncio.Event] = None
 
     # --- the test's side -------------------------------------------------------------------
 
     def push(self, update: dict[str, Any]) -> None:
         self._pending.append(update)
         self._changed.set()
+
+    @property
+    def pending(self) -> list[dict[str, Any]]:
+        """What Telegram still holds for the next getUpdates, in delivery order."""
+        return list(self._pending)
+
+    def hold_acknowledgements(self) -> asyncio.Event:
+        """From now on a getUpdates that carries an offset (the acknowledgement of what the
+        previous call returned) waits for the returned event BEFORE the server applies it.
+        Leaving it unset is a lost acknowledgement: the server never accepted the higher
+        offset, and the original updates stay pending."""
+        self._ack_gate = asyncio.Event()
+        return self._ack_gate
+
+    def release_acknowledgements(self) -> None:
+        """Stop holding acknowledgements (a new process talks to a server with no such
+        block). Already blocked requests are not released by this; closing the application
+        cancels them."""
+        self._ack_gate = None
 
     def hold_sends(self) -> asyncio.Event:
         """From now on a sendMessage waits until the returned event is set."""
@@ -161,6 +188,10 @@ class FakeBot:
         offset = body.get("offset")
         self.offsets.append(offset)
         self.waits.append(body.get("timeout"))
+        if offset is not None and self._ack_gate is not None:
+            # The acknowledgement is in flight and Telegram has not accepted it yet: the
+            # pending queue is untouched until the gate is set (or the request is cancelled).
+            await self._ack_gate.wait()
         if offset is not None:
             self._pending = [u for u in self._pending if u["update_id"] >= offset]
         if not self._pending:
@@ -192,7 +223,7 @@ def private_message(
         "message_id": update_id * 10,
         "from": sender,
         "chat": {"id": account, "type": "private", "first_name": first_name},
-        "date": 1790000000,
+        "date": DEFAULT_MESSAGE_DATE,
     }
     if text is not None:
         message["text"] = text
@@ -322,7 +353,11 @@ class TelegramHarness:
         one answer."""
         if tick:
             self.chat.clock.advance(seconds=1)
-        update = private_message(self.next_id(), account, text, **kwargs)
+        # Dated from the harness clock: a test that advanced days before delivering must not
+        # produce a message the stale or cutover policy would (correctly) refuse.
+        dated = {"date": int(self.chat.clock().timestamp())}
+        dated.update(kwargs)
+        update = private_message(self.next_id(), account, text, **dated)
         await self.service.handle_update(update)
         return update
 

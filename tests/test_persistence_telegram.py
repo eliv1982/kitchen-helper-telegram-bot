@@ -38,6 +38,7 @@ from tests.persistence_support import (  # noqa: F401  (fixtures)
 NOW = utc(2026, 10, 28, 12)
 ACCOUNT = 987654321  # what the Bot API says a sender's id is: nothing like a sign-in `sub`
 OTHER_ACCOUNT = 123456789
+BOT = 777000111  # the numeric id in the bot's token; the admission ledger's bot scope
 
 
 def run(factory, work):
@@ -636,27 +637,45 @@ def test_the_look_finds_the_update_in_any_conversation_of_its_owner_and_in_any_s
     assert run(factory, lambda db: tg.update_admitted_for_another(db, other_user_id, 1002)) is True
 
 
+def claim(factory, user_id, update_id, *, existing=False, bot=BOT, account=ACCOUNT):
+    return run(
+        factory,
+        lambda db: tg.admit_update(
+            db,
+            account,
+            user_id,
+            update_id,
+            bot_id=bot,
+            now=NOW,
+            existing=existing,
+        ),
+    )
+
+
 def test_a_claim_is_admitted_for_the_account_that_is_still_the_users_and_a_fresh_update(factory, user_id):
     present(factory, issue(factory, user_id).code, ACCOUNT)
 
-    assert run(factory, lambda db: tg.admit_update(db, ACCOUNT, user_id, 1001)) is True
+    assert claim(factory, user_id, 1001) is tg.AdmissionOutcome.ADMITTED
+    # ... and the marker is there, under the bot's id, readable by its primary key.
+    assert run(factory, lambda db: tg.update_admission_exists(db, BOT, 1001)) is True
+    assert run(factory, lambda db: tg.update_admission_exists(db, BOT + 1, 1001)) is False
 
 
 def test_a_claim_is_refused_for_an_update_admitted_for_somebody_else(factory, user_id, other_user_id):
     present(factory, issue(factory, other_user_id).code, ACCOUNT)
     admit_for(factory, user_id, 1001)  # admitted while the account was the first person's
 
-    assert run(factory, lambda db: tg.admit_update(db, ACCOUNT, other_user_id, 1001)) is False
-    assert run(factory, lambda db: tg.admit_update(db, ACCOUNT, other_user_id, 1002)) is True
+    assert claim(factory, other_user_id, 1001) is tg.AdmissionOutcome.BINDING_CHANGED
+    assert claim(factory, other_user_id, 1002) is tg.AdmissionOutcome.ADMITTED
 
 
 def test_a_claim_is_refused_when_the_account_is_not_the_users_or_the_user_is_not_enrolled(factory, user_id, other_user_id):
     present(factory, issue(factory, user_id).code, ACCOUNT)
 
-    assert run(factory, lambda db: tg.admit_update(db, ACCOUNT, other_user_id, 1001)) is False  # another user's account
-    assert run(factory, lambda db: tg.admit_update(db, OTHER_ACCOUNT, user_id, 1001)) is False  # an account with no link
+    assert claim(factory, other_user_id, 1001) is tg.AdmissionOutcome.BINDING_CHANGED  # another user's account
+    assert claim(factory, user_id, 1001, account=OTHER_ACCOUNT) is tg.AdmissionOutcome.BINDING_CHANGED  # an account with no link
     run(factory, lambda db: setattr(db.get(User, user_id), "disabled_at", NOW))
-    assert run(factory, lambda db: tg.admit_update(db, ACCOUNT, user_id, 1001)) is False
+    assert claim(factory, user_id, 1001) is tg.AdmissionOutcome.BINDING_CHANGED
 
 
 def test_holding_the_link_asks_postgresql_for_a_share_lock_on_the_link_row_and_sqlite_for_nothing():

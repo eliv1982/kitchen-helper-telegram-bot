@@ -12,6 +12,7 @@ import sqlalchemy as sa
 
 from house_helper.persistence.authn import authenticate
 from house_helper.persistence.base import Base
+from house_helper.persistence.models import User
 from house_helper.persistence.database import (
     create_db_engine,
     create_session_factory,
@@ -23,6 +24,7 @@ from tests.test_persistence_migrations import (
     FAVORITES,
     HEAD,
     LATER,
+    RECIPES,
     TELEGRAM,
     _fingerprint,
     _offline_sql,
@@ -34,9 +36,12 @@ from tests.test_persistence_migrations import (
 from tests.test_persistence_schema import TABLES
 
 TELEGRAM_TABLES = {"telegram_links", "telegram_link_codes"}
+ACTIVE_TABLES = {"telegram_active_conversations"}
+ADMISSION_TABLES = {"telegram_update_admissions"}
+NEW_TABLES = ACTIVE_TABLES | ADMISSION_TABLES
 PHOTO_TABLES = {"message_attachments"}
 RECIPE_TABLES = {"message_recipes"}
-OLD_TABLES = TABLES - TELEGRAM_TABLES - PHOTO_TABLES - RECIPE_TABLES
+OLD_TABLES = TABLES - TELEGRAM_TABLES - NEW_TABLES - PHOTO_TABLES - RECIPE_TABLES
 
 
 @pytest.fixture
@@ -67,7 +72,7 @@ def test_each_revision_adds_only_its_own_empty_tables_and_changes_no_row(engine)
     assert _tables(engine) == TABLES | {"alembic_version"}
     assert _snapshot_of(engine, OLD_TABLES) == before  # every row of every old table
     with engine.connect() as connection:
-        for table in TELEGRAM_TABLES | PHOTO_TABLES | RECIPE_TABLES:
+        for table in TELEGRAM_TABLES | NEW_TABLES | PHOTO_TABLES | RECIPE_TABLES:
             assert connection.exec_driver_sql(f"SELECT count(*) FROM {table}").scalar() == 0
         assert connection.exec_driver_sql("PRAGMA foreign_key_check").all() == []
         assert connection.exec_driver_sql("PRAGMA integrity_check").scalars().all() == ["ok"]
@@ -83,7 +88,7 @@ def test_the_migration_and_the_models_describe_the_same_tables(tmp_path):
         Base.metadata.create_all(modeled)
         a, b = _fingerprint(migrated), _fingerprint(modeled)
 
-        for table in sorted(TELEGRAM_TABLES | PHOTO_TABLES):
+        for table in sorted(TELEGRAM_TABLES | NEW_TABLES | PHOTO_TABLES):
             assert a[table] == b[table], table
     finally:
         migrated.dispose()
@@ -137,7 +142,7 @@ def test_nothing_that_existed_refers_to_the_new_tables(engine):
     upgrade_database(engine)
 
     inspector = sa.inspect(engine)
-    new = TELEGRAM_TABLES | PHOTO_TABLES
+    new = TELEGRAM_TABLES | NEW_TABLES | PHOTO_TABLES
     referring = {
         table: [key["referred_table"] for key in inspector.get_foreign_keys(table) if key["referred_table"] in new]
         for table in inspector.get_table_names()
@@ -145,6 +150,142 @@ def test_nothing_that_existed_refers_to_the_new_tables(engine):
     }
 
     assert {table: found for table, found in referring.items() if found} == {}
+
+
+def test_the_0011_migration_adds_two_empty_tables_and_changes_no_row(tmp_path):
+    """0010 -> 0011: a database with real rows in every other table keeps all of them,
+    byte for byte; the only additions are the empty selection table and the empty admission
+    ledger."""
+    engine = create_db_engine(f"sqlite:///{tmp_path / 'active_migration.db'}")
+    try:
+        _r4c_database(engine)  # users, identity links, sessions, conversations, messages, invitations, states
+        upgrade_database(engine, RECIPES)
+        before = _snapshot_of(engine, TABLES - NEW_TABLES)
+        assert _version(engine) == [RECIPES]
+
+        upgrade_database(engine)
+
+        assert _version(engine) == [HEAD]
+        assert _tables(engine) == TABLES | {"alembic_version"}
+        assert _snapshot_of(engine, TABLES - NEW_TABLES) == before  # every old row
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql(
+                "SELECT count(*) FROM telegram_active_conversations"
+            ).scalar() == 0
+            assert connection.exec_driver_sql(
+                "SELECT count(*) FROM telegram_update_admissions"
+            ).scalar() == 0
+            assert connection.exec_driver_sql("PRAGMA foreign_key_check").all() == []
+            assert connection.exec_driver_sql("PRAGMA integrity_check").scalars().all() == ["ok"]
+    finally:
+        engine.dispose()
+
+
+def test_the_active_conversation_table_has_the_keys_and_checks_the_design_says(tmp_path):
+    engine = create_db_engine(f"sqlite:///{tmp_path / 'active_keys.db'}")
+    try:
+        upgrade_database(engine)
+        found = _fingerprint(engine)["telegram_active_conversations"]
+
+        assert list(found["columns"]) == ["user_id", "conversation_id", "selected_at"]
+        assert {
+            name: nullable for name, (_, nullable, _) in found["columns"].items()
+        } == {"user_id": False, "conversation_id": True, "selected_at": False}
+        assert found["pk"]["name"] == "pk_telegram_active_conversations"
+        assert found["pk"]["constrained_columns"] == ["user_id"]
+        assert found["uniques"] == []
+        assert found["fks"] == [
+            (
+                "fk_telegram_active_conversations_conversation_id_conversations",
+                ("conversation_id",),
+                "conversations",
+                ("id",),
+                (("ondelete", "SET NULL"),),
+            ),
+            (
+                "fk_telegram_active_conversations_user_id_users",
+                ("user_id",),
+                "users",
+                ("id",),
+                (("ondelete", "CASCADE"),),
+            ),
+        ]
+        assert found["checks"] == []
+        assert found["indexes"] == [
+            ("ix_telegram_active_conversations_conversation_id", ("conversation_id",), False)
+        ]
+    finally:
+        engine.dispose()
+
+
+def test_the_admission_ledger_has_the_keys_and_checks_the_design_says(tmp_path):
+    engine = create_db_engine(f"sqlite:///{tmp_path / 'admission_keys.db'}")
+    try:
+        upgrade_database(engine)
+        found = _fingerprint(engine)["telegram_update_admissions"]
+
+        assert list(found["columns"]) == [
+            "bot_id",
+            "update_id",
+            "kind",
+            "admitted_at",
+            "expires_at",
+        ]
+        assert {
+            name: nullable for name, (_, nullable, _) in found["columns"].items()
+        } == {
+            "bot_id": False,
+            "update_id": False,
+            "kind": False,
+            "admitted_at": False,
+            "expires_at": True,  # NULL for the bot's cutover row
+        }
+        assert found["pk"]["name"] == "pk_telegram_update_admissions"
+        assert found["pk"]["constrained_columns"] == ["bot_id", "update_id"]
+        assert found["uniques"] == []  # the primary key is the uniqueness rule
+        assert found["fks"] == []  # deliberately: no user, conversation or request can erase it
+        assert found["indexes"] == [
+            ("ix_telegram_update_admissions_expires_at", ("expires_at",), False)
+        ]
+        assert [name for name, _ in found["checks"]] == [
+            "ck_telegram_update_admissions_bot_id_positive",
+            "ck_telegram_update_admissions_kind_valid",
+            "ck_telegram_update_admissions_shape_valid",
+        ]
+    finally:
+        engine.dispose()
+
+
+def test_the_active_conversation_migration_downgrades_to_the_same_schema(tmp_path):
+    migrated = create_db_engine(f"sqlite:///{tmp_path / 'migrated.db'}")
+    pristine = create_db_engine(f"sqlite:///{tmp_path / 'pristine.db'}")
+    try:
+        upgrade_database(migrated, RECIPES)
+        upgrade_database(pristine, RECIPES)
+        with create_session_factory(migrated)() as db, db.begin():
+            db.add(User(display_name="Elena"))
+        before = _snapshot_of(migrated, TABLES - NEW_TABLES)
+        upgrade_database(migrated)
+
+        downgrade_database(migrated, RECIPES)
+
+        assert _version(migrated) == [RECIPES]
+        assert _tables(migrated) == (TABLES - NEW_TABLES) | {"alembic_version"}
+        assert _fingerprint(migrated) == _fingerprint(pristine)  # the 0010 schema, exactly
+        assert _snapshot_of(migrated, TABLES - NEW_TABLES) == before
+
+        upgrade_database(migrated)  # and forward again: empty tables, as they began
+        assert _version(migrated) == [HEAD]
+        with migrated.connect() as connection:
+            assert connection.exec_driver_sql(
+                "SELECT count(*) FROM telegram_active_conversations"
+            ).scalar() == 0
+            assert connection.exec_driver_sql(
+                "SELECT count(*) FROM telegram_update_admissions"
+            ).scalar() == 0
+    finally:
+        migrated.dispose()
+        pristine.dispose()
 
 
 def test_the_way_back_drops_only_what_each_revision_added(tmp_path):
@@ -182,6 +323,12 @@ def test_the_two_revisions_render_as_postgresql_sql_that_only_creates_tables_and
     for source, target, tables, indexes in [
         (FAVORITES, TELEGRAM, ["telegram_links", "telegram_link_codes"], 2),
         (TELEGRAM, ATTACHMENTS, ["message_attachments"], 2),
+        (
+            RECIPES,
+            HEAD,
+            ["telegram_active_conversations", "telegram_update_admissions"],
+            2,
+        ),
     ]:
         revision = up.split(f"Running upgrade {source} -> {target}")[1].split("-- Running")[0]
         statements = [re.sub(r"\s+", " ", part.strip()) for part in revision.split(";")]
@@ -202,4 +349,12 @@ def test_the_two_revisions_render_as_postgresql_sql_that_only_creates_tables_and
     assert re.findall(r"^DROP [^;]*", uncommented, re.MULTILINE) == [
         "DROP TABLE telegram_link_codes",
         "DROP TABLE telegram_links",
+    ]
+    down = _offline_sql("down_from_head")
+    uncommented = re.sub(r"^--.*$", "", down, flags=re.MULTILINE)
+    assert re.findall(r"^DROP [^;]*", uncommented, re.MULTILINE) == [
+        "DROP INDEX ix_telegram_update_admissions_expires_at",
+        "DROP TABLE telegram_update_admissions",
+        "DROP INDEX ix_telegram_active_conversations_conversation_id",
+        "DROP TABLE telegram_active_conversations",
     ]

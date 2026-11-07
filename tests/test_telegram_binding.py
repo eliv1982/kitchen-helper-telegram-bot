@@ -134,8 +134,10 @@ async def test_access_withdrawn_between_the_check_and_the_claim_still_stops_the_
         checked, proceed = asyncio.Event(), asyncio.Event()
         original = t.service._conversation_for
 
-        async def held(user_id, key):
-            found = await original(user_id, key)
+        async def held(account, user_id, key, update_id, *, admitted_here=False):
+            found = await original(
+                account, user_id, key, update_id, admitted_here=admitted_here
+            )
             checked.set()
             await proceed.wait()  # the check above has passed; the claim has not been made
             return found
@@ -171,9 +173,10 @@ async def test_the_runner_makes_the_claim_conditional_when_asked_to_and_stores_n
             )
 
         with pytest.raises(TurnNotAuthorized):
-            await submit("k-1", lambda session: False)
+            await submit("k-1", lambda session, started: False)
         refused = (backend.calls, len(t.all_turns()), len(t.all_messages()))
-        done = await submit("k-1", lambda session: True)  # the same key is still free: nothing was kept
+        # the same key is still free: nothing was kept
+        done = await submit("k-1", lambda session, started: True)
 
     assert refused == (0, 0, 0)
     assert done.completed.assistant_message.text == "Ответ" and backend.calls == 1

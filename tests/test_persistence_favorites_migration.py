@@ -37,7 +37,15 @@ from tests.test_persistence_migrations import (
 )
 from tests.test_persistence_schema import TABLES
 
-TABLES_BEFORE_0007 = TABLES - {"favorite_recipes", "telegram_links", "telegram_link_codes", "message_attachments", "message_recipes"}
+TABLES_BEFORE_0007 = TABLES - {
+    "favorite_recipes",
+    "telegram_links",
+    "telegram_link_codes",
+    "telegram_active_conversations",
+    "telegram_update_admissions",
+    "message_attachments",
+    "message_recipes",
+}
 
 
 @pytest.fixture
