@@ -41,6 +41,7 @@
     chat: byId("chat"),
     chatTitle: byId("chat-title"),
     helpToggle: byId("help-toggle"),
+    helpBackdrop: byId("help-backdrop"),
     helpPanel: byId("help-panel"),
     helpTitle: byId("help-title"),
     helpText: byId("help-text"),
@@ -712,34 +713,92 @@
   });
 
   // The help explanation of the ideas -> chosen dish -> full recipe -> favorites workflow. It
-  // is a disclosure beside the conversation title, so it is reachable while the conversation
-  // is empty and while it is active; it only shows text and never sends, clears or changes
-  // anything of the conversation.
+  // is a modal dialog over the page, opened from the conversation header: the page behind it
+  // is inert while it is up, the focus stays inside it, and closing returns the focus to the
+  // button that asked. It only shows text and never sends, clears or changes anything of the
+  // conversation; opening and closing it leave the messages, the scroll position and the
+  // unsent draft exactly as they were.
   var helpOpen = false;
+
+  // The controls of the dialog, in reading order; the close button is the only one today,
+  // but the trap does not depend on that.
+  function helpControls() {
+    var found = [];
+    (function walk(node) {
+      for (var i = 0; i < node.childNodes.length; i++) {
+        var child = node.childNodes[i];
+        if (child.nodeType !== 1) {
+          continue;
+        }
+        if (child.localName === "button" && !child.disabled) {
+          found.push(child);
+        }
+        walk(child);
+      }
+    })(els.helpPanel);
+    return found;
+  }
+
   function setHelp(open, focusToggle) {
     helpOpen = open;
     els.helpPanel.hidden = !open;
+    els.helpBackdrop.hidden = !open;
+    // While the dialog is up nothing behind it takes a click, a tap or a focus.
+    els.app.inert = open;
     els.helpToggle.setAttribute("aria-expanded", open ? "true" : "false");
-    if (focusToggle) {
+    if (open) {
+      els.helpClose.focus();
+    } else if (focusToggle) {
       els.helpToggle.focus();
     }
   }
+
   els.helpToggle.addEventListener("click", function () {
     setHelp(!helpOpen, false);
   });
   els.helpClose.addEventListener("click", function () {
     setHelp(false, true);
   });
-  els.helpToggle.addEventListener("keydown", function (event) {
-    if (event.key === "Escape" && helpOpen) {
-      event.preventDefault();
-      setHelp(false, false);
-    }
+  els.helpBackdrop.addEventListener("click", function () {
+    setHelp(false, true);
   });
-  els.helpPanel.addEventListener("keydown", function (event) {
-    if (event.key === "Escape" && helpOpen) {
+  // The keys are heard on the document, not only on the dialog: the focus can be thrown out
+  // of an open dialog (a script, an extension, a browser quirk), and Escape or Tab from the
+  // page body must still close it or bring the focus back in. One listener is added when the
+  // page starts and lives as long as the page; while the dialog is closed it does nothing at
+  // all, so repeated opening and closing never stacks another handler.
+  document.addEventListener("keydown", function (event) {
+    if (!helpOpen) {
+      return;
+    }
+    if (event.key === "Escape") {
       event.preventDefault();
       setHelp(false, true);
+      return;
+    }
+    if (event.key !== "Tab") {
+      return;
+    }
+    // The focus never leaves the dialog: Tab on the last control wraps to the first, and
+    // Shift+Tab on the first wraps to the last (with one control, both keep it there). A key
+    // that arrives while the focus is outside the dialog pulls it back to the edge it came
+    // from: the first control for Tab, the last for Shift+Tab.
+    var controls = helpControls();
+    if (!controls.length) {
+      event.preventDefault();
+      return;
+    }
+    var first = controls[0];
+    var last = controls[controls.length - 1];
+    var inside = within(document.activeElement, els.helpPanel);
+    if (event.shiftKey) {
+      if (!inside || document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      }
+    } else if (!inside || document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
     }
   });
   els.helpTitle.textContent = Logic.TEXT.helpTitle;

@@ -202,7 +202,8 @@ _SHELL = """\
       <div class="chat-head">
         <h1 id="chat-title" class="chat-title" tabindex="-1"></h1>
         <button id="help-toggle" class="btn btn-quiet chat-help-toggle" type="button"
-                aria-expanded="false" aria-controls="help-panel" aria-label="Помощь">Помощь</button>
+                aria-haspopup="dialog" aria-expanded="false" aria-controls="help-panel"
+                aria-label="Помощь">Помощь</button>
         <div id="chat-actions" class="chat-actions" hidden>
           <button id="chat-actions-toggle" class="btn btn-quiet chat-actions-toggle" type="button"
                   aria-haspopup="menu" aria-expanded="false" aria-controls="chat-actions-menu"
@@ -210,11 +211,6 @@ _SHELL = """\
           <div id="chat-actions-menu" class="chat-actions-menu" role="menu"
                aria-label="Действия с разговором" hidden></div>
         </div>
-      </div>
-      <div id="help-panel" class="help-panel" role="region" aria-labelledby="help-title" hidden>
-        <h2 id="help-title" class="help-title"></h2>
-        <p id="help-text" class="hint"></p>
-        <button id="help-close" class="btn btn-quiet" type="button">Закрыть</button>
       </div>
       <div id="chat-delete" class="chat-delete" hidden></div>
       <div id="banner" class="banner" hidden>
@@ -239,6 +235,16 @@ _SHELL = """\
       <div id="recipe-body" class="recipe-body" tabindex="0"></div>
     </section>
   </div>
+</div>
+
+<div id="help-backdrop" class="help-backdrop" hidden></div>
+<div id="help-panel" class="help-panel" role="dialog" aria-modal="true"
+     aria-labelledby="help-title" aria-describedby="help-text" hidden>
+  <div class="help-head">
+    <h2 id="help-title" class="help-title"></h2>
+    <button id="help-close" class="btn btn-quiet help-close" type="button">Закрыть</button>
+  </div>
+  <p id="help-text" class="hint"></p>
 </div>
 
 <script src="/static/chat-logic.js"></script>

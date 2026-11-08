@@ -757,39 +757,197 @@ scenario("opening_another_conversation_closes_the_actions_menu", async () => {
   assert.equal(toggle.getAttribute("aria-expanded"), "false");
 });
 
-scenario("the_help_explanation_opens_in_an_active_conversation_and_changes_nothing", async () => {
+function outsideApplication(page, id) {
+  for (let node = page.el(id); node; node = node.parentNode) {
+    if (node === page.el("screen-app")) return false;
+  }
+  return true;
+}
+
+// A key press as a browser delivers it: to the node the key happened on, then up through each
+// of its ancestors, then to the document. The mini DOM (fake_dom.js) has no bubbling of its
+// own, so the scenarios model it here; the event keeps the node the key happened on as its
+// target, and the same event object is handed to every listener on the way.
+function pressKey(page, target, init = {}) {
+  const event = {
+    type: "keydown",
+    defaultPrevented: false,
+    preventDefault() {
+      this.defaultPrevented = true;
+    },
+    ...init,
+    target,
+  };
+  const path = [];
+  for (let node = target; node; node = node.parentNode) {
+    path.push(node);
+  }
+  path.push(page.doc);
+  for (const node of path) {
+    const listeners = (node.listeners && node.listeners.keydown) || [];
+    for (const listener of listeners.slice()) {
+      listener.call(node, event);
+    }
+  }
+  return event;
+}
+
+scenario("the_help_explanation_opens_in_a_modal_over_an_active_conversation_and_changes_nothing", async () => {
   const page = await open(oneConversation());
   const toggle = page.el("help-toggle");
+  const panel = page.el("help-panel");
+  const backdrop = page.el("help-backdrop");
+  const close = page.el("help-close");
+  const app = page.el("screen-app");
 
-  // An active conversation (two messages), and the explanation closed until asked for.
+  // An active conversation (two messages), an unsent draft and a scrolled list: the modal
+  // must leave all three exactly as they are.
   assert.equal(page.articles().length, 2);
   const before = page.articleTexts();
   assert.ok(before.some((text) => text.includes("Старый вопрос")));
+  page.type("неотправленное сообщение");
+  page.messages().scrollTop = 120;
+
+  // Closed until asked for; the entry is in the conversation header.
   assert.equal(page.visible("help-panel"), false);
+  assert.equal(page.visible("help-backdrop"), false);
+  assert.equal(app.inert, false);
   assert.equal(toggle.parentNode.className, "chat-head", "the entry is in the conversation header");
   assert.equal(toggle.getAttribute("type"), "button");
+  assert.equal(toggle.getAttribute("aria-haspopup"), "dialog");
   assert.equal(toggle.getAttribute("aria-expanded"), "false");
   assert.equal(toggle.getAttribute("aria-controls"), "help-panel");
   assert.equal(toggle.getAttribute("aria-label"), "Помощь");
+  assert.equal(panel.getAttribute("role"), "dialog");
+  assert.equal(panel.getAttribute("aria-modal"), "true");
+  assert.equal(panel.getAttribute("aria-labelledby"), "help-title");
+  assert.equal(panel.getAttribute("aria-describedby"), "help-text");
+  assert.ok(outsideApplication(page, "help-panel"), "the dialog is outside the box made inert");
 
   toggle.click();
   assert.equal(page.visible("help-panel"), true);
+  assert.equal(page.visible("help-backdrop"), true);
+  assert.equal(app.inert, true, "the page behind the dialog takes no interaction");
   assert.equal(toggle.getAttribute("aria-expanded"), "true");
+  assert.equal(page.doc.activeElement, close, "the focus moves into the dialog");
   assert.equal(page.el("help-title").textContent, Logic.TEXT.helpTitle);
   const text = page.el("help-text").textContent;
   assert.equal(text, Logic.TEXT.help);
   for (const phrase of ["идеи блюд", "полный рецепт", "избранное"]) {
     assert.ok(text.includes(phrase), "the help explains " + phrase);
   }
-  // The conversation is neither cleared nor changed, and no request is made.
+  // The conversation is neither cleared nor changed, the draft stays, the list stays where
+  // it was, and no request is made.
   assert.deepEqual(page.articleTexts(), before);
+  assert.equal(page.el("composer-input").value, "неотправленное сообщение");
+  assert.equal(page.messages().scrollTop, 120);
   assert.equal(page.env.net.requests("POST", /.*/).length, 0);
 
-  // Escape closes it, leaving the conversation as it was.
-  toggle.fire("keydown", { key: "Escape" });
+  // The focus never leaves the dialog: Tab and Shift+Tab keep it on the only control. The key
+  // happens on the focused element and reaches the page's handling through the document.
+  const tab = pressKey(page, close, { key: "Tab" });
+  assert.equal(tab.defaultPrevented, true);
+  assert.equal(page.doc.activeElement, close);
+  const back = pressKey(page, close, { key: "Tab", shiftKey: true });
+  assert.equal(back.defaultPrevented, true);
+  assert.equal(page.doc.activeElement, close);
+
+  // Escape closes it, gives the focus back to the entry and leaves everything as it was.
+  const escaped = pressKey(page, close, { key: "Escape" });
+  assert.equal(escaped.defaultPrevented, true);
   assert.equal(page.visible("help-panel"), false);
+  assert.equal(page.visible("help-backdrop"), false);
+  assert.equal(app.inert, false);
   assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  assert.equal(page.doc.activeElement, toggle);
   assert.deepEqual(page.articleTexts(), before);
+  assert.equal(page.el("composer-input").value, "неотправленное сообщение");
+  assert.equal(page.messages().scrollTop, 120);
+
+  // The close button and a click outside the dialog both close it the same way.
+  for (const dismiss of [() => close.click(), () => backdrop.click()]) {
+    toggle.click();
+    assert.equal(page.visible("help-panel"), true);
+    dismiss();
+    assert.equal(page.visible("help-panel"), false);
+    assert.equal(page.visible("help-backdrop"), false);
+    assert.equal(app.inert, false);
+    assert.equal(page.doc.activeElement, toggle, "the focus returns to the button that asked");
+    assert.deepEqual(page.articleTexts(), before);
+  }
+});
+
+scenario("the_help_modal_hears_the_keyboard_wherever_the_focus_is_and_only_while_it_is_open", async () => {
+  const page = await open(oneConversation());
+  const toggle = page.el("help-toggle");
+  const close = page.el("help-close");
+  const body = page.doc.body;
+  const app = page.el("screen-app");
+  const handlers = page.doc.listeners.keydown.length;
+
+  // Escape that really happens on the page body (the focus thrown out of the dialog by a
+  // script, an extension or a browser quirk) still closes it and gives the focus back.
+  toggle.click();
+  assert.equal(page.visible("help-panel"), true);
+  assert.equal(page.doc.activeElement, close);
+  page.doc.activeElement = body;
+  const escaped = pressKey(page, body, { key: "Escape" });
+  assert.equal(escaped.target, body, "the key really happens outside the dialog");
+  assert.equal(escaped.defaultPrevented, true);
+  assert.equal(page.visible("help-panel"), false);
+  assert.equal(page.visible("help-backdrop"), false);
+  assert.equal(app.inert, false);
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  assert.equal(page.doc.activeElement, toggle, "the focus returns to the entry");
+
+  // Tab and Shift+Tab from outside pull the focus back to the edge of the dialog: the first
+  // control for Tab, the last for Shift+Tab (one control here, so both land on it).
+  for (const shiftKey of [false, true]) {
+    toggle.click();
+    assert.equal(page.visible("help-panel"), true);
+    page.doc.activeElement = body;
+    const tab = pressKey(page, body, { key: "Tab", shiftKey });
+    assert.equal(tab.defaultPrevented, true);
+    assert.equal(page.doc.activeElement, close, "the focus is back inside the dialog");
+    assert.equal(page.visible("help-panel"), true, "the dialog stays open");
+    pressKey(page, close, { key: "Escape" });
+    assert.equal(page.visible("help-panel"), false);
+  }
+
+  // Closed, the page's keys are its own again: nothing is prevented, the focus does not move.
+  page.doc.activeElement = body;
+  const closedTab = pressKey(page, body, { key: "Tab" });
+  assert.equal(closedTab.defaultPrevented, false);
+  assert.equal(page.doc.activeElement, body);
+  const closedEscape = pressKey(page, body, { key: "Escape" });
+  assert.equal(closedEscape.defaultPrevented, false);
+  assert.equal(page.visible("help-panel"), false);
+
+  // Repeated opening and closing adds no handler and leaves none behind.
+  for (let i = 0; i < 6; i++) {
+    toggle.click();
+    assert.equal(page.visible("help-panel"), true);
+    close.click();
+    assert.equal(page.visible("help-panel"), false);
+  }
+  assert.equal(page.doc.listeners.keydown.length, handlers, "one dialog keydown handler, never duplicated");
+
+  // The session ending under an open dialog changes the screen as it did before: the dialog
+  // closes, the login takes the focus, and its keys are not heard any more.
+  const ended = await open((env) => {
+    oneConversation()(env);
+    env.net.route("GET", "/auth/me", me(30));
+  });
+  ended.el("help-toggle").click();
+  assert.equal(ended.visible("help-panel"), true);
+  await ended.env.timers.advance(31000);
+  await ended.settle();
+  assert.equal(ended.visible("screen-login"), true);
+  assert.equal(ended.visible("help-panel"), false);
+  assert.equal(ended.el("screen-app").inert, false);
+  assert.equal(ended.doc.activeElement, ended.el("login-title"));
+  const lateEscape = pressKey(ended, ended.doc.body, { key: "Escape" });
+  assert.equal(lateEscape.defaultPrevented, false);
 });
 
 scenario("the_help_explanation_is_reachable_in_an_empty_conversation_on_a_narrow_screen", async () => {
@@ -802,12 +960,15 @@ scenario("the_help_explanation_is_reachable_in_an_empty_conversation_on_a_narrow
   assert.equal(page.visible("help-toggle"), true);
   page.el("help-toggle").click();
   assert.equal(page.visible("help-panel"), true);
+  assert.equal(page.visible("help-backdrop"), true);
   assert.equal(page.el("help-text").textContent, Logic.TEXT.help);
   assert.equal(page.articles().length, 0, "the explanation did not create a message");
+  assert.equal(page.el("screen-app").inert, true);
 
   // Closing gives the focus back to the entry.
   page.el("help-close").click();
   assert.equal(page.visible("help-panel"), false);
+  assert.equal(page.el("screen-app").inert, false);
   assert.equal(page.doc.activeElement, page.el("help-toggle"));
 });
 

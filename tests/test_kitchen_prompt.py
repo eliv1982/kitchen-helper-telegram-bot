@@ -64,15 +64,17 @@ def test_the_telegram_provider_layer_uses_the_shared_prompt():
 
 def test_the_prompt_is_russian_and_bounded():
     assert PROMPT == PROMPT.strip()
-    # It is sent with every request: it costs tokens. 8462 characters now (the photo
+    # It is sent with every request: it costs tokens. 9810 characters now (the photo
     # section, KH-F07A's ingredient block and KH-MENU-01A's occasion/budget block,
     # including the three-state availability and scoped-restriction rules the Codex
     # audit required, KH-MENU-01A-FIX-01's optional-inventory, two-section shopping-list
-    # and recipe/favorites workflow correction, and the Codex-FAIL remediation's removal
-    # of the staple exception and separation of necessity from availability); 8550 is
-    # the ceiling this test allows. The FIX-01 correction added 1089 characters
-    # (+15.6%); the Codex-FAIL remediation added 413 (+5.1%).
-    assert 500 < len(PROMPT) < 8550
+    # and recipe/favorites workflow correction, the Codex-FAIL remediation's removal
+    # of the staple exception and separation of necessity from availability, and
+    # KH-MENU-01B's combined affordability/originality and complete ingredient-accounting
+    # rules); 10000 is the ceiling this test allows. The FIX-01 correction added 1089
+    # characters (+15.6%); the Codex-FAIL remediation added 413 (+5.1%); KH-MENU-01B
+    # added 1348 (+15.9%).
+    assert 500 < len(PROMPT) < 10000
     assert "по-русски" in PROMPT
     cyrillic = sum("а" <= c.lower() <= "я" or c.lower() == "ё" for c in PROMPT)
     assert cyrillic > 0.7 * sum(c.isalpha() for c in PROMPT)
@@ -228,6 +230,42 @@ INGREDIENT_RULES = [
         "Необязательное в «точно купить» не попадает",
     ),
     (
+        "a chosen dish or set is checked against every selected recipe",
+        "сверься с рецептами всех выбранных блюд",
+    ),
+    (
+        "all mandatory ingredients of the chosen dishes are listed",
+        "обязательные продукты перечисляй все",
+    ),
+    (
+        "confirmed available ingredients are not purchases",
+        "подтверждённо имеющиеся в покупки не включай",
+    ),
+    (
+        "required missing and unknown ingredients are not dropped",
+        "подтверждённо отсутствующие и неизвестные не пропускай",
+    ),
+    (
+        "required ingredients count even when not discussed before",
+        "даже если раньше о них не говорили",
+    ),
+    (
+        "optional additions stay apart from mandatory ones",
+        "Необязательное отделяй от обязательного",
+    ),
+    (
+        "quantities are not invented when the recipe gives none",
+        "количество не выдумывай",
+    ),
+    (
+        "a repeated ingredient across chosen dishes is named once",
+        "Один и тот же продукт у нескольких выбранных блюд называй один раз",
+    ),
+    (
+        "quantities merge only when the units match",
+        "складывай, только когда совпадают единицы измерения",
+    ),
+    (
         "basic staples are not an exception",
         "Соль, масло, вода и другие базовые запасы — не исключение",
     ),
@@ -287,10 +325,12 @@ def test_the_ingredient_block_appears_once_and_stays_compact():
     end = PROMPT.index("Праздник, гости и бюджет:", start)
     # It is sent with every request: it stays short. It grew with KH-MENU-01A's
     # three-state availability rule (R2), which replaced the unmentioned-means-missing
-    # wording, with KH-MENU-01A-FIX-01's two-section shopping list, and with the
+    # wording, with KH-MENU-01A-FIX-01's two-section shopping list, with the
     # Codex-FAIL remediation's necessity/availability split and removal of the staple
-    # exception; the bound moved from 1500 to 1700 and then to 2050.
-    assert 500 < end - start < 2050
+    # exception, and with KH-MENU-01B's complete accounting of a chosen dish or set
+    # (every mandatory ingredient, duplicates once, no invented quantities); the bound
+    # moved from 1500 to 1700, 2050 and 2650.
+    assert 500 < end - start < 2650
 
 
 def test_the_ingredient_block_does_not_weaken_the_safety_or_recipe_rules():
@@ -325,6 +365,47 @@ MENU_RULES = [
     ("an explicit restriction to what is available is honoured", "только из этого"),
     ("budget requests get real dishes from inexpensive products", "реальные блюда из недорогих продуктов"),
     ("cheaper substitutes are offered", "более дешёвые замены"),
+    (
+        "affordability and originality are simultaneous preferences",
+        "это два пожелания сразу",
+    ),
+    (
+        "combined requests favour affordable but less obvious dishes",
+        "недорогие, но менее очевидные блюда",
+    ),
+    (
+        "creative combinations of affordable products are welcome",
+        "неожиданные сочетания доступных продуктов",
+    ),
+    (
+        "a combined request is not a choice between the two",
+        "а не выбирай между дешевизной и оригинальностью",
+    ),
+    (
+        "festive food is not an obligatory traditional set",
+        "Праздник не обязан повторять традиционный набор",
+    ),
+    (
+        "a traditional dish stays available when the person named it",
+        "уместны, когда человек их назвал",
+    ),
+    (
+        "a traditional dish stays available when it fits",
+        "подходят ему по вкусу",
+    ),
+    (
+        "refining one aspect changes only that aspect",
+        "меняй только её",
+    ),
+    (
+        "other constraints survive a refinement",
+        "условия сохраняй, пока человек не изменил и их",
+    ),
+    ("no numerical budget is invented", "придуманного числового бюджета"),
+    (
+        "no exact cost-limit claim is made",
+        "не утверждай, что блюдо укладывается в точную сумму",
+    ),
     ("no current or exact prices are invented", "Цены не выдумывай"),
     ("recommendations are 2-4 concrete different dishes", "2–4 конкретных разных блюда"),
     ("generic dish categories are ruled out", "общие категории"),
@@ -451,8 +532,10 @@ def test_the_occasion_block_appears_once_and_is_in_the_one_shared_prompt():
     block = PROMPT[start : PROMPT.index("Как отвечать:", start)]
     # Sent with every request: it stays compact. KH-MENU-01A-FIX-01 moved the bound
     # from 1600 to 1800 for the optional-inventory and variety correction; the
-    # Codex-FAIL remediation moved it to 1950 for the new-main-ingredient rule.
-    assert 500 < len(block) < 1950
+    # Codex-FAIL remediation moved it to 1950 for the new-main-ingredient rule; and
+    # KH-MENU-01B moved it to 2750 for combined affordability/originality, the
+    # non-obligatory traditional set and one-aspect refinement.
+    assert 500 < len(block) < 2750
     assert "2–4 конкретных разных блюда" in block
     assert "никаких текущих цен и точных сумм" in block
 

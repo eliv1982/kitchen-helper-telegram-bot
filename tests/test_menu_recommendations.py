@@ -24,6 +24,15 @@ What is deterministic here:
     shopping-list sections. The Web help entry's reachability in an active conversation
     is behaviourally exercised by tests/js/dom_scenarios.js (tests/test_web_ui_dom.py);
     these Python tests pin that the same workflow text is in the shared prompt.
+  * KH-MENU-01B's 2026-11-08 production smoke: a combined "inexpensive but interesting"
+    request reaches the model as one turn, a traditional dish named by the person is
+    passed through unchanged, dietary and budget constraints survive a later refinement,
+    the three ingredient states reach the model, and a multi-dish choice followed by a
+    shopping question reaches the model with every chosen dish in order. The prompt
+    clauses for both improvements are pinned literally. There is no shopping-list
+    post-processing in the application -- the list is the model's prose -- so these
+    tests prove the contract and the inputs, never that a model produced a complete
+    list. That is the same limit the rest of this file records.
 
 What is NOT shown here: that a real model obeys any of it. The scripted replies are
 chosen by the test, not by a provider, and the prompt-clause assertions only prove that
@@ -628,3 +637,159 @@ async def test_the_ideas_then_recipe_then_favorites_workflow_is_stated_in_both_c
     assert "Помощник может предложить идеи блюд" in logic
     assert "он даст полный рецепт" in logic
     assert "который можно сохранить в избранное" in logic
+
+
+# --- KH-MENU-01B: the 2026-11-08 production smoke -----------------------------------------------
+#
+# The smoke found two things a real person saw:
+#
+#   1. "inexpensive but interesting" was read as a request for conventional festive
+#      staples (dressed herring, charlotte, stuffed eggs) first, with the less obvious
+#      suggestions arriving only after further clarification;
+#   2. the ingredients of a chosen dish or set were not all accounted for in the
+#      shopping/checklist answer -- nothing was falsely called available, but some
+#      required items were left out.
+#
+# The application still has no shopping-list or inventory structure: the list is the
+# model's prose, and the ordered history is the only context it gets. These tests
+# therefore pin the prompt clauses and the exact turns each channel hands the model,
+# not a real model's answer (see the module docstring).
+
+COMBINED_BUDGET_ORIGINAL = (
+    "Нужно праздничное меню недорого, но интересно и не слишком стандартно. "
+    "Кое-что можно докупить."
+)
+TRADITIONAL_REQUEST = "Хочу селёдку под шубой и шарлотку, как обычно."
+DIET_AND_BUDGET = "Только без свинины и орехов, и желательно подешевле."
+REFINEMENT = "Пусть будет еще дешевле, но блюда оставь необычными."
+TWO_DISHES = "Беру картофельные гнёзда с грибами и свекольный салат."
+INGREDIENT_STATES = "Курица и рис есть, моркови точно нет, про сметану не знаю."
+
+
+async def test_a_combined_affordable_and_original_request_reaches_the_model_in_order(tmp_path):
+    backend = ScriptedBackend("Недорогие, но менее очевидные варианты.", default="Ответ.")
+    async with chat_app(tmp_path, backend) as chat:
+        conversation = await chat.create()
+        await chat.send(conversation, COMBINED_BUDGET_ORIGINAL, "k-1")
+
+    assert contents(backend.requests[-1][0]) == [COMBINED_BUDGET_ORIGINAL]
+    # The two wishes are one request, not a trade-off; the suggestions are affordable
+    # but less obvious, with creative combinations of affordable products.
+    assert "это два пожелания сразу" in KITCHEN_SYSTEM_PROMPT
+    assert "недорогие, но менее очевидные блюда" in KITCHEN_SYSTEM_PROMPT
+    assert "неожиданные сочетания доступных продуктов" in KITCHEN_SYSTEM_PROMPT
+    assert "а не выбирай между дешевизной и оригинальностью" in KITCHEN_SYSTEM_PROMPT
+    # No invented numbers: no budget, no exact cost claim, no prices.
+    assert "придуманного числового бюджета" in KITCHEN_SYSTEM_PROMPT
+    assert "не утверждай, что блюдо укладывается в точную сумму" in KITCHEN_SYSTEM_PROMPT
+    assert "Цены не выдумывай" in KITCHEN_SYSTEM_PROMPT
+
+
+async def test_traditional_dishes_named_by_the_person_are_passed_through_and_stay_available():
+    backend = FakeBackend("Вот рецепты селёдки под шубой и шарлотки.")
+    service = ChatService(backend)
+
+    await say(service, TELEGRAM_ONE, TRADITIONAL_REQUEST)
+
+    # The request reaches the model as the person wrote it: the application neither
+    # rewrites it nor filters it.
+    assert contents(backend.requests[-1][0]) == [TRADITIONAL_REQUEST]
+    # The prompt names the traditional dishes only as an example of what is *not*
+    # obligatory, and says such dishes are fitting when the person named them or they
+    # suit the person's taste; nothing bans them.
+    assert KITCHEN_SYSTEM_PROMPT.count("селёдка под шубой") == 1
+    assert "Праздник не обязан повторять традиционный набор" in KITCHEN_SYSTEM_PROMPT
+    assert "уместны, когда человек их назвал" in KITCHEN_SYSTEM_PROMPT
+    assert "подходят ему по вкусу" in KITCHEN_SYSTEM_PROMPT
+
+
+async def test_dietary_and_budget_constraints_survive_a_one_aspect_refinement(tmp_path):
+    backend = ScriptedBackend(
+        "Праздничные варианты без свинины и орехов, подешевле.",
+        "Еще дешевле, но по-прежнему необычно.",
+        default="Ответ.",
+    )
+    async with telegram_app(tmp_path, backend) as t:
+        await t.pair(MOTHER)
+        await t.deliver(MOTHER, DIET_AND_BUDGET)
+        await t.deliver(MOTHER, REFINEMENT)
+
+    # Both constraint turns and the answers between them are in the model's history:
+    # the refinement does not replace the dietary condition or the budget wish.
+    assert contents(backend.requests[-1][0]) == [
+        DIET_AND_BUDGET,
+        "Праздничные варианты без свинины и орехов, подешевле.",
+        REFINEMENT,
+    ]
+    assert "меняй только её" in KITCHEN_SYSTEM_PROMPT
+    assert "условия сохраняй, пока человек не изменил и их" in KITCHEN_SYSTEM_PROMPT
+    assert "об аллергиях, непереносимости, исключённых продуктах" in KITCHEN_SYSTEM_PROMPT
+    assert "не нарушай их ни в одном варианте" in KITCHEN_SYSTEM_PROMPT
+
+
+async def test_the_three_ingredient_states_reach_the_model_before_the_shopping_question(tmp_path):
+    backend = ScriptedBackend(
+        "Записала: есть курица и рис, моркови нет, сметана под вопросом.",
+        "Вот рецепт.",
+        "Купить морковь; сметану проверить.",
+        default="Ответ.",
+    )
+    async with chat_app(tmp_path, backend) as chat:
+        conversation = await chat.create()
+        await chat.send(conversation, INGREDIENT_STATES, "k-1")
+        await chat.send(conversation, DISH_SELECTION, "k-2")
+        await chat.send(conversation, SHOPPING, "k-3")
+
+    assert contents(backend.requests[-1][0]) == [
+        INGREDIENT_STATES,
+        "Записала: есть курица и рис, моркови нет, сметана под вопросом.",
+        DISH_SELECTION,
+        "Вот рецепт.",
+        SHOPPING,
+    ]
+    # Available, confirmed missing and unknown are three different states, and each is
+    # kept where the prompt says it belongs.
+    assert "подтверждено, что продукт есть; подтверждено, что его нет" in KITCHEN_SYSTEM_PROMPT
+    assert "о продукте не говорили — тогда он неизвестен" in KITCHEN_SYSTEM_PROMPT
+    assert "подтверждённо имеющиеся в покупки не включай" in KITCHEN_SYSTEM_PROMPT
+    assert "подтверждённо отсутствующие и неизвестные не пропускай" in KITCHEN_SYSTEM_PROMPT
+
+
+async def test_a_multi_dish_choice_gives_the_model_every_selected_dish_before_the_shopping_list(tmp_path):
+    backend = ScriptedBackend(
+        "Праздничные варианты.",
+        "Вот рецепты обоих блюд.",
+        "Список покупок для обоих блюд.",
+        default="Ответ.",
+    )
+    async with chat_app(tmp_path, backend) as chat:
+        conversation = await chat.create()
+        await chat.send(conversation, COMBINED_BUDGET_ORIGINAL, "k-1")
+        await chat.send(conversation, TWO_DISHES, "k-2")
+        await chat.send(conversation, SHOPPING, "k-3")
+
+    # The shopping question is answered with the two chosen dishes and the earlier
+    # request still in the history: the model is not asked to remember prose itself.
+    assert contents(backend.requests[-1][0]) == [
+        COMBINED_BUDGET_ORIGINAL,
+        "Праздничные варианты.",
+        TWO_DISHES,
+        "Вот рецепты обоих блюд.",
+        SHOPPING,
+    ]
+    # The accounting rule is over all selected recipes; required ingredients are not
+    # dropped merely because they were never discussed.
+    assert "сверься с рецептами всех выбранных блюд" in KITCHEN_SYSTEM_PROMPT
+    assert "обязательные продукты перечисляй все" in KITCHEN_SYSTEM_PROMPT
+    assert "даже если раньше о них не говорили" in KITCHEN_SYSTEM_PROMPT
+
+
+async def test_duplicate_and_optional_ingredients_are_kept_apart_in_the_shopping_rules():
+    # The list is the model's prose, so what is deterministic is the rule it is given:
+    # one line per repeated ingredient, quantities merged only where units match, optional
+    # additions separate from mandatory ones, and no invented quantities.
+    assert "Один и тот же продукт у нескольких выбранных блюд называй один раз" in KITCHEN_SYSTEM_PROMPT
+    assert "складывай, только когда совпадают единицы измерения" in KITCHEN_SYSTEM_PROMPT
+    assert "Необязательное отделяй от обязательного" in KITCHEN_SYSTEM_PROMPT
+    assert "количество не выдумывай" in KITCHEN_SYSTEM_PROMPT
+    assert "«если есть» и «можно добавить» — только для необязательных продуктов" in KITCHEN_SYSTEM_PROMPT

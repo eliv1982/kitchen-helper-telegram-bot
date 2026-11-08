@@ -621,7 +621,7 @@ textarea[aria-invalid="true"] {
 
 /* The help entry of the open conversation: beside the title, so it is in reach whether the
    conversation is empty or active, on a wide screen and in the narrow layout. It opens the
-   explanation in the flow under the header; nothing of the conversation is touched. */
+   explanation as a dialog over the page; nothing of the conversation is touched. */
 .chat-help-toggle {
   flex: none;
   min-width: 2.75rem;
@@ -631,20 +631,59 @@ textarea[aria-invalid="true"] {
   font-size: 0.95rem;
 }
 
+/* The help dialog: a dimmed layer swallows the clicks meant for the page, and the dialog
+   itself sits above it, centered, with its own scrolling. Neither the page nor the
+   conversation scrolls while it is up, and the close button stays within reach on a
+   narrow screen. */
+.help-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  background: rgba(22, 32, 51, 0.5);
+}
+
 .help-panel {
-  flex: none;
-  padding: 0.75rem var(--gutter);
-  border-bottom: 1px solid var(--line);
-  background: var(--pale);
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  z-index: 91;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  width: min(30rem, calc(100vw - 2rem));
+  max-height: min(80vh, 40rem);
+  max-height: min(80dvh, 40rem);
+  padding: 1rem 1.1rem;
+  transform: translate(-50%, -50%);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.help-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.75rem;
 }
 
 .help-title {
-  margin: 0 0 0.4rem;
-  font-size: 1rem;
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.help-close {
+  flex: none;
+  min-width: 2.75rem;
+  min-height: 2.75rem;
 }
 
 .help-panel .hint {
-  margin: 0 0 0.6rem;
+  margin: 0;
   color: var(--text);
 }
 
