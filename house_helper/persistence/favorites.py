@@ -212,6 +212,21 @@ class TelegramSavedFavorite:
     user_id: UUID  # the owner the saving transaction resolved and saved for
 
 
+@dataclass(frozen=True)
+class FavoriteRecipeSnapshot:
+    """The validated recipe fields of a structured favorite, copied by another feature.
+
+    `version` is the version the snapshot was read at: the caller named it and the row
+    still carried it, so the copy is of the favorite the person selected and never of a
+    later edit.
+    """
+
+    favorite_id: UUID
+    version: int
+    title: str
+    ingredients: tuple[Ingredient, ...]
+
+
 def favorite_title(text: str) -> str:
     """A label for the answer `text`: its first non-empty line, on one line, stripped of
     Markdown marks and cut at TITLE_LENGTH characters with an ellipsis when longer.
@@ -626,6 +641,50 @@ def get_favorite(session: OrmSession, user_id: UUID, favorite_id: UUID) -> Favor
     if row is None:
         raise FavoriteNotFound
     return _detail(row)
+
+
+def structured_favorite_snapshot(
+    session: OrmSession, user_id: UUID, favorite_id: UUID, *, expected_version: int
+) -> FavoriteRecipeSnapshot:
+    """The validated recipe of the user's structured favorite, at the version they named.
+
+    For a caller that copies the favorite into something else (a saved shopping list):
+    the ingredients are read from THIS row, never from the request, and the copy is only
+    made when the row still holds `expected_version`. FavoriteNotFound if the favorite is
+    not the user's (unknown, somebody else's, removed: not told apart); InvalidFavorite
+    if it is a text favorite (it has no structured fields to copy); FavoriteConflict if
+    the favorite changed since `expected_version`, in which case nothing is copied and the
+    caller must not substitute the newer version silently. The fields are validated by
+    the protocol's own rules again, as every structured read is. A plain read; the caller
+    owns the transaction.
+    """
+    row = session.execute(
+        sa.select(
+            FavoriteRecipe.id,
+            FavoriteRecipe.kind,
+            FavoriteRecipe.title,
+            FavoriteRecipe.servings,
+            FavoriteRecipe.ingredients,
+            FavoriteRecipe.steps,
+            FavoriteRecipe.source_recipe_index,
+            FavoriteRecipe.version,
+        ).where(FavoriteRecipe.id == favorite_id, FavoriteRecipe.user_id == user_id)
+    ).first()
+    if row is None:
+        raise FavoriteNotFound
+    if row.kind != FavoriteKind.STRUCTURED.value:
+        raise InvalidFavorite("only a structured favorite can be copied as a list")
+    if row.version != expected_version:
+        raise FavoriteConflict
+    checked = validate_recipe(
+        row.source_recipe_index, row.title, row.servings, row.ingredients, row.steps
+    )
+    return FavoriteRecipeSnapshot(
+        favorite_id=row.id,
+        version=row.version,
+        title=checked.title,
+        ingredients=checked.ingredients,
+    )
 
 
 def remove_favorite(session: OrmSession, user_id: UUID, favorite_id: UUID) -> None:

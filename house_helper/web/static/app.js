@@ -56,8 +56,10 @@
     logout: byId("logout"),
     tabChats: byId("tab-chats"),
     tabFavorites: byId("tab-favorites"),
+    tabShopping: byId("tab-shopping"),
     panelChats: byId("panel-chats"),
     panelFavorites: byId("panel-favorites"),
+    panelShopping: byId("panel-shopping"),
     newConversation: byId("new-conversation"),
     listStatus: byId("list-status"),
     listRetry: byId("list-retry"),
@@ -65,6 +67,12 @@
     favoritesStatus: byId("favorites-status"),
     favoritesRetry: byId("favorites-retry"),
     favoriteList: byId("favorite-list"),
+    shoppingStatus: byId("shopping-status"),
+    shoppingRetry: byId("shopping-retry"),
+    shoppingList: byId("shopping-list"),
+    shopping: byId("shopping"),
+    shoppingTitle: byId("shopping-title"),
+    shoppingBody: byId("shopping-body"),
     telegram: byId("telegram"),
     telegramText: byId("telegram-text"),
     telegramNotice: byId("telegram-notice"),
@@ -296,7 +304,8 @@
       );
       // The actions belong to an existing conversation that the list still holds (the logic refuses to
       // ask about any other), and only while the conversations are in front. The drawing of the recipe
-      // resets focusNodes, so these are drawn after it.
+      // resets focusNodes, so these -- and the shopping pane's own safe answers -- are drawn after it.
+      region("shopping", view.shopping, drawShopping);
       var canAct = view.currentId !== null && view.list.items.some(function (item) {
         return item.id === view.currentId;
       });
@@ -420,6 +429,7 @@
     els.login.hidden = screen !== "login";
     els.app.hidden = screen !== "app";
     els.chat.hidden = screen !== "app";
+    els.shopping.hidden = screen !== "app";
     els.gate.setAttribute("aria-busy", waiting ? "true" : "false");
 
     if (waiting) {
@@ -469,17 +479,24 @@
         clear(els.list);
         clear(els.favoriteList);
         clear(els.recipeBody);
+        clear(els.shoppingList);
+        clear(els.shoppingBody);
         clear(els.chatDelete);
         closeChatMenu(false);
         setHelp(false, false);
         els.chatActions.hidden = true;
         els.chatDelete.hidden = true;
-        drawn.favoriteList = drawn.recipe = null;
+        drawn.favoriteList = drawn.recipe = drawn.shopping = null;
         els.recipe.hidden = true;
         els.recipeTitle.textContent = "";
         els.favoritesStatus.textContent = "";
         els.favoritesRetry.hidden = true;
+        els.shopping.hidden = true;
+        els.shoppingTitle.textContent = "";
+        els.shoppingStatus.textContent = "";
+        els.shoppingRetry.hidden = true;
         lastRecipeId = null;
+        lastShoppingKey = null;
         wantFocus = null;
         focusNodes = {};
         els.input.value = "";
@@ -895,15 +912,21 @@
     return structuredRecipes ? Logic.TEXT.favoritesEmptyStructured : Logic.TEXT.favoritesEmpty;
   }
 
-  // Which part is in front: the conversations (the chat) or the favorites (the recipe).
+  // Which part is in front: the conversations (the chat), the favorites (the recipe) or the
+  // shopping lists (their own pane, which holds a draft or a saved list).
   function drawSection(section) {
+    var chats = section === "chats";
     var favorites = section === "favorites";
-    els.tabChats.setAttribute("aria-pressed", favorites ? "false" : "true");
+    var shopping = section === "shopping";
+    els.tabChats.setAttribute("aria-pressed", chats ? "true" : "false");
     els.tabFavorites.setAttribute("aria-pressed", favorites ? "true" : "false");
-    els.panelChats.hidden = favorites;
+    els.tabShopping.setAttribute("aria-pressed", shopping ? "true" : "false");
+    els.panelChats.hidden = !chats;
     els.panelFavorites.hidden = !favorites;
-    els.chat.hidden = favorites;
+    els.panelShopping.hidden = !shopping;
+    els.chat.hidden = !chats;
     els.recipe.hidden = !favorites;
+    els.shopping.hidden = !shopping;
   }
 
   function drawFavoriteList(list) {
@@ -928,6 +951,767 @@
         openFavorite(item.id);
       });
       els.favoriteList.appendChild(h("li", null, [button]));
+    });
+  }
+
+  // The shopping lists ------------------------------------------------------------------------------------
+
+  var lastShoppingKey = null;
+  var lastShoppingAlert = null;
+
+  // A field of text in the shopping pane, associated with its label without an id per row.
+  function shopField(labelText, input) {
+    return h("label", { class: "shop-field" }, [
+      h("span", { class: "edit-label", text: labelText }),
+      input,
+    ]);
+  }
+
+  function filledText(template, values) {
+    return String(template).replace(/\{(\w+)\}/g, function (whole, name) {
+      return Object.prototype.hasOwnProperty.call(values, name) ? String(values[name]) : whole;
+    });
+  }
+
+  function findByFocus(root, wanted) {
+    var found = null;
+    (function walk(node) {
+      for (var i = 0; i < node.childNodes.length; i++) {
+        var child = node.childNodes[i];
+        if (child.nodeType !== 1) {
+          continue;
+        }
+        if (child.getAttribute("data-focus") === wanted) {
+          found = child;
+        }
+        walk(child);
+      }
+    })(root);
+    return found;
+  }
+
+  function stateWord(stateName) {
+    return stateName === "at_home" ? Logic.TEXT.atHome : stateName === "purchased" ? Logic.TEXT.bought : Logic.TEXT.toBuy;
+  }
+
+  function drawShopping(shopping) {
+    // The side panel: the saved lists, active first, each with its progress and status.
+    var status = "";
+    els.shoppingRetry.hidden = true;
+    if (shopping.status === "loading" && shopping.lists.length === 0) {
+      status = Logic.TEXT.shoppingLoading;
+    } else if (shopping.status === "error") {
+      status = shopping.error ? shopping.error.text : Logic.TEXT.shoppingFailed;
+      els.shoppingRetry.hidden = false;
+    } else if (shopping.empty) {
+      status = Logic.TEXT.shoppingEmpty;
+    }
+    els.shoppingStatus.textContent = status;
+    clear(els.shoppingList);
+    shopping.lists.forEach(function (entry) {
+      var button = h(
+        "button",
+        {
+          class: "conv-item",
+          type: "button",
+          "aria-current": entry.current ? "true" : false,
+          disabled: shopping.blocked.indexOf(entry.id) !== -1,
+        },
+        [h("span", { class: "conv-label", text: entry.title }), h("span", { class: "conv-meta", text: entry.meta })]
+      );
+      button.addEventListener("click", function () {
+        openShoppingList(entry.id);
+      });
+      els.shoppingList.appendChild(h("li", null, [button]));
+    });
+
+    els.shoppingTitle.textContent = shopping.title;
+    var key = shopping.draft !== null ? "draft" : shopping.current !== null ? "list:" + shopping.current.id : "list";
+    var focused =
+      within(document.activeElement, els.shoppingBody) && document.activeElement
+        ? document.activeElement.getAttribute("data-focus")
+        : null;
+    var scroll = lastShoppingKey === key ? els.shoppingBody.scrollTop : 0;
+    clear(els.shoppingBody);
+    if (shopping.draft !== null) {
+      drawShoppingDraft(shopping.draft);
+    } else if (shopping.current !== null) {
+      drawShoppingList(shopping.current, shopping.notice);
+    } else {
+      drawShoppingEmpty(shopping);
+    }
+    lastShoppingKey = key;
+    els.shoppingBody.scrollTop = scroll;
+    if (focused) {
+      var again = findByFocus(els.shoppingBody, focused);
+      if (again) {
+        again.focus();
+      }
+    }
+  }
+
+  function drawShoppingEmpty(shopping) {
+    var box = h("div", { class: "shopping-content empty" });
+    if (shopping.notice) {
+      box.appendChild(drawShoppingNotice(shopping.notice));
+    }
+    if (shopping.status === "loading" && shopping.lists.length === 0) {
+      box.appendChild(
+        h("p", { class: "loading" }, [h("span", { class: "spinner", "aria-hidden": "true" }), document.createTextNode(Logic.TEXT.shoppingLoading)])
+      );
+      els.shoppingBody.appendChild(box);
+      return;
+    }
+    if (shopping.status === "error") {
+      box.appendChild(
+        h("p", { class: "notice notice-error", role: "alert", text: shopping.error ? shopping.error.text : Logic.TEXT.shoppingFailed })
+      );
+      if (shopping.error && shopping.error.correlationId) {
+        box.appendChild(h("p", { class: "hint", text: Logic.TEXT.correlation.replace("{id}", shopping.error.correlationId) }));
+      }
+      els.shoppingBody.appendChild(box);
+      return;
+    }
+    box.appendChild(
+      h("p", { class: "lead", text: shopping.empty ? Logic.TEXT.shoppingEmpty : Logic.TEXT.shoppingPick })
+    );
+    els.shoppingBody.appendChild(box);
+  }
+
+  function drawShoppingNotice(notice) {
+    return h("p", {
+      class: "notice" + (notice.kind === "error" ? " notice-error" : ""),
+      role: notice.kind === "error" ? "alert" : "status",
+      text: notice.text,
+    });
+  }
+
+  function draftCheckbox(ingredient, editable) {
+    var box = h("input", {
+      type: "checkbox",
+      checked: ingredient.atHome,
+      disabled: !editable,
+      "aria-label": Logic.TEXT.atHome + ": " + ingredient.name,
+      "data-focus": "draft-" + ingredient.position,
+    });
+    box.addEventListener("change", function () {
+      controller.toggleShoppingDraftAtHome(ingredient.position, box.checked);
+    });
+    return h("label", { class: "shop-check" }, [
+      box,
+      h("span", { class: "shop-check-text" }, [
+        h("span", { class: "shop-name", text: ingredient.name }),
+        ingredient.amount ? h("span", { class: "shop-amount", text: " — " + ingredient.amount }) : null,
+      ]),
+    ]);
+  }
+
+  function drawShoppingDraft(draft) {
+    var box = h("div", { class: "shopping-content" });
+    els.shoppingBody.appendChild(box);
+    if (draft.phase === "loading") {
+      box.appendChild(
+        h("p", { class: "loading" }, [h("span", { class: "spinner", "aria-hidden": "true" }), document.createTextNode(Logic.TEXT.shoppingDraftLoading)])
+      );
+      box.appendChild(h("div", { class: "shop-actions" }, [action(Logic.TEXT.shoppingCancel, "btn-quiet", cancelDraft)]));
+      return;
+    }
+    if (draft.phase === "load_error" || draft.phase === "load_gone") {
+      box.appendChild(
+        h("p", { class: "notice notice-error", role: "alert", text: draft.error ? draft.error.text : Logic.TEXT.shoppingDraftFailed })
+      );
+      if (draft.error && draft.error.correlationId) {
+        box.appendChild(h("p", { class: "hint", text: Logic.TEXT.correlation.replace("{id}", draft.error.correlationId) }));
+      }
+      var loadActions = h("div", { class: "shop-actions" });
+      if (draft.canRetry) {
+        loadActions.appendChild(
+          action(draft.retryLabel, "btn-primary", function () {
+            controller.reloadShoppingDraft();
+          })
+        );
+      }
+      loadActions.appendChild(action(Logic.TEXT.shoppingCancel, "btn-quiet", cancelDraft));
+      box.appendChild(loadActions);
+      return;
+    }
+
+    if (draft.title) {
+      box.appendChild(h("h2", { class: "shop-recipe-title", text: draft.title }));
+    }
+    if (draft.servings) {
+      box.appendChild(
+        h("p", { class: "recipe-servings" }, [
+          h("span", { class: "visually-hidden", text: Logic.TEXT.servings + ": " }),
+          document.createTextNode(draft.servings),
+        ])
+      );
+    }
+    box.appendChild(h("p", { class: "hint", text: draft.instruction }));
+    box.appendChild(
+      h("p", {
+        class: "shop-remaining",
+        role: "status",
+        "aria-live": "polite",
+        text: filledText(Logic.TEXT.shoppingRemaining, { count: draft.remaining }),
+      })
+    );
+    box.appendChild(h("p", { class: "hint shop-unchecked-note", text: Logic.TEXT.shoppingUncheckedNote }));
+    var draftItems = h("div", { class: "shop-draft-items" });
+    draft.ingredients.forEach(function (ingredient) {
+      draftItems.appendChild(draftCheckbox(ingredient, draft.editable));
+    });
+    box.appendChild(draftItems);
+
+    if (draft.error) {
+      box.appendChild(h("p", { class: "notice notice-error", role: "alert", text: draft.error.text }));
+      if (draft.error.correlationId) {
+        box.appendChild(h("p", { class: "hint", text: Logic.TEXT.correlation.replace("{id}", draft.error.correlationId) }));
+      }
+    }
+
+    var buttons = h("div", { class: "shop-actions" });
+    if (draft.canSave || draft.saving) {
+      if (draft.saving) {
+        buttons.appendChild(
+          h("button", {
+            class: "btn btn-quiet",
+            type: "button",
+            text: Logic.TEXT.shoppingSaving,
+            "aria-disabled": "true",
+            "data-focus": "draft-save",
+          })
+        );
+      } else {
+        var saveButton = action(Logic.TEXT.shoppingSave, "btn-primary", saveDraft, Logic.TEXT.shoppingSave);
+        saveButton.setAttribute("data-focus", "draft-save");
+        buttons.appendChild(saveButton);
+      }
+    } else if (draft.canRetry) {
+      buttons.appendChild(
+        action(draft.retryLabel, "btn-primary", function () {
+          controller.retryShoppingDraft();
+        }, false)
+      );
+    } else if (draft.canSaveNew) {
+      buttons.appendChild(
+        action(draft.saveNewLabel, "btn-primary", function () {
+          controller.saveShoppingDraftWithNewKey();
+        })
+      );
+    }
+    if (draft.canCancel) {
+      buttons.appendChild(
+        action(draft.terminal ? Logic.TEXT.shoppingUnderstand : Logic.TEXT.shoppingCancel, "btn-quiet", cancelDraft)
+      );
+    }
+    box.appendChild(buttons);
+  }
+
+  function cancelDraft() {
+    var result = controller.cancelShoppingDraft();
+    if (!result || !result.ok) {
+      return;
+    }
+    if (result.origin === "favorites") {
+      els.recipeTitle.focus();
+    } else {
+      els.chatTitle.focus();
+    }
+  }
+
+  function saveDraft() {
+    controller.saveShoppingDraft().then(function (result) {
+      if (result && result.ok) {
+        els.shoppingTitle.focus();
+      }
+    });
+  }
+
+  // The main interaction of a saved item: one checkbox that marks it bought (or unmarks it).
+  // While any write of this list is unsettled (here or on another item) every conflicting
+  // control is disabled: the controller would refuse the same overlap.
+  function shoppingItemCheckbox(entry, locked) {
+    var box = h("input", {
+      type: "checkbox",
+      checked: entry.state === "purchased",
+      disabled: locked || Boolean(entry.pending),
+      "aria-label":
+        entry.state === "purchased" ? "Вернуть в список: " + entry.name : Logic.TEXT.toBuy + ": " + entry.name,
+      "data-focus": "item-check-" + entry.id,
+    });
+    box.addEventListener("change", function () {
+      controller.setShoppingItemState(entry.id, box.checked ? "purchased" : "unchecked");
+    });
+    return box;
+  }
+
+  function shoppingStateSelect(entry, locked) {
+    var select = h("select", {
+      class: "shop-state",
+      disabled: locked || Boolean(entry.pending),
+      "aria-label": Logic.TEXT.itemStateLabel + ": " + entry.name,
+      "data-focus": "item-state-" + entry.id,
+    });
+    ["unchecked", "at_home", "purchased"].forEach(function (stateName) {
+      select.appendChild(h("option", { value: stateName, text: stateWord(stateName) }));
+    });
+    select.value = entry.state;
+    select.addEventListener("change", function () {
+      controller.setShoppingItemState(entry.id, select.value);
+    });
+    return select;
+  }
+
+  function drawShoppingItem(entry, detail) {
+    var readOnly = detail.readOnly;
+    var locked = readOnly || detail.busy;
+    var row = h("li", { class: "shop-item", "data-id": entry.id }, [
+      h("div", { class: "shop-item-main" }, [
+        h("label", { class: "shop-check" }, [
+          shoppingItemCheckbox(entry, locked),
+          h("span", { class: "shop-check-text" }, [
+            h("span", { class: "shop-name", text: entry.name }),
+            entry.amount ? h("span", { class: "shop-amount", text: " — " + entry.amount }) : null,
+          ]),
+        ]),
+      ]),
+    ]);
+    var controls = h("div", { class: "shop-item-controls" });
+    controls.appendChild(shoppingStateSelect(entry, locked));
+    var inlineBusy =
+      detail.editor !== null || detail.adding !== null || detail.removing !== null || detail.deleting !== null || detail.busy;
+    if (!readOnly && !inlineBusy) {
+      var editButton = action(Logic.TEXT.itemEdit, "btn-quiet", function () {
+        wantFocus = "item-name-" + entry.id;
+        controller.startShoppingItemEdit(entry.id);
+      }, Logic.TEXT.itemEdit + ": " + entry.name);
+      editButton.setAttribute("data-focus", "item-edit-" + entry.id);
+      controls.appendChild(editButton);
+      var deleteButton = action(Logic.TEXT.itemRemove, "btn-quiet", function () {
+        wantFocus = "shop-keep-" + entry.id;
+        controller.askDeleteShoppingItem(entry.id);
+      }, Logic.TEXT.itemRemove + ": " + entry.name);
+      deleteButton.setAttribute("data-focus", "item-delete-" + entry.id);
+      focusNodes["item-delete-" + entry.id] = deleteButton;
+      controls.appendChild(deleteButton);
+    }
+    row.appendChild(controls);
+    if (detail.editor !== null && detail.editor.id === entry.id) {
+      row.appendChild(shoppingItemEditor(detail.editor, detail.busy));
+    }
+    if (detail.removing !== null && detail.removing.id === entry.id) {
+      row.appendChild(shoppingItemRemoval(detail.removing, entry, detail.busy));
+    }
+    return row;
+  }
+
+  function shoppingItemEditor(editor, busy) {
+    var saving = editor.phase === "saving";
+    var locked = saving || busy;
+    var form = h("form", { class: "shop-item-form", novalidate: true, "aria-label": Logic.TEXT.itemEdit + ": " + editor.draft.name });
+    var name = h("input", {
+      id: "shop-edit-name-" + editor.id,
+      type: "text",
+      value: editor.draft.name,
+      readonly: saving,
+      autocomplete: "off",
+      maxlength: "200",
+      "data-focus": "item-name-" + editor.id,
+    });
+    var amount = h("input", {
+      id: "shop-edit-amount-" + editor.id,
+      type: "text",
+      value: editor.draft.amount,
+      readonly: saving,
+      autocomplete: "off",
+      maxlength: "100",
+      "data-focus": "item-amount-" + editor.id,
+    });
+    function collect() {
+      return { name: name.value, amount: amount.value };
+    }
+    name.addEventListener("input", function () {
+      controller.syncShoppingItemEdit(collect());
+    });
+    amount.addEventListener("input", function () {
+      controller.syncShoppingItemEdit(collect());
+    });
+    form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      if (!locked) {
+        controller.saveShoppingItemEdit(collect()).then(function (result) {
+          if (result && result.ok) {
+            var node = findByFocus(els.shoppingBody, "item-check-" + result.id);
+            if (node) {
+              node.focus();
+            }
+          }
+        });
+      }
+    });
+    form.appendChild(
+      h("label", { class: "shop-field", for: name.id }, [
+        h("span", { class: "edit-label", text: Logic.TEXT.itemNameLabel }),
+        name,
+      ])
+    );
+    form.appendChild(
+      h("label", { class: "shop-field", for: amount.id }, [
+        h("span", { class: "edit-label", text: Logic.TEXT.itemAmountLabel }),
+        amount,
+      ])
+    );
+    if (editor.error) {
+      form.appendChild(h("p", { class: "notice notice-error", role: "alert", text: editor.error.text }));
+    }
+    var buttons = h("div", { class: "shop-actions" });
+    buttons.appendChild(
+      h("button", {
+        class: "btn " + (saving ? "btn-quiet" : "btn-primary"),
+        type: "submit",
+        text: saving ? Logic.TEXT.shoppingSaving : Logic.TEXT.itemSave,
+        disabled: locked,
+        "aria-disabled": locked ? "true" : false,
+      })
+    );
+    buttons.appendChild(
+      action(Logic.TEXT.itemEditCancel, "btn-quiet", function () {
+        if (!saving) {
+          controller.cancelShoppingItemEdit();
+        }
+      })
+    );
+    form.appendChild(buttons);
+    return form;
+  }
+
+  function shoppingItemRemoval(removing, entry, busy) {
+    var box = h("div", { class: "confirm", role: "group", "aria-label": Logic.TEXT.itemRemoveAsk });
+    box.appendChild(
+      h("p", { class: "confirm-text", text: removing.error ? removing.error.text : Logic.TEXT.itemRemoveAsk })
+    );
+    if (removing.error && removing.error.correlationId) {
+      box.appendChild(h("p", { class: "hint", text: Logic.TEXT.correlation.replace("{id}", removing.error.correlationId) }));
+    }
+    var buttons = h("div", { class: "msg-actions" });
+    if (removing.phase === "deleting") {
+      buttons.appendChild(
+        h("p", { class: "loading" }, [h("span", { class: "spinner", "aria-hidden": "true" }), document.createTextNode(Logic.TEXT.itemRemoving)])
+      );
+    } else {
+      var removeConfirm = action(removing.error ? Logic.TEXT.retry : Logic.TEXT.itemRemoveConfirm, "btn-danger", function () {
+        controller.deleteShoppingItem().then(function (result) {
+          if (result && result.ok) {
+            var node = findByFocus(els.shoppingBody, "shop-add");
+            if (node) {
+              node.focus();
+            }
+          }
+        });
+      }, Logic.TEXT.itemRemove + ": " + entry.name);
+      if (busy) {
+        removeConfirm.setAttribute("disabled", "");
+      }
+      buttons.appendChild(removeConfirm);
+      var keep = action(Logic.TEXT.itemRemoveKeep, "btn-quiet", function () {
+        wantFocus = "item-delete-" + entry.id;
+        controller.cancelDeleteShoppingItem();
+      });
+      focusNodes["shop-keep-" + entry.id] = keep;
+      buttons.appendChild(keep);
+    }
+    box.appendChild(buttons);
+    if (removing.error) {
+      alertText(removing.error.text);
+    }
+    return box;
+  }
+
+  function drawShoppingList(detail, notice) {
+    var box = h("div", { class: "shopping-content" });
+    els.shoppingBody.appendChild(box);
+    if (notice) {
+      box.appendChild(drawShoppingNotice(notice));
+    }
+    if (detail.status === "loading") {
+      box.appendChild(
+        h("p", { class: "loading" }, [h("span", { class: "spinner", "aria-hidden": "true" }), document.createTextNode(Logic.TEXT.shoppingListLoading)])
+      );
+      return;
+    }
+    if (detail.status === "error" || detail.status === "gone") {
+      box.appendChild(
+        h("p", { class: "notice notice-error", role: "alert", text: detail.error ? detail.error.text : Logic.TEXT.shoppingListFailed })
+      );
+      if (detail.error && detail.error.correlationId) {
+        box.appendChild(h("p", { class: "hint", text: Logic.TEXT.correlation.replace("{id}", detail.error.correlationId) }));
+      }
+      var loadActions = h("div", { class: "shop-actions" });
+      if (detail.status === "error") {
+        loadActions.appendChild(
+          action(Logic.TEXT.retry, "btn-primary", function () {
+            controller.reloadShoppingList();
+          }, false)
+        );
+      }
+      loadActions.appendChild(action("Назад к покупкам", "btn-quiet", function () {
+        controller.closeShoppingList();
+        els.shoppingTitle.focus();
+      }));
+      box.appendChild(loadActions);
+      if (detail.status === "error") {
+        alertText(detail.error ? detail.error.text : "");
+      }
+      return;
+    }
+
+    if (detail.meta) {
+      box.appendChild(h("p", { class: "hint shop-meta", text: detail.meta }));
+    }
+    box.appendChild(h("p", { class: "shop-progress", text: detail.progress }));
+    var counts = h("ul", { class: "shop-counts", "aria-label": "Пункты списка" });
+    [
+      [Logic.TEXT.countToBuy, detail.counts.unchecked],
+      [Logic.TEXT.countBought, detail.counts.purchased],
+      [Logic.TEXT.countAtHome, detail.counts.at_home],
+    ].forEach(function (pair) {
+      counts.appendChild(
+        h("li", { class: "shop-count" }, [
+          h("span", { text: filledText(pair[0], { count: pair[1] }) }),
+        ])
+      );
+    });
+    box.appendChild(counts);
+    box.appendChild(h("p", { class: "hint shop-unchecked-note", text: Logic.TEXT.shoppingUncheckedNote }));
+
+    var actions = h("div", { class: "shop-actions" });
+    var statusButton;
+    if (detail.readOnly) {
+      statusButton = action(Logic.TEXT.reopenList, "btn-secondary", function () {
+        controller.setShoppingListStatus("active");
+      });
+      box.appendChild(h("p", { class: "hint shop-completed-note", text: Logic.TEXT.listCompletedNote }));
+    } else {
+      statusButton = action(Logic.TEXT.completeList, "btn-secondary", function () {
+        controller.setShoppingListStatus("completed");
+      });
+    }
+    statusButton.setAttribute("data-focus", "shop-status");
+    if (detail.busy || detail.statusBusy) {
+      statusButton.setAttribute("disabled", "");
+    }
+    actions.appendChild(statusButton);
+    if (detail.statusBusy) {
+      actions.appendChild(
+        h("p", { class: "loading" }, [h("span", { class: "spinner", "aria-hidden": "true" }), document.createTextNode(Logic.TEXT.shoppingSaving)])
+      );
+    }
+    var deleteListButton = action(Logic.TEXT.deleteList, "btn-quiet", function () {
+      wantFocus = "shop-list-keep";
+      controller.askDeleteShoppingList();
+    });
+    deleteListButton.setAttribute("data-focus", "shop-list-delete");
+    if (detail.busy) {
+      deleteListButton.setAttribute("disabled", "");
+    }
+    focusNodes["shop-list-delete"] = deleteListButton;
+    actions.appendChild(deleteListButton);
+    box.appendChild(actions);
+
+    if (detail.deleting !== null) {
+      box.appendChild(shoppingListRemoval(detail));
+    }
+    if (detail.actionError) {
+      box.appendChild(
+        h("p", { class: "notice notice-error", role: "alert", text: detail.actionError.text })
+      );
+      if (detail.actionError.correlationId) {
+        box.appendChild(h("p", { class: "hint", text: Logic.TEXT.correlation.replace("{id}", detail.actionError.correlationId) }));
+      }
+      if (lastShoppingAlert !== detail.actionError.text) {
+        lastShoppingAlert = detail.actionError.text;
+        alertText(detail.actionError.text);
+      }
+    } else {
+      lastShoppingAlert = null;
+    }
+
+    if (detail.itemCount === 0) {
+      box.appendChild(h("p", { class: "hint", text: Logic.TEXT.itemsEmpty }));
+    }
+    detail.groups.forEach(function (group) {
+      var section = h("section", { class: "shop-group" }, [
+        h("h2", { class: "shop-group-title", text: group.title + " (" + group.count + ")" }),
+      ]);
+      var groupItems = h("ul", { class: "shop-items" });
+      group.items.forEach(function (item) {
+        groupItems.appendChild(drawShoppingItem(item, detail));
+      });
+      section.appendChild(groupItems);
+      box.appendChild(section);
+    });
+
+    if (detail.adding !== null) {
+      // An unresolved addition is shown even over a list that has become completed since:
+      // hiding it would leave the person with a warning, a retry and a cancellation they
+      // cannot see, while the list refuses «Вернуть в работу» in the name of that same
+      // hidden form. The form keeps what was typed; a completed list only refuses to send.
+      box.appendChild(shoppingItemAdd(detail.adding, detail.busy, detail.readOnly));
+    } else if (!detail.readOnly) {
+      if (detail.editor === null && detail.removing === null && detail.deleting === null && !detail.busy) {
+        var addButton = action(Logic.TEXT.addItem, "btn-secondary shop-add", function () {
+          wantFocus = "shop-add-name";
+          controller.beginShoppingItemAdd();
+        });
+        addButton.setAttribute("data-focus", "shop-add");
+        box.appendChild(addButton);
+      }
+    }
+  }
+
+  function shoppingListRemoval(detail) {
+    var deleting = detail.deleting;
+    var box = h("div", { class: "confirm", role: "group", "aria-label": Logic.TEXT.deleteList });
+    box.appendChild(
+      h("p", {
+        class: "confirm-text",
+        text: deleting.error
+          ? deleting.error.text
+          : filledText(Logic.TEXT.deleteListAsk, { title: detail.title }),
+      })
+    );
+    if (deleting.error && deleting.error.correlationId) {
+      box.appendChild(h("p", { class: "hint", text: Logic.TEXT.correlation.replace("{id}", deleting.error.correlationId) }));
+    }
+    var buttons = h("div", { class: "msg-actions" });
+    if (deleting.phase === "deleting") {
+      buttons.appendChild(
+        h("p", { class: "loading" }, [h("span", { class: "spinner", "aria-hidden": "true" }), document.createTextNode(Logic.TEXT.deletingList)])
+      );
+    } else {
+      var deleteConfirm = action(deleting.error ? Logic.TEXT.retry : Logic.TEXT.deleteListConfirm, "btn-danger", function () {
+        controller.deleteShoppingList().then(function (result) {
+          if (result && result.ok) {
+            els.shoppingTitle.focus();
+          }
+        });
+      });
+      if (detail.busy) {
+        deleteConfirm.setAttribute("disabled", "");
+      }
+      buttons.appendChild(deleteConfirm);
+      var keep = action(Logic.TEXT.deleteListKeep, "btn-quiet", function () {
+        wantFocus = "shop-list-delete";
+        controller.cancelDeleteShoppingList();
+      });
+      focusNodes["shop-list-keep"] = keep;
+      buttons.appendChild(keep);
+    }
+    box.appendChild(buttons);
+    if (deleting.error) {
+      alertText(deleting.error.text);
+    }
+    return box;
+  }
+
+  function shoppingItemAdd(adding, busy, readOnly) {
+    var saving = adding.phase === "saving";
+    // A completed list is read-only: an unresolved addition keeps its form and its values,
+    // and «Отмена» works, but the fields and «Добавить» wait for «Вернуть в работу».
+    var completedList = readOnly === true;
+    var locked = saving || busy;
+    var form = h("form", { class: "shop-item-form shop-add", novalidate: true, "aria-label": Logic.TEXT.addItem });
+    var name = h("input", {
+      id: "shop-add-name",
+      type: "text",
+      value: adding.draft.name,
+      readonly: saving || completedList,
+      autocomplete: "off",
+      maxlength: "200",
+      "data-focus": "shop-add-name",
+    });
+    var amount = h("input", {
+      id: "shop-add-amount",
+      type: "text",
+      value: adding.draft.amount,
+      readonly: saving || completedList,
+      autocomplete: "off",
+      maxlength: "100",
+      "data-focus": "shop-add-amount",
+    });
+    function collect() {
+      return { name: name.value, amount: amount.value };
+    }
+    name.addEventListener("input", function () {
+      controller.syncShoppingItemAdd(collect());
+    });
+    amount.addEventListener("input", function () {
+      controller.syncShoppingItemAdd(collect());
+    });
+    form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      if (!locked && !completedList) {
+        controller.saveShoppingItemAdd(collect()).then(function (result) {
+          if (result && result.ok) {
+            var node = findByFocus(els.shoppingBody, "item-check-" + result.id);
+            if (node) {
+              node.focus();
+            }
+          }
+        });
+      }
+    });
+    form.appendChild(shopField(Logic.TEXT.addItemName, name));
+    form.appendChild(shopField(Logic.TEXT.addItemAmount, amount));
+    if (adding.error) {
+      form.appendChild(h("p", { class: "notice notice-error", role: "alert", text: adding.error.text }));
+    }
+    var buttons = h("div", { class: "shop-actions" });
+    buttons.appendChild(
+      h("button", {
+        class: "btn " + (saving ? "btn-quiet" : "btn-primary"),
+        type: "submit",
+        text: saving ? Logic.TEXT.shoppingSaving : Logic.TEXT.addItemSubmit,
+        disabled: locked || completedList,
+        "aria-disabled": locked || completedList ? "true" : false,
+      })
+    );
+    buttons.appendChild(
+      action(Logic.TEXT.addItemCancel, "btn-quiet", function () {
+        if (!saving) {
+          controller.cancelShoppingItemAdd();
+          els.shoppingTitle.focus();
+        }
+      })
+    );
+    form.appendChild(buttons);
+    return form;
+  }
+
+  // Opening a saved list (or beginning another draft) gives up a modified shopping draft:
+  // ask first, unless the browser has nobody to ask (the call is best effort), as for an
+  // open recipe editor. The question is only asked by an explicit navigation, never by a
+  // redraw, and a refused question leaves the draft and its marks exactly as they were.
+  function leaveShoppingDraft() {
+    if (!controller.shoppingDraftDirty()) {
+      return true;
+    }
+    if (typeof window.confirm !== "function") {
+      return true;
+    }
+    return window.confirm(Logic.TEXT.shoppingDraftUnsaved);
+  }
+
+  function openShoppingList(id) {
+    if (!leaveShoppingDraft()) {
+      return;
+    }
+    setDrawer(false, false); // the navigation was accepted: the drawer gives way to the list
+    controller.openShoppingList(id).then(function (result) {
+      if (result && result.ok) {
+        els.shoppingTitle.focus();
+      }
     });
   }
 
@@ -984,14 +1768,27 @@
         box.appendChild(recipeEditor(current));
       } else {
         box.appendChild(recipeContent(current));
-        box.appendChild(
-          h("div", { class: "recipe-actions" }, [
-            action(Logic.TEXT.editAction, "btn-secondary", function () {
-              wantFocus = "edit-title";
-              controller.beginEditFavorite();
-            }),
-          ])
-        );
+        var recipeActionsRow = h("div", { class: "recipe-actions" }, [
+          action(Logic.TEXT.editAction, "btn-secondary", function () {
+            wantFocus = "edit-title";
+            controller.beginEditFavorite();
+          }),
+        ]);
+        if (current.kind === "structured") {
+          recipeActionsRow.appendChild(
+            action(Logic.TEXT.shoppingDraftTitle, "btn-secondary", function () {
+              if (!leaveShoppingDraft()) {
+                return;
+              }
+              var result = controller.beginShoppingDraftFromFavorite();
+              if (result && result.ok) {
+                setDrawer(false, false);
+                els.shoppingTitle.focus();
+              }
+            }, "Составить список покупок: " + current.title)
+          );
+        }
+        box.appendChild(recipeActionsRow);
         box.appendChild(removalControls(current));
       }
     }
@@ -1476,38 +2273,53 @@
           "Открыть сохраненный рецепт «" + recipe.title + "»"
         )
       );
-      return row;
-    }
-    if (recipe.state === "saving") {
+    } else if (recipe.state === "saving") {
       row.appendChild(
         h("p", { class: "msg-note" }, [
           h("span", { class: "spinner", "aria-hidden": "true" }),
           h("span", { text: shown + ": " + Logic.TEXT.recipeSaving }),
         ])
       );
-      return row;
-    }
-    if (recipe.state === "error") {
+    } else {
+      if (recipe.state === "error") {
+        row.appendChild(
+          h("p", { class: "msg-note msg-note-error", text: shown + ": " + recipe.error.text })
+        );
+      }
       row.appendChild(
-        h("p", { class: "msg-note msg-note-error", text: shown + ": " + recipe.error.text })
+        action(label, "btn-quiet", function () {
+          controller.keepFavorite(conversationId, messageId, recipe.position).then(function (result) {
+            if (result && !result.ok && result.reason !== "busy" && result.reason !== "stale") {
+              var failed = lastView && lastView.thread.items.filter(function (item) {
+                return item.type === "message" && item.id === messageId;
+              })[0];
+              var mark = failed && failed.recipes ? failed.recipes.filter(function (found) {
+                return found.position === recipe.position;
+              })[0] : null;
+              if (mark && mark.error) {
+                alertText(mark.error.text);
+              }
+            }
+          });
+        }, label)
       );
     }
+    // «Что купить?»: every structured recipe can be turned into a shopping list, whatever
+    // its Save state; nothing is inferred from conversational text.
     row.appendChild(
-      action(label, "btn-quiet", function () {
-        controller.keepFavorite(conversationId, messageId, recipe.position).then(function (result) {
-          if (result && !result.ok && result.reason !== "busy" && result.reason !== "stale") {
-            var failed = lastView && lastView.thread.items.filter(function (item) {
-              return item.type === "message" && item.id === messageId;
-            })[0];
-            var mark = failed && failed.recipes ? failed.recipes.filter(function (found) {
-              return found.position === recipe.position;
-            })[0] : null;
-            if (mark && mark.error) {
-              alertText(mark.error.text);
+      action(Logic.TEXT.shoppingDraftTitle, "btn-quiet", function () {
+        if (!leaveShoppingDraft()) {
+          return;
+        }
+        controller
+          .beginShoppingDraftFromRecipe(conversationId, messageId, recipe.position)
+          .then(function (result) {
+            if (result && result.ok) {
+              setDrawer(false, false);
+              els.shoppingTitle.focus();
             }
-          }
-        });
-      }, label)
+          });
+      }, "Составить список покупок: " + recipe.title)
     );
     return row;
   }
@@ -1885,9 +2697,20 @@
     els.app.setAttribute("data-drawer", isOpen ? "open" : "closed");
     els.drawerToggle.setAttribute("aria-expanded", isOpen ? "true" : "false");
     els.backdrop.hidden = !isOpen;
+    // Everything under the drawer is out of reach, not only the conversation: the favorites
+    // and the shopping pane are the same kind of background and take no focus or click
+    // while the drawer covers them. Closing gives all of them back.
     els.chat.inert = isOpen;
+    els.recipe.inert = isOpen;
+    els.shopping.inert = isOpen;
     if (isOpen) {
-      (els.tabFavorites.getAttribute("aria-pressed") === "true" ? els.tabFavorites : els.tabChats).focus();
+      var activeTab =
+        els.tabShopping.getAttribute("aria-pressed") === "true"
+          ? els.tabShopping
+          : els.tabFavorites.getAttribute("aria-pressed") === "true"
+            ? els.tabFavorites
+            : els.tabChats;
+      activeTab.focus();
     } else if (restoreFocus) {
       els.drawerToggle.focus();
     }
@@ -1932,8 +2755,14 @@
   els.tabFavorites.addEventListener("click", function () {
     controller.showSection("favorites");
   });
+  els.tabShopping.addEventListener("click", function () {
+    controller.showSection("shopping");
+  });
   els.favoritesRetry.addEventListener("click", function () {
     controller.reloadFavorites();
+  });
+  els.shoppingRetry.addEventListener("click", function () {
+    controller.reloadShoppingLists();
   });
   els.bannerClose.addEventListener("click", function () {
     controller.dismissBanner();
@@ -2018,9 +2847,10 @@
     controller.recheck();
   });
   // A refresh or a closed tab cannot be stopped by the application: the browser's own
-  // question is the best that can be done for an editor that was not saved.
+  // question is the best that can be done for an editor or a shopping draft that was not
+  // saved. Whether the question is actually shown is the browser's decision.
   window.addEventListener("beforeunload", function (event) {
-    if (controller.hasUnsavedChanges()) {
+    if (controller.hasUnsavedChanges() || controller.shoppingDraftDirty()) {
       event.preventDefault();
       event.returnValue = "";
     }

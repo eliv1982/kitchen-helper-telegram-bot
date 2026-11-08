@@ -121,14 +121,16 @@ def test_the_application_exposes_health_sign_in_chat_the_page_and_nothing_else(t
     # The sign-in routes (R3A Telegram, R3B-2 email, R4C-Auth A3 Telegram invitation: the
     # page, its start and the page after it, none of which serves a person's data), the chat API (R4A: the
     # conversations and their messages), the favorites API (the answers a person chose to
-    # keep), the Telegram pairing API (the link between a person and their Telegram account)
-    # and the page (R4B: the shell at "/" and its few static files) are the only
-    # additions to /healthz: no preference or other user-data route may exist, and not even
-    # the interactive API pages FastAPI would add by default. A route added later has to
+    # keep), the shopping-list API (a recipe's ingredients saved as a checklist), the
+    # Telegram pairing API (the link between a person and their Telegram account) and the
+    # page (R4B: the shell at "/" and its few static files) are the only additions to
+    # /healthz: no preference or other user-data route may exist, and not even the
+    # interactive API pages FastAPI would add by default. A route added later has to
     # change this list on purpose, and a route that serves a person's data has to use
-    # auth.require_user (the chat and favorites routes do: see test_web_chat_api.py and
-    # test_web_favorites.py, which ask each of them without a session; the page holds no
-    # data of anyone's: see test_web_ui.py).
+    # auth.require_user (the chat, favorites and shopping-list routes do: see
+    # test_web_chat_api.py, test_web_favorites.py and test_web_shopping_lists.py, which ask
+    # each of them without a session; the page holds no data of anyone's: see
+    # test_web_ui.py).
     app = create_app(settings_for(tmp_path / "routes.db"))
 
     # openapi() is the public listing (app.routes holds FastAPI internals); the
@@ -148,8 +150,13 @@ def test_the_application_exposes_health_sign_in_chat_the_page_and_nothing_else(t
         "/api/conversations": ["get", "post"],
         "/api/conversations/{conversation_id}": ["delete"],
         "/api/conversations/{conversation_id}/messages": ["get", "post"],
+        "/api/conversations/{conversation_id}/messages/{message_id}/recipes/{position}": ["get"],
         "/api/favorites": ["get", "post"],
         "/api/favorites/{favorite_id}": ["delete", "get", "patch"],
+        "/api/shopping-lists": ["get", "post"],
+        "/api/shopping-lists/{list_id}": ["delete", "get", "patch"],
+        "/api/shopping-lists/{list_id}/items": ["post"],
+        "/api/shopping-lists/{list_id}/items/{item_id}": ["delete", "patch"],
         "/api/telegram": ["get"],
         "/api/attachments/{attachment_id}": ["get"],
         "/api/telegram/link": ["delete", "post"],
@@ -410,7 +417,7 @@ async def test_starting_and_stopping_leaves_a_migrated_database_as_it_was(tmp_pa
     upgrade_database(engine)
     engine.dispose()
     before = _snapshot(target)
-    assert before[1] == [("0011_telegram_active_selection",)]
+    assert before[1] == [("0012_shopping_lists",)]
 
     async with serving(create_app(settings_for(target))) as client:
         await client.get("/healthz")

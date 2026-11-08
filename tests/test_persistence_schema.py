@@ -30,6 +30,9 @@ TABLES = {
     "telegram_update_admissions",
     "message_attachments",
     "message_recipes",
+    "shopping_lists",
+    "shopping_list_items",
+    "shopping_list_requests",
     "conversations",
     "messages",
     "turn_requests",
@@ -38,7 +41,7 @@ TABLES = {
 POSTGRESQL_IDENTIFIER_LIMIT = 63
 
 
-def test_the_schema_has_exactly_the_seventeen_tables():
+def test_the_schema_has_exactly_the_twenty_tables():
     assert set(Base.metadata.tables) == TABLES
 
 
@@ -187,6 +190,8 @@ def test_only_the_dialect_specific_rules_are_spelled_differently_per_database():
         "ck_identity_links_subject_printable_ascii",
         "ck_identity_links_email_printable_ascii",
         "ck_turn_requests_idempotency_key_printable_ascii",
+        "ck_shopping_lists_idempotency_key_printable_ascii",
+        "ck_shopping_list_requests_idempotency_key_printable_ascii",
         "ck_messages_expires_within_retention",
         "ck_turn_requests_expires_within_retention",
     }
@@ -284,6 +289,9 @@ def test_lists_of_values_fit_their_columns():
         FailureKind,
         FavoriteKind,
         MessageRole,
+        ShoppingListItemState,
+        ShoppingListSourceKind,
+        ShoppingListStatus,
         TelegramUpdateAdmissionKind,
         TurnStatus,
     )
@@ -293,6 +301,8 @@ def test_lists_of_values_fit_their_columns():
     allowlist = Base.metadata.tables["allowlist_entries"]
     favorites = Base.metadata.tables["favorite_recipes"]
     admissions = Base.metadata.tables["telegram_update_admissions"]
+    lists = Base.metadata.tables["shopping_lists"]
+    items = Base.metadata.tables["shopping_list_items"]
 
     assert max(len(r.value) for r in MessageRole) <= messages.c.role.type.length
     assert max(len(r.value) for r in TurnStatus) <= turns.c.status.type.length
@@ -300,6 +310,9 @@ def test_lists_of_values_fit_their_columns():
     assert max(len(r.value) for r in AllowlistProvider) <= allowlist.c.provider.type.length
     assert max(len(r.value) for r in FavoriteKind) <= favorites.c.kind.type.length
     assert max(len(r.value) for r in TelegramUpdateAdmissionKind) <= admissions.c.kind.type.length
+    assert max(len(r.value) for r in ShoppingListStatus) <= lists.c.status.type.length
+    assert max(len(r.value) for r in ShoppingListSourceKind) <= lists.c.source_kind.type.length
+    assert max(len(r.value) for r in ShoppingListItemState) <= items.c.state.type.length
 
 
 # --- the shape of the references ---------------------------------------------------

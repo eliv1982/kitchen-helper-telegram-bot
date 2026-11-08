@@ -550,19 +550,20 @@ textarea[aria-invalid="true"] {
 .tabs {
   display: flex;
   flex: none;
-  gap: 0.4rem;
+  gap: 0.35rem;
   margin-bottom: 0.9rem;
 }
 
 .tab {
   flex: 1;
   min-height: 2.75rem;
-  padding: 0.5rem 0.6rem;
+  padding: 0.5rem 0.35rem;
   border: 2px solid var(--blue);
   border-radius: var(--radius);
   background: var(--surface);
   color: var(--blue);
   font: inherit;
+  font-size: 0.95rem;
   font-weight: 600;
   cursor: pointer;
 }
@@ -1092,6 +1093,219 @@ textarea[aria-invalid="true"] {
   font-weight: 600;
 }
 
+/* --- the shopping lists ------------------------------------------------------------------ */
+
+.shopping .chat-title {
+  padding-right: var(--recipe-gutter);
+  padding-left: var(--recipe-gutter);
+}
+
+.shopping-body {
+  flex: 1;
+  min-height: 0;
+  padding: 1rem var(--recipe-gutter);
+  overflow-y: auto;
+}
+
+.shopping-content {
+  max-width: var(--recipe-column);
+}
+
+.shop-recipe-title {
+  margin: 0 0 0.4rem;
+  overflow-wrap: anywhere;
+  font-size: 1.25rem;
+  line-height: 1.3;
+}
+
+.shop-remaining {
+  margin: 0.2rem 0 0;
+  font-weight: 600;
+}
+
+/* A row of a draft: the whole row is the checkbox's label, so a thumb anywhere on it checks it. */
+.shop-draft-items {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  margin: 0.6rem 0 1rem;
+}
+
+.shop-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.65rem;
+  min-height: 2.75rem;
+  min-width: 0;
+  padding: 0.4rem 0.55rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  cursor: pointer;
+}
+
+.shop-check input[type="checkbox"] {
+  flex: none;
+  width: 1.35rem;
+  height: 1.35rem;
+  margin: 0.15rem 0 0;
+  accent-color: var(--green);
+}
+
+.shop-check input[disabled] {
+  cursor: default;
+}
+
+.shop-check-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.shop-name {
+  font-weight: 600;
+}
+
+.shop-amount {
+  color: var(--muted);
+}
+
+.shop-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.9rem 0;
+}
+
+.shop-progress {
+  margin: 0 0 0.35rem;
+  font-weight: 600;
+}
+
+.shop-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.9rem;
+  margin: 0 0 0.35rem;
+  padding: 0;
+  color: var(--muted);
+  list-style: none;
+}
+
+.shop-count {
+  white-space: nowrap;
+}
+
+.shop-group {
+  margin-top: 1.1rem;
+}
+
+.shop-group-title {
+  margin: 0 0 0.4rem;
+  font-size: 1.05rem;
+}
+
+.shop-items {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.shop-item {
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.shop-item-main {
+  display: flex;
+  min-width: 0;
+}
+
+.shop-item .shop-check {
+  border: 0;
+  padding: 0.2rem 0;
+  background: transparent;
+}
+
+.shop-item-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.3rem;
+}
+
+.shop-state {
+  max-width: 12rem;
+  min-height: 2.75rem;
+  padding: 0.35rem 0.5rem;
+  border: 2px solid var(--field-edge);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+}
+
+.shop-item-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin-top: 0.6rem;
+}
+
+.shop-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.shop-field input[type="text"] {
+  width: 100%;
+  min-height: 2.75rem;
+  padding: 0.55rem 0.75rem;
+  border: 2px solid var(--field-edge);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+}
+
+.shop-field input[readonly] {
+  background: var(--pale);
+}
+
+.shop-add {
+  margin-top: 1rem;
+}
+
+.shop-meta {
+  margin-bottom: 0.35rem;
+}
+
+.shop-completed-note {
+  margin-top: 0.25rem;
+}
+
+.shop-unchecked-note {
+  margin: 0.15rem 0 0.35rem;
+}
+
+@media (max-width: 30rem) {
+  .shop-item-controls .btn {
+    flex: 1 1 auto;
+  }
+
+  .shop-state {
+    width: 100%;
+    max-width: 100%;
+  }
+}
+
 .only-narrow {
   display: none;
 }
@@ -1207,6 +1421,13 @@ textarea[aria-invalid="true"] {
   .btn {
     padding-right: 0.8rem;
     padding-left: 0.8rem;
+  }
+
+  /* Three tabs in the narrowest drawer: the words stay on one line. */
+  .tab {
+    padding-right: 0.25rem;
+    padding-left: 0.25rem;
+    font-size: 0.9rem;
   }
 
   .messages {

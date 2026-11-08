@@ -71,7 +71,7 @@ pytestmark = pytest.mark.skipif(
 
 NOW = utc(2026, 11, 7, 12)
 PREVIOUS = "0010_structured_recipe_favorites"
-HEAD = "0011_telegram_active_selection"
+HEAD = "0012_shopping_lists"
 ACCOUNT = 555000111
 BOT = 123456789
 

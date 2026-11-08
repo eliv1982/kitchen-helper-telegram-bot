@@ -644,6 +644,86 @@ journeys.deleting_a_conversation_keeps_its_favorite_and_returns_to_a_new_draft =
   return { favorite: favoriteId };
 };
 
+journeys.a_shopping_list_is_saved_from_a_recipe_and_kept_across_devices = async ({ base, cookie }) => {
+  const first = page(base, cookie);
+  await first.boot();
+  const sent = await first.ctl.send("борщ для списка");
+  assert.equal(sent.ok, true);
+  await sent.done;
+  const conversation = first.view().currentId;
+  const answer = assistantOf(first);
+
+  const draft = await first.ctl.beginShoppingDraftFromRecipe(conversation, answer.id, 0);
+  await first.ctl.idle();
+  assert.deepEqual(draft, { ok: true });
+  assert.deepEqual(first.view().shopping.draft.ingredients.map((ingredient) => ingredient.name), ["свёкла", "мясо"]);
+  first.ctl.toggleShoppingDraftAtHome(0, true);
+  const saved = await first.ctl.saveShoppingDraft();
+  await first.ctl.idle();
+  assert.equal(saved.ok, true);
+  const listId = saved.id;
+  const creation = first.net.log.find((request) => request.method === "POST" && request.url === "/api/shopping-lists");
+  assert.ok(creation.key && creation.status === 201);
+
+  let view = first.view();
+  assert.equal(view.shopping.current.title, "Борщ");
+  assert.deepEqual(view.shopping.current.counts, { total: 2, unchecked: 1, at_home: 1, purchased: 0 });
+
+  // A second device (another tab, its own memory) reads the same account's list from the server.
+  const second = page(base, cookie);
+  await second.boot();
+  second.ctl.showSection("shopping");
+  await second.ctl.idle();
+  assert.deepEqual(second.view().shopping.lists.map((item) => item.id), [listId]);
+  await second.ctl.openShoppingList(listId);
+  await second.ctl.idle();
+  let current = second.view().shopping.current;
+  assert.deepEqual([current.title, current.counts.unchecked], ["Борщ", 1]);
+  const animal = current.groups.reduce((all, group) => all.concat(group.items), []).find((item) => item.name === "мясо");
+
+  const marked = await second.ctl.setShoppingItemState(animal.id, "purchased");
+  await second.ctl.idle();
+  assert.equal(marked.ok, true);
+  current = second.view().shopping.current;
+  assert.deepEqual([current.counts.unchecked, current.counts.purchased], [0, 1]);
+
+  const completed = await second.ctl.setShoppingListStatus("completed");
+  await second.ctl.idle();
+  assert.deepEqual([completed.ok, second.view().shopping.current.readOnly], [true, true]);
+  assert.deepEqual(second.view().shopping.current.counts, { total: 2, unchecked: 0, at_home: 1, purchased: 1 });
+
+  const reopened = await second.ctl.setShoppingListStatus("active");
+  await second.ctl.idle();
+  assert.deepEqual([reopened.ok, second.view().shopping.current.readOnly], [true, false]);
+
+  second.ctl.askDeleteShoppingList();
+  const removed = await second.ctl.deleteShoppingList();
+  await second.ctl.idle();
+  assert.equal(removed.ok, true);
+  assert.deepEqual([second.view().shopping.current, second.view().shopping.lists], [null, []]);
+
+  // The key of the deleted list stays consumed: the very same save cannot recreate it.
+  const replay = await second.net.raw(
+    "POST",
+    "/api/shopping-lists",
+    {
+      source: "message",
+      conversation_id: conversation,
+      message_id: answer.id,
+      recipe_index: 0,
+      item_states: [{ position: 0, state: "at_home" }],
+    },
+    creation.key
+  );
+  assert.deepEqual([replay.status, replay.json.detail], [409, "shopping_list_deleted"]);
+
+  // The first device still holds its copy until it asks the server again; asking shows the truth.
+  first.ctl.showSection("shopping");
+  await first.ctl.idle();
+  assert.equal(first.view().shopping.lists.length, 0, "the list is gone for every device");
+  return { list: listId };
+};
+
 // --- run -------------------------------------------------------------------------------------------------------
 
 (async () => {

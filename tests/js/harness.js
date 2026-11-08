@@ -16,6 +16,11 @@ const CONV_C = "33333333-3333-4333-8333-333333333333";
 const FAV_1 = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1";
 const FAV_2 = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2";
 const FAV_3 = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3";
+const LIST_1 = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1";
+const LIST_2 = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2";
+const ITEM_1 = "cccccccc-cccc-4ccc-8ccc-ccccccccccc1";
+const ITEM_2 = "cccccccc-cccc-4ccc-8ccc-ccccccccccc2";
+const ITEM_3 = "cccccccc-cccc-4ccc-8ccc-ccccccccccc3";
 const START = Date.UTC(2026, 9, 18, 12, 0, 0);
 
 async function flush(rounds = 25) {
@@ -286,6 +291,64 @@ function favoriteDetail(item, textValue, extra = {}) {
 const keptBody = (item, created = true) => json(created ? 201 : 200, { ...item, created });
 const removedBody = () => ({ kind: "empty", status: 204 });
 
+// The shopping lists, in the shapes of the real API (tests/test_web_shopping_lists.py checks those).
+const shoppingAt = (minutes = 0) =>
+  new Date(START - 3600_000 + minutes * 60_000).toISOString().replace("Z", "+00:00");
+
+function shoppingItem(id, position, name, amount, state, extra = {}) {
+  return {
+    id,
+    position,
+    name,
+    amount,
+    state,
+    created_at: shoppingAt(position),
+    updated_at: shoppingAt(position),
+    ...extra,
+  };
+}
+
+function shoppingDetail(id, title, status, items, extra = {}) {
+  return {
+    id,
+    title,
+    status,
+    created_at: shoppingAt(0),
+    updated_at: shoppingAt(items.length),
+    items,
+    ...extra,
+  };
+}
+
+// The list the API answers for GET /api/shopping-lists (no items, only their counts).
+function shoppingSummary(detail) {
+  const counts = { total: detail.items.length, unchecked: 0, at_home: 0, purchased: 0 };
+  detail.items.forEach((item) => {
+    counts[item.state]++;
+  });
+  return {
+    id: detail.id,
+    title: detail.title,
+    status: detail.status,
+    created_at: detail.created_at,
+    updated_at: detail.updated_at,
+    counts,
+  };
+}
+
+const shoppingListsBody = (lists) => json(200, { lists });
+
+function recipeBody(messageId, position, title, servings, ingredients, steps = []) {
+  return json(200, {
+    message_id: messageId,
+    position,
+    title,
+    servings,
+    ingredients,
+    steps,
+  });
+}
+
 function message(id, role, textValue, extra = {}) {
   return { id, role, text: textValue, created_at: iso(id), status: "completed", ...extra };
 }
@@ -431,6 +494,11 @@ module.exports = {
   FAV_1,
   FAV_2,
   FAV_3,
+  LIST_1,
+  LIST_2,
+  ITEM_1,
+  ITEM_2,
+  ITEM_3,
   START,
   flush,
   Timers,
@@ -451,6 +519,12 @@ module.exports = {
   favoriteDetail,
   keptBody,
   removedBody,
+  shoppingAt,
+  shoppingItem,
+  shoppingDetail,
+  shoppingSummary,
+  shoppingListsBody,
+  recipeBody,
   message,
   historyBody,
   turnBody,

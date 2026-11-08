@@ -45,6 +45,9 @@ TABLES_BEFORE_0007 = TABLES - {
     "telegram_update_admissions",
     "message_attachments",
     "message_recipes",
+    "shopping_lists",
+    "shopping_list_items",
+    "shopping_list_requests",
 }
 
 

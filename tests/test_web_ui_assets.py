@@ -74,11 +74,15 @@ def test_the_page_calls_only_its_own_origin_and_names_no_other_address():
         code = code_of(source)
         assert not re.search(r"https?://", code), name
         assert "//cdn" not in code and "unpkg" not in code and "jsdelivr" not in code, name
-    paths = re.findall(r'http\(\s*"(GET|POST)",\s*("[^"]*")', LOGIC) + re.findall(r'http\(\s*"(GET|POST)",\s*(\S+?),', LOGIC)
+    paths = re.findall(r'http\(\s*"(GET|POST|PATCH|DELETE)",\s*("[^"]*")', LOGIC) + re.findall(
+        r'http\(\s*"(GET|POST|PATCH|DELETE)",\s*(\S+?),', LOGIC
+    )
     assert paths, "the requests of the logic were not found"
     for method, path in paths:
         assert path.startswith('"/api/') or path.startswith('"/auth/'), path
-    assert {method for method, _ in paths} == {"GET", "POST"}
+    assert {method for method, _ in paths} == {"GET", "POST", "PATCH", "DELETE"}
+    # The shopping lists are read and written only through those routes.
+    assert any("/api/shopping-lists" in path for _, path in paths)
     # Every request goes through one of two places, and each asks for the cookie of this site only: the
     # conversations' http() and the Telegram panel's call() (a controller of its own, which talks to
     # /api/telegram and nothing else).
@@ -103,14 +107,19 @@ def test_the_user_id_is_kept_to_tell_whose_page_it_is_and_is_never_sent():
     # ...the page keeps the id (the principal, and the owner written in each record of an unresolved message)
     # only to know whose page and whose record it is. It is sent nowhere: no request line mentions it, the
     # bodies are the message text, nothing, the conversation, message and optional recipe position of an
-    # answer to keep, the editable fields of a favorite, and the e-mail address, and the one header is the
-    # idempotency key.
+    # answer to keep, the editable fields of a favorite, a shopping item's state/name/amount or list status,
+    # the source and initial states of a shopping list, and the e-mail address, and the headers are the
+    # idempotency keys alone.
     for line in code.splitlines():
         if re.search(r"http\(|json:|headers|\.body|Idempotency", line):
             assert not re.search(r"principal|userId|owner|user_id", line), line
     assert re.findall(r"json:\s*(\{[^}]*\})", code) == [
         "{ text: turn.text }",
         "{}",
+        "{ state: itemState }",
+        "{ name: checked.name, amount: checked.amount }",
+        "{ name: checked.name, amount: checked.amount }",
+        "{ status: status }",
         "{ email: checked.address }",
     ]
     # The keep body names the answer (and, when a recipe is kept on its own, its position);
@@ -118,7 +127,8 @@ def test_the_user_id_is_kept_to_tell_whose_page_it_is_and_is_never_sent():
     assert "var body = { conversation_id: conversationId, message_id: messageId };" in code
     assert "body.recipe_index = recipeIndex;" in code
     assert "function editBody(draft, kind, version)" in code
-    assert "Idempotency-Key" in code and code.count('"Idempotency-Key"') == 1
+    # One key for a message, one for a shopping list: each frozen with the request it stands for.
+    assert "Idempotency-Key" in code and code.count('"Idempotency-Key"') == 2
 
 
 # --- the shell and the script agree about the ids -----------------------------------------------------------------
@@ -148,7 +158,7 @@ def test_the_script_and_the_style_use_the_same_breakpoint_and_the_script_looks_o
     used = set(re.findall(r'class:\s*"([^"]+)"', APP))
     for group in used:
         for name in group.split():
-            if name.startswith(("btn", "msg", "conv", "notice", "chip", "hint", "loading", "spinner", "empty", "older", "banner", "counter")):
+            if name.startswith(("btn", "msg", "conv", "notice", "chip", "hint", "loading", "spinner", "empty", "older", "banner", "counter", "shop")):
                 assert name in classes_in_css, f"app.js uses .{name}, which the style does not define"
 
 
@@ -274,6 +284,12 @@ def test_touch_targets_are_at_least_44_css_pixels():
     for selector in (".chat-actions-toggle", ".chat-menu-item"):
         assert float(rules[selector]["min-height"][:-3]) * root_size >= 44, selector
     assert float(rules[".chat-actions-toggle"]["min-width"][:-3]) * root_size >= 44
+    # The shopping controls: the whole row is the checkbox's label, and the state control and
+    # the name/amount fields are the size of the rest.
+    assert float(rules[".shop-check"]["min-height"][:-3]) * root_size >= 44
+    assert float(rules[".shop-state"]["min-height"][:-3]) * root_size >= 44
+    assert float(rules['.shop-field input[type="text"]']["min-height"][:-3]) * root_size >= 44
+    assert float(rules[".tab"]["min-height"][:-3]) * root_size >= 44
 
 
 def test_keyboard_focus_is_visible_and_motion_and_hidden_are_handled():
@@ -314,6 +330,20 @@ def test_the_page_cannot_be_made_taller_than_the_window_by_what_is_in_the_messag
     # ...and the application, exactly as tall as the window, holds whatever else sticks out.
     assert rules[".app"]["position"] == "relative" and rules[".app"]["overflow"] == "clip"
     assert rules[".app"]["height"] == "100dvh"
+
+
+def test_the_shopping_pane_scrolls_inside_the_window_and_long_names_wrap():
+    rules = _merged_rules()
+
+    assert rules[".shopping-body"]["flex"] == "1"
+    assert rules[".shopping-body"]["min-height"] == "0"
+    assert rules[".shopping-body"]["overflow-y"] == "auto"
+    assert rules[".shopping-content"]["max-width"] == "var(--recipe-column)"
+    # A long product name or amount wraps inside its row: no horizontal scrolling.
+    assert rules[".shop-check-text"]["overflow-wrap"] == "anywhere"
+    assert ".shop-item-controls" in rules and rules[".shop-item-controls"]["flex-wrap"] == "wrap"
+    # The three tabs fit the desktop side column without pushing it wider.
+    assert rules[".tab"]["flex"] == "1"
 
 
 def test_the_side_column_keeps_its_top_and_its_foot_and_scrolls_the_list_between_them():

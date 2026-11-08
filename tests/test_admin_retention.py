@@ -748,6 +748,59 @@ def test_a_real_favorite_survives_the_expiry_and_purge_of_its_answer_its_convers
     integrity(db_url)
 
 
+def test_a_saved_shopping_list_survives_the_expiry_and_purge_of_its_source_and_its_own_age(db_url):
+    gone, kept = seeded(db_url, seed_history)
+    owner_id = read(db_url, "SELECT user_id FROM conversations ORDER BY created_at LIMIT 1")[0][0]
+    expired = gone["messages"][0]
+    saved_at = NOW - 2 * RETENTION  # kept for more than a year: its own age is no reason to delete it
+    list_id = uuid.uuid4().hex
+    engine = create_db_engine(db_url)
+    try:
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "INSERT INTO shopping_lists (id, user_id, title, status, source_kind, "
+                "source_message_id, source_recipe_index, source_favorite_id, "
+                "source_favorite_version, idempotency_key, request_fingerprint, created_at, "
+                "updated_at) VALUES (?, ?, 'Борщ', 'active', 'message', ?, 0, NULL, NULL, "
+                "'list-1', ?, ?, ?)",
+                (
+                    list_id,
+                    owner_id,
+                    expired.id,
+                    "0" * 64,
+                    stored(saved_at),
+                    stored(saved_at),
+                ),
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO shopping_list_items (id, list_id, position, name, amount, state, "
+                "created_at, updated_at) VALUES (?, ?, 0, 'свёкла', '2 шт.', 'at_home', ?, ?)",
+                (uuid.uuid4().hex, list_id, stored(saved_at), stored(saved_at)),
+            )
+    finally:
+        engine.dispose()
+    before = {
+        "shopping_lists": dump(db_url)["shopping_lists"],
+        "shopping_list_items": dump(db_url)["shopping_list_items"],
+    }
+    assert len(before["shopping_lists"]) == 1 and len(before["shopping_list_items"]) == 1
+
+    preview = purge(db_url, dry_run=True)
+    real = purge(db_url)
+
+    assert "shopping_lists" not in preview.deleted and "shopping_lists" not in real.deleted
+    assert "shopping_list_items" not in preview.deleted and "shopping_list_items" not in real.deleted
+    assert real.deleted["messages"] > 0  # the purge did run over the answer the list came from
+    check(db_url, gone, kept)
+    assert expired.id not in present(db_url, "messages")  # the source is gone; the list is not
+    after = dump(db_url)
+    assert {
+        "shopping_lists": after["shopping_lists"],
+        "shopping_list_items": after["shopping_list_items"],
+    } == before
+    integrity(db_url)
+
+
 def test_the_batch_statements_take_row_locks_only_where_the_database_has_them():
     from sqlalchemy.dialects import postgresql, sqlite
 
@@ -777,6 +830,9 @@ def test_every_table_of_the_schema_has_a_retention_decision():
         "identity_links": "the Telegram or email identity of a user",
         "favorite_recipes": "answers a person chose to keep: copies with no deadline and no link to the history",
         "message_recipes": "structured recipes of an answer: the foreign key deletes them with their message at 365 days",
+        "shopping_lists": "saved shopping lists: complete snapshots a person keeps, with no deadline and no link to the history",
+        "shopping_list_items": "the items of a saved list: they live and die with their list, and the purge does not name them",
+        "shopping_list_requests": "the consumed idempotency keys of list creation: kept for the account's life, never by age",
         "telegram_links": "the tie between a person and their Telegram account: removed by unlinking and with the user",
         "telegram_active_conversations": "the Telegram conversation cursor: no deadline, removed by unlinking and with the user; its deleted conversation merely nulls it",
     }
@@ -793,6 +849,7 @@ def test_the_purge_names_exactly_the_tables_it_may_delete_from():
     assert tables == {c.value for c in Category}
     untouchable = {
         "users", "allowlist_entries", "identity_links", "favorite_recipes", "message_recipes",
+        "shopping_lists", "shopping_list_items", "shopping_list_requests",
         "telegram_links", "telegram_active_conversations", "alembic_version",
     }
     assert not tables & untouchable

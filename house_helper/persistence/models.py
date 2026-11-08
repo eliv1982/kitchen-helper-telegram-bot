@@ -59,6 +59,15 @@ expires_at to be the canonical UTC spelling, "YYYY-MM-DD HH:MM:SS.ffffff" (see
 base.UtcDateTime and sqlchecks.py): text with an offset, a "Z" or another
 precision would compare wrongly against the bound, so it is refused.
 
+What a person keeps: a favorite (FavoriteRecipe) and a saved shopping list
+(ShoppingList) are copies with no deadline and no foreign key to the history they
+came from, so they outlive the expiry, the purge and the deletion of their source.
+A shopping list's creation key lives on after the list itself is gone: the
+ShoppingListRequest ledger keeps each consumed (user, key) reserved for the
+account's lifetime, so a lost reply can never recreate a deleted list. The purge
+names the tables it deletes from and does not know any of these; only deleting the
+user (the foreign key) or the person's own DELETE removes them.
+
 Widths: SQLite does not enforce the declared width of a VARCHAR, so every
 bounded text column has a matching length() CHECK, and the identifiers that come
 from outside (idempotency keys, subjects) also have a character-set CHECK, which
@@ -148,6 +157,49 @@ class FavoriteKind(str, enum.Enum):
 
     TEXT = "text"
     STRUCTURED = "structured"
+
+
+class ShoppingListStatus(str, enum.Enum):
+    """Where a saved shopping list is in its life.
+
+    ACTIVE is a list being worked on: its items may be added, edited, moved between
+    states and deleted. COMPLETED is a finished list: it is kept (and can be reopened by
+    moving it back to ACTIVE), but its items are read-only until then. There is no other
+    status: nothing expires a list, and deleting one removes it.
+    """
+
+    ACTIVE = "active"
+    COMPLETED = "completed"
+
+
+class ShoppingListItemState(str, enum.Enum):
+    """What a saved shopping-list item records.
+
+    The three states are what a person knows about one ingredient, and they are not
+    interchangeable: UNCHECKED means availability is unconfirmed (it is the default:
+    nothing is assumed), AT_HOME means the ingredient is confirmed to be at home, and
+    PURCHASED means it was bought during this shopping. An item can move between any two
+    of them while its list is active, and AT_HOME never deletes the item: the list is a
+    snapshot of every ingredient of the recipe, whether it is needed or not.
+    """
+
+    UNCHECKED = "unchecked"
+    AT_HOME = "at_home"
+    PURCHASED = "purchased"
+
+
+class ShoppingListSourceKind(str, enum.Enum):
+    """What a shopping list's ingredients were copied from.
+
+    MESSAGE is one validated recipe of an assistant answer, named by its message and the
+    recipe's position in that answer; FAVORITE is a structured favorite, named by its id
+    and the version that was current when the list was made. Both are stored as plain
+    values, with NO foreign key: the list is a self-contained snapshot that must survive
+    the deletion or editing of its source.
+    """
+
+    MESSAGE = "message"
+    FAVORITE = "favorite"
 
 
 class AllowlistProvider(str, enum.Enum):
@@ -264,6 +316,9 @@ class User(Base):
         back_populates="user", cascade="save-update, merge", passive_deletes="all"
     )
     favorites: Mapped[list["FavoriteRecipe"]] = relationship(
+        back_populates="user", cascade="save-update, merge", passive_deletes="all"
+    )
+    shopping_lists: Mapped[list["ShoppingList"]] = relationship(
         back_populates="user", cascade="save-update, merge", passive_deletes="all"
     )
 
@@ -1013,6 +1068,213 @@ class FavoriteRecipe(Base):
     user: Mapped[User] = relationship(back_populates="favorites")
 
 
+class ShoppingList(Base):
+    """A saved shopping checklist: a complete snapshot of one recipe's ingredients.
+
+    A list is what a person keeps when they decide to shop for a recipe. Every ingredient
+    of the source recipe is copied into shopping_list_items, including the ones the person
+    already has at home: the list is a snapshot of the recipe, not a filter of it. Its
+    items are independent rows; nothing here points at a conversation, a message, a
+    message recipe or a favorite by a foreign key. source_kind, source_message_id,
+    source_recipe_index, source_favorite_id and source_favorite_version are plain values
+    that record where the copy came from, so the list survives the expiry and deletion of
+    that source and the editing or deletion of that favorite. Deleting the user deletes
+    the list and its items (user_id, ON DELETE CASCADE), and the person removing it
+    (shopping_lists.delete_list). The purge does not know this table and never touches it:
+    a list has no deadline.
+
+    The title is copied from the source recipe (1 to 200 characters). status is 'active'
+    while the list is being worked on and 'completed' when it is finished; a completed
+    list is kept and can be reopened. Items may be added, edited and deleted only while
+    the list is active. created_at never changes; updated_at is informational and moves
+    when the list or one of its items changes.
+
+    Idempotent creation. (user_id, idempotency_key) is unique, so one client-chosen key
+    creates at most one list for one user. request_fingerprint is the SHA-256 hex digest
+    of the canonical request: the same key with the same request answers the list that
+    exists (a retry that lost its reply), and the same key with a different request is a
+    conflict (shopping_lists.IdempotencyKeyReused), never a second list and never a
+    silent substitution.
+
+    The source is copied when the list is made, under the same transaction that checks
+    it: a message recipe is read from message_recipes through the user's conversation and
+    must not have expired, and a structured favorite is read through its owner and must
+    still have the version the request named. The request's initial item states are
+    applied to the copy; an ingredient the request does not name starts 'unchecked'
+    (nothing is assumed about availability).
+
+    What may change: status, updated_at, and (through shopping_list_items) the items.
+    The owner, the title, the source and the idempotency identity never change once the
+    row exists; the ORM refuses those rewrites.
+    """
+
+    __tablename__ = "shopping_lists"
+    __table_args__ = (
+        # One key, one list. The target is the (id, user_id) pair the route reads, not a
+        # content rule: a repeated key with another request is refused in the application.
+        sa.UniqueConstraint("user_id", "idempotency_key"),
+        # The user's list, newest first (and the foreign key's cascade).
+        sa.Index(None, "user_id", "created_at"),
+        _max_length("title", 200),
+        sa.CheckConstraint("length(title) >= 1", name="title_not_empty"),
+        sa.CheckConstraint(_in_list("status", ShoppingListStatus), name="status_valid"),
+        sa.CheckConstraint(_in_list("source_kind", ShoppingListSourceKind), name="source_kind_valid"),
+        # What each source kind carries: a message names its message and recipe position;
+        # a favorite names its id and the version that was copied. The two are exclusive.
+        sa.CheckConstraint(
+            "(source_kind = 'message' AND source_message_id IS NOT NULL "
+            "AND source_recipe_index IS NOT NULL AND source_favorite_id IS NULL "
+            "AND source_favorite_version IS NULL) OR "
+            "(source_kind = 'favorite' AND source_message_id IS NULL "
+            "AND source_recipe_index IS NULL AND source_favorite_id IS NOT NULL "
+            "AND source_favorite_version IS NOT NULL)",
+            name="source_consistent",
+        ),
+        sa.CheckConstraint(
+            "source_message_id IS NULL OR source_message_id > 0",
+            name="source_message_id_positive",
+        ),
+        sa.CheckConstraint(
+            f"source_recipe_index IS NULL OR source_recipe_index BETWEEN 0 AND {MAX_RECIPES_PER_MESSAGE - 1}",
+            name="source_recipe_index_valid",
+        ),
+        sa.CheckConstraint(
+            "source_favorite_version IS NULL OR source_favorite_version >= 1",
+            name="source_favorite_version_valid",
+        ),
+        sa.CheckConstraint(
+            f"length(idempotency_key) BETWEEN 1 AND {MAX_IDEMPOTENCY_KEY_LENGTH}",
+            name="idempotency_key_length",
+        ),
+        sa.CheckConstraint(PrintableAscii("idempotency_key"), name="idempotency_key_printable_ascii"),
+        sa.CheckConstraint("length(request_fingerprint) = 64", name="fingerprint_length"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("users.id", ondelete="CASCADE"))
+    title: Mapped[str] = mapped_column(sa.String(200))
+    status: Mapped[str] = mapped_column(
+        sa.String(16),
+        default=ShoppingListStatus.ACTIVE.value,
+        server_default=sa.text("'active'"),
+    )
+    source_kind: Mapped[str] = mapped_column(sa.String(16))
+    source_message_id: Mapped[Optional[int]] = mapped_column(_BIGINT_ID)
+    source_recipe_index: Mapped[Optional[int]]
+    source_favorite_id: Mapped[Optional[uuid.UUID]]
+    source_favorite_version: Mapped[Optional[int]]
+    idempotency_key: Mapped[str] = mapped_column(sa.String(MAX_IDEMPOTENCY_KEY_LENGTH))
+    request_fingerprint: Mapped[str] = mapped_column(sa.String(64))
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
+
+    user: Mapped[User] = relationship(back_populates="shopping_lists")
+    items: Mapped[list["ShoppingListItem"]] = relationship(
+        back_populates="shopping_list",
+        cascade="save-update, merge",
+        passive_deletes="all",
+        order_by="ShoppingListItem.position",
+    )
+
+
+class ShoppingListItem(Base):
+    """One line of a saved shopping list: a copied ingredient and what is known about it.
+
+    Every ingredient of the source recipe becomes one row, in the recipe's order:
+    position is zero-based and is the stable order of the list. A manual item is
+    appended at the end (the application takes max(position) + 1 under the list's lock),
+    and deleting an item leaves the positions of the others as they were. (list_id,
+    position) is unique, so two rows cannot claim one place in a list.
+
+    name and amount are the copied ingredient: name is 1 to 200 characters, amount is the
+    recipe's own phrase (at most 100 characters) or NULL for a manual item that has no
+    amount. state is one of the three ShoppingListItemState values; 'unchecked' is the
+    default, because an unconfirmed ingredient must never be recorded as if its
+    availability were known. The owner is the list's user, and every read and write goes
+    through the list (shopping_lists), not through this table alone.
+
+    The foreign key is ON DELETE CASCADE: deleting the list deletes its items, deleting
+    the user deletes both. A list completes or reopens as a whole; an item's own row has
+    no deadline. created_at never changes; updated_at moves when the item changes.
+    """
+
+    __tablename__ = "shopping_list_items"
+    __table_args__ = (
+        # One row per place in a list, and the index that reads a list in order.
+        sa.UniqueConstraint("list_id", "position"),
+        sa.CheckConstraint("position >= 0", name="position_valid"),
+        _max_length("name", 200),
+        sa.CheckConstraint("length(name) >= 1", name="name_not_empty"),
+        _max_length("amount", 100),
+        sa.CheckConstraint(_in_list("state", ShoppingListItemState), name="state_valid"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    list_id: Mapped[uuid.UUID] = mapped_column(
+        sa.ForeignKey("shopping_lists.id", ondelete="CASCADE")
+    )
+    position: Mapped[int] = mapped_column(sa.Integer)
+    name: Mapped[str] = mapped_column(sa.String(200))
+    amount: Mapped[Optional[str]] = mapped_column(sa.String(100))
+    state: Mapped[str] = mapped_column(
+        sa.String(16),
+        default=ShoppingListItemState.UNCHECKED.value,
+        server_default=sa.text("'unchecked'"),
+    )
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
+
+    shopping_list: Mapped[ShoppingList] = relationship(back_populates="items")
+
+
+class ShoppingListRequest(Base):
+    """The durable reservation of one shopping-list creation request's idempotency key.
+
+    One row per (user, key), written in the same transaction as the shopping list the
+    request created and kept for the lifetime of the user account. list_id names that
+    list; it is ON DELETE SET NULL, so deleting the list leaves this row behind as a
+    tombstone (list_id NULL) that keeps the key reserved: a retry of the same request
+    answers "the list was deleted" instead of recreating it, and the key cannot be used
+    for another request. request_fingerprint is the SHA-256 hex digest of the canonical
+    creation request (the same value the list records); after the list is gone it is what
+    tells a replay of that request from a different one.
+
+    Nothing of the shopping list itself is kept here: no title, no ingredients, no item
+    states. The row holds only what the idempotency contract needs (owner, key,
+    fingerprint, the list reference and when the key was consumed).
+
+    (user_id, idempotency_key) is UNIQUE. The application writes the row once; the only
+    later change is the database's own SET NULL when the list is deleted, which the ORM
+    guard in _guard_shopping_list_request_on_update refuses to make by hand. Deleting
+    the user deletes the row (user_id, ON DELETE CASCADE). The retention purge does not
+    know this table.
+    """
+
+    __tablename__ = "shopping_list_requests"
+    __table_args__ = (
+        # One key, one request. The reservation outlives the list, which is the point.
+        sa.UniqueConstraint("user_id", "idempotency_key"),
+        # The SET NULL transition of a list deletion looks rows up by list_id.
+        sa.Index(None, "list_id"),
+        sa.CheckConstraint(
+            f"length(idempotency_key) BETWEEN 1 AND {MAX_IDEMPOTENCY_KEY_LENGTH}",
+            name="idempotency_key_length",
+        ),
+        sa.CheckConstraint(PrintableAscii("idempotency_key"), name="idempotency_key_printable_ascii"),
+        sa.CheckConstraint("length(request_fingerprint) = 64", name="fingerprint_length"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("users.id", ondelete="CASCADE"))
+    idempotency_key: Mapped[str] = mapped_column(sa.String(MAX_IDEMPOTENCY_KEY_LENGTH))
+    request_fingerprint: Mapped[str] = mapped_column(sa.String(64))
+    # The list this request made; NULL once that list is deleted (the tombstone).
+    list_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        sa.ForeignKey("shopping_lists.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
 class MessageRecipe(Base):
     """One validated recipe of an assistant answer, in the order the answer gave it.
 
@@ -1457,6 +1719,43 @@ def _guard_message_recipe_on_update(mapper: Any, connection: Any, target: Any) -
     _forbid_changes(target, "message_id", "message_role", "position", "created_at")
 
 
+def _guard_shopping_list_on_update(mapper: Any, connection: Any, target: Any) -> None:
+    """A list's snapshot identity never changes. What it records may: its status (the
+    application's complete/reopen path) and its activity time. The items are other rows."""
+    _forbid_changes(
+        target,
+        "user_id",
+        "title",
+        "source_kind",
+        "source_message_id",
+        "source_recipe_index",
+        "source_favorite_id",
+        "source_favorite_version",
+        "idempotency_key",
+        "request_fingerprint",
+        "created_at",
+    )
+
+
+def _guard_shopping_list_item_on_update(mapper: Any, connection: Any, target: Any) -> None:
+    """An item keeps its place and its list; a person may change its name, amount and
+    state, and every write moves updated_at."""
+    _forbid_changes(target, "list_id", "position", "created_at")
+
+
+def _guard_shopping_list_request_on_update(mapper: Any, connection: Any, target: Any) -> None:
+    """A consumed key is never rewritten by the application. The one transition a row
+    ever makes is the database's own SET NULL when its list is deleted."""
+    _forbid_changes(
+        target,
+        "user_id",
+        "idempotency_key",
+        "request_fingerprint",
+        "list_id",
+        "created_at",
+    )
+
+
 sa.event.listen(Session, "before_update", _guard_session_on_update)
 sa.event.listen(OidcState, "before_update", _guard_oidc_state_on_update)
 sa.event.listen(EmailLoginChallenge, "before_update", _guard_challenge_on_update)
@@ -1469,6 +1768,11 @@ sa.event.listen(
 )
 sa.event.listen(FavoriteRecipe, "before_update", _guard_favorite_on_update)
 sa.event.listen(MessageRecipe, "before_update", _guard_message_recipe_on_update)
+sa.event.listen(ShoppingList, "before_update", _guard_shopping_list_on_update)
+sa.event.listen(ShoppingListItem, "before_update", _guard_shopping_list_item_on_update)
+sa.event.listen(
+    ShoppingListRequest, "before_update", _guard_shopping_list_request_on_update
+)
 sa.event.listen(Message, "before_insert", _guard_retention_on_insert)
 sa.event.listen(Message, "before_update", _guard_message)
 sa.event.listen(TurnRequest, "before_insert", _guard_turn_request_on_insert)

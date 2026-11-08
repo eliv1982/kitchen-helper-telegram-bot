@@ -250,6 +250,42 @@ def test_the_conversation_actions_menu_is_a_menu_button_that_starts_closed():
     assert menu["role"] == "menu" and menu["aria-label"] == "Действия с разговором"
 
 
+def test_the_shopping_tab_is_a_third_section_with_its_own_panel_and_pane():
+    page = shell_for(telegram=True, email=True)
+    html = ui.render_shell(telegram=True, email=True)
+
+    # The tab, its side panel and its main pane exist; the pane's heading is drawn by the
+    # script (the shell names the product only), so the page stays one product.
+    assert page.by_id("tab-shopping")["type"] == "button"
+    assert page.by_id("tab-shopping")["aria-pressed"] == "false"
+    assert page.by_id("tab-shopping")["class"] == "tab"
+    assert "hidden" in page.by_id("panel-shopping")
+    assert "hidden" in page.by_id("shopping")
+    assert page.by_id("shopping")["aria-labelledby"] == "shopping-title"
+    assert page.by_id("shopping-body")["class"] == "shopping-body"
+    assert page.by_id("shopping-title")["tabindex"] == "-1"
+    assert page.by_id("shopping-title")["class"] == "chat-title"
+    assert page.by_id("shopping-status")["role"] == "status"
+    assert page.by_id("shopping-retry")["type"] == "button"
+    assert page.by_id("shopping-list")["class"] == "conv-list"
+    # The three tabs are in one row, in reading order, and the panels follow them.
+    order = [
+        html.index('id="tab-chats"'),
+        html.index('id="tab-favorites"'),
+        html.index('id="tab-shopping"'),
+        html.index('id="panel-chats"'),
+        html.index('id="panel-favorites"'),
+        html.index('id="panel-shopping"'),
+        html.index('id="chat"'),
+        html.index('id="recipe"'),
+        html.index('id="shopping"'),
+    ]
+    assert order == sorted(order)
+    assert page.by_id("sidebar")["aria-label"] == "Разговоры, избранное и покупки"
+    # The heading the destination shows is «Мои покупки»; the script draws it from its own
+    # words (tests/test_web_ui_logic.py checks those).
+
+
 def test_the_help_entry_opens_a_modal_dialog_beside_the_conversation_title_that_starts_closed():
     page = shell_for(telegram=True, email=True)
     toggle = page.by_id("help-toggle")

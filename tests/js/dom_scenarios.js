@@ -1051,7 +1051,7 @@ scenario("deleting_the_open_conversation_asks_first_and_returns_to_a_new_empty_o
   assert.equal(page.el("list-status").textContent, "Разговоров пока нет. Начните новый.");
   assert.equal(page.el("chat-title").textContent, "Новый разговор");
   assert.equal(page.el("screen-app").getAttribute("data-drawer"), "closed", "the drawer closes on the new draft");
-  assert.equal(page.doc.activeElement, page.el("chat-title"));
+  assert.ok(page.doc.activeElement === page.el("chat-title"));
   assert.equal(page.articles().length, 0);
   assert.equal(page.el("banner-text").textContent, Logic.TEXT.deleted);
   assert.equal(page.visible("banner"), true);
@@ -1084,7 +1084,7 @@ scenario("the_actions_menu_deletes_the_open_conversation_and_the_list_keeps_the_
   assert.ok(list.textContent.includes("Борщ"));
   assert.equal(page.el("chat-title").textContent, "Новый разговор");
   assert.equal(page.visible("chat-actions"), false, "the new draft has no actions");
-  assert.equal(page.doc.activeElement, page.el("chat-title"));
+  assert.ok(page.doc.activeElement === page.el("chat-title"));
 
   list.byTag("button")[0].click();
   await page.settle();
@@ -1174,7 +1174,7 @@ scenario("the_actions_menu_works_on_a_narrow_screen_after_the_drawer_closes", as
   assert.equal(page.el("screen-app").getAttribute("data-drawer"), "closed");
   assert.equal(page.el("chat-title").textContent, "Новый разговор");
   assert.equal(page.visible("chat-actions"), false);
-  assert.equal(page.doc.activeElement, page.el("chat-title"));
+  assert.ok(page.doc.activeElement === page.el("chat-title"));
 });
 
 scenario("signing_out_leaves_nothing_of_the_conversation_on_screen_or_in_storage", async () => {
@@ -1659,7 +1659,7 @@ scenario("an_answer_is_kept_from_the_chat_and_then_says_so_and_opens_the_recipe"
   assert.deepEqual(["chat", "recipe"].map(page.visible), [false, true]);
   assert.equal(page.el("recipe-title").textContent, "Борщ классический");
   assert.ok(page.el("recipe-body").textContent.includes("1. Сварите бульон."));
-  assert.equal(page.doc.activeElement, page.el("recipe-title"));
+  assert.ok(page.doc.activeElement === page.el("recipe-title"));
 });
 
 scenario("a_failed_keep_says_so_under_the_answer_and_the_button_is_still_there", async () => {
@@ -1703,7 +1703,7 @@ scenario("a_recipe_is_chosen_from_the_list_and_on_a_narrow_screen_the_drawer_clo
 
   assert.equal(page.el("screen-app").getAttribute("data-drawer"), "closed");
   assert.equal(page.el("recipe-title").textContent, "Плов с курицей");
-  assert.equal(page.doc.activeElement, page.el("recipe-title"));
+  assert.ok(page.doc.activeElement === page.el("recipe-title"));
   assert.equal(page.el("favorite-list").byTag("button")[1].getAttribute("aria-current"), "true");
 });
 
@@ -2894,6 +2894,1115 @@ scenario("a_draft_is_never_shown_after_the_session_ends_or_another_person_signs_
   assert.ok(!other.root().includes("UNSAVED REVIEW DRAFT"));
   assert.ok(!other.root().includes("Борщ"), "nothing of the last person's card is left");
   assert.equal(other.el("recipe-body").byClass("edit-title").length, 0);
+});
+
+// ============================================================================================
+// Shopping lists
+// ============================================================================================
+
+const SHOP_URL = "/api/shopping-lists";
+const SHOP_LIST_URL = `/api/shopping-lists/${H.LIST_1}`;
+const SHOP_LIST_URL_DONE = `/api/shopping-lists/${H.LIST_2}`;
+const CHAT_RECIPE_URL = `/api/conversations/${CONV_A}/messages/2/recipes/0`;
+const SHOP_INGREDIENTS = [
+  { name: "свёкла", amount: "2 шт." },
+  { name: "мясо", amount: "500 г" },
+];
+const SHOP_ITEMS = [
+  H.shoppingItem(H.ITEM_1, 0, "свёкла", "2 шт.", "at_home"),
+  H.shoppingItem(H.ITEM_2, 1, "мясо", "500 г", "unchecked"),
+  H.shoppingItem(H.ITEM_3, 2, "сметана", "200 г", "purchased"),
+];
+const SHOP_DETAIL = H.shoppingDetail(H.LIST_1, "Борщ", "active", SHOP_ITEMS);
+const SHOP_DETAIL_DONE = H.shoppingDetail(
+  H.LIST_2,
+  "Плов",
+  "completed",
+  [H.shoppingItem(H.ITEM_3, 0, "рис", "200 г", "purchased")]
+);
+
+// A conversation whose last answer carries one structured recipe, and the review of that
+// recipe's stored rows that the draft asks for.
+const withStructuredRecipe = (title = "Борщ", ingredients = SHOP_INGREDIENTS) => (env) => {
+  env.signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [
+      message(1, "user", "Приготовь борщ"),
+      message(2, "assistant", "Борщ: свекла, мясо.", { recipes: [{ position: 0, title }] }),
+    ]),
+  });
+  env.net.route("GET", CHAT_RECIPE_URL, H.recipeBody(2, 0, title, "4 порции", ingredients, ["Сварите бульон."]));
+};
+
+const shoppingLists = (details) => H.shoppingListsBody(details.map((detail) => H.shoppingSummary(detail)));
+
+scenario("every_structured_recipe_offers_what_to_buy_beside_its_save_control", async () => {
+  const page = await open(withStructuredRecipe(), { structured: true });
+
+  const article = page.articles()[1];
+  assert.equal(article.buttons("Сохранить «Борщ»").length, 1);
+  assert.equal(article.buttons("Что купить?").length, 1);
+  assert.equal(page.articles()[0].buttons("Что купить?").length, 0, "only the assistant's structured recipes");
+
+  article.buttons("Что купить?")[0].click();
+  await page.settle();
+
+  assert.deepEqual(["chat", "recipe", "shopping"].map(page.visible), [false, false, true]);
+  assert.equal(page.el("tab-shopping").getAttribute("aria-pressed"), "true");
+  assert.equal(page.el("shopping-title").textContent, "Что купить?");
+  const body = page.el("shopping-body");
+  assert.ok(body.textContent.includes("Борщ"));
+  assert.ok(body.textContent.includes("4 порции"));
+  assert.ok(body.textContent.includes(Logic.TEXT.shoppingDraftInstruction));
+  assert.ok(body.textContent.includes("Проверить / купить: 2"));
+  assert.ok(body.textContent.includes(Logic.TEXT.shoppingUncheckedNote));
+  assert.deepEqual(body.byTag("input").map((input) => input.getAttribute("type")), ["checkbox", "checkbox"]);
+  assert.deepEqual(body.byTag("input").map((input) => input.getAttribute("aria-label")), ["Есть дома: свёкла", "Есть дома: мясо"]);
+  assert.equal(body.buttons("Сохранить список").length, 1);
+  assert.equal(body.buttons("Отмена").length, 1);
+  assert.equal(page.env.net.requests("POST", SHOP_URL).length, 0, "nothing is saved by opening the draft");
+});
+
+scenario("marking_ingredients_at_home_counts_them_and_saving_opens_the_saved_list", async () => {
+  const page = await open(withStructuredRecipe(), { structured: true });
+  page.env.net.route("POST", SHOP_URL, json(201, SHOP_DETAIL));
+  page.articles()[1].buttons("Что купить?")[0].click();
+  await page.settle();
+  const body = () => page.el("shopping-body");
+
+  const first = body().byTag("input")[0];
+  first.checked = true;
+  first.fire("change");
+  await page.settle();
+  assert.ok(body().textContent.includes("Проверить / купить: 1"));
+
+  body().buttons("Сохранить список")[0].click();
+  await page.settle();
+
+  assert.deepEqual(page.env.net.requests("POST", SHOP_URL)[0].body.item_states, [{ position: 0, state: "at_home" }]);
+  assert.equal(page.el("shopping-title").textContent, "Борщ");
+  assert.ok(body().textContent.includes("Куплено 1 из 3"));
+  assert.ok(body().textContent.includes("Проверить / купить: 1"));
+  assert.ok(body().textContent.includes("Есть дома: 1"));
+  assert.ok(body().textContent.includes("Куплено: 1"));
+  assert.ok(body().textContent.includes(Logic.TEXT.shoppingUncheckedNote));
+  await page.env.timers.advance(100);
+  await page.settle();
+  assert.equal(page.el("announcer").textContent, Logic.TEXT.shoppingSaved);
+});
+
+scenario("a_draft_can_be_cancelled_back_to_the_conversation_without_a_list", async () => {
+  const page = await open(withStructuredRecipe(), { structured: true });
+  page.articles()[1].buttons("Что купить?")[0].click();
+  await page.settle();
+
+  page.el("shopping-body").buttons("Отмена")[0].click();
+  await page.settle();
+
+  assert.deepEqual(["chat", "recipe", "shopping"].map(page.visible), [true, false, false]);
+  assert.equal(page.el("tab-chats").getAttribute("aria-pressed"), "true");
+  assert.ok(page.doc.activeElement === page.el("chat-title"));
+  assert.equal(page.env.net.requests("POST", SHOP_URL).length, 0);
+});
+
+scenario("a_structured_favorite_offers_what_to_buy_and_a_legacy_one_does_not", async () => {
+  const structured = H.structuredFavorite(H.FAV_1, 2, "Борщ", 0, 0, { version: 2 });
+  const legacy = H.favorite(H.FAV_2, 12, "Плов", 30);
+  const page = await open((env) => {
+    oneConversation()(env);
+    env.net.route("GET", "/api/favorites", H.favoritesBody([structured, legacy]));
+    env.net.route(
+      "GET",
+      `/api/favorites/${H.FAV_1}`,
+      H.favoriteDetail(structured, "Борщ", {
+        servings: "4 порции",
+        ingredients: SHOP_INGREDIENTS,
+        steps: ["Сварите бульон."],
+      })
+    );
+    env.net.route("GET", `/api/favorites/${H.FAV_2}`, H.favoriteDetail(legacy, "Плов: рис."));
+  });
+  page.el("tab-favorites").click();
+  await page.settle();
+  page.el("favorite-list").byTag("button")[0].click();
+  await page.settle();
+
+  assert.equal(page.el("recipe-body").buttons("Что купить?").length, 1);
+  page.el("recipe-body").buttons("Что купить?")[0].click();
+  await page.settle();
+  assert.equal(page.visible("shopping"), true);
+  assert.ok(page.el("shopping-body").textContent.includes(Logic.TEXT.shoppingDraftInstruction));
+
+  page.el("shopping-body").buttons("Отмена")[0].click();
+  await page.settle();
+  assert.equal(page.visible("recipe"), true);
+  assert.ok(page.doc.activeElement === page.el("recipe-title"));
+
+  page.el("favorite-list").byTag("button")[1].click();
+  await page.settle();
+  assert.equal(page.el("recipe-body").buttons("Что купить?").length, 0, "nothing is inferred from a text favorite");
+});
+
+scenario("the_shopping_tab_lists_active_before_completed_and_opens_a_saved_list", async () => {
+  const page = await open((env) => {
+    env.signedIn([]);
+    env.net.route("GET", SHOP_URL, shoppingLists([SHOP_DETAIL_DONE, SHOP_DETAIL]));
+    env.net.route("GET", SHOP_LIST_URL, json(200, SHOP_DETAIL));
+    env.net.route("GET", SHOP_LIST_URL_DONE, json(200, SHOP_DETAIL_DONE));
+  });
+
+  page.el("tab-shopping").click();
+  await page.settle();
+
+  assert.deepEqual(["panel-chats", "panel-favorites", "panel-shopping", "chat", "recipe", "shopping"].map(page.visible), [
+    false, false, true, false, false, true,
+  ]);
+  assert.equal(page.el("shopping-title").textContent, Logic.TEXT.shoppingTitle);
+  const items = page.el("shopping-list").byTag("button");
+  assert.deepEqual(items.map((button) => button.byClass("conv-label")[0].textContent), ["Борщ", "Плов"]);
+  assert.ok(items[0].byClass("conv-meta")[0].textContent.includes("Куплено 1 из 3"));
+  assert.ok(items[0].byClass("conv-meta")[0].textContent.includes("В работе"));
+  assert.ok(items[1].byClass("conv-meta")[0].textContent.includes("Завершен"));
+  assert.ok(page.el("shopping-body").textContent.includes(Logic.TEXT.shoppingPick));
+
+  items[0].click();
+  await page.settle();
+  assert.equal(page.el("shopping-title").textContent, "Борщ");
+  const body = page.el("shopping-body");
+  assert.ok(body.textContent.includes("Куплено 1 из 3"));
+  assert.deepEqual(body.byClass("shop-group-title").map((heading) => heading.textContent), ["Проверить / купить (1)", "Есть дома (1)", "Куплено (1)"]);
+  assert.deepEqual(body.byTag("select").map((select) => select.value), ["unchecked", "at_home", "purchased"]);
+  assert.equal(body.byTag("input")[2].getAttribute("checked"), "", "the purchased item is checked");
+  assert.equal(page.el("shopping-list").byTag("button")[0].getAttribute("aria-current"), "true");
+});
+
+scenario("an_empty_shopping_section_says_where_lists_come_from", async () => {
+  const page = await open((env) => {
+    env.signedIn([]);
+    env.net.route("GET", SHOP_URL, H.shoppingListsBody([]));
+  });
+
+  page.el("tab-shopping").click();
+  await page.settle();
+
+  assert.equal(page.el("shopping-status").textContent, "Пока нет списков покупок. Откройте рецепт и нажмите „Что купить?“");
+  assert.ok(page.el("shopping-body").textContent.includes("Пока нет списков покупок."));
+  assert.equal(page.el("shopping-list").byTag("button").length, 0);
+});
+
+scenario("a_shopping_checkbox_and_the_state_control_move_an_item_between_all_three_states", async () => {
+  const page = await open((env) => {
+    env.signedIn([]);
+    env.net.route("GET", SHOP_URL, shoppingLists([SHOP_DETAIL]));
+    env.net.route("GET", SHOP_LIST_URL, json(200, SHOP_DETAIL));
+  });
+  page.env.net.route("PATCH", `${SHOP_LIST_URL}/items/${H.ITEM_2}`, json(200, H.shoppingItem(H.ITEM_2, 1, "мясо", "500 г", "purchased")), json(200, H.shoppingItem(H.ITEM_2, 1, "мясо", "500 г", "at_home")));
+  page.env.net.route("PATCH", `${SHOP_LIST_URL}/items/${H.ITEM_3}`, json(200, H.shoppingItem(H.ITEM_3, 2, "сметана", "200 г", "unchecked")));
+  page.el("tab-shopping").click();
+  await page.settle();
+  page.el("shopping-list").byTag("button")[0].click();
+  await page.settle();
+  const item = () => page.el("shopping-body").find((element) => element.getAttribute("data-id") === H.ITEM_2)[0];
+  const body = page.el("shopping-body");
+
+  const checkbox = item().byTag("input")[0];
+  page.doc.activeElement = checkbox;
+  checkbox.checked = true;
+  checkbox.fire("change");
+  await page.settle();
+  assert.deepEqual(page.env.net.requests("PATCH", `${SHOP_LIST_URL}/items/${H.ITEM_2}`)[0].body, { state: "purchased" });
+  assert.equal(page.el("shopping-body").find((element) => element.getAttribute("data-id") === H.ITEM_2)[0].byTag("input")[0].getAttribute("checked"), "");
+  assert.ok(page.el("shopping-body").find((element) => element.getAttribute("data-id") === H.ITEM_2)[0].byTag("input")[0] === page.doc.activeElement, "the focus stays on the item");
+
+  const select = page.el("shopping-body").find((element) => element.getAttribute("data-id") === H.ITEM_2)[0].byTag("select")[0];
+  select.value = "at_home";
+  select.fire("change");
+  await page.settle();
+  assert.deepEqual(page.env.net.requests("PATCH", `${SHOP_LIST_URL}/items/${H.ITEM_2}`)[1].body, { state: "at_home" });
+  assert.ok(page.el("shopping-body").textContent.includes("Есть дома: 2"));
+
+  const purchased = page.el("shopping-body").find((element) => element.getAttribute("data-id") === H.ITEM_3)[0].byTag("input")[0];
+  assert.equal(purchased.getAttribute("checked"), "");
+  purchased.checked = false;
+  purchased.fire("change");
+  await page.settle();
+  assert.deepEqual(page.env.net.requests("PATCH", `${SHOP_LIST_URL}/items/${H.ITEM_3}`)[0].body, { state: "unchecked" });
+  assert.ok(page.el("shopping-body").textContent.includes("Куплено: 0"));
+  assert.equal(body.scrollTop, 0);
+});
+
+scenario("a_completed_list_is_read_only_in_the_page_and_can_be_reopened", async () => {
+  const page = await open((env) => {
+    env.signedIn([]);
+    env.net.route("GET", SHOP_URL, shoppingLists([SHOP_DETAIL_DONE]));
+    env.net.route("GET", SHOP_LIST_URL_DONE, json(200, SHOP_DETAIL_DONE));
+  });
+  page.env.net.route("PATCH", SHOP_LIST_URL_DONE, json(200, H.shoppingDetail(H.LIST_2, "Плов", "active", SHOP_DETAIL_DONE.items)));
+  page.el("tab-shopping").click();
+  await page.settle();
+  page.el("shopping-list").byTag("button")[0].click();
+  await page.settle();
+
+  const body = page.el("shopping-body");
+  assert.ok(body.textContent.includes(Logic.TEXT.listCompletedNote));
+  assert.equal(body.byClass("shop-item")[0].byTag("input")[0].getAttribute("disabled"), "");
+  assert.equal(body.byClass("shop-item")[0].byTag("select")[0].getAttribute("disabled"), "");
+  assert.equal(body.buttons("Изменить").length, 0);
+  assert.equal(body.buttons("Добавить продукт").length, 0);
+  assert.equal(body.buttons("Вернуть в работу").length, 1);
+
+  body.buttons("Вернуть в работу")[0].click();
+  await page.settle();
+  assert.deepEqual(page.env.net.requests("PATCH", SHOP_LIST_URL_DONE)[0].body, { status: "active" });
+  assert.ok(page.el("shopping-body").textContent.includes(Logic.TEXT.completeList));
+  assert.equal(page.el("shopping-body").textContent.includes(Logic.TEXT.listCompletedNote), false);
+});
+
+scenario("deleting_a_list_asks_first_and_removes_only_that_list", async () => {
+  const page = await open((env) => {
+    env.signedIn([]);
+    env.net.route("GET", SHOP_URL, shoppingLists([SHOP_DETAIL]));
+    env.net.route("GET", SHOP_LIST_URL, json(200, SHOP_DETAIL));
+  });
+  page.env.net.route("DELETE", SHOP_LIST_URL, H.removedBody());
+  page.el("tab-shopping").click();
+  await page.settle();
+  page.el("shopping-list").byTag("button")[0].click();
+  await page.settle();
+
+  page.el("shopping-body").buttons("Удалить список")[0].click();
+  await page.settle();
+  const confirm = page.el("shopping-body").byClass("confirm")[0];
+  assert.ok(confirm.textContent.includes("Удалить список «Борщ»?"));
+  assert.deepEqual(confirm.byTag("button").map((button) => button.textContent), ["Удалить", "Оставить"]);
+  assert.equal(page.doc.activeElement.textContent, "Оставить");
+  assert.equal(page.env.net.requests("DELETE", SHOP_LIST_URL).length, 0);
+
+  page.el("shopping-body").byClass("confirm")[0].buttons("Оставить")[0].click();
+  await page.settle();
+  assert.equal(page.el("shopping-body").byClass("confirm").length, 0);
+  assert.equal(page.env.net.requests("DELETE", SHOP_LIST_URL).length, 0);
+
+  page.el("shopping-body").buttons("Удалить список")[0].click();
+  await page.settle();
+  page.el("shopping-body").byClass("confirm")[0].buttons("Удалить")[0].click();
+  await page.settle();
+
+  assert.equal(page.env.net.requests("DELETE", SHOP_LIST_URL).length, 1);
+  assert.equal(page.el("shopping-list").byTag("button").length, 0);
+  assert.ok(page.el("shopping-body").textContent.includes("Пока нет списков покупок."));
+  await page.env.timers.advance(100);
+  await page.settle();
+  assert.equal(page.el("announcer").textContent, Logic.TEXT.listDeleted);
+});
+
+scenario("a_product_is_added_edited_and_removed_in_place_and_a_failed_edit_keeps_its_words", async () => {
+  const added = H.shoppingItem("cccccccc-cccc-4ccc-8ccc-ccccccccccc4", 3, "соль", "1 ч. л.", "unchecked");
+  const page = await open((env) => {
+    env.signedIn([]);
+    env.net.route("GET", SHOP_URL, shoppingLists([SHOP_DETAIL]));
+    env.net.route("GET", SHOP_LIST_URL, json(200, SHOP_DETAIL));
+  });
+  page.env.net.route("POST", `${SHOP_LIST_URL}/items`, json(201, added));
+  page.env.net.route("PATCH", `${SHOP_LIST_URL}/items/${H.ITEM_2}`, apiError(400, "invalid_request"), json(200, H.shoppingItem(H.ITEM_2, 1, "мясо на кости", "500 г", "unchecked")));
+  page.env.net.route("DELETE", `${SHOP_LIST_URL}/items/${H.ITEM_2}`, H.removedBody());
+  page.el("tab-shopping").click();
+  await page.settle();
+  page.el("shopping-list").byTag("button")[0].click();
+  await page.settle();
+  const body = () => page.el("shopping-body");
+
+  body().buttons("Добавить продукт")[0].click();
+  await page.settle();
+  assert.deepEqual([page.el("shop-add-name").getAttribute("id"), page.el("shop-add-amount").getAttribute("id")], ["shop-add-name", "shop-add-amount"]);
+  page.editField(page.el("shop-add-name"), "  соль ");
+  page.editField(page.el("shop-add-amount"), " 1 ч. л. ");
+  body().byTag("form")[0].byTag("button")[0].click();
+  await page.settle();
+  assert.deepEqual(page.env.net.requests("POST", `${SHOP_LIST_URL}/items`)[0].body, { name: "соль", amount: "1 ч. л." });
+  assert.ok(body().textContent.includes("соль"));
+
+  body().buttons("Изменить").filter((button) => button.getAttribute("aria-label") === "Изменить: мясо")[0].click();
+  await page.settle();
+  const nameField = body().elements().filter((element) => element.getAttribute("data-focus") === "item-name-" + H.ITEM_2)[0];
+  page.editField(nameField, "мясо на кости");
+  body().byTag("form")[0].byTag("button")[0].click();
+  await page.settle();
+  assert.deepEqual(page.env.net.requests("PATCH", `${SHOP_LIST_URL}/items/${H.ITEM_2}`)[0].body, { name: "мясо на кости", amount: "500 г" });
+  assert.ok(body().textContent.includes(Logic.CODE_MESSAGES.invalid_request));
+  assert.equal(body().elements().filter((element) => element.getAttribute("data-focus") === "item-name-" + H.ITEM_2)[0].value, "мясо на кости", "the edit is not discarded");
+
+  body().byTag("form")[0].byTag("button")[0].click();
+  await page.settle();
+  assert.ok(body().textContent.includes("мясо на кости"));
+
+  body().buttons("Удалить").filter((button) => button.getAttribute("aria-label") === "Удалить: мясо на кости")[0].click();
+  await page.settle();
+  assert.ok(body().byClass("confirm")[0].textContent.includes(Logic.TEXT.itemRemoveAsk));
+  body().byClass("confirm")[0].buttons("Удалить")[0].click();
+  await page.settle();
+  assert.equal(page.env.net.requests("DELETE", `${SHOP_LIST_URL}/items/${H.ITEM_2}`).length, 1);
+  assert.equal(body().textContent.includes("мясо на кости"), false);
+  assert.ok(page.el("shopping-title").textContent === "Борщ", "the list itself stays");
+});
+
+scenario("hostile_product_and_recipe_text_stays_text_in_the_shopping_pane", async () => {
+  const hostile = '<img src=x onerror=alert(9)><script>alert(1)</script>';
+  const page = await open(withStructuredRecipe(hostile, [{ name: hostile, amount: hostile }]), { structured: true });
+  page.articles()[1].buttons("Что купить?")[0].click();
+  await page.settle();
+
+  const body = page.el("shopping-body");
+  assert.ok(body.textContent.includes("<script>alert(1)</script>"));
+  assert.deepEqual(["img", "script", "svg", "a", "iframe"].map((tag) => body.byTag(tag).length), [0, 0, 0, 0, 0]);
+  // No attribute can run anything. (A label may NAME the hostile product -- the same inert way the
+  // existing "open the kept recipe" control names its title -- but no value is ever a handler or an
+  // address the page could load.)
+  for (const [tag, name] of page.doc.attributeLog) {
+    assert.ok(!/^on/i.test(name), `${tag}[${name}]`);
+    assert.ok(!["style", "href", "src", "srcdoc", "action", "formaction"].includes(name), `${tag}[${name}]`);
+  }
+});
+
+scenario("a_shopping_list_chosen_on_a_narrow_screen_closes_the_drawer", async () => {
+  const page = await open((env) => {
+    env.signedIn([]);
+    env.net.route("GET", SHOP_URL, shoppingLists([SHOP_DETAIL]));
+    env.net.route("GET", SHOP_LIST_URL, json(200, SHOP_DETAIL));
+  }, { narrow: true });
+  page.el("drawer-toggle").click();
+  page.el("tab-shopping").click();
+  await page.settle();
+  assert.equal(page.el("screen-app").getAttribute("data-drawer"), "open");
+  assert.equal(page.doc.activeElement.getAttribute("id"), "tab-chats", "the drawer opens on the part that is in front");
+
+  page.el("shopping-list").byTag("button")[0].click();
+  await page.settle();
+  assert.equal(page.el("screen-app").getAttribute("data-drawer"), "closed");
+  assert.equal(page.el("shopping-title").textContent, "Борщ");
+  assert.ok(page.doc.activeElement === page.el("shopping-title"));
+});
+
+scenario("overlapping_item_clicks_are_serialized_and_pending_clears", async () => {
+  const page = await open((env) => {
+    env.signedIn([]);
+    env.net.route("GET", SHOP_URL, shoppingLists([SHOP_DETAIL]));
+    env.net.route("GET", SHOP_LIST_URL, json(200, SHOP_DETAIL));
+  });
+  const gate = deferred();
+  page.env.net.route("PATCH", `${SHOP_LIST_URL}/items/${H.ITEM_2}`, async () => {
+    await gate.promise;
+    return apiError(400, "invalid_request");
+  });
+  page.el("tab-shopping").click();
+  await page.settle();
+  page.el("shopping-list").byTag("button")[0].click();
+  await page.settle();
+  const item = (id) => page.el("shopping-body").find((element) => element.getAttribute("data-id") === id)[0];
+
+  const first = item(H.ITEM_2).byTag("input")[0];
+  first.checked = true;
+  first.fire("change");
+  await page.settle();
+  assert.equal(item(H.ITEM_2).byTag("input")[0].getAttribute("disabled"), "", "the item being written is locked");
+  assert.equal(item(H.ITEM_3).byTag("input")[0].getAttribute("disabled"), "", "so is every conflicting item");
+
+  const second = item(H.ITEM_3).byTag("input")[0];
+  second.checked = true;
+  second.fire("change");
+  await page.settle();
+  assert.equal(page.env.net.requests("PATCH", `${SHOP_LIST_URL}/items/${H.ITEM_3}`).length, 0, "no overlapping write starts");
+
+  gate.resolve();
+  await page.settle();
+  assert.equal(item(H.ITEM_2).byTag("input")[0].getAttribute("disabled"), null);
+  assert.equal(item(H.ITEM_2).byTag("input")[0].getAttribute("checked"), null, "the refused change is taken back");
+  assert.equal(item(H.ITEM_3).byTag("input")[0].getAttribute("disabled"), null);
+  assert.ok(page.el("shopping-body").textContent.includes(Logic.CODE_MESSAGES.invalid_request));
+});
+
+scenario("a_modified_shopping_draft_is_not_left_without_a_question", async () => {
+  const page = await open(withStructuredRecipe(), { structured: true });
+  page.articles()[1].buttons("Что купить?")[0].click();
+  await page.settle();
+  const box = page.el("shopping-body").byTag("input")[0];
+  box.checked = true;
+  box.fire("change");
+  await page.settle();
+
+  page.env.net.route("GET", SHOP_URL, shoppingLists([SHOP_DETAIL]));
+  page.env.net.route("GET", SHOP_LIST_URL, json(200, SHOP_DETAIL));
+  page.el("tab-shopping").click(); // reads the lists; the draft stays
+  await page.settle();
+  assert.equal(page.el("shopping-list").byTag("button").length, 1);
+
+  let asked = 0;
+  let answer = false;
+  page.window.confirm = () => {
+    asked++;
+    return answer;
+  };
+  page.el("shopping-list").byTag("button")[0].click();
+  await page.settle();
+  assert.equal(asked, 1, "a modified draft is not discarded without a question");
+  assert.equal(page.el("shopping-title").textContent, Logic.TEXT.shoppingDraftTitle);
+  assert.equal(page.el("shopping-body").byTag("input")[0].getAttribute("checked"), "", "its mark is kept");
+  assert.equal(page.env.net.requests("GET", SHOP_LIST_URL).length, 0, "a refused question navigates nowhere");
+  assert.equal(page.env.net.requests("POST", SHOP_URL).length, 0, "nothing is saved or created");
+
+  answer = true;
+  page.el("shopping-list").byTag("button")[0].click();
+  await page.settle();
+  assert.equal(asked, 2);
+  assert.equal(page.el("shopping-title").textContent, "Борщ");
+  assert.equal(page.env.net.requests("GET", SHOP_LIST_URL).length, 1, "the confirmed question opens the list asked for");
+});
+
+scenario("a_dirty_shopping_draft_asks_before_the_mobile_drawer_navigates_away", async () => {
+  const page = await open(withStructuredRecipe(), { structured: true, narrow: true });
+  page.articles()[1].buttons("Что купить?")[0].click();
+  await page.settle();
+  const box = page.el("shopping-body").byTag("input")[0];
+  box.checked = true;
+  box.fire("change");
+  await page.settle();
+
+  page.env.net.route("GET", SHOP_URL, shoppingLists([SHOP_DETAIL]));
+  page.env.net.route("GET", SHOP_LIST_URL, json(200, SHOP_DETAIL));
+  page.el("drawer-toggle").click();
+  page.el("tab-shopping").click();
+  await page.settle();
+  assert.equal(page.el("screen-app").getAttribute("data-drawer"), "open");
+
+  page.window.confirm = () => false;
+  page.el("shopping-list").byTag("button")[0].click();
+  await page.settle();
+  assert.equal(page.el("screen-app").getAttribute("data-drawer"), "open", "a refused question leaves the drawer as it was");
+  assert.equal(page.el("shopping-title").textContent, Logic.TEXT.shoppingDraftTitle);
+  assert.equal(page.el("shopping-body").byTag("input")[0].getAttribute("checked"), "");
+
+  page.window.confirm = () => true;
+  page.el("shopping-list").byTag("button")[0].click();
+  await page.settle();
+  assert.equal(page.el("screen-app").getAttribute("data-drawer"), "closed");
+  assert.equal(page.el("shopping-title").textContent, "Борщ");
+});
+
+scenario("a_modified_shopping_draft_asks_the_browser_before_a_refresh_or_a_close", async () => {
+  // beforeunload is the browser's own question. The page cannot force it to be shown (a real
+  // browser decides that), so what is checked here is the only part it controls: preventDefault
+  // is called exactly while the draft holds a modification. Both the wide and the narrow
+  // layouts are checked; the drawing differs, the protection does not.
+  for (const narrow of [false, true]) {
+    const page = await open(withStructuredRecipe(), { structured: true, narrow });
+    const prevented = () => {
+      let yes = false;
+      page.fireWindow("beforeunload", {
+        preventDefault() {
+          yes = true;
+        },
+      });
+      return yes;
+    };
+
+    page.articles()[1].buttons("Что купить?")[0].click();
+    await page.settle();
+    assert.equal(prevented(), false, "an untouched draft is not unsaved work");
+
+    const box = page.el("shopping-body").byTag("input")[0];
+    box.checked = true;
+    box.fire("change");
+    await page.settle();
+    assert.equal(prevented(), true, "a mark is an unsaved modification");
+
+    // The draft's own in-app question is still asked, and a refused one keeps the draft.
+    let asked = 0;
+    page.window.confirm = () => {
+      asked++;
+      return false;
+    };
+    page.articles()[1].buttons("Что купить?")[0].click();
+    await page.settle();
+    assert.equal(asked, 1);
+    assert.equal(page.el("shopping-title").textContent, Logic.TEXT.shoppingDraftTitle);
+    assert.equal(prevented(), true);
+
+    // Explicitly discarded: nothing is left to warn about.
+    page.el("shopping-body").buttons(Logic.TEXT.shoppingCancel)[0].click();
+    await page.settle();
+    assert.equal(prevented(), false, "a discarded draft is not unsaved work");
+
+    // Saved: the draft becomes a list, and the question is gone.
+    page.env.net.route("POST", SHOP_URL, json(201, SHOP_DETAIL));
+    page.articles()[1].buttons("Что купить?")[0].click();
+    await page.settle();
+    const again = page.el("shopping-body").byTag("input")[0];
+    again.checked = true;
+    again.fire("change");
+    await page.settle();
+    assert.equal(prevented(), true);
+    page.el("shopping-body").buttons(Logic.TEXT.shoppingSave)[0].click();
+    await page.settle();
+    assert.equal(page.el("shopping-title").textContent, SHOP_DETAIL.title);
+    assert.equal(prevented(), false, "a saved draft is not unsaved work");
+  }
+});
+
+scenario("a_draft_whose_save_is_out_or_in_doubt_is_protected_until_it_is_settled", async () => {
+  // A refresh or a close while a save is still out -- or while the draft of a save whose answer
+  // was lost waits for its retry -- would take the marked ingredients and the remembered key
+  // with it. The browser's own question is kept until the save is confirmed or the person
+  // discards the draft. (A mobile browser may still suppress that question; this checks only
+  // what the page asks of it.)
+  const configure = (env) => {
+    withStructuredRecipe()(env);
+    const item = structuredFavoriteItem();
+    env.net.route("GET", "/api/favorites", H.favoritesBody([item]));
+    env.net.route("GET", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(item, "Борщ\n\n1. Сварите бульон."));
+  };
+  const page = await open(configure, { structured: true });
+  const prevented = () => {
+    let yes = false;
+    page.fireWindow("beforeunload", {
+      preventDefault() {
+        yes = true;
+      },
+    });
+    return yes;
+  };
+  const openDraft = async () => {
+    page.el("tab-chats").click();
+    await page.settle();
+    page.articles()[1].buttons("Что купить?")[0].click();
+    await page.settle();
+  };
+  const markOne = async () => {
+    const box = page.el("shopping-body").byTag("input")[0];
+    box.checked = true;
+    box.fire("change");
+    await page.settle();
+  };
+
+  await openDraft();
+  assert.equal(prevented(), false, "an untouched draft is not unsaved work");
+  await markOne();
+  assert.equal(prevented(), true, "a mark is an unsaved modification");
+
+  // The save is out and nothing has answered yet: the draft and its key must not be lost.
+  const gate = deferred();
+  page.env.net.route("POST", SHOP_URL, async () => {
+    await gate.promise;
+    return json(201, SHOP_DETAIL);
+  });
+  page.el("shopping-body").buttons(Logic.TEXT.shoppingSave)[0].click();
+  await page.settle();
+  assert.equal(page.env.net.requests("POST", SHOP_URL).length, 1);
+  assert.equal(page.el("shopping-body").buttons(Logic.TEXT.shoppingSaving).length, 1, "the save is under way");
+  assert.equal(prevented(), true, "an outstanding save is not settled work");
+
+  gate.resolve();
+  await page.settle();
+  assert.equal(page.el("shopping-title").textContent, SHOP_DETAIL.title);
+  assert.equal(prevented(), false, "a confirmed save is not unsaved work");
+
+  // Its answer is lost instead: the draft is kept, with the same key, for an explicit retry.
+  await openDraft();
+  await markOne();
+  page.env.net.route("POST", SHOP_URL, fail());
+  page.el("shopping-body").buttons(Logic.TEXT.shoppingSave)[0].click();
+  await page.settle();
+  assert.ok(page.el("shopping-body").textContent.includes(Logic.TEXT.shoppingUncertain));
+  assert.equal(prevented(), true, "a save of an unknown outcome is still unsaved work");
+
+  page.env.net.route("POST", SHOP_URL, json(200, { ...SHOP_DETAIL, created: false }));
+  page.el("shopping-body").buttons(Logic.TEXT.shoppingRetrySave)[0].click();
+  await page.settle();
+  const keys = page.env.net.requests("POST", SHOP_URL).map((request) => request.headers["idempotency-key"]);
+  assert.equal(keys.length, 3);
+  assert.equal(keys[1], keys[2], "the retry sends the same key");
+  assert.equal(page.el("shopping-title").textContent, SHOP_DETAIL.title);
+  assert.equal(prevented(), false, "the confirmed retry ends the question");
+
+  // Explicitly discarded after an unclear save: nothing is left to warn about.
+  await openDraft();
+  await markOne();
+  page.env.net.route("POST", SHOP_URL, fail());
+  page.el("shopping-body").buttons(Logic.TEXT.shoppingSave)[0].click();
+  await page.settle();
+  assert.equal(prevented(), true);
+  page.el("shopping-body").buttons(Logic.TEXT.shoppingCancel)[0].click();
+  await page.settle();
+  assert.equal(prevented(), false, "a discarded draft is not unsaved work");
+
+  // The favorites editor keeps its own protection beside all of this.
+  page.el("tab-favorites").click();
+  await page.settle();
+  page.el("favorite-list").byTag("button")[0].click();
+  await page.settle();
+  page.el("recipe-body").buttons(Logic.TEXT.editAction)[0].click();
+  await page.settle();
+  assert.equal(prevented(), true, "an open editor is still unsaved work");
+  page.el("recipe-body").buttons(Logic.TEXT.editCancel)[0].click();
+  await page.settle();
+  assert.equal(prevented(), false);
+});
+
+scenario("an_unmarked_draft_is_protected_while_its_save_is_out_or_in_doubt", async () => {
+  // Nothing is marked, but a save that is out, or one whose answer was lost, holds the key that
+  // is the only way to learn whether the list was made: the browser's own question is kept for
+  // it exactly as for a marked draft.
+  const page = await open(withStructuredRecipe(), { structured: true });
+  const prevented = () => {
+    let yes = false;
+    page.fireWindow("beforeunload", {
+      preventDefault() {
+        yes = true;
+      },
+    });
+    return yes;
+  };
+  const openDraft = async () => {
+    page.el("tab-chats").click();
+    await page.settle();
+    page.articles()[1].buttons("Что купить?")[0].click();
+    await page.settle();
+  };
+
+  await openDraft();
+  assert.equal(prevented(), false, "an untouched draft is not unsaved work");
+  assert.equal(
+    page.el("shopping-body").byTag("input").filter((box) => box.getAttribute("checked") === "").length,
+    0,
+    "nothing is marked"
+  );
+
+  // The save is out: the unmarked draft is still work that would be lost with the page.
+  const gate = deferred();
+  page.env.net.route("POST", SHOP_URL, async () => {
+    await gate.promise;
+    return json(201, SHOP_DETAIL);
+  });
+  page.el("shopping-body").buttons(Logic.TEXT.shoppingSave)[0].click();
+  await page.settle();
+  assert.equal(page.el("shopping-body").buttons(Logic.TEXT.shoppingSaving).length, 1, "the save is under way");
+  assert.equal(prevented(), true, "an unmarked save that is out is not settled work");
+
+  gate.resolve();
+  await page.settle();
+  assert.equal(page.el("shopping-title").textContent, SHOP_DETAIL.title);
+  assert.equal(prevented(), false, "a confirmed save is not unsaved work");
+
+  // Its answer is lost instead, again with nothing marked.
+  await openDraft();
+  page.env.net.route("POST", SHOP_URL, fail());
+  page.el("shopping-body").buttons(Logic.TEXT.shoppingSave)[0].click();
+  await page.settle();
+  assert.ok(page.el("shopping-body").textContent.includes(Logic.TEXT.shoppingUncertain));
+  assert.equal(prevented(), true, "an unmarked save of an unknown outcome is still unsaved work");
+
+  page.el("shopping-body").buttons(Logic.TEXT.shoppingCancel)[0].click();
+  await page.settle();
+  assert.equal(page.el("shopping-body").byTag("input").length, 0, "the discarded draft is gone from the page");
+  assert.equal(prevented(), false, "an explicitly discarded draft is not unsaved work");
+
+  // A session that is over holds nothing of the unmarked draft, its save included.
+  await openDraft();
+  const late = deferred();
+  page.env.net.route("POST", SHOP_URL, async () => {
+    await late.promise;
+    return json(201, SHOP_DETAIL);
+  });
+  page.el("shopping-body").buttons(Logic.TEXT.shoppingSave)[0].click();
+  await page.settle();
+  assert.equal(prevented(), true);
+  page.env.net.route("GET", "/auth/me", notAuthenticated());
+  page.doc.visibilityState = "visible";
+  page.doc.fire("visibilitychange");
+  await page.settle();
+  assert.equal(page.visible("screen-login"), true);
+  assert.equal(prevented(), false, "nothing of the ended session is unsaved work");
+  late.resolve();
+  await page.settle();
+  assert.equal(page.visible("screen-login"), true);
+  assert.equal(page.el("shopping-body").childNodes.length, 0, "the late answer does not bring the draft back");
+  assert.equal(prevented(), false);
+});
+
+scenario("a_draft_of_a_session_that_is_over_asks_nothing_and_a_late_save_changes_nothing", async () => {
+  const page = await open(withStructuredRecipe(), { structured: true });
+  const prevented = () => {
+    let yes = false;
+    page.fireWindow("beforeunload", {
+      preventDefault() {
+        yes = true;
+      },
+    });
+    return yes;
+  };
+
+  page.articles()[1].buttons("Что купить?")[0].click();
+  await page.settle();
+  const box = page.el("shopping-body").byTag("input")[0];
+  box.checked = true;
+  box.fire("change");
+  await page.settle();
+  assert.equal(prevented(), true);
+
+  // The save is still out when the session ends: everything of the person is dropped at once,
+  // the draft and its key included, and the answer that comes later brings nothing back.
+  const gate = deferred();
+  page.env.net.route("POST", SHOP_URL, async () => {
+    await gate.promise;
+    return json(201, SHOP_DETAIL);
+  });
+  page.el("shopping-body").buttons(Logic.TEXT.shoppingSave)[0].click();
+  await page.settle();
+  assert.equal(page.el("shopping-body").buttons(Logic.TEXT.shoppingSaving).length, 1);
+
+  page.env.net.route("GET", "/auth/me", notAuthenticated());
+  page.doc.visibilityState = "visible";
+  page.doc.fire("visibilitychange");
+  await page.settle();
+  assert.equal(page.visible("screen-login"), true);
+  assert.equal(prevented(), false, "nothing of the ended session is unsaved work");
+
+  gate.resolve();
+  await page.settle();
+  assert.equal(page.visible("screen-login"), true);
+  assert.equal(page.el("shopping-body").childNodes.length, 0, "the late answer does not bring the draft back");
+  assert.equal(prevented(), false);
+});
+
+scenario("the_mobile_drawer_makes_the_shopping_pane_inert_and_restores_it", async () => {
+  const page = await open((env) => {
+    env.signedIn([]);
+    env.net.route("GET", SHOP_URL, shoppingLists([SHOP_DETAIL]));
+    env.net.route("GET", SHOP_LIST_URL, json(200, SHOP_DETAIL));
+  }, { narrow: true });
+  page.el("tab-shopping").click();
+  await page.settle();
+  page.el("shopping-list").byTag("button")[0].click();
+  await page.settle();
+  assert.deepEqual(["chat", "recipe", "shopping"].map((id) => page.el(id).inert), [false, false, false]);
+
+  page.el("drawer-toggle").click();
+  assert.equal(page.el("screen-app").getAttribute("data-drawer"), "open");
+  assert.deepEqual(["chat", "recipe", "shopping"].map((id) => page.el(id).inert), [true, true, true], "nothing behind the drawer takes a focus or a click");
+
+  page.el("backdrop").click();
+  await page.settle();
+  assert.equal(page.el("screen-app").getAttribute("data-drawer"), "closed");
+  assert.deepEqual(["chat", "recipe", "shopping"].map((id) => page.el(id).inert), [false, false, false]);
+});
+
+scenario("deleting_one_list_while_another_is_opening_leaves_the_other_usable", async () => {
+  const plov = H.shoppingDetail(H.LIST_2, "Плов", "active", [
+    H.shoppingItem("cccccccc-cccc-4ccc-8ccc-ccccccccccc4", 0, "рис", "200 г", "unchecked"),
+  ]);
+  const page = await open((env) => {
+    env.signedIn([]);
+    env.net.route("GET", SHOP_URL, shoppingLists([SHOP_DETAIL, plov]));
+    env.net.route("GET", SHOP_LIST_URL, json(200, SHOP_DETAIL));
+  });
+  const deleteGate = deferred();
+  const readGate = deferred();
+  page.env.net.route("DELETE", SHOP_LIST_URL, async () => {
+    await deleteGate.promise;
+    return H.removedBody();
+  });
+  page.env.net.route("GET", SHOP_LIST_URL_DONE, async () => {
+    await readGate.promise;
+    return json(200, plov);
+  });
+
+  page.el("tab-shopping").click();
+  await page.settle();
+  page.el("shopping-list").byTag("button")[0].click(); // Борщ
+  await page.settle();
+  page.el("shopping-body").buttons(Logic.TEXT.deleteList)[0].click();
+  await page.settle();
+  page.el("shopping-body").byClass("confirm")[0].buttons(Logic.TEXT.deleteListConfirm)[0].click();
+  await page.settle();
+  assert.equal(page.env.net.requests("DELETE", SHOP_LIST_URL).length, 1);
+
+  // B is not blocked by A's unsettled write; its read is let out while A's answer is still out.
+  const plovButton = page.el("shopping-list").byTag("button")[1];
+  assert.equal(plovButton.getAttribute("disabled"), null);
+  plovButton.click();
+  await page.settle();
+  assert.ok(page.el("shopping-body").textContent.includes(Logic.TEXT.shoppingListLoading));
+
+  deleteGate.resolve();
+  await page.settle();
+  assert.ok(
+    page.el("shopping-body").textContent.includes(Logic.TEXT.shoppingListLoading),
+    "B keeps waiting for B's own answer, not for A's deletion"
+  );
+
+  readGate.resolve();
+  await page.settle();
+  assert.equal(page.el("shopping-title").textContent, "Плов");
+  assert.equal(
+    page.el("shopping-body").textContent.includes(Logic.TEXT.shoppingListLoading),
+    false,
+    "B's answer is applied even though A's deletion finished first"
+  );
+  assert.ok(page.el("shopping-body").textContent.includes("рис"));
+  assert.equal(page.el("shopping-list").byTag("button").length, 1, "A is gone from the summaries");
+  assert.equal(page.el("shopping-body").buttons(Logic.TEXT.addItem).length, 1, "B can still be worked with");
+});
+
+scenario("an_unclear_product_add_keeps_the_form_and_its_words", async () => {
+  const page = await open((env) => {
+    env.signedIn([]);
+    env.net.route("GET", SHOP_URL, shoppingLists([SHOP_DETAIL]));
+    env.net.route("GET", SHOP_LIST_URL, json(200, SHOP_DETAIL), json(200, SHOP_DETAIL));
+  });
+  page.env.net.route("POST", `${SHOP_LIST_URL}/items`, fail());
+  page.el("tab-shopping").click();
+  await page.settle();
+  page.el("shopping-list").byTag("button")[0].click();
+  await page.settle();
+  const body = () => page.el("shopping-body");
+
+  body().buttons("Добавить продукт")[0].click();
+  await page.settle();
+  page.editField(page.el("shop-add-name"), "соль");
+  page.editField(page.el("shop-add-amount"), "1 ч. л.");
+  body().byTag("form")[0].byTag("button")[0].click();
+  await page.settle();
+
+  assert.equal(page.env.net.requests("POST", `${SHOP_LIST_URL}/items`).length, 1, "nothing is sent again by itself");
+  assert.equal(body().byClass("shop-add").length, 1, "the form is still there");
+  assert.deepEqual([page.el("shop-add-name").value, page.el("shop-add-amount").value], ["соль", "1 ч. л."]);
+  assert.ok(body().textContent.includes(Logic.TEXT.addItemUncertain));
+  assert.equal(
+    body().byTag("form")[0].byTag("button")[0].getAttribute("disabled"),
+    null,
+    "an active list still offers the explicit retry"
+  );
+  assert.equal(body().elements().filter((element) => element.getAttribute("data-id") === H.ITEM_2).length, 1, "the list itself stays");
+
+  body().buttons("Отмена")[0].click();
+  await page.settle();
+  assert.equal(body().byTag("form").length, 0);
+  assert.equal(body().buttons("Добавить продукт").length, 1);
+  assert.equal(page.env.net.requests("POST", `${SHOP_LIST_URL}/items`).length, 1);
+});
+
+scenario("an_unclear_add_over_a_completed_list_stays_visible_and_reopens_before_sending", async () => {
+  // The review's reproduction: the add's answer is lost and the true list turns out to be
+  // completed without the item. The form must not vanish (it holds the only copy of the words
+  // and the only cancellation), and «Вернуть в работу» must work; only after that may the
+  // retained values be sent again, by an explicit click.
+  const completed = H.shoppingDetail(H.LIST_1, "Борщ", "completed", SHOP_ITEMS);
+  const added = H.shoppingItem("cccccccc-cccc-4ccc-8ccc-ccccccccccc4", 3, "соль", "1 ч. л.", "unchecked");
+  const page = await open((env) => {
+    env.signedIn([]);
+    env.net.route("GET", SHOP_URL, shoppingLists([SHOP_DETAIL]));
+    env.net.route("GET", SHOP_LIST_URL, json(200, SHOP_DETAIL), json(200, completed));
+  });
+  page.env.net.route("POST", `${SHOP_LIST_URL}/items`, fail());
+  page.el("tab-shopping").click();
+  await page.settle();
+  page.el("shopping-list").byTag("button")[0].click();
+  await page.settle();
+  const body = () => page.el("shopping-body");
+
+  body().buttons(Logic.TEXT.addItem)[0].click();
+  await page.settle();
+  page.editField(page.el("shop-add-name"), "соль");
+  page.editField(page.el("shop-add-amount"), "1 ч. л.");
+  body().byTag("form")[0].byTag("button")[0].click();
+  await page.settle();
+
+  assert.equal(page.env.net.requests("POST", `${SHOP_LIST_URL}/items`).length, 1, "nothing is sent again by itself");
+  assert.ok(body().textContent.includes(Logic.TEXT.listCompletedNote), "the list is completed now");
+  assert.ok(body().textContent.includes(Logic.TEXT.addItemUncertain), "the warning is not hidden by the completion");
+  assert.deepEqual([page.el("shop-add-name").value, page.el("shop-add-amount").value], ["соль", "1 ч. л."]);
+  assert.equal(page.el("shop-add-name").getAttribute("readonly"), "");
+  assert.equal(
+    body().byTag("form")[0].byTag("button")[0].getAttribute("disabled"),
+    "",
+    "a completed list sends no new item"
+  );
+  assert.equal(body().buttons(Logic.TEXT.addItemCancel).length, 1, "the unresolved addition can be cancelled");
+  const reopen = body().buttons(Logic.TEXT.reopenList)[0];
+  assert.ok(reopen, "«Вернуть в работу» is offered");
+  assert.equal(reopen.getAttribute("disabled"), null, "and is not refused by the hidden form");
+
+  page.env.net.route("PATCH", SHOP_LIST_URL, json(200, SHOP_DETAIL));
+  reopen.click();
+  await page.settle();
+  assert.equal(page.env.net.requests("PATCH", SHOP_LIST_URL).length, 1);
+  assert.equal(page.env.net.requests("POST", `${SHOP_LIST_URL}/items`).length, 1, "reopening retries nothing");
+  assert.equal(body().textContent.includes(Logic.TEXT.listCompletedNote), false);
+  assert.ok(body().textContent.includes(Logic.TEXT.addItemUncertain), "the unresolved warning stays");
+  assert.deepEqual([page.el("shop-add-name").value, page.el("shop-add-amount").value], ["соль", "1 ч. л."]);
+  const submit = body().byTag("form")[0].byTag("button")[0];
+  assert.equal(submit.getAttribute("disabled"), null, "the retained values can now be sent explicitly");
+
+  page.env.net.route("POST", `${SHOP_LIST_URL}/items`, json(201, added));
+  submit.click();
+  await page.settle();
+  assert.equal(page.env.net.requests("POST", `${SHOP_LIST_URL}/items`).length, 2, "the person's click is the second send");
+  assert.equal(body().byTag("form").length, 0, "the resolved form is gone");
+  assert.ok(body().textContent.includes("соль"));
+  assert.ok(body().textContent.includes("Куплено 1 из 4"));
+});
+
+scenario("an_unresolved_add_can_be_cancelled_from_a_completed_list", async () => {
+  const completed = H.shoppingDetail(H.LIST_1, "Борщ", "completed", SHOP_ITEMS);
+  const page = await open((env) => {
+    env.signedIn([]);
+    env.net.route("GET", SHOP_URL, shoppingLists([SHOP_DETAIL]));
+    env.net.route("GET", SHOP_LIST_URL, json(200, SHOP_DETAIL), json(200, completed));
+  });
+  page.env.net.route("POST", `${SHOP_LIST_URL}/items`, fail());
+  page.el("tab-shopping").click();
+  await page.settle();
+  page.el("shopping-list").byTag("button")[0].click();
+  await page.settle();
+  const body = () => page.el("shopping-body");
+
+  body().buttons(Logic.TEXT.addItem)[0].click();
+  await page.settle();
+  page.editField(page.el("shop-add-name"), "соль");
+  body().byTag("form")[0].byTag("button")[0].click();
+  await page.settle();
+  assert.ok(body().textContent.includes(Logic.TEXT.addItemUncertain));
+
+  body().buttons(Logic.TEXT.addItemCancel)[0].click();
+  await page.settle();
+  assert.equal(body().byTag("form").length, 0, "the hidden blocking form is gone");
+  assert.equal(page.env.net.requests("POST", `${SHOP_LIST_URL}/items`).length, 1, "cancelling sends nothing");
+  assert.ok(body().textContent.includes(Logic.TEXT.listCompletedNote), "the completed list itself stays");
+  assert.equal(
+    body().elements().filter((element) => element.getAttribute("data-id") === H.ITEM_2).length,
+    1,
+    "its items are untouched"
+  );
+
+  // With nothing unresolved left, the list opens for work normally.
+  page.env.net.route("PATCH", SHOP_LIST_URL, json(200, SHOP_DETAIL));
+  body().buttons(Logic.TEXT.reopenList)[0].click();
+  await page.settle();
+  assert.equal(body().textContent.includes(Logic.TEXT.listCompletedNote), false);
+  assert.equal(body().buttons(Logic.TEXT.addItem).length, 1);
+});
+
+scenario("an_item_with_a_position_beyond_the_item_count_is_drawn_and_editable", async () => {
+  const atCap = H.shoppingItem("cccccccc-cccc-4ccc-8ccc-ccccccccccc4", 200, "соль", "1 ч. л.", "unchecked");
+  const detail = H.shoppingDetail(H.LIST_1, "Борщ", "active", SHOP_ITEMS.concat([atCap]));
+  const page = await open((env) => {
+    env.signedIn([]);
+    env.net.route("GET", SHOP_URL, shoppingLists([detail]));
+    env.net.route("GET", SHOP_LIST_URL, json(200, detail));
+  });
+  page.env.net.route("PATCH", `${SHOP_LIST_URL}/items/${atCap.id}`, json(200, { ...atCap, state: "purchased" }));
+  page.el("tab-shopping").click();
+  await page.settle();
+  page.el("shopping-list").byTag("button")[0].click();
+  await page.settle();
+
+  const row = page.el("shopping-body").find((element) => element.getAttribute("data-id") === atCap.id)[0];
+  assert.ok(row, "the item at position 200 is drawn");
+  assert.ok(row.textContent.includes("соль"));
+  const checkbox = row.byTag("input")[0];
+  checkbox.checked = true;
+  checkbox.fire("change");
+  await page.settle();
+  assert.deepEqual(page.env.net.requests("PATCH", `${SHOP_LIST_URL}/items/${atCap.id}`)[0].body, { state: "purchased" });
+  assert.ok(page.el("shopping-body").textContent.includes("Куплено: 2"));
+});
+
+scenario("a_reused_key_says_so_and_a_new_list_needs_the_persons_click", async () => {
+  const page = await open(withStructuredRecipe(), { structured: true });
+  page.env.net.route("POST", SHOP_URL, apiError(409, "shopping_list_key_reused"), json(201, SHOP_DETAIL));
+  page.articles()[1].buttons("Что купить?")[0].click();
+  await page.settle();
+  const body = () => page.el("shopping-body");
+
+  body().buttons("Сохранить список")[0].click();
+  await page.settle();
+  assert.ok(body().textContent.includes(Logic.TEXT.shoppingKeyReused));
+  assert.equal(body().buttons("Сохранить новый список").length, 1);
+  assert.equal(page.env.net.requests("POST", SHOP_URL).length, 1, "nothing is sent by itself");
+
+  body().buttons("Сохранить новый список")[0].click();
+  await page.settle();
+  assert.equal(page.env.net.requests("POST", SHOP_URL).length, 2);
+  assert.equal(page.el("shopping-title").textContent, "Борщ");
+  const keys = page.env.net.requests("POST", SHOP_URL).map((request) => request.headers["idempotency-key"]);
+  assert.equal(new Set(keys).size, 2, "the explicit new save made a new key");
+});
+
+scenario("a_deleted_lists_key_is_terminal_and_the_person_is_told", async () => {
+  const page = await open(withStructuredRecipe(), { structured: true });
+  page.env.net.route("POST", SHOP_URL, apiError(409, "shopping_list_deleted"));
+  page.articles()[1].buttons("Что купить?")[0].click();
+  await page.settle();
+
+  page.el("shopping-body").buttons("Сохранить список")[0].click();
+  await page.settle();
+  assert.ok(page.el("shopping-body").textContent.includes(Logic.TEXT.shoppingDeletedElsewhere));
+  assert.equal(page.el("shopping-body").buttons("Сохранить новый список").length, 0);
+  assert.equal(page.el("shopping-body").buttons("Повторить").length, 0);
+  assert.equal(page.el("shopping-body").buttons("Понятно").length, 1);
+
+  page.el("shopping-body").buttons("Понятно")[0].click();
+  await page.settle();
+  assert.equal(page.visible("chat"), true);
+  assert.equal(page.env.net.requests("POST", SHOP_URL).length, 1);
+});
+
+scenario("an_unclear_save_offers_the_same_key_again_and_nothing_else", async () => {
+  const page = await open(withStructuredRecipe(), { structured: true });
+  page.env.net.route("POST", SHOP_URL, fail(), json(200, { ...SHOP_DETAIL, created: false }));
+  page.articles()[1].buttons("Что купить?")[0].click();
+  await page.settle();
+  page.el("shopping-body").byTag("input")[0].checked = true;
+  page.el("shopping-body").byTag("input")[0].fire("change");
+  await page.settle();
+
+  page.el("shopping-body").buttons("Сохранить список")[0].click();
+  await page.settle();
+  assert.ok(page.el("shopping-body").textContent.includes(Logic.TEXT.shoppingUncertain));
+  assert.equal(page.el("shopping-body").byTag("input")[0].getAttribute("disabled"), "");
+  assert.equal(page.el("shopping-body").buttons("Повторить").length, 1);
+  assert.equal(page.el("shopping-body").buttons("Сохранить новый список").length, 0);
+
+  page.el("shopping-body").buttons("Повторить")[0].click();
+  await page.settle();
+  const requests = page.env.net.requests("POST", SHOP_URL);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].headers["idempotency-key"], requests[1].headers["idempotency-key"]);
+  assert.equal(page.el("shopping-title").textContent, "Борщ");
+});
+
+scenario("a_session_that_ends_takes_the_shopping_lists_and_drafts_off_the_page", async () => {
+  const page = await open((env) => {
+    env.signedIn([]);
+    env.net.route("GET", SHOP_URL, shoppingLists([SHOP_DETAIL]));
+    env.net.route("GET", SHOP_LIST_URL, json(200, SHOP_DETAIL));
+    env.net.route("GET", "/auth/me", me(30));
+  });
+  page.el("tab-shopping").click();
+  await page.settle();
+  page.el("shopping-list").byTag("button")[0].click();
+  await page.settle();
+  page.env.net.route("PATCH", `${SHOP_LIST_URL}/items/${H.ITEM_2}`, notAuthenticated());
+  const checkbox = page.el("shopping-body").find((element) => element.getAttribute("data-id") === H.ITEM_2)[0].byTag("input")[0];
+  checkbox.checked = true;
+  checkbox.fire("change");
+  await page.settle();
+
+  assert.equal(page.visible("screen-login"), true);
+  assert.equal(page.visible("screen-app"), false);
+  assert.equal(page.el("shopping-body").childNodes.length, 0);
+  assert.equal(page.el("shopping-list").childNodes.length, 0);
+  assert.equal(page.el("shopping-title").textContent, "");
+  assert.ok(!page.root().includes("Борщ"));
+  assert.ok(!page.root().includes("мясо"));
 });
 
 module.exports = { scenarios, useShell, useNoLoginShell };

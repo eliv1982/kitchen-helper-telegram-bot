@@ -164,10 +164,11 @@ _SHELL = """\
     <button id="logout" class="btn btn-onblue" type="button">Выйти</button>
   </header>
   <div class="workspace">
-    <nav id="sidebar" class="sidebar" aria-label="Разговоры и избранное">
+    <nav id="sidebar" class="sidebar" aria-label="Разговоры, избранное и покупки">
       <div class="tabs" role="group" aria-label="Раздел">
         <button id="tab-chats" class="tab" type="button" aria-pressed="true">Разговоры</button>
         <button id="tab-favorites" class="tab" type="button" aria-pressed="false">Избранное</button>
+        <button id="tab-shopping" class="tab" type="button" aria-pressed="false">Покупки</button>
       </div>
       <div id="panel-chats" class="panel">
         <button id="new-conversation" class="btn btn-secondary btn-block" type="button">Новый разговор</button>
@@ -179,6 +180,11 @@ _SHELL = """\
         <p id="favorites-status" class="hint" role="status"></p>
         <button id="favorites-retry" class="btn btn-quiet btn-block" type="button" hidden>Обновить избранное</button>
         <ul id="favorite-list" class="conv-list"></ul>
+      </div>
+      <div id="panel-shopping" class="panel" hidden>
+        <p id="shopping-status" class="hint" role="status"></p>
+        <button id="shopping-retry" class="btn btn-quiet btn-block" type="button" hidden>Обновить покупки</button>
+        <ul id="shopping-list" class="conv-list"></ul>
       </div>
       <section id="telegram" class="telegram" aria-labelledby="telegram-title" hidden>
         <h2 id="telegram-title" class="telegram-title">Telegram</h2>
@@ -233,6 +239,10 @@ _SHELL = """\
     <section id="recipe" class="chat recipe" aria-labelledby="recipe-title" hidden>
       <h1 id="recipe-title" class="chat-title" tabindex="-1"></h1>
       <div id="recipe-body" class="recipe-body" tabindex="0"></div>
+    </section>
+    <section id="shopping" class="chat shopping" aria-labelledby="shopping-title" hidden>
+      <h1 id="shopping-title" class="chat-title" tabindex="-1"></h1>
+      <div id="shopping-body" class="shopping-body" tabindex="0"></div>
     </section>
   </div>
 </div>

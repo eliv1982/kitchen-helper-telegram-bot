@@ -4975,4 +4975,1484 @@ scenario("a_failed_deletion_does_not_discard_a_list_answer_on_its_way", async ()
   assert.equal(view.list.deleting.phase, "error", "the failed deletion is still there with its retry");
 });
 
+// ============================================================================================
+// Shopping lists
+// ============================================================================================
+
+const SHOP_URL = "/api/shopping-lists";
+const LIST_URL_1 = `/api/shopping-lists/${H.LIST_1}`;
+const LIST_URL_2 = `/api/shopping-lists/${H.LIST_2}`;
+const RECIPE_URL = `/api/conversations/${CONV_A}/messages/2/recipes/0`;
+const ITEM_4 = "cccccccc-cccc-4ccc-8ccc-ccccccccccc4";
+const BORSH_INGREDIENTS = [
+  { name: "свёкла", amount: "2 шт." },
+  { name: "капуста", amount: "300 г" },
+  { name: "говядина", amount: "500 г" },
+];
+const BORSH_ITEMS = [
+  H.shoppingItem(H.ITEM_1, 0, "свёкла", "2 шт.", "at_home"),
+  H.shoppingItem(H.ITEM_2, 1, "капуста", "300 г", "unchecked"),
+  H.shoppingItem(H.ITEM_3, 2, "говядина", "500 г", "unchecked"),
+];
+
+function borshList(status = "active", items = BORSH_ITEMS) {
+  return H.shoppingDetail(
+    H.LIST_1,
+    "Борщ",
+    status,
+    items.map((item) => ({ ...item })),
+    { created: true }
+  );
+}
+
+const shoppingListBody = (detail) => H.shoppingListsBody([H.shoppingSummary(detail)]);
+
+async function withShopping() {
+  const env = makeEnv().signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Старый вопрос"), message(2, "assistant", "Старый ответ")]),
+  });
+  env.net.route("GET", RECIPE_URL, H.recipeBody(2, 0, "Борщ", "4 порции", BORSH_INGREDIENTS, ["Сварите бульон."]));
+  await env.boot();
+  return env;
+}
+
+async function openedShoppingList(extra = {}) {
+  const env = await withShopping();
+  env.net.route("GET", SHOP_URL, shoppingListBody(borshList()));
+  env.net.route("GET", LIST_URL_1, json(200, borshList()));
+  await env.ctl.showSection("shopping");
+  await env.ctl.openShoppingList(H.LIST_1);
+  await env.settle();
+  return env;
+}
+
+scenario("a_recipe_opens_a_draft_with_every_ingredient_and_nothing_marked_at_home", async () => {
+  const env = await withShopping();
+
+  const result = await env.ctl.beginShoppingDraftFromRecipe(CONV_A, 2, 0);
+  await env.settle();
+
+  assert.deepEqual(result, { ok: true });
+  const view = env.view();
+  assert.equal(view.section, "shopping");
+  assert.equal(view.shopping.title, Logic.TEXT.shoppingDraftTitle);
+  const draft = view.shopping.draft;
+  assert.deepEqual(
+    [draft.title, draft.servings, draft.total, draft.remaining, draft.canSave, draft.editable],
+    ["Борщ", "4 порции", 3, 3, true, true]
+  );
+  assert.deepEqual(
+    draft.ingredients.map((ingredient) => [ingredient.name, ingredient.amount, ingredient.atHome]),
+    [
+      ["свёкла", "2 шт.", false],
+      ["капуста", "300 г", false],
+      ["говядина", "500 г", false],
+    ]
+  );
+  assert.deepEqual(env.net.requests("GET", RECIPE_URL).map((request) => request.url), [RECIPE_URL]);
+  assert.equal(env.net.requests("POST", SHOP_URL).length, 0, "only the person's save creates a list");
+  assert.equal(env.ctl.toggleShoppingDraftAtHome(1, true), true);
+  assert.equal(env.view().shopping.draft.remaining, 2);
+});
+
+scenario("the_draft_saves_only_the_marked_ingredients_as_at_home_and_opens_the_list", async () => {
+  const env = await withShopping();
+  await env.ctl.beginShoppingDraftFromRecipe(CONV_A, 2, 0);
+  env.net.route("POST", SHOP_URL, json(201, borshList()));
+
+  env.ctl.toggleShoppingDraftAtHome(0, true);
+  env.ctl.toggleShoppingDraftAtHome(2, true);
+  const result = await env.ctl.saveShoppingDraft();
+  await env.settle();
+
+  assert.equal(result.ok, true);
+  const [request] = env.net.requests("POST", SHOP_URL);
+  assert.deepEqual(request.body, {
+    source: "message",
+    conversation_id: CONV_A,
+    message_id: 2,
+    recipe_index: 0,
+    item_states: [
+      { position: 0, state: "at_home" },
+      { position: 2, state: "at_home" },
+    ],
+  });
+  assert.match(request.headers["idempotency-key"], /^web-[0-9a-f]+$/);
+  const view = env.view();
+  assert.equal(view.shopping.draft, null);
+  assert.equal(view.section, "shopping");
+  assert.deepEqual([view.shopping.current.id, view.shopping.current.title], [H.LIST_1, "Борщ"]);
+  assert.deepEqual(view.shopping.current.counts, { total: 3, unchecked: 2, at_home: 1, purchased: 0 });
+  assert.equal(view.shopping.current.progress, "Куплено 0 из 3");
+  assert.deepEqual(view.shopping.lists.map((item) => item.id), [H.LIST_1]);
+  assert.ok(env.announced.includes(Logic.TEXT.shoppingSaved));
+});
+
+scenario("an_unclear_save_is_retried_with_the_same_key_and_the_same_frozen_payload", async () => {
+  const env = await withShopping();
+  await env.ctl.beginShoppingDraftFromRecipe(CONV_A, 2, 0);
+  env.net.route("POST", SHOP_URL, fail(), json(200, { ...borshList(), created: false }));
+
+  env.ctl.toggleShoppingDraftAtHome(1, true);
+  const first = await env.ctl.saveShoppingDraft();
+  await env.settle();
+
+  assert.deepEqual([first.ok, first.reason], [false, "uncertain"]);
+  let draft = env.view().shopping.draft;
+  assert.equal(draft.phase, "uncertain");
+  assert.equal(draft.canRetry, true);
+  assert.equal(draft.editable, false, "the selection cannot change while the key must stay identical");
+  assert.equal(env.ctl.toggleShoppingDraftAtHome(0, true), false);
+  assert.equal(draft.error.text, Logic.TEXT.shoppingUncertain);
+  const [firstRequest] = env.net.requests("POST", SHOP_URL);
+
+  const second = await env.ctl.retryShoppingDraft();
+  await env.settle();
+
+  assert.equal(second.ok, true);
+  const requests = env.net.requests("POST", SHOP_URL);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].headers["idempotency-key"], firstRequest.headers["idempotency-key"]);
+  assert.deepEqual(requests[1].body, firstRequest.body);
+  assert.equal(env.view().shopping.draft, null);
+  assert.equal(env.view().shopping.current.status, "ready");
+});
+
+scenario("a_second_save_while_one_is_pending_sends_nothing_and_cannot_be_cancelled", async () => {
+  const env = await withShopping();
+  await env.ctl.beginShoppingDraftFromRecipe(CONV_A, 2, 0);
+  const gate = deferred();
+  env.net.route("POST", SHOP_URL, async () => {
+    await gate.promise;
+    return json(201, borshList());
+  });
+
+  const first = env.ctl.saveShoppingDraft();
+  await flush();
+  assert.equal(env.view().shopping.draft.phase, "saving");
+  assert.deepEqual(await env.ctl.saveShoppingDraft(), { ok: false, reason: "not_ready" });
+  assert.deepEqual(env.ctl.cancelShoppingDraft(), { ok: false, reason: "busy" });
+  gate.resolve();
+  await first;
+  await env.settle();
+
+  assert.equal(env.net.requests("POST", SHOP_URL).length, 1);
+});
+
+scenario("a_reused_key_is_shown_and_only_an_explicit_click_makes_a_new_key", async () => {
+  const env = await withShopping();
+  await env.ctl.beginShoppingDraftFromRecipe(CONV_A, 2, 0);
+  env.net.route("POST", SHOP_URL, apiError(409, "shopping_list_key_reused"), json(201, borshList()));
+
+  env.ctl.toggleShoppingDraftAtHome(1, true);
+  const refused = await env.ctl.saveShoppingDraft();
+  await env.settle();
+
+  assert.deepEqual([refused.ok, refused.reason], [false, "reused"]);
+  let draft = env.view().shopping.draft;
+  assert.equal(draft.phase, "reused");
+  assert.equal(draft.canSaveNew, true);
+  assert.equal(draft.error.text, Logic.TEXT.shoppingKeyReused);
+  assert.equal(draft.editable, true, "the draft can be reviewed before saving again");
+  assert.deepEqual(await env.ctl.saveShoppingDraft(), { ok: false, reason: "not_ready" });
+  assert.deepEqual(await env.ctl.retryShoppingDraft(), { ok: false, reason: "not_ready" });
+
+  const [first] = env.net.requests("POST", SHOP_URL);
+  env.ctl.toggleShoppingDraftAtHome(2, true); // the review changed the draft before the explicit new save
+  const saved = await env.ctl.saveShoppingDraftWithNewKey();
+  await env.settle();
+
+  assert.equal(saved.ok, true);
+  const requests = env.net.requests("POST", SHOP_URL);
+  assert.equal(requests.length, 2);
+  assert.notEqual(requests[1].headers["idempotency-key"], first.headers["idempotency-key"]);
+  assert.deepEqual(requests[1].body.item_states, [
+    { position: 1, state: "at_home" },
+    { position: 2, state: "at_home" },
+  ]);
+});
+
+scenario("a_deleted_list_key_is_not_recreated_by_anything_the_page_can_do", async () => {
+  const env = await withShopping();
+  await env.ctl.beginShoppingDraftFromRecipe(CONV_A, 2, 0);
+  env.net.route("POST", SHOP_URL, apiError(409, "shopping_list_deleted"));
+
+  const refused = await env.ctl.saveShoppingDraft();
+  await env.settle();
+
+  assert.deepEqual([refused.ok, refused.reason], [false, "deleted"]);
+  const draft = env.view().shopping.draft;
+  assert.equal(draft.phase, "deleted");
+  assert.equal(draft.terminal, true);
+  assert.equal(draft.canSaveNew, false);
+  assert.equal(draft.canRetry, false);
+  assert.equal(draft.error.text, Logic.TEXT.shoppingDeletedElsewhere);
+  assert.deepEqual(await env.ctl.saveShoppingDraftWithNewKey(), { ok: false, reason: "not_ready" });
+  assert.deepEqual(await env.ctl.retryShoppingDraft(), { ok: false, reason: "not_ready" });
+  assert.equal(env.net.requests("POST", SHOP_URL).length, 1);
+});
+
+scenario("a_full_account_shows_the_servers_words_and_an_explicit_new_save_is_possible", async () => {
+  const env = await withShopping();
+  await env.ctl.beginShoppingDraftFromRecipe(CONV_A, 2, 0);
+  env.net.route("POST", SHOP_URL, apiError(409, "shopping_lists_full"), json(201, borshList()));
+
+  const refused = await env.ctl.saveShoppingDraft();
+  await env.settle();
+
+  assert.equal(refused.reason, "rejected");
+  let draft = env.view().shopping.draft;
+  assert.equal(draft.phase, "rejected");
+  assert.equal(draft.error.text, Logic.CODE_MESSAGES.shopping_lists_full);
+  assert.equal(draft.canSaveNew, true);
+  assert.equal(draft.saveNewLabel, Logic.TEXT.shoppingSaveAgain);
+
+  assert.equal((await env.ctl.saveShoppingDraftWithNewKey()).ok, true);
+  assert.equal(env.view().shopping.draft, null);
+});
+
+scenario("cancelling_a_draft_returns_to_whence_it_was_opened_without_a_list", async () => {
+  const env = await withShopping();
+  await env.ctl.beginShoppingDraftFromRecipe(CONV_A, 2, 0);
+  assert.equal(env.view().section, "shopping");
+
+  const cancelled = env.ctl.cancelShoppingDraft();
+  assert.deepEqual(cancelled, { ok: true, origin: "chats" });
+  assert.equal(env.view().section, "chats");
+  assert.equal(env.view().shopping.draft, null);
+  assert.equal(env.net.requests("POST", SHOP_URL).length, 0);
+});
+
+scenario("a_structured_favorite_makes_a_draft_from_the_card_and_its_version", async () => {
+  const structured = H.structuredFavorite(H.FAV_1, 2, "Борщ", 0, 0, { version: 3 });
+  const env = makeEnv().signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Старый вопрос"), message(2, "assistant", "Старый ответ")]),
+  });
+  env.net.route("GET", "/api/favorites", H.favoritesBody([structured]));
+  env.net.route(
+    "GET",
+    `/api/favorites/${H.FAV_1}`,
+    H.favoriteDetail(structured, "Борщ", {
+      servings: "4 порции",
+      ingredients: BORSH_INGREDIENTS,
+      steps: ["Сварите бульон."],
+    })
+  );
+  env.net.route("POST", SHOP_URL, json(201, borshList()));
+  await env.boot();
+  await env.ctl.openFavorite(H.FAV_1);
+
+  const opened = env.ctl.beginShoppingDraftFromFavorite();
+  assert.equal(opened.ok, true);
+  assert.equal(env.view().section, "shopping");
+  assert.deepEqual(
+    env.view().shopping.draft.ingredients.map((ingredient) => ingredient.name),
+    ["свёкла", "капуста", "говядина"]
+  );
+  env.ctl.toggleShoppingDraftAtHome(1, true);
+  const saved = await env.ctl.saveShoppingDraft();
+  await env.settle();
+
+  assert.equal(saved.ok, true);
+  assert.deepEqual(env.net.requests("POST", SHOP_URL)[0].body, {
+    source: "favorite",
+    favorite_id: H.FAV_1,
+    expected_version: 3,
+    item_states: [{ position: 1, state: "at_home" }],
+  });
+});
+
+scenario("a_legacy_text_favorite_offers_no_shopping_draft", async () => {
+  const env = await withFavorites([F1]);
+  await env.ctl.openFavorite(H.FAV_1);
+
+  assert.deepEqual(env.ctl.beginShoppingDraftFromFavorite(), { ok: false, reason: "not_ready" });
+  assert.equal(env.view().section, "favorites");
+  assert.equal(env.net.requests("GET", RECIPE_URL).length, 0);
+  assert.equal(env.net.requests("POST", SHOP_URL).length, 0);
+});
+
+scenario("the_shopping_section_lists_active_lists_before_completed_ones_with_progress_and_status", async () => {
+  const active = borshList();
+  active.items[0].state = "purchased";
+  const completed = H.shoppingDetail(H.LIST_2, "Плов", "completed", [
+    H.shoppingItem(ITEM_4, 0, "рис", "200 г", "purchased"),
+  ]);
+  const env = await withShopping();
+  env.net.route("GET", SHOP_URL, H.shoppingListsBody([H.shoppingSummary(completed), H.shoppingSummary(active)]));
+
+  env.ctl.showSection("shopping");
+  await env.settle();
+
+  const view = env.view();
+  assert.equal(view.section, "shopping");
+  assert.deepEqual(view.shopping.lists.map((item) => item.id), [H.LIST_1, H.LIST_2]);
+  assert.equal(view.shopping.lists[0].meta.startsWith("Куплено 1 из 3 · В работе"), true, view.shopping.lists[0].meta);
+  assert.equal(view.shopping.lists[1].meta.startsWith("Куплено 1 из 1 · Завершен"), true, view.shopping.lists[1].meta);
+  assert.equal(view.shopping.empty, false);
+});
+
+scenario("returning_to_the_shopping_section_reads_the_lists_again", async () => {
+  const env = await withShopping();
+  env.net.route("GET", SHOP_URL, H.shoppingListsBody([]));
+
+  env.ctl.showSection("shopping");
+  await env.settle();
+  assert.equal(env.view().shopping.empty, true);
+  env.ctl.showSection("chats");
+  env.ctl.showSection("shopping");
+  await env.settle();
+
+  assert.equal(env.net.requests("GET", SHOP_URL).length, 2);
+});
+
+scenario("a_saved_list_shows_every_item_grouped_by_state_and_counts_them", async () => {
+  const env = await openedShoppingList();
+
+  const current = env.view().shopping.current;
+  assert.deepEqual(
+    [current.id, current.title, current.status, current.readOnly],
+    [H.LIST_1, "Борщ", "ready", false]
+  );
+  assert.deepEqual(current.counts, { total: 3, unchecked: 2, at_home: 1, purchased: 0 });
+  assert.deepEqual(current.groups.map((group) => [group.title, group.count]), [["Проверить / купить", 2], ["Есть дома", 1]]);
+  assert.deepEqual(current.groups[0].items.map((item) => item.name), ["капуста", "говядина"]);
+  assert.equal(current.progress, "Куплено 0 из 3");
+  assert.equal(env.view().shopping.lists[0].current, true);
+});
+
+scenario("a_state_change_is_applied_at_once_and_taken_back_when_it_fails", async () => {
+  const env = await withShopping();
+  env.net.route("GET", SHOP_URL, shoppingListBody(borshList()));
+  env.net.route("GET", LIST_URL_1, json(200, borshList()));
+  await env.ctl.openShoppingList(H.LIST_1);
+  const gate = deferred();
+  env.net.route("PATCH", `${LIST_URL_1}/items/${H.ITEM_2}`, async () => {
+    await gate.promise;
+    return fail();
+  });
+
+  const itemById = () =>
+    env.view().shopping.current.groups.reduce((all, group) => all.concat(group.items), []).filter((item) => item.id === H.ITEM_2)[0];
+  const changing = env.ctl.setShoppingItemState(H.ITEM_2, "purchased");
+  await flush();
+  let item = itemById();
+  assert.deepEqual([item.state, item.pending], ["purchased", "purchased"]);
+  assert.equal(env.view().shopping.current.counts.purchased, 1);
+  gate.resolve();
+  const result = await changing;
+  await env.settle();
+
+  assert.equal(result.ok, false);
+  assert.equal(env.view().shopping.current.counts.purchased, 0);
+  item = itemById();
+  assert.deepEqual([item.state, item.pending], ["unchecked", null]);
+  assert.equal(env.view().shopping.current.actionError.text, Logic.TEXT.network);
+});
+
+scenario("overlapping_item_state_changes_are_serialized_and_the_first_settles_after_a_refusal", async () => {
+  const env = await openedShoppingList();
+  const gate = deferred();
+  env.net.route(
+    "PATCH",
+    `${LIST_URL_1}/items/${H.ITEM_2}`,
+    async () => {
+      await gate.promise;
+      return apiError(400, "invalid_request");
+    },
+    json(200, H.shoppingItem(H.ITEM_2, 1, "капуста", "300 г", "purchased"))
+  );
+  env.net.route("PATCH", `${LIST_URL_1}/items/${H.ITEM_3}`, json(200, H.shoppingItem(H.ITEM_3, 2, "говядина", "500 г", "purchased")));
+  const itemById = (id) =>
+    env.view().shopping.current.groups.reduce((all, group) => all.concat(group.items), []).filter((item) => item.id === id)[0];
+
+  const first = env.ctl.setShoppingItemState(H.ITEM_2, "purchased");
+  await flush();
+  assert.deepEqual([itemById(H.ITEM_2).state, itemById(H.ITEM_2).pending], ["purchased", "purchased"]);
+  assert.equal(env.view().shopping.current.busy, true);
+
+  // The second change is refused while the first is out: no request, no optimistic state.
+  assert.deepEqual(await env.ctl.setShoppingItemState(H.ITEM_3, "purchased"), { ok: false, reason: "busy" });
+  assert.equal(env.net.requests("PATCH", `${LIST_URL_1}/items/${H.ITEM_3}`).length, 0);
+  assert.deepEqual([itemById(H.ITEM_3).state, itemById(H.ITEM_3).pending], ["unchecked", null]);
+
+  gate.resolve();
+  const result = await first;
+  await env.settle();
+  assert.deepEqual(result, { ok: false, reason: "rejected" });
+  assert.deepEqual([itemById(H.ITEM_2).state, itemById(H.ITEM_2).pending], ["unchecked", null], "the pending state is cleared");
+  assert.equal(env.view().shopping.current.busy, false);
+  assert.equal(env.view().shopping.current.actionError.text, Logic.CODE_MESSAGES.invalid_request);
+
+  // And the same item can be changed again now that the first write has settled.
+  const second = await env.ctl.setShoppingItemState(H.ITEM_2, "purchased");
+  await env.settle();
+  assert.equal(second.ok, true);
+  assert.deepEqual([itemById(H.ITEM_2).state, itemById(H.ITEM_2).pending], ["purchased", null]);
+  assert.equal(env.view().shopping.current.counts.purchased, 1);
+});
+
+scenario("an_edit_held_open_cannot_be_overlapped_and_reaches_a_terminal_state_either_way", async () => {
+  const env = await openedShoppingList();
+  const gate = deferred();
+  env.net.route(
+    "PATCH",
+    `${LIST_URL_1}/items/${H.ITEM_2}`,
+    async () => {
+      await gate.promise;
+      return apiError(400, "invalid_request");
+    },
+    json(200, H.shoppingItem(H.ITEM_2, 1, "капуста белая", "300 г", "unchecked"))
+  );
+  env.net.route("PATCH", `${LIST_URL_1}/items/${H.ITEM_3}`, json(200, H.shoppingItem(H.ITEM_3, 2, "говядина", "500 г", "purchased")));
+  env.net.route("PATCH", LIST_URL_1, json(200, borshList("completed")));
+
+  assert.equal(env.ctl.startShoppingItemEdit(H.ITEM_2), true);
+  const saving = env.ctl.saveShoppingItemEdit({ name: "капуста белая", amount: "300 г" });
+  await flush();
+  assert.equal(env.view().shopping.current.editor.phase, "saving");
+  assert.equal(env.view().shopping.current.busy, true);
+
+  // While the editor is saving, another item's change is refused and cannot start.
+  assert.deepEqual(await env.ctl.setShoppingItemState(H.ITEM_3, "purchased"), { ok: false, reason: "busy" });
+  assert.equal(env.ctl.beginShoppingItemAdd(), false);
+  assert.equal(env.ctl.askDeleteShoppingItem(H.ITEM_3), false);
+  assert.equal(env.net.requests("PATCH", `${LIST_URL_1}/items/${H.ITEM_3}`).length, 0);
+
+  gate.resolve();
+  const refused = await saving;
+  await env.settle();
+  assert.deepEqual(refused, { ok: false, reason: "rejected" });
+  let editor = env.view().shopping.current.editor;
+  assert.equal(editor.phase, "editing", "the editor never stays in saving");
+  assert.equal(editor.error.text, Logic.CODE_MESSAGES.invalid_request);
+  assert.equal(env.view().shopping.current.busy, false);
+
+  // Cancellation, editing and completing the list all work again.
+  assert.equal(env.ctl.cancelShoppingItemEdit(), true);
+  assert.equal(env.view().shopping.current.editor, null);
+  assert.equal(env.ctl.startShoppingItemEdit(H.ITEM_2), true);
+  const saved = await env.ctl.saveShoppingItemEdit({ name: "капуста белая", amount: "300 г" });
+  await env.settle();
+  assert.equal(saved.ok, true);
+  assert.equal(env.view().shopping.current.editor, null);
+  const completed = await env.ctl.setShoppingListStatus("completed");
+  await env.settle();
+  assert.equal(completed.ok, true);
+  assert.equal(env.view().shopping.current.readOnly, true);
+});
+
+scenario("a_valid_position_at_or_beyond_the_item_cap_is_accepted", async () => {
+  const env = await withShopping();
+  const atCap = H.shoppingItem(ITEM_4, 200, "соль", "1 ч. л.", "unchecked");
+  const items = BORSH_ITEMS.concat([atCap]);
+  const detail = H.shoppingDetail(H.LIST_1, "Борщ", "active", items.map((item) => ({ ...item })));
+  env.net.route("GET", SHOP_URL, H.shoppingListsBody([H.shoppingSummary(detail)]));
+  env.net.route("GET", LIST_URL_1, json(200, detail), json(200, detail));
+  env.net.route(
+    "PATCH",
+    `${LIST_URL_1}/items/${ITEM_4}`,
+    json(200, H.shoppingItem(ITEM_4, 200, "соль морская", "1 ч. л.", "unchecked")),
+    json(200, H.shoppingItem(ITEM_4, 200, "соль морская", "1 ч. л.", "purchased"))
+  );
+
+  const opened = await env.ctl.openShoppingList(H.LIST_1);
+  await env.settle();
+  assert.deepEqual(opened, { ok: true });
+  const itemById = (id) =>
+    env.view().shopping.current.groups.reduce((all, group) => all.concat(group.items), []).filter((item) => item.id === id)[0];
+  assert.equal(env.view().shopping.current.itemCount, 4);
+  assert.equal(itemById(ITEM_4).position, 200);
+
+  assert.equal(env.ctl.startShoppingItemEdit(ITEM_4), true);
+  const edited = await env.ctl.saveShoppingItemEdit({ name: "соль морская", amount: "1 ч. л." });
+  await env.settle();
+  assert.equal(edited.ok, true);
+  assert.equal(itemById(ITEM_4).position, 200);
+  assert.equal(itemById(ITEM_4).name, "соль морская");
+
+  const purchased = await env.ctl.setShoppingItemState(ITEM_4, "purchased");
+  await env.settle();
+  assert.equal(purchased.ok, true);
+  assert.deepEqual([itemById(ITEM_4).position, itemById(ITEM_4).state], [200, "purchased"]);
+
+  const reopened = await env.ctl.openShoppingList(H.LIST_1);
+  await env.settle();
+  assert.deepEqual(reopened, { ok: true });
+  assert.equal(env.view().shopping.current.itemCount, 4, "the list opens again with the high position");
+});
+
+scenario("a_write_that_finishes_after_the_session_ended_changes_nothing", async () => {
+  const env = await openedShoppingList();
+  const gate = deferred();
+  env.net.route("PATCH", `${LIST_URL_1}/items/${H.ITEM_2}`, async () => {
+    await gate.promise;
+    return json(200, H.shoppingItem(H.ITEM_2, 1, "капуста", "300 г", "purchased"));
+  });
+
+  const changing = env.ctl.setShoppingItemState(H.ITEM_2, "purchased");
+  await flush();
+  await env.timers.advance(86400 * 1000 + 1000);
+  env.ctl.checkSession();
+  assert.equal(env.view().screen, "login");
+
+  gate.resolve();
+  assert.deepEqual(await changing, { ok: false, reason: "stale" });
+  await env.settle();
+  assert.equal(env.view().screen, "login");
+  assert.deepEqual(env.view().shopping.lists, []);
+  assert.equal(env.view().shopping.current, null);
+});
+
+scenario("a_completed_list_is_read_only_and_can_be_reopened", async () => {
+  const env = await withShopping();
+  env.net.route("GET", SHOP_URL, shoppingListBody(borshList("completed")));
+  env.net.route("GET", LIST_URL_1, json(200, borshList("completed")));
+  env.net.route(
+    "PATCH",
+    LIST_URL_1,
+    json(200, borshList("active"))
+  );
+  await env.ctl.openShoppingList(H.LIST_1);
+
+  let current = env.view().shopping.current;
+  assert.equal(current.readOnly, true);
+  assert.equal(current.status, "ready");
+  assert.deepEqual(await env.ctl.setShoppingItemState(H.ITEM_2, "purchased"), { ok: false, reason: "not_ready" });
+  assert.equal(env.net.requests("PATCH", new RegExp("/items/")).length, 0);
+
+  const reopened = await env.ctl.setShoppingListStatus("active");
+  await env.settle();
+  assert.equal(reopened.ok, true);
+  current = env.view().shopping.current;
+  assert.equal(current.readOnly, false);
+  assert.deepEqual([current.readOnly, env.view().shopping.lists[0].meta.includes("В работе")], [false, true]);
+  assert.ok(env.announced.includes(Logic.TEXT.listReopened));
+});
+
+scenario("items_are_added_edited_and_removed_with_the_servers_own_bodies", async () => {
+  const env = await withShopping();
+  env.net.route("GET", SHOP_URL, shoppingListBody(borshList()));
+  env.net.route("GET", LIST_URL_1, json(200, borshList()));
+  const added = H.shoppingItem(ITEM_4, 3, "соль", "1 ч. л.", "unchecked");
+  env.net.route("POST", `${LIST_URL_1}/items`, json(201, added));
+  env.net.route(
+    "PATCH",
+    `${LIST_URL_1}/items/${H.ITEM_2}`,
+    json(200, H.shoppingItem(H.ITEM_2, 1, "капуста белая", null, "unchecked"))
+  );
+  env.net.route("DELETE", `${LIST_URL_1}/items/${H.ITEM_3}`, H.removedBody());
+  await env.ctl.openShoppingList(H.LIST_1);
+
+  assert.equal(env.ctl.beginShoppingItemAdd(), true);
+  const addedResult = await env.ctl.saveShoppingItemAdd({ name: "  соль ", amount: " 1 ч. л. " });
+  await env.settle();
+  assert.equal(addedResult.ok, true);
+  assert.deepEqual(env.net.requests("POST", `${LIST_URL_1}/items`)[0].body, {
+    name: "соль",
+    amount: "1 ч. л.",
+  });
+  assert.equal(env.view().shopping.current.counts.total, 4);
+  assert.ok(env.announced.includes(Logic.TEXT.itemAdded));
+
+  assert.equal(env.ctl.startShoppingItemEdit(H.ITEM_2), true);
+  const edited = await env.ctl.saveShoppingItemEdit({ name: " капуста белая ", amount: " " });
+  await env.settle();
+  assert.equal(edited.ok, true);
+  assert.deepEqual(env.net.requests("PATCH", `${LIST_URL_1}/items/${H.ITEM_2}`)[0].body, {
+    name: "капуста белая",
+    amount: null,
+  });
+  let items = env.view().shopping.current.groups.filter((group) => group.state === "unchecked")[0].items;
+  assert.equal(items.some((item) => item.name === "капуста белая" && item.amount === null), true);
+
+  assert.equal(env.ctl.askDeleteShoppingItem(H.ITEM_3), true);
+  assert.equal(env.net.requests("DELETE", /.*/).length, 0, "asking deletes nothing");
+  assert.equal(env.ctl.cancelDeleteShoppingItem(), true);
+  assert.equal(env.ctl.askDeleteShoppingItem(H.ITEM_3), true);
+  const removed = await env.ctl.deleteShoppingItem();
+  await env.settle();
+  assert.equal(removed.ok, true);
+  assert.equal(env.net.requests("DELETE", `${LIST_URL_1}/items/${H.ITEM_3}`).length, 1);
+  items = env.view().shopping.current.groups.reduce((all, group) => all.concat(group.items), []);
+  assert.equal(items.some((item) => item.id === H.ITEM_3), false);
+  assert.equal(env.view().shopping.current.counts.total, 3);
+  assert.ok(env.announced.includes(Logic.TEXT.itemRemoved));
+});
+
+scenario("a_refused_edit_keeps_the_persons_words_and_says_why", async () => {
+  const env = await openedShoppingList();
+  env.net.route("PATCH", `${LIST_URL_1}/items/${H.ITEM_2}`, apiError(400, "invalid_request"));
+
+  env.ctl.startShoppingItemEdit(H.ITEM_2);
+  const result = await env.ctl.saveShoppingItemEdit({ name: "капуста белая", amount: "300 г" });
+  await env.settle();
+
+  assert.equal(result.ok, false);
+  const editor = env.view().shopping.current.editor;
+  assert.equal(editor.phase, "editing");
+  assert.equal(editor.error.text, Logic.CODE_MESSAGES.invalid_request);
+  assert.deepEqual(editor.draft, { name: "капуста белая", amount: "300 г" });
+  assert.equal(env.view().shopping.current.groups.some((group) => group.items.some((item) => item.name === "капуста белая")), false);
+});
+
+scenario("an_add_whose_answer_is_lost_keeps_the_typed_values_and_is_never_resent", async () => {
+  const env = await withShopping();
+  env.net.route("GET", SHOP_URL, shoppingListBody(borshList()));
+  env.net.route("GET", LIST_URL_1, json(200, borshList()), json(200, borshList()));
+  env.net.route("POST", `${LIST_URL_1}/items`, fail());
+  await env.ctl.openShoppingList(H.LIST_1);
+
+  env.ctl.beginShoppingItemAdd();
+  const result = await env.ctl.saveShoppingItemAdd({ name: "  соль ", amount: " 1 ч. л. " });
+  await env.settle();
+
+  assert.equal(result.ok, false);
+  assert.equal(env.net.requests("POST", `${LIST_URL_1}/items`).length, 1, "nothing is sent again by itself");
+  assert.equal(env.net.requests("GET", LIST_URL_1).length, 2, "the list is read again for the truth");
+  const adding = env.view().shopping.current.adding;
+  assert.ok(adding, "the form is still there");
+  assert.equal(adding.phase, "uncertain");
+  assert.deepEqual(adding.draft, { name: "  соль ", amount: " 1 ч. л. " }, "what was typed is kept");
+  assert.equal(adding.error.text, Logic.TEXT.addItemUncertain);
+  assert.equal(env.view().shopping.current.actionError, null);
+
+  // The person may send it again, explicitly: the second click is the one that POSTs.
+  const added = H.shoppingItem(ITEM_4, 3, "соль", "1 ч. л.", "unchecked");
+  env.net.route("POST", `${LIST_URL_1}/items`, json(201, added));
+  const again = await env.ctl.saveShoppingItemAdd({ name: "соль", amount: "1 ч. л." });
+  await env.settle();
+  assert.equal(again.ok, true);
+  assert.equal(env.net.requests("POST", `${LIST_URL_1}/items`).length, 2);
+  assert.equal(env.view().shopping.current.adding, null);
+  assert.equal(env.net.requests("GET", LIST_URL_1).length, 2, "a certain answer needs no second read");
+});
+
+scenario("an_add_whose_lost_answer_turned_out_to_have_been_saved_closes_with_the_servers_item", async () => {
+  const env = await withShopping();
+  env.net.route("GET", SHOP_URL, shoppingListBody(borshList()));
+  const added = H.shoppingItem(ITEM_4, 3, "соль", null, "unchecked");
+  env.net.route(
+    "GET",
+    LIST_URL_1,
+    json(200, borshList()),
+    json(200, borshList("active", BORSH_ITEMS.concat([added])))
+  );
+  env.net.route("POST", `${LIST_URL_1}/items`, fail());
+  await env.ctl.openShoppingList(H.LIST_1);
+
+  env.ctl.beginShoppingItemAdd();
+  const result = await env.ctl.saveShoppingItemAdd({ name: "соль", amount: "" });
+  await env.settle();
+
+  assert.equal(result.ok, true);
+  assert.equal(result.id, ITEM_4);
+  assert.equal(env.net.requests("POST", `${LIST_URL_1}/items`).length, 1, "the first request is never repeated");
+  assert.equal(env.view().shopping.current.adding, null, "the item the server really has closes the form");
+  assert.ok(env.announced.includes(Logic.TEXT.itemAdded));
+  const items = env.view().shopping.current.groups.reduce((all, group) => all.concat(group.items), []);
+  assert.ok(items.some((item) => item.id === ITEM_4 && item.name === "соль"));
+});
+
+scenario("an_ambiguous_add_on_a_list_completed_meanwhile_keeps_its_form_and_can_be_reopened", async () => {
+  // The review's reproduction: the POST's answer is lost, the true list has meanwhile been
+  // completed elsewhere and does not name the item. That proves nothing about the POST, so the
+  // form keeps the words; the completed list must offer its warning and cancellation, and
+  // «Вернуть в работу» must not be refused by that form.
+  const env = await withShopping();
+  env.net.route("GET", SHOP_URL, shoppingListBody(borshList()));
+  env.net.route("GET", LIST_URL_1, json(200, borshList()), json(200, borshList("completed")));
+  env.net.route("POST", `${LIST_URL_1}/items`, fail());
+  await env.ctl.openShoppingList(H.LIST_1);
+
+  env.ctl.beginShoppingItemAdd();
+  const result = await env.ctl.saveShoppingItemAdd({ name: "соль", amount: "1 ч. л." });
+  await env.settle();
+
+  assert.deepEqual(result, { ok: false, reason: "uncertain" });
+  let current = env.view().shopping.current;
+  assert.equal(current.readOnly, true, "the list is completed now");
+  assert.equal(current.adding.phase, "uncertain");
+  assert.deepEqual(current.adding.draft, { name: "соль", amount: "1 ч. л." }, "what was typed is kept");
+  assert.equal(current.adding.error.text, Logic.TEXT.addItemUncertain);
+  assert.equal(current.busy, false, "no write is in flight");
+
+  // A completed list sends no new item, even from the retained form.
+  assert.deepEqual(await env.ctl.saveShoppingItemAdd({ name: "соль", amount: "1 ч. л." }), {
+    ok: false,
+    reason: "not_ready",
+  });
+  assert.equal(env.net.requests("POST", `${LIST_URL_1}/items`).length, 1, "nothing is sent again by itself");
+
+  // The unresolved form does not hold the list hostage: it can be returned to work.
+  env.net.route("PATCH", LIST_URL_1, json(200, borshList("active")));
+  const reopened = await env.ctl.setShoppingListStatus("active");
+  await env.settle();
+  assert.equal(reopened.ok, true);
+  current = env.view().shopping.current;
+  assert.equal(current.readOnly, false);
+  assert.equal(current.adding.phase, "uncertain", "reopening keeps the unresolved form");
+  assert.deepEqual(current.adding.draft, { name: "соль", amount: "1 ч. л." });
+  assert.equal(
+    env.net.requests("POST", `${LIST_URL_1}/items`).length,
+    1,
+    "reopening never retries the original POST"
+  );
+
+  // Now the person can send the retained values explicitly.
+  const added = H.shoppingItem(ITEM_4, 3, "соль", "1 ч. л.", "unchecked");
+  env.net.route("POST", `${LIST_URL_1}/items`, json(201, added));
+  const again = await env.ctl.saveShoppingItemAdd({ name: "соль", amount: "1 ч. л." });
+  await env.settle();
+  assert.equal(again.ok, true);
+  assert.equal(again.id, ITEM_4);
+  assert.equal(env.net.requests("POST", `${LIST_URL_1}/items`).length, 2, "the second click is the one that sends");
+  assert.equal(env.view().shopping.current.adding, null);
+});
+
+scenario("an_unresolved_add_can_be_cancelled_from_a_completed_list", async () => {
+  const env = await withShopping();
+  env.net.route("GET", SHOP_URL, shoppingListBody(borshList()));
+  env.net.route("GET", LIST_URL_1, json(200, borshList()), json(200, borshList("completed")));
+  env.net.route("POST", `${LIST_URL_1}/items`, fail());
+  await env.ctl.openShoppingList(H.LIST_1);
+
+  env.ctl.beginShoppingItemAdd();
+  await env.ctl.saveShoppingItemAdd({ name: "соль", amount: "1 ч. л." });
+  await env.settle();
+  assert.equal(env.view().shopping.current.readOnly, true);
+  assert.equal(env.view().shopping.current.adding.phase, "uncertain");
+
+  assert.equal(env.ctl.cancelShoppingItemAdd(), true);
+  const current = env.view().shopping.current;
+  assert.equal(current.adding, null);
+  assert.equal(current.readOnly, true, "cancelling the form changes nothing of the list");
+  assert.equal(current.itemCount, 3, "the list data is untouched");
+  assert.equal(env.net.requests("POST", `${LIST_URL_1}/items`).length, 1);
+
+  // Nothing hidden blocks the list afterwards.
+  env.net.route("PATCH", LIST_URL_1, json(200, borshList("active")));
+  const reopened = await env.ctl.setShoppingListStatus("active");
+  await env.settle();
+  assert.equal(reopened.ok, true);
+  assert.equal(env.view().shopping.current.readOnly, false);
+});
+
+scenario("a_session_that_ends_while_a_completed_list_is_being_reopened_leaves_no_hidden_state", async () => {
+  const env = await withShopping();
+  env.net.route("GET", SHOP_URL, shoppingListBody(borshList()));
+  env.net.route("GET", LIST_URL_1, json(200, borshList()), json(200, borshList("completed")));
+  env.net.route("POST", `${LIST_URL_1}/items`, fail());
+  await env.ctl.openShoppingList(H.LIST_1);
+  env.ctl.beginShoppingItemAdd();
+  await env.ctl.saveShoppingItemAdd({ name: "соль", amount: "1 ч. л." });
+  await env.settle();
+  assert.equal(env.view().shopping.current.readOnly, true);
+
+  const reopenGate = deferred();
+  env.net.route("PATCH", LIST_URL_1, async () => {
+    await reopenGate.promise;
+    return json(200, borshList("active"));
+  });
+  const reopening = env.ctl.setShoppingListStatus("active");
+  await flush();
+  assert.equal(env.view().shopping.current.busy, true);
+
+  await env.timers.advance(86400 * 1000 + 1000);
+  env.ctl.checkSession();
+  assert.equal(env.view().screen, "login");
+
+  reopenGate.resolve();
+  assert.deepEqual(await reopening, { ok: false, reason: "stale" });
+  await env.settle();
+  assert.equal(env.view().screen, "login");
+  assert.equal(env.view().shopping.current, null);
+  assert.deepEqual(env.view().shopping.lists, []);
+  assert.deepEqual(await env.ctl.setShoppingListStatus("active"), { ok: false, reason: "not_ready" });
+});
+
+scenario("deleting_a_list_asks_first_then_removes_it_and_leaves_no_draft", async () => {
+  const env = await openedShoppingList();
+  env.net.route("DELETE", LIST_URL_1, H.removedBody());
+
+  assert.equal(env.ctl.askDeleteShoppingList(), true);
+  assert.equal(env.view().shopping.current.deleting.phase, "asking");
+  assert.equal(env.net.requests("DELETE", /.*/).length, 0);
+  assert.equal(env.ctl.cancelDeleteShoppingList(), true);
+  assert.equal(env.view().shopping.current.deleting, null);
+  assert.equal(env.ctl.askDeleteShoppingList(), true);
+  const result = await env.ctl.deleteShoppingList();
+  await env.settle();
+
+  assert.equal(result.ok, true);
+  assert.equal(env.view().shopping.current, null);
+  assert.deepEqual(env.view().shopping.lists, []);
+  assert.equal(env.view().shopping.draft, null);
+  assert.ok(env.announced.includes(Logic.TEXT.listDeleted));
+  assert.equal(env.net.requests("POST", SHOP_URL).length, 0, "the old save request is never used");
+});
+
+scenario("a_confirmed_deletion_is_not_suppressed_by_a_re_entry_or_an_older_read", async () => {
+  const env = await openedShoppingList();
+  const readGate = deferred();
+  env.net.route("GET", LIST_URL_1, async () => {
+    await readGate.promise;
+    return json(200, borshList());
+  });
+  const deleteGate = deferred();
+  env.net.route("DELETE", LIST_URL_1, async () => {
+    await deleteGate.promise;
+    return H.removedBody();
+  });
+
+  // A read of the list that began before the deletion, still on its way.
+  env.ctl.recheck();
+  await flush();
+  assert.equal(env.net.requests("GET", LIST_URL_1).length, 2);
+
+  assert.equal(env.ctl.askDeleteShoppingList(), true);
+  const deleting = env.ctl.deleteShoppingList();
+  await flush();
+
+  // Re-entering the list while the deletion is unsettled starts no read and changes nothing.
+  assert.deepEqual(await env.ctl.openShoppingList(H.LIST_1), { ok: false, reason: "busy" });
+  assert.equal(env.net.requests("GET", LIST_URL_1).length, 2);
+  assert.equal(env.view().shopping.current.id, H.LIST_1);
+
+  deleteGate.resolve();
+  assert.deepEqual(await deleting, { ok: true });
+  assert.equal(env.view().shopping.current, null);
+  assert.deepEqual(env.view().shopping.lists, []);
+  assert.ok(env.announced.includes(Logic.TEXT.listDeleted));
+
+  // The older read lands after the server's confirmation: it cannot put the list back.
+  readGate.resolve();
+  await env.settle();
+  assert.equal(env.view().shopping.current, null);
+  assert.deepEqual(env.view().shopping.lists, []);
+});
+
+scenario("deleting_one_list_never_makes_a_read_of_another_list_stale", async () => {
+  // The review's reproduction: DELETE A is out, the person goes to B and B's read is out,
+  // then A's deletion is confirmed before B's answer. B's answer is still B's, and the pane
+  // must not stay on "Загружаем список…" because of a deletion of another list.
+  const env = await openedShoppingList();
+  const plov = H.shoppingDetail(H.LIST_2, "Плов", "active", [
+    H.shoppingItem(ITEM_4, 0, "рис", "200 г", "unchecked"),
+  ]);
+  const deleteGate = deferred();
+  const readGate = deferred();
+  env.net.route("DELETE", LIST_URL_1, async () => {
+    await deleteGate.promise;
+    return H.removedBody();
+  });
+  env.net.route("GET", LIST_URL_2, async () => {
+    await readGate.promise;
+    return json(200, plov);
+  });
+
+  assert.equal(env.ctl.askDeleteShoppingList(), true);
+  const deleting = env.ctl.deleteShoppingList();
+  await flush();
+  const opening = env.ctl.openShoppingList(H.LIST_2);
+  await flush();
+  assert.equal(env.view().shopping.current.id, H.LIST_2);
+  assert.equal(env.view().shopping.current.status, "loading");
+
+  deleteGate.resolve();
+  assert.deepEqual(await deleting, { ok: true });
+  await flush();
+  assert.equal(env.view().shopping.current.id, H.LIST_2);
+  assert.equal(env.view().shopping.current.status, "loading", "the deletion of A leaves B's own read alone");
+
+  readGate.resolve();
+  assert.deepEqual(await opening, { ok: true });
+  await env.settle();
+  assert.equal(env.view().shopping.current.status, "ready");
+  assert.equal(env.view().shopping.current.id, H.LIST_2);
+  assert.equal(env.view().shopping.current.itemCount, 1, "B's answer is applied");
+  assert.deepEqual(env.view().shopping.lists.map((entry) => entry.id), [H.LIST_2], "A is gone, B is there");
+  assert.equal(env.net.requests("GET", LIST_URL_2).length, 1);
+
+  // The person can go on working with B after the odd interleaving.
+  assert.equal(env.ctl.beginShoppingItemAdd(), true);
+  assert.equal(env.view().shopping.current.adding.phase, "editing");
+  assert.equal(env.view().shopping.current.busy, false);
+});
+
+scenario("a_late_answer_to_a_read_of_a_deleted_list_cannot_bring_it_back", async () => {
+  const env = await openedShoppingList();
+  const readGate = deferred();
+  const deleteGate = deferred();
+  env.net.route("GET", LIST_URL_1, async () => {
+    await readGate.promise;
+    return json(200, borshList());
+  });
+  env.net.route("DELETE", LIST_URL_1, async () => {
+    await deleteGate.promise;
+    return H.removedBody();
+  });
+
+  // A read of A that began before the deletion, still on its way.
+  env.ctl.recheck();
+  await flush();
+  assert.equal(env.net.requests("GET", LIST_URL_1).length, 2);
+
+  assert.equal(env.ctl.askDeleteShoppingList(), true);
+  const deleting = env.ctl.deleteShoppingList();
+  await flush();
+  deleteGate.resolve();
+  assert.deepEqual(await deleting, { ok: true });
+  assert.equal(env.view().shopping.current, null);
+  assert.deepEqual(env.view().shopping.lists, []);
+
+  // The older read lands after the server's confirmation: it cannot put the list back.
+  readGate.resolve();
+  await env.settle();
+  assert.equal(env.view().shopping.current, null);
+  assert.deepEqual(env.view().shopping.lists, []);
+  assert.equal(env.net.requests("GET", LIST_URL_1).length, 2, "late answers start no second read");
+});
+
+scenario("a_failed_deletion_does_not_disturb_another_list_being_read", async () => {
+  const env = await openedShoppingList();
+  const plov = H.shoppingDetail(H.LIST_2, "Плов", "active", [
+    H.shoppingItem(ITEM_4, 0, "рис", "200 г", "unchecked"),
+  ]);
+  const deleteGate = deferred();
+  const readGate = deferred();
+  env.net.route("DELETE", LIST_URL_1, async () => {
+    await deleteGate.promise;
+    return fail();
+  });
+  env.net.route("GET", LIST_URL_2, async () => {
+    await readGate.promise;
+    return json(200, plov);
+  });
+
+  assert.equal(env.ctl.askDeleteShoppingList(), true);
+  const deleting = env.ctl.deleteShoppingList();
+  await flush();
+  const opening = env.ctl.openShoppingList(H.LIST_2);
+  await flush();
+
+  deleteGate.resolve();
+  assert.deepEqual(await deleting, { ok: false, reason: "uncertain" });
+  await flush();
+  assert.equal(env.view().shopping.current.id, H.LIST_2);
+  assert.equal(env.view().shopping.current.status, "loading", "the failure of A's deletion leaves B's read alone");
+  assert.ok(
+    env.view().shopping.lists.some((entry) => entry.id === H.LIST_1),
+    "a failed deletion removes nothing locally"
+  );
+
+  readGate.resolve();
+  assert.deepEqual(await opening, { ok: true });
+  await env.settle();
+  assert.equal(env.view().shopping.current.status, "ready");
+  assert.equal(env.view().shopping.current.id, H.LIST_2);
+  assert.deepEqual(
+    env.view().shopping.lists.map((entry) => entry.id).sort(),
+    [H.LIST_1, H.LIST_2].sort(),
+    "A stays until a deletion is confirmed, and B is there"
+  );
+});
+
+scenario("a_session_that_ends_while_a_deletion_and_another_read_are_out_leaves_nothing_behind", async () => {
+  const env = await openedShoppingList();
+  const plov = H.shoppingDetail(H.LIST_2, "Плов", "active", [
+    H.shoppingItem(ITEM_4, 0, "рис", "200 г", "unchecked"),
+  ]);
+  const deleteGate = deferred();
+  const readGate = deferred();
+  env.net.route("DELETE", LIST_URL_1, async () => {
+    await deleteGate.promise;
+    return H.removedBody();
+  });
+  env.net.route("GET", LIST_URL_2, async () => {
+    await readGate.promise;
+    return json(200, plov);
+  });
+
+  assert.equal(env.ctl.askDeleteShoppingList(), true);
+  const deleting = env.ctl.deleteShoppingList();
+  await flush();
+  const opening = env.ctl.openShoppingList(H.LIST_2);
+  await flush();
+
+  await env.timers.advance(86400 * 1000 + 1000);
+  env.ctl.checkSession();
+  assert.equal(env.view().screen, "login");
+
+  deleteGate.resolve();
+  readGate.resolve();
+  assert.deepEqual(await deleting, { ok: false, reason: "stale" });
+  assert.deepEqual(await opening, { ok: false, reason: "stale" });
+  await env.settle();
+  assert.equal(env.view().screen, "login");
+  assert.deepEqual(env.view().shopping.lists, []);
+  assert.equal(env.view().shopping.current, null);
+});
+
+scenario("a_deletion_that_fails_keeps_the_list_and_is_never_sent_again_by_itself", async () => {
+  const env = await openedShoppingList();
+  env.net.route("DELETE", LIST_URL_1, fail());
+  env.net.route("GET", LIST_URL_1, json(200, borshList()), json(200, borshList()));
+
+  assert.equal(env.ctl.askDeleteShoppingList(), true);
+  const result = await env.ctl.deleteShoppingList();
+  await env.settle();
+
+  assert.deepEqual(result, { ok: false, reason: "uncertain" });
+  assert.equal(env.net.requests("DELETE", LIST_URL_1).length, 1, "nothing is sent again by itself");
+  assert.equal(env.view().shopping.current.id, H.LIST_1, "a failed deletion removes nothing locally");
+  assert.deepEqual(env.view().shopping.lists.map((item) => item.id), [H.LIST_1]);
+  assert.equal(env.view().shopping.current.deleting.phase, "error");
+});
+
+scenario("a_list_removed_elsewhere_leaves_the_ui_with_an_explanation", async () => {
+  const env = await withShopping();
+  env.net.route("GET", SHOP_URL, H.shoppingListsBody([]));
+  env.net.route("GET", LIST_URL_1, apiError(404, "shopping_list_not_found"));
+
+  const result = await env.ctl.openShoppingList(H.LIST_1);
+  await env.settle();
+
+  assert.deepEqual(result, { ok: false, reason: "gone" });
+  assert.equal(env.view().shopping.current, null);
+  assert.equal(env.view().shopping.notice.text, Logic.TEXT.shoppingListGone);
+});
+
+scenario("a_late_answer_about_a_list_that_is_no_longer_open_changes_nothing", async () => {
+  const env = await withShopping();
+  env.net.route("GET", SHOP_URL, H.shoppingListsBody([H.shoppingSummary(borshList()), H.shoppingSummary(H.shoppingDetail(H.LIST_2, "Плов", "active", []))]));
+  const slow = deferred();
+  env.net.route("GET", LIST_URL_1, async () => {
+    await slow.promise;
+    return json(200, borshList());
+  });
+  env.net.route("GET", LIST_URL_2, json(200, H.shoppingDetail(H.LIST_2, "Плов", "active", [])));
+
+  const first = env.ctl.openShoppingList(H.LIST_1);
+  await flush();
+  await env.ctl.openShoppingList(H.LIST_2);
+  slow.resolve();
+  await first;
+  await env.settle();
+
+  assert.equal(env.view().shopping.current.id, H.LIST_2);
+  assert.equal(env.view().shopping.current.title, "Плов");
+});
+
+scenario("the_session_ending_clears_every_shopping_list_and_draft", async () => {
+  const env = await openedShoppingList();
+  env.net.route("PATCH", `${LIST_URL_1}/items/${H.ITEM_2}`, notAuthenticated());
+
+  await env.ctl.setShoppingItemState(H.ITEM_2, "purchased");
+  await env.settle();
+
+  const view = env.view();
+  assert.equal(view.screen, "login");
+  assert.equal(view.section, "chats");
+  assert.deepEqual(view.shopping.lists, []);
+  assert.equal(view.shopping.current, null);
+  assert.equal(view.shopping.draft, null);
+});
+
+scenario("another_person_signing_in_gets_no_shopping_list_of_the_last_one", async () => {
+  const env = await openedShoppingList();
+  env.net.route("GET", "/auth/me", me(86400, USER_B));
+  env.net.route("GET", "/api/conversations", listBody([]));
+  env.net.route("GET", "/api/favorites", H.favoritesBody([]));
+
+  env.ctl.recheck();
+  await env.settle();
+
+  const view = env.view();
+  assert.equal(view.screen, "app");
+  assert.equal(view.currentId, null);
+  assert.deepEqual(view.shopping.lists, []);
+  assert.equal(view.shopping.current, null);
+  assert.equal(view.shopping.draft, null);
+});
+
+scenario("a_draft_is_not_lost_when_the_page_asks_again_who_is_signed_in", async () => {
+  const env = await withShopping();
+  await env.ctl.beginShoppingDraftFromRecipe(CONV_A, 2, 0);
+  env.ctl.toggleShoppingDraftAtHome(0, true);
+  assert.equal(env.view().shopping.draft.remaining, 2);
+
+  env.ctl.recheck(); // the tab became visible again: the same person, the server is asked afresh
+  await env.settle();
+
+  const view = env.view();
+  assert.equal(view.screen, "app");
+  assert.equal(view.section, "shopping");
+  assert.equal(view.shopping.draft.remaining, 2, "the unread draft is exactly as it was");
+  assert.equal(view.shopping.draft.ingredients[0].atHome, true);
+  assert.equal(env.net.requests("POST", SHOP_URL).length, 0);
+});
+
+scenario("a_background_refresh_does_not_overwrite_a_state_change_in_flight", async () => {
+  const env = await withShopping();
+  env.net.route("GET", SHOP_URL, shoppingListBody(borshList()));
+  env.net.route("GET", LIST_URL_1, json(200, borshList()));
+  await env.ctl.openShoppingList(H.LIST_1);
+  const gate = deferred();
+  env.net.route("PATCH", `${LIST_URL_1}/items/${H.ITEM_2}`, async () => {
+    await gate.promise;
+    return json(200, H.shoppingItem(H.ITEM_2, 1, "капуста", "300 г", "purchased"));
+  });
+
+  const changing = env.ctl.setShoppingItemState(H.ITEM_2, "purchased");
+  await flush();
+  env.ctl.showSection("shopping"); // the return to the lists, while the write is out
+  await flush();
+  assert.equal(env.net.requests("GET", LIST_URL_1).length, 1, "the open list is not read over a write in flight");
+  gate.resolve();
+  await changing;
+  await env.settle();
+
+  assert.equal(env.view().shopping.current.counts.purchased, 1);
+  assert.equal(env.net.requests("GET", LIST_URL_1).length, 1);
+});
+
+scenario("a_list_read_overtaken_by_a_new_list_does_not_leave_the_panel_loading", async () => {
+  const env = await withShopping();
+  const gate = deferred();
+  env.net.route("GET", SHOP_URL, async () => {
+    await gate.promise;
+    return H.shoppingListsBody([]);
+  });
+  env.net.route("POST", SHOP_URL, json(201, borshList()));
+
+  env.ctl.showSection("shopping");
+  await flush();
+  assert.equal(env.view().shopping.status, "loading");
+  await env.ctl.beginShoppingDraftFromRecipe(CONV_A, 2, 0);
+  const saved = await env.ctl.saveShoppingDraft();
+  assert.equal(saved.ok, true);
+  gate.resolve();
+  await env.settle();
+
+  assert.deepEqual([env.view().shopping.status, env.view().shopping.lists.map((item) => item.id)], ["ready", [H.LIST_1]]);
+  assert.equal(env.view().shopping.current.id, H.LIST_1);
+});
+
+scenario("a_shopping_list_read_that_fails_says_so_and_can_be_asked_again", async () => {
+  const env = await withShopping();
+  env.net.route("GET", SHOP_URL, fail(), H.shoppingListsBody([]));
+
+  env.ctl.showSection("shopping");
+  await env.settle();
+  assert.deepEqual([env.view().shopping.status, env.view().shopping.error.text], ["error", Logic.TEXT.network]);
+  assert.deepEqual(env.view().shopping.lists, []);
+
+  await env.ctl.reloadShoppingLists();
+  await env.settle();
+  assert.deepEqual([env.view().shopping.status, env.view().shopping.lists], ["ready", []]);
+  assert.equal(env.view().shopping.empty, true);
+});
+
+scenario("coming_back_to_the_page_while_a_list_is_open_reads_it_again", async () => {
+  const env = await withShopping();
+  env.net.route("GET", SHOP_URL, shoppingListBody(borshList()));
+  env.net.route("GET", LIST_URL_1, json(200, borshList()));
+  await env.ctl.openShoppingList(H.LIST_1);
+  assert.equal(env.net.requests("GET", LIST_URL_1).length, 1);
+
+  env.ctl.recheck(); // the same person, checked with the server
+  await env.settle();
+
+  assert.equal(env.view().screen, "app");
+  assert.equal(env.view().shopping.current.id, H.LIST_1);
+  assert.equal(env.net.requests("GET", LIST_URL_1).length, 2, "the open list is read from the server again");
+  assert.equal(env.net.requests("GET", SHOP_URL).length, 1, "and the lists with it");
+});
+
+scenario("a_draft_with_everything_at_home_is_still_a_saveable_list", async () => {
+  const env = await withShopping();
+  env.net.route("POST", SHOP_URL, json(201, borshList("active", BORSH_ITEMS.map((item) => ({ ...item, state: "at_home" })))));
+
+  await env.ctl.beginShoppingDraftFromRecipe(CONV_A, 2, 0);
+  for (let position = 0; position < 3; position++) {
+    env.ctl.toggleShoppingDraftAtHome(position, true);
+  }
+  assert.equal(env.view().shopping.draft.remaining, 0);
+  const result = await env.ctl.saveShoppingDraft();
+  await env.settle();
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(env.net.requests("POST", SHOP_URL)[0].body.item_states.map((state) => [state.position, state.state]), [
+    [0, "at_home"],
+    [1, "at_home"],
+    [2, "at_home"],
+  ]);
+  assert.deepEqual(env.view().shopping.current.counts, { total: 3, unchecked: 0, at_home: 3, purchased: 0 });
+});
+
+scenario("only_identifiers_and_states_that_can_be_one_are_sent", async () => {
+  const env = await withShopping();
+
+  for (const source of [["x", 2, 0], [CONV_A, 0, 0], [CONV_A, 2, -1], [CONV_A, 2, 5], [CONV_A, "2", 0]]) {
+    assert.equal((await env.ctl.beginShoppingDraftFromRecipe(...source)).reason, "invalid");
+  }
+  assert.equal(env.net.requests("GET", /recipes/).length, 0);
+
+  const opened = await openedShoppingList();
+  assert.deepEqual(await opened.ctl.setShoppingItemState(H.ITEM_2, "lost"), { ok: false, reason: "invalid" });
+  assert.deepEqual(await opened.ctl.setShoppingItemState("not-an-id", "purchased"), { ok: false, reason: "invalid" });
+  assert.equal(opened.net.requests("PATCH", /items/).length, 0);
+});
+
+// ============================================================================================
+// The last draft protection: a save that is out, or whose answer was lost, is unsaved work
+// ============================================================================================
+
+scenario("a_draft_is_unsaved_while_its_save_is_out_or_in_doubt", async () => {
+  const env = await withShopping();
+  await env.ctl.beginShoppingDraftFromRecipe(CONV_A, 2, 0);
+  assert.equal(env.ctl.shoppingDraftDirty(), false, "an untouched draft is not unsaved work");
+  env.ctl.toggleShoppingDraftAtHome(0, true);
+  assert.equal(env.ctl.shoppingDraftDirty(), true, "a mark is unsaved work");
+
+  const gate = deferred();
+  env.net.route("POST", SHOP_URL, async () => {
+    await gate.promise;
+    return json(201, borshList());
+  });
+  const saving = env.ctl.saveShoppingDraft();
+  await flush();
+  assert.equal(env.view().shopping.draft.phase, "saving");
+  assert.equal(env.ctl.shoppingDraftDirty(), true, "the save is still out, so the draft is still unsaved");
+  assert.equal(env.ctl.cancelShoppingDraft().ok, false, "the draft cannot be discarded while the save is out");
+
+  gate.resolve();
+  assert.equal((await saving).ok, true);
+  await env.settle();
+  assert.equal(env.ctl.shoppingDraftDirty(), false, "a confirmed save ends the question");
+
+  // An answer that never came leaves the draft, with its key and frozen payload, for a retry.
+  await env.ctl.beginShoppingDraftFromRecipe(CONV_A, 2, 0);
+  env.ctl.toggleShoppingDraftAtHome(0, true);
+  env.net.route("POST", SHOP_URL, fail());
+  assert.deepEqual((await env.ctl.saveShoppingDraft()).reason, "uncertain");
+  const draft = env.ctl._state().shopping.draft;
+  assert.equal(draft.phase, "uncertain");
+  assert.ok(draft.key, "the key is not thrown away");
+  assert.ok(draft.payload, "the frozen payload is not thrown away");
+  assert.equal(env.ctl.shoppingDraftDirty(), true, "a save of an unknown outcome is still unsaved work");
+
+  assert.deepEqual(env.ctl.cancelShoppingDraft(), { ok: true, origin: "chats" });
+  assert.equal(env.ctl.shoppingDraftDirty(), false, "an explicitly discarded draft ends the question");
+});
+
+scenario("an_unmarked_draft_is_unsaved_while_its_save_is_out_or_in_doubt", async () => {
+  const env = await withShopping();
+  const draft = () => env.ctl._state().shopping.draft;
+  const unmarked = () => draft() !== null && !draft().atHome.some(Boolean);
+
+  await env.ctl.beginShoppingDraftFromRecipe(CONV_A, 2, 0);
+  assert.equal(env.ctl.shoppingDraftDirty(), false, "an untouched draft is not unsaved work");
+
+  // Nothing is marked, but the save is out: its key and its frozen payload are the only way to
+  // learn whether the list was made, and leaving would take them with the page.
+  const gate = deferred();
+  env.net.route("POST", SHOP_URL, async () => {
+    await gate.promise;
+    return json(201, borshList("active", []));
+  });
+  const saving = env.ctl.saveShoppingDraft();
+  await flush();
+  assert.equal(draft().phase, "saving");
+  assert.equal(unmarked(), true, "the draft is still unmarked");
+  assert.equal(env.ctl.shoppingDraftDirty(), true, "an unmarked save that is out is unsaved work");
+  assert.deepEqual(env.ctl.cancelShoppingDraft(), { ok: false, reason: "busy" }, "the draft cannot be discarded while the save is out");
+
+  gate.resolve();
+  assert.equal((await saving).ok, true);
+  await env.settle();
+  assert.equal(env.ctl.shoppingDraftDirty(), false, "a confirmed save ends the question");
+
+  // An answer that never came leaves the unmarked draft, with its key and frozen payload.
+  await env.ctl.beginShoppingDraftFromRecipe(CONV_A, 2, 0);
+  env.net.route("POST", SHOP_URL, fail());
+  assert.deepEqual((await env.ctl.saveShoppingDraft()).reason, "uncertain");
+  assert.equal(draft().phase, "uncertain");
+  assert.equal(unmarked(), true, "the draft is still unmarked");
+  assert.ok(draft().key, "the key is not thrown away");
+  assert.ok(draft().payload, "the frozen payload is not thrown away");
+  assert.equal(env.ctl.shoppingDraftDirty(), true, "an unmarked save of an unknown outcome is unsaved work");
+
+  // The retry with the same key settles it: nothing is left to warn about.
+  env.net.route("POST", SHOP_URL, json(200, { ...borshList("active", []), created: false }));
+  assert.equal((await env.ctl.retryShoppingDraft()).ok, true);
+  await env.settle();
+  assert.equal(env.ctl.shoppingDraftDirty(), false, "the confirmed retry ends the question");
+
+  // An explicit discard of an unmarked draft whose save is in doubt ends it too.
+  await env.ctl.beginShoppingDraftFromRecipe(CONV_A, 2, 0);
+  env.net.route("POST", SHOP_URL, fail());
+  assert.deepEqual((await env.ctl.saveShoppingDraft()).reason, "uncertain");
+  assert.equal(env.ctl.shoppingDraftDirty(), true);
+  assert.deepEqual(env.ctl.cancelShoppingDraft(), { ok: true, origin: "chats" });
+  assert.equal(env.ctl.shoppingDraftDirty(), false, "an explicitly discarded draft ends the question");
+
+  // A session that ends takes the unmarked draft and its save with it: nothing of it is unsaved
+  // work, and the answer that comes later brings nothing back. (settle() would wait for the save
+  // that is still out, so the page is only flushed while its answer is held.)
+  await env.ctl.beginShoppingDraftFromRecipe(CONV_A, 2, 0);
+  const late = deferred();
+  env.net.route("POST", SHOP_URL, async () => {
+    await late.promise;
+    return json(201, borshList("active", []));
+  });
+  const savingEnded = env.ctl.saveShoppingDraft();
+  await flush();
+  assert.equal(env.ctl.shoppingDraftDirty(), true);
+  env.net.route("GET", "/auth/me", notAuthenticated());
+  env.ctl.recheck();
+  await flush();
+  assert.equal(env.view().screen, "login");
+  assert.equal(env.ctl._state().shopping.draft, null);
+  assert.equal(env.ctl.shoppingDraftDirty(), false, "nothing of the ended session is unsaved work");
+  late.resolve();
+  await savingEnded;
+  await env.settle();
+  assert.equal(env.ctl._state().shopping.draft, null, "the late answer does not bring the draft back");
+  assert.equal(env.ctl.shoppingDraftDirty(), false);
+});
+
+// ============================================================================================
+// The per-list read counts belong to one page of one person, and are released with it
+// ============================================================================================
+
+const OTHER_LIST = "dddddddd-dddd-4ddd-8ddd-ddddddddddd1";
+
+function signInAs(env, userId, conversations, histories = {}) {
+  env.net.route("GET", "/auth/me", me(86400, userId));
+  env.net.route("GET", "/api/conversations", listBody(conversations));
+  for (const conversationItem of conversations) {
+    env.net.route(
+      "GET",
+      new RegExp("/api/conversations/" + conversationItem.id + "/messages(\\?|$)"),
+      histories[conversationItem.id] || historyBody(conversationItem.id, [])
+    );
+  }
+}
+
+scenario("the_per_list_read_counts_are_released_with_the_account_and_do_not_accumulate", async () => {
+  const env = await withShopping();
+  const plov = H.shoppingDetail(H.LIST_2, "Плов", "active", [
+    H.shoppingItem(H.ITEM_3, 0, "рис", "200 г", "unchecked"),
+  ]);
+  env.net.route("GET", SHOP_URL, H.shoppingListsBody([H.shoppingSummary(borshList()), H.shoppingSummary(plov)]));
+  env.net.route("GET", LIST_URL_1, json(200, borshList()));
+  env.net.route("GET", LIST_URL_2, json(200, plov));
+
+  env.ctl.showSection("shopping");
+  await env.settle();
+  assert.deepEqual(await env.ctl.openShoppingList(H.LIST_1), { ok: true });
+  assert.deepEqual(await env.ctl.openShoppingList(H.LIST_2), { ok: true });
+  assert.deepEqual(
+    env.ctl._state().shoppingDetailReads,
+    { [H.LIST_1]: 1, [H.LIST_2]: 1 },
+    "every list that was read has its own count"
+  );
+
+  // Another person signs in: nothing of the last person's counts is kept.
+  signInAs(env, USER_B, []);
+  env.ctl.recheck();
+  await env.settle();
+  assert.equal(env.view().screen, "app");
+  assert.deepEqual(env.ctl._state().shoppingDetailReads, {}, "the counts are released with the account");
+
+  // The first read of his page starts from nothing.
+  const other = H.shoppingDetail(OTHER_LIST, "Суп", "active", [
+    H.shoppingItem(H.ITEM_1, 0, "лук", "1 шт.", "unchecked"),
+  ]);
+  env.net.route("GET", SHOP_URL, H.shoppingListsBody([H.shoppingSummary(other)]));
+  env.net.route("GET", `/api/shopping-lists/${OTHER_LIST}`, json(200, other));
+  env.ctl.showSection("shopping");
+  await env.settle();
+  assert.deepEqual(await env.ctl.openShoppingList(OTHER_LIST), { ok: true });
+  assert.deepEqual(env.ctl._state().shoppingDetailReads, { [OTHER_LIST]: 1 });
+
+  // Back and forth twice: each page starts over, and no list of an earlier page is retained.
+  signInAs(env, USER_A, [conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Старый вопрос"), message(2, "assistant", "Старый ответ")]),
+  });
+  env.ctl.recheck();
+  await env.settle();
+  assert.deepEqual(env.ctl._state().shoppingDetailReads, {});
+  env.ctl.showSection("shopping");
+  await env.settle();
+  assert.deepEqual(await env.ctl.openShoppingList(H.LIST_1), { ok: true });
+  assert.deepEqual(env.ctl._state().shoppingDetailReads, { [H.LIST_1]: 1 }, "her list is read as her page's first");
+
+  signInAs(env, USER_B, []);
+  env.ctl.recheck();
+  await env.settle();
+  assert.deepEqual(env.ctl._state().shoppingDetailReads, {});
+  env.ctl.showSection("shopping");
+  await env.settle();
+  env.net.route("GET", `/api/shopping-lists/${OTHER_LIST}`, json(200, other));
+  assert.deepEqual(await env.ctl.openShoppingList(OTHER_LIST), { ok: true });
+  assert.deepEqual(
+    env.ctl._state().shoppingDetailReads,
+    { [OTHER_LIST]: 1 },
+    "three account changes leave only the current page's own counts"
+  );
+});
+
+scenario("a_read_of_the_previous_account_never_lands_in_the_next_ones_page", async () => {
+  const env = await withShopping();
+  env.net.route("GET", SHOP_URL, H.shoppingListsBody([H.shoppingSummary(borshList())]));
+  const slow = deferred();
+  env.net.route("GET", LIST_URL_1, async () => {
+    await slow.promise;
+    return json(200, borshList());
+  });
+
+  const reading = env.ctl.openShoppingList(H.LIST_1);
+  await flush();
+  assert.equal(env.net.requests("GET", LIST_URL_1).length, 1);
+  assert.deepEqual(Object.keys(env.ctl._state().shoppingDetailReads), [H.LIST_1]);
+
+  // Another person signs in while the read is still out.
+  signInAs(env, USER_B, []);
+  env.ctl.recheck();
+  await flush(80); // (not settle: the previous person's read is deliberately still out)
+  assert.equal(env.view().screen, "app");
+  assert.deepEqual(env.ctl._state().shoppingDetailReads, {});
+
+  // The old answer lands: it is applied to nothing and reported as stale.
+  slow.resolve();
+  assert.deepEqual(await reading, { ok: false, reason: "stale" });
+  await env.settle();
+  assert.equal(env.view().shopping.current, null);
+  assert.deepEqual(env.view().shopping.lists, []);
+
+  // Normal reads and writes work on the new page.
+  const other = H.shoppingDetail(OTHER_LIST, "Суп", "active", [
+    H.shoppingItem(H.ITEM_2, 0, "лук", "1 шт.", "unchecked"),
+  ]);
+  env.net.route("GET", SHOP_URL, H.shoppingListsBody([H.shoppingSummary(other)]));
+  env.net.route("GET", `/api/shopping-lists/${OTHER_LIST}`, json(200, other));
+  env.net.route(
+    "PATCH",
+    `/api/shopping-lists/${OTHER_LIST}/items/${H.ITEM_2}`,
+    json(200, H.shoppingItem(H.ITEM_2, 0, "лук", "1 шт.", "purchased"))
+  );
+  env.ctl.showSection("shopping");
+  await env.settle();
+  assert.deepEqual(await env.ctl.openShoppingList(OTHER_LIST), { ok: true });
+  assert.deepEqual(env.ctl._state().shoppingDetailReads, { [OTHER_LIST]: 1 });
+
+  const changed = await env.ctl.setShoppingItemState(H.ITEM_2, "purchased");
+  await env.settle();
+  assert.equal(changed.ok, true);
+  assert.equal(env.view().shopping.current.counts.purchased, 1, "a write works after the reset");
+});
+
 module.exports = scenarios;

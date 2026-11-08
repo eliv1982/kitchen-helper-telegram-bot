@@ -26,6 +26,7 @@ from tests.test_persistence_migrations import (
     LATER,
     RECIPES,
     TELEGRAM,
+    TELEGRAM_ACTIVE,
     _fingerprint,
     _offline_sql,
     _r4c_database,
@@ -41,7 +42,15 @@ ADMISSION_TABLES = {"telegram_update_admissions"}
 NEW_TABLES = ACTIVE_TABLES | ADMISSION_TABLES
 PHOTO_TABLES = {"message_attachments"}
 RECIPE_TABLES = {"message_recipes"}
-OLD_TABLES = TABLES - TELEGRAM_TABLES - NEW_TABLES - PHOTO_TABLES - RECIPE_TABLES
+SHOPPING_TABLES = {"shopping_lists", "shopping_list_items", "shopping_list_requests"}
+OLD_TABLES = (
+    TABLES
+    - TELEGRAM_TABLES
+    - NEW_TABLES
+    - PHOTO_TABLES
+    - RECIPE_TABLES
+    - SHOPPING_TABLES
+)
 
 
 @pytest.fixture
@@ -160,14 +169,14 @@ def test_the_0011_migration_adds_two_empty_tables_and_changes_no_row(tmp_path):
     try:
         _r4c_database(engine)  # users, identity links, sessions, conversations, messages, invitations, states
         upgrade_database(engine, RECIPES)
-        before = _snapshot_of(engine, TABLES - NEW_TABLES)
+        before = _snapshot_of(engine, TABLES - NEW_TABLES - SHOPPING_TABLES)
         assert _version(engine) == [RECIPES]
 
         upgrade_database(engine)
 
         assert _version(engine) == [HEAD]
         assert _tables(engine) == TABLES | {"alembic_version"}
-        assert _snapshot_of(engine, TABLES - NEW_TABLES) == before  # every old row
+        assert _snapshot_of(engine, TABLES - NEW_TABLES - SHOPPING_TABLES) == before  # every old row
         with engine.connect() as connection:
             assert connection.exec_driver_sql(
                 "SELECT count(*) FROM telegram_active_conversations"
@@ -264,15 +273,15 @@ def test_the_active_conversation_migration_downgrades_to_the_same_schema(tmp_pat
         upgrade_database(pristine, RECIPES)
         with create_session_factory(migrated)() as db, db.begin():
             db.add(User(display_name="Elena"))
-        before = _snapshot_of(migrated, TABLES - NEW_TABLES)
+        before = _snapshot_of(migrated, TABLES - NEW_TABLES - SHOPPING_TABLES)
         upgrade_database(migrated)
 
         downgrade_database(migrated, RECIPES)
 
         assert _version(migrated) == [RECIPES]
-        assert _tables(migrated) == (TABLES - NEW_TABLES) | {"alembic_version"}
+        assert _tables(migrated) == (TABLES - NEW_TABLES - SHOPPING_TABLES) | {"alembic_version"}
         assert _fingerprint(migrated) == _fingerprint(pristine)  # the 0010 schema, exactly
-        assert _snapshot_of(migrated, TABLES - NEW_TABLES) == before
+        assert _snapshot_of(migrated, TABLES - NEW_TABLES - SHOPPING_TABLES) == before
 
         upgrade_database(migrated)  # and forward again: empty tables, as they began
         assert _version(migrated) == [HEAD]
@@ -325,8 +334,14 @@ def test_the_two_revisions_render_as_postgresql_sql_that_only_creates_tables_and
         (TELEGRAM, ATTACHMENTS, ["message_attachments"], 2),
         (
             RECIPES,
-            HEAD,
+            TELEGRAM_ACTIVE,
             ["telegram_active_conversations", "telegram_update_admissions"],
+            2,
+        ),
+        (
+            TELEGRAM_ACTIVE,
+            HEAD,
+            ["shopping_lists", "shopping_list_items", "shopping_list_requests"],
             2,
         ),
     ]:
@@ -353,6 +368,11 @@ def test_the_two_revisions_render_as_postgresql_sql_that_only_creates_tables_and
     down = _offline_sql("down_from_head")
     uncommented = re.sub(r"^--.*$", "", down, flags=re.MULTILINE)
     assert re.findall(r"^DROP [^;]*", uncommented, re.MULTILINE) == [
+        "DROP INDEX ix_shopping_list_requests_list_id",
+        "DROP TABLE shopping_list_requests",
+        "DROP TABLE shopping_list_items",
+        "DROP INDEX ix_shopping_lists_user_id_created_at",
+        "DROP TABLE shopping_lists",
         "DROP INDEX ix_telegram_update_admissions_expires_at",
         "DROP TABLE telegram_update_admissions",
         "DROP INDEX ix_telegram_active_conversations_conversation_id",

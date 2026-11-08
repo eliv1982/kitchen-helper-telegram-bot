@@ -33,6 +33,7 @@ import uvicorn
 from sqlalchemy.exc import SQLAlchemyError
 
 from house_helper.core.backend import BackendConnectionError, BackendReply
+from house_helper.core.recipes import Ingredient, Recipe, render_recipe
 from house_helper.persistence import authn
 from house_helper.persistence.base import utcnow
 from house_helper.persistence.database import create_db_engine, create_session_factory, upgrade_database
@@ -69,6 +70,15 @@ class LiveBackend:
             await asyncio.sleep(0.8)
         if text.startswith("break always") or (text.startswith("break once") and first_time):
             raise BackendConnectionError("the assistant is down")
+        if text.startswith("борщ"):
+            recipe = Recipe(
+                index=0,
+                title="Борщ",
+                servings="4 порции",
+                ingredients=(Ingredient("свёкла", "2 шт."), Ingredient("мясо", "500 г")),
+                steps=("Сварите бульон.",),
+            )
+            return BackendReply(text=render_recipe(recipe), recipes=(recipe,))
         return BackendReply(text="Ответ на: " + text)
 
 
@@ -223,6 +233,9 @@ EXPECTED = {
     "favorites_belong_to_the_person_who_kept_them": (Counter({"секрет рецепт Анны": 1}), (1, 1)),
     "deleting_a_conversation_keeps_its_favorite_and_returns_to_a_new_draft": (
         Counter({"Удалить это?": 1}), (0, 0)
+    ),
+    "a_shopping_list_is_saved_from_a_recipe_and_kept_across_devices": (
+        Counter({"борщ для списка": 1}), (1, 1)
     ),
 }
 

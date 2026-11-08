@@ -40,9 +40,14 @@ deleting the conversation it names only nulls it, by that table's own foreign ke
 cutover row in the admission ledger (a record of when the ledger began, not an update), anything
 alembic owns, and any table that is not named here (the favourites are one: favorite_recipes
 holds copies of answers that a person chose to keep, with no deadline and no key to the
-history, and this module does not know it; the long-term preferences of the product
-requirements are not in this schema yet, and when they arrive they will be independent tables
-too). A new table is therefore safe by default.
+history, and this module does not know it; the saved shopping lists are another:
+shopping_lists and shopping_list_items hold a complete ingredient snapshot a person keeps,
+with no deadline and no key to the recipe they came from, and deleting a list (or its user)
+is the only thing that removes them; shopping_list_requests holds the idempotency key of
+each creation request for the life of the account, so a deleted list's key stays consumed,
+and only deleting the user removes those rows; the long-term preferences of the product requirements
+are not in this schema yet, and when they arrive they will be independent tables too). A new
+table is therefore safe by default.
 
 Order, which is what the foreign keys demand: sessions, login states, emailed links,
 invitations (after the states bound to them), pairing codes, update admission markers (which

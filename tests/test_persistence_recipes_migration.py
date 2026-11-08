@@ -45,6 +45,9 @@ OTHER_TABLES = TABLES - {
     "message_recipes",
     "telegram_active_conversations",
     "telegram_update_admissions",
+    "shopping_lists",
+    "shopping_list_items",
+    "shopping_list_requests",
 }
 
 BORSH = {"name": "свёкла", "amount": "2 шт."}
@@ -337,7 +340,7 @@ def test_the_way_back_restores_0009_and_keeps_every_text_favorite(tmp_path):
         downgrade_database(migrated, ATTACHMENTS)
 
         assert _version(migrated) == [ATTACHMENTS]
-        assert _tables(migrated) == TABLES - {"message_recipes", "telegram_active_conversations", "telegram_update_admissions"} | {"alembic_version"}
+        assert _tables(migrated) == TABLES - {"message_recipes", "telegram_active_conversations", "telegram_update_admissions", "shopping_lists", "shopping_list_items", "shopping_list_requests"} | {"alembic_version"}
         assert _fingerprint(migrated) == _fingerprint(pristine)  # the 0009 schema, exactly
         assert _favorite_rows(migrated) == old_rows
         assert _snapshot_of(migrated, OTHER_TABLES) == others_before

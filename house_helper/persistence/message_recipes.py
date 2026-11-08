@@ -49,6 +49,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Session as OrmSession
 
 from house_helper.core.recipes import Ingredient, Recipe, parse_reply, validate_recipe
+from house_helper.persistence.conversations import ConversationNotFound
 from house_helper.persistence.models import (
     Conversation,
     Message,
@@ -332,6 +333,45 @@ def get_recipe_for_user(
     return _checked(recipe_at(session, message_id, position))
 
 
+def get_recipe_in_conversation(
+    session: OrmSession,
+    user_id: UUID,
+    conversation_id: UUID,
+    message_id: int,
+    position: int,
+    *,
+    now: datetime,
+) -> StoredRecipe:
+    """One recipe of an unexpired assistant message of the user's named conversation.
+
+    The same rule as get_recipe_for_user with the conversation named as well, for a
+    caller that identifies the source by both ids (the shopping-list screen reads the
+    recipe it is about to copy). ConversationNotFound if the conversation is not the
+    user's (unknown and somebody else's are not told apart); MessageNotFound if it holds
+    no such unexpired assistant message; RecipeNotFound if the answer has no accepted
+    recipe at that position. A plain read; the recipe is validated again by the
+    protocol's own rules before it is returned.
+    """
+    found = session.scalar(
+        sa.select(Conversation.id).where(
+            Conversation.id == conversation_id, Conversation.user_id == user_id
+        )
+    )
+    if found is None:
+        raise ConversationNotFound
+    message = session.scalar(
+        sa.select(Message.id).where(
+            Message.id == message_id,
+            Message.conversation_id == conversation_id,
+            Message.role == MessageRole.ASSISTANT.value,
+            Message.expires_at > now,
+        )
+    )
+    if message is None:
+        raise MessageNotFound
+    return _checked(recipe_at(session, message_id, position))
+
+
 def message_ids_with_recipes(
     session: OrmSession, message_ids: Iterable[int]
 ) -> set[int]:
@@ -354,6 +394,7 @@ __all__ = [
     "RecipeSummary",
     "StoredRecipe",
     "get_recipe_for_user",
+    "get_recipe_in_conversation",
     "message_ids_with_recipes",
     "recipe_at",
     "recipes_for_message",

@@ -113,6 +113,9 @@
   var MAX_EDIT_STEP = 1000; // the protocol's MAX_STEP_LENGTH
   var MAX_EDIT_TEXT = 100000; // the server's MAX_FAVORITE_TEXT_LENGTH
   var MAX_EDIT_NOTES = 2000; // the server's MAX_FAVORITE_NOTES_LENGTH
+  var MAX_SHOPPING_ITEMS = 200; // the server's shopping_lists.ITEMS_LIMIT
+  var MAX_SHOPPING_NAME = 200; // the server's shopping_lists.MAX_NAME_LENGTH
+  var MAX_SHOPPING_AMOUNT = 100; // the server's shopping_lists.MAX_AMOUNT_LENGTH
   var MAX_AUTO_ATTEMPTS = 24; // waiting for a busy conversation, at 5 s each: about two minutes
   var DEFAULT_RETRY_MS = 5000;
   var MIN_RETRY_MS = 1000;
@@ -265,6 +268,109 @@
     recipeSaved: "В избранном",
     recipeSaveFailed: "Не удалось сохранить рецепт. Попробуйте еще раз.",
     openRecipe: "Открыть",
+    // The shopping lists: a draft of a recipe's ingredients, and the saved checklists.
+    shoppingTab: "Покупки",
+    shoppingTitle: "Мои покупки",
+    shoppingDraftTitle: "Что купить?",
+    shoppingPick: "Выберите список покупок в списке.",
+    shoppingEmpty:
+      "Пока нет списков покупок. Откройте рецепт и нажмите „Что купить?“",
+    shoppingLoading: "Загружаем списки покупок…",
+    shoppingFailed: "Не удалось загрузить списки покупок.",
+    shoppingRetry: "Обновить покупки",
+    shoppingListLoading: "Загружаем список…",
+    shoppingListFailed: "Не удалось загрузить список покупок.",
+    shoppingListGone: "Этот список покупок больше недоступен.",
+    shoppingDraftLoading: "Загружаем рецепт…",
+    shoppingDraftFailed: "Не удалось открыть рецепт для списка покупок.",
+    shoppingDraftInstruction: "Отметьте продукты, которые уже есть дома",
+    shoppingDraftUnsaved: "Изменения в списке не сохранены. Выйти без сохранения?",
+    shoppingRemaining: "Проверить / купить: {count}",
+    shoppingUncheckedNote: "Неотмеченные продукты нужно проверить перед покупками.",
+    shoppingSave: "Сохранить список",
+    shoppingSaving: "Сохраняем список…",
+    shoppingSaved: "Список покупок сохранен",
+    shoppingRetrySave: "Повторить",
+    shoppingSaveNew: "Сохранить новый список",
+    shoppingSaveAgain: "Сохранить снова",
+    shoppingCancel: "Отмена",
+    shoppingUnderstand: "Понятно",
+    shoppingUncertain:
+      "Не удалось получить подтверждение сохранения: связь прервалась. Возможно, список уже сохранен. " +
+      "Нажмите «Повторить» — список не будет создан дважды.",
+    shoppingTimeout:
+      "Сервер слишком долго не отвечает на сохранение. Возможно, список уже сохранен. " +
+      "Нажмите «Повторить» — список не будет создан дважды.",
+    shoppingUncertainServer:
+      "Сервис сообщил об ошибке, но список мог быть сохранен. Нажмите «Повторить» — он не будет создан дважды.",
+    shoppingKeyReused:
+      "Этот ключ запроса уже использован для другого списка покупок. Проверьте отмеченные продукты " +
+      "и сохраните список заново.",
+    shoppingDeletedElsewhere:
+      "Этот список покупок уже удален. Сохраните новый список из рецепта.",
+    shoppingFavoriteConflict:
+      "Этот рецепт изменился. Вернитесь в избранное, откройте его заново и повторите.",
+    shoppingDeletedNotice: "Список покупок удален.",
+    atHome: "Есть дома",
+    toBuy: "Проверить / купить",
+    bought: "Куплено",
+    listActive: "В работе",
+    listCompleted: "Завершен",
+    progress: "Куплено {purchased} из {total}",
+    countToBuy: "Проверить / купить: {count}",
+    countBought: "Куплено: {count}",
+    countAtHome: "Есть дома: {count}",
+    listUpdated: "Обновлено: {when}",
+    completeList: "Завершить список",
+    reopenList: "Вернуть в работу",
+    deleteList: "Удалить список",
+    deleteListAsk:
+      "Удалить список «{title}»? Все его пункты будут удалены без возможности восстановления.",
+    deleteListConfirm: "Удалить",
+    deleteListKeep: "Оставить",
+    deletingList: "Удаляем…",
+    listDeleted: "Список покупок удален.",
+    deleteListFailed: "Не удалось удалить список. Попробуйте еще раз.",
+    listCompletedNote: "Список завершен: пункты нельзя изменить, пока список не возвращен в работу.",
+    listCompletedNow: "Список завершен.",
+    listReopened: "Список возвращен в работу.",
+    completeListFailed: "Не удалось завершить список. Попробуйте еще раз.",
+    reopenListFailed: "Не удалось вернуть список в работу. Попробуйте еще раз.",
+    listChanged: "Список покупок изменился. Мы обновили его.",
+    listStatusFailed: "Не удалось изменить список. Попробуйте еще раз.",
+    addItem: "Добавить продукт",
+    addItemName: "Название продукта",
+    addItemAmount: "Количество (необязательно)",
+    addItemSubmit: "Добавить",
+    addItemCancel: "Отмена",
+    addItemFailed: "Не удалось добавить продукт. Попробуйте еще раз.",
+    addItemUncertain:
+      "Не удалось подтвердить добавление: связь прервалась. Продукт мог быть добавлен. " +
+      "Проверьте список; если его там нет, нажмите «Добавить» еще раз.",
+    itemAdded: "Продукт добавлен.",
+    itemRequired: "Введите название продукта.",
+    itemNameTooLong: "Название слишком длинное (максимум 200 символов).",
+    itemAmountTooLong: "Количество слишком длинное (максимум 100 символов).",
+    itemBadCharacters: "В названии или количестве есть недопустимые символы.",
+    itemEdit: "Изменить",
+    itemSave: "Сохранить",
+    itemEditCancel: "Отмена",
+    itemEditFailed: "Не удалось сохранить изменения. Попробуйте еще раз.",
+    itemSaved: "Изменения сохранены.",
+    itemUpdated: "Пункт обновлен.",
+    itemRemove: "Удалить",
+    itemRemoveAsk: "Удалить этот пункт?",
+    itemRemoveConfirm: "Удалить",
+    itemRemoveKeep: "Оставить",
+    itemRemoving: "Удаляем…",
+    itemRemoved: "Пункт удален.",
+    itemRemoveFailed: "Не удалось удалить пункт. Попробуйте еще раз.",
+    itemStateFailed: "Не удалось изменить пункт. Попробуйте еще раз.",
+    itemNameLabel: "Название",
+    itemAmountLabel: "Количество",
+    itemStateLabel: "Состояние",
+    itemAddLabel: "Добавить продукт",
+    itemsEmpty: "В списке пока нет пунктов.",
     // The card and its editing.
     servings: "Порции",
     ingredients: "Ингредиенты",
@@ -337,6 +443,16 @@
     recipe_not_found: "В этом ответе нет такого рецепта.",
     favorite_conflict: "Этот рецепт уже изменен. Обновите страницу и повторите.",
     favorites_full: "В избранном набралось максимальное число рецептов. Уберите ненужные, чтобы добавить новый.",
+    shopping_list_not_found: "Список покупок не найден.",
+    shopping_list_item_not_found: "Этого пункта нет в списке покупок.",
+    shopping_list_completed: "Список покупок завершен. Откройте его, чтобы изменить.",
+    shopping_lists_full:
+      "Сохранено максимальное число списков покупок. Удалите ненужный, чтобы сохранить новый.",
+    shopping_list_items_full:
+      "В списке покупок максимальное число пунктов. Удалите ненужный, чтобы добавить новый.",
+    shopping_list_key_reused:
+      "Этот ключ запроса уже использован для другого списка покупок. Сохраните список заново.",
+    shopping_list_deleted: "Этот список покупок уже удален. Сохраните новый список.",
     idempotency_key_reused: "Этот ключ запроса уже использован для другого сообщения. Отправьте сообщение заново.",
     conversation_busy: "В этом разговоре еще готовится предыдущий ответ. Подождите немного и повторите.",
     turn_in_progress: "Ответ на это сообщение еще готовится. Подождите немного.",
@@ -1037,6 +1153,295 @@
     return { type: "failed", text: unavailableText(response, error), correlationId: error ? error.correlationId : null };
   }
 
+  // --- shopping lists: what the server says about a saved checklist ------------------------------------
+
+  var SHOPPING_STATES = { unchecked: true, at_home: true, purchased: true };
+  var SHOPPING_STATUSES = { active: true, completed: true };
+  // A shopping-list item is one line with no control character at all (a tab or a newline
+  // included), which is stricter than a message's rule: the server refuses them too.
+  var ITEM_CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f]/;
+
+  function validItemText(value) {
+    return (
+      typeof value === "string" &&
+      value !== "" &&
+      !ITEM_CONTROL_CHARACTER.test(value) &&
+      !hasLoneSurrogate(value)
+    );
+  }
+
+  // The position is the item's order in the list, not its index: the server keeps it
+  // monotonically increasing (max + 1), so a list that has lost items can hold positions
+  // at or above the item cap. Only the number of items is capped.
+  function normalizeShoppingItem(item) {
+    if (
+      !isObject(item) ||
+      typeof item.id !== "string" ||
+      !UUID_PATTERN.test(item.id) ||
+      !isCount(item.position) ||
+      !validItemText(item.name) ||
+      (item.amount !== null && item.amount !== undefined && !validItemText(item.amount)) ||
+      typeof item.state !== "string" ||
+      SHOPPING_STATES[item.state] !== true
+    ) {
+      return null;
+    }
+    return {
+      id: item.id.toLowerCase(),
+      position: item.position,
+      name: item.name,
+      amount: item.amount === undefined ? null : item.amount,
+      state: item.state,
+      createdAt: parseTimestamp(item.created_at),
+      updatedAt: parseTimestamp(item.updated_at),
+    };
+  }
+
+  function normalizeShoppingDetail(body) {
+    if (
+      !isObject(body) ||
+      typeof body.id !== "string" ||
+      !UUID_PATTERN.test(body.id) ||
+      typeof body.title !== "string" ||
+      body.title === "" ||
+      typeof body.status !== "string" ||
+      SHOPPING_STATUSES[body.status] !== true ||
+      !Array.isArray(body.items) ||
+      body.items.length > MAX_SHOPPING_ITEMS ||
+      (body.created !== undefined && typeof body.created !== "boolean")
+    ) {
+      return null;
+    }
+    var items = [];
+    var seen = {};
+    for (var i = 0; i < body.items.length; i++) {
+      var item = normalizeShoppingItem(body.items[i]);
+      if (item === null || seen[item.position] === true) {
+        return null;
+      }
+      seen[item.position] = true;
+      items.push(item);
+    }
+    items.sort(function (left, right) {
+      return left.position - right.position;
+    });
+    return {
+      id: body.id.toLowerCase(),
+      title: body.title,
+      status: body.status,
+      createdAt: parseTimestamp(body.created_at),
+      updatedAt: parseTimestamp(body.updated_at),
+      items: items,
+      created: body.created === true,
+    };
+  }
+
+  // The count of items in each state, read from the items themselves (the server-backed data).
+  function shoppingCounts(items) {
+    var counts = { total: items.length, unchecked: 0, at_home: 0, purchased: 0 };
+    for (var i = 0; i < items.length; i++) {
+      counts[items[i].state]++;
+    }
+    return counts;
+  }
+
+  function normalizeShoppingSummary(item) {
+    if (
+      !isObject(item) ||
+      typeof item.id !== "string" ||
+      !UUID_PATTERN.test(item.id) ||
+      typeof item.title !== "string" ||
+      item.title === "" ||
+      typeof item.status !== "string" ||
+      SHOPPING_STATUSES[item.status] !== true ||
+      !isObject(item.counts) ||
+      !isCount(item.counts.total) ||
+      !isCount(item.counts.unchecked) ||
+      !isCount(item.counts.at_home) ||
+      !isCount(item.counts.purchased) ||
+      item.counts.unchecked + item.counts.at_home + item.counts.purchased !== item.counts.total
+    ) {
+      return null;
+    }
+    return {
+      id: item.id.toLowerCase(),
+      title: item.title,
+      status: item.status,
+      createdAt: parseTimestamp(item.created_at),
+      updatedAt: parseTimestamp(item.updated_at),
+      counts: {
+        total: item.counts.total,
+        unchecked: item.counts.unchecked,
+        at_home: item.counts.at_home,
+        purchased: item.counts.purchased,
+      },
+    };
+  }
+
+  function normalizeShoppingLists(body) {
+    if (!isObject(body) || !Array.isArray(body.lists)) {
+      return null;
+    }
+    var items = [];
+    for (var i = 0; i < body.lists.length; i++) {
+      var summary = normalizeShoppingSummary(body.lists[i]);
+      if (summary === null) {
+        return null;
+      }
+      items.push(summary);
+    }
+    return items;
+  }
+
+  // One stored recipe of an answer, for a draft: the server's validated fields, copied as they are.
+  function normalizeRecipeRead(body, conversationId, messageId, recipeIndex) {
+    if (
+      !isObject(body) ||
+      body.message_id !== messageId ||
+      body.position !== recipeIndex ||
+      typeof body.title !== "string" ||
+      body.title === "" ||
+      (body.servings !== null && body.servings !== undefined && typeof body.servings !== "string") ||
+      !Array.isArray(body.ingredients) ||
+      body.ingredients.length < 1 ||
+      body.ingredients.length > MAX_EDIT_INGREDIENTS
+    ) {
+      return null;
+    }
+    var ingredients = [];
+    for (var i = 0; i < body.ingredients.length; i++) {
+      var ingredient = body.ingredients[i];
+      if (
+        !isObject(ingredient) ||
+        !validItemText(ingredient.name) ||
+        !validItemText(ingredient.amount)
+      ) {
+        return null;
+      }
+      ingredients.push({ name: ingredient.name, amount: ingredient.amount });
+    }
+    return {
+      title: body.title,
+      servings: typeof body.servings === "string" ? body.servings : "",
+      ingredients: ingredients,
+    };
+  }
+
+  // The answer to the recipe read, as what the draft screen must do next:
+  //   ok         200 and the recipe of this very message and position
+  //   auth       401
+  //   gone       404: the answer or the recipe is not there (expired, deleted, another person's)
+  //   unavailable no answer, a body that is not the application's, any 5xx
+  function classifyRecipeRead(response) {
+    if (response.kind === "network") {
+      return { type: "unavailable", text: unavailableText(response, null), correlationId: null };
+    }
+    if (response.status === 401) {
+      return { type: "auth" };
+    }
+    var error = readApiError(response);
+    if (response.status === 200 && response.jsonOk && isObject(response.json)) {
+      return { type: "ok", body: response.json };
+    }
+    if (
+      response.status === 404 &&
+      error &&
+      (error.code === "recipe_not_found" ||
+        error.code === "message_not_found" ||
+        error.code === "conversation_not_found")
+    ) {
+      return { type: "gone", text: error.message, correlationId: error.correlationId };
+    }
+    return {
+      type: "unavailable",
+      text: unavailableText(response, error),
+      correlationId: error ? error.correlationId : null,
+    };
+  }
+
+  // The answer to POST /api/shopping-lists, as what the draft must do next:
+  //   saved      201 (saved now) or 200 (this exact request already saved it): the list
+  //   auth       401
+  //   reused     409 shopping_list_key_reused: the key was used for another request. Never
+  //              replaced by another key without the person asking for it.
+  //   deleted    409 shopping_list_deleted: the key's list has been deleted; nothing is recreated
+  //   rejected   another 4xx: the application refused the request; nothing was written
+  //   uncertain  no answer, a body that is not the application's, any 5xx: the list MAY exist
+  function classifyShoppingCreate(response) {
+    if (response.kind === "network") {
+      return { type: "uncertain", reason: response.timedOut ? "timeout" : "network", text: null };
+    }
+    if (response.status === 401) {
+      return { type: "auth" };
+    }
+    if (response.status === 200 || response.status === 201) {
+      if (response.jsonOk) {
+        var detail = normalizeShoppingDetail(response.json);
+        if (detail !== null) {
+          return { type: "saved", detail: detail };
+        }
+      }
+      return { type: "uncertain", reason: "proxy", text: TEXT.unexpected, correlationId: null };
+    }
+    var error = readApiError(response);
+    var text = error && error.message ? error.message : null;
+    var correlationId = error ? error.correlationId : null;
+    if (response.status === 409 && error && error.code === "shopping_list_key_reused") {
+      return { type: "reused", text: text, correlationId: correlationId };
+    }
+    if (response.status === 409 && error && error.code === "shopping_list_deleted") {
+      return { type: "deleted", text: text, correlationId: correlationId };
+    }
+    if (error && response.status >= 400 && response.status < 500) {
+      return { type: "rejected", text: text, correlationId: correlationId, code: error.code };
+    }
+    if (response.status >= 500) {
+      return { type: "uncertain", reason: "server", text: text, correlationId: correlationId };
+    }
+    return { type: "uncertain", reason: "proxy", text: null, correlationId: correlationId };
+  }
+
+  // The answer to an item or list write (POST/PATCH/DELETE). The body is the server's own
+  // row and is normalized by the caller.
+  function classifyShoppingWrite(response) {
+    if (response.kind === "network") {
+      return { type: "uncertain", text: unavailableText(response, null), correlationId: null };
+    }
+    if (response.status === 401) {
+      return { type: "auth" };
+    }
+    if (response.status === 200 || response.status === 201) {
+      return response.jsonOk && isObject(response.json)
+        ? { type: "ok", body: response.json }
+        : { type: "uncertain", text: TEXT.unexpected, correlationId: null };
+    }
+    if (response.status === 204) {
+      return { type: "removed" };
+    }
+    var error = readApiError(response);
+    var common = { text: error && error.message ? error.message : null, correlationId: error ? error.correlationId : null };
+    if (error && response.status === 404) {
+      return {
+        type: "not_found",
+        code: error.code,
+        text: common.text,
+        correlationId: common.correlationId,
+      };
+    }
+    if (error && response.status === 409 && error.code === "shopping_list_completed") {
+      return { type: "completed", text: common.text, correlationId: common.correlationId };
+    }
+    if (error && response.status >= 400 && response.status < 500) {
+      return {
+        type: "rejected",
+        code: error.code,
+        text: common.text,
+        correlationId: common.correlationId,
+      };
+    }
+    return { type: "uncertain", text: unavailableText(response, error), correlationId: common.correlationId };
+  }
+
   var MESSAGE_STATUSES = { completed: true, in_progress: true, failed: true };
 
   // The address of a photo that came with a message: this site's own route and nothing else. The server
@@ -1384,6 +1789,17 @@
     // Counts the beginnings of list reads: an answer to an older read never replaces the answer
     // of a newer one (a deletion starts a fresh read, which a reload may in turn overtake).
     var listRead = 0;
+    // The same for the shopping lists: an older read of the list or of one list's items never
+    // replaces a newer answer, and a write, a deletion or a disappearance makes every read of
+    // that list that began before it stale. The detail reads are counted per list (the counts
+    // are part of the state, below), so an answer about one list can never make a read of
+    // another list stale.
+    var shoppingListsRead = 0;
+    // The writes of saved lists that have not settled, by list id. One write per list at a
+    // time: a second one is refused (the controls are drawn from the same guard) instead of
+    // being allowed to overlap the first, and every write -- its reconciliation included --
+    // ends here, whatever its answer was.
+    var shoppingMutations = {};
     // A deletion was confirmed while the page was held back (the server's answer to who is
     // signed in was still out): the list is read as soon as the same person is let through.
     var listRefreshOnUnlock = false;
@@ -1420,12 +1836,52 @@
       };
     }
 
+    // What the page knows of the shopping lists: the sidebar's summaries, the open list (its
+    // items, its inline editor and its confirmations) and the draft being prepared. The draft is
+    // memory only: nothing of it is stored in the browser, and it is never overwritten by a
+    // refresh of the saved lists.
+    function freshShopping() {
+      return {
+        status: "idle",
+        error: null,
+        lists: [],
+        currentId: null,
+        detail: null,
+        draft: null,
+        notice: null,
+      };
+    }
+
+    function freshShoppingDetail(id) {
+      return {
+        id: id,
+        status: "loading", // loading | ready | error | gone
+        item: null,
+        error: null,
+        editor: null,
+        adding: null,
+        removing: null,
+        deleting: null,
+        actionError: null,
+        statusBusy: false,
+        // The write of this list that is under way, if any: { kind }. A write starts only
+        // when this and shoppingMutations[id] are both clear, and ends only after its
+        // outcome (and its reconciliation, when the outcome was unclear) has been applied.
+        mutation: null,
+      };
+    }
+
     function freshState(screen) {
       return {
         screen: screen,
-        // Which part of the app is in front: the conversations or the favorites.
+        // Which part of the app is in front: the conversations, the favorites or the shopping lists.
         section: "chats",
         favorites: freshFavorites(),
+        shopping: freshShopping(),
+        // The detail reads of the shopping lists, by list id. They belong to one page of one
+        // person: a new state (another start, another sign-in) begins them from nothing, so
+        // nothing of an earlier account's reads is kept or added to.
+        shoppingDetailReads: {},
         // While set, the signed-in page is held back: nothing of the conversations is in the view and
         // nothing is asked for them, until /auth/me has said who is signed in. { phase: "checking" } while
         // the question is out; { phase: "unavailable", failure } when it could not be answered.
@@ -1603,8 +2059,13 @@
 
     function resetData() {
       var screen = state.screen;
+      // The new state releases everything the page kept for the person who was here: the
+      // threads, the favorites, the open list and its draft -- and the per-list read counts,
+      // which must not grow from one account to the next (an answer still on its way is
+      // stale by the epoch as well).
       state = freshState(screen);
       listRefreshOnUnlock = false;
+      shoppingMutations = {};
     }
 
     // --- the stored record of unresolved turns -----------------------------------------------
@@ -1752,6 +2213,14 @@
       });
       if (state.favorites.status === "idle") {
         track(loadFavorites()); // (asked for while it was held back)
+      }
+      // Returning to the page while «Покупки» is in front reads the server again. A draft is
+      // never touched (and is not even a reason to read over it): it is the person's unsaved work.
+      if (state.section === "shopping" && state.shopping.draft === null) {
+        if (state.shopping.status !== "loading") {
+          track(loadShoppingLists());
+        }
+        track(refreshOpenShoppingList());
       }
       var open = state.currentId === null ? null : state.threads[state.currentId];
       if (open && !open.synced) {
@@ -2762,9 +3231,10 @@
 
     // Which part of the app is in front. The list of the favorites (and the open card, when
     // there is one) is read whenever the person returns to it, so a recipe kept or changed
-    // in another tab or on another device shows up.
+    // in another tab or on another device shows up. The saved shopping lists are read the
+    // same way; an open list is read again beside them, and a draft is never touched.
     function showSection(name) {
-      if (state.screen !== "app" || state.gate || (name !== "chats" && name !== "favorites")) {
+      if (state.screen !== "app" || state.gate || (name !== "chats" && name !== "favorites" && name !== "shopping")) {
         return;
       }
       state.section = name;
@@ -2772,6 +3242,10 @@
       if (name === "favorites" && state.favorites.status !== "loading") {
         track(loadFavorites());
         track(refreshOpenFavorite());
+      }
+      if (name === "shopping") {
+        track(loadShoppingLists());
+        track(refreshOpenShoppingList());
       }
     }
 
@@ -3358,6 +3832,1408 @@
       return { ok: false, reason: "failed" };
     }
 
+    // --- the shopping lists ----------------------------------------------------------------------------
+
+    function sortShoppingSummaries(items) {
+      var active = [];
+      var completed = [];
+      for (var i = 0; i < items.length; i++) {
+        (items[i].status === "completed" ? completed : active).push(items[i]);
+      }
+      return active.concat(completed);
+    }
+
+    function shoppingSummaryOf(detail) {
+      return {
+        id: detail.id,
+        title: detail.title,
+        status: detail.status,
+        createdAt: detail.createdAt,
+        updatedAt: detail.updatedAt,
+        counts: shoppingCounts(detail.items),
+      };
+    }
+
+    // Every read of one list numbers itself in that list's own count. A write, a deletion or a
+    // disappearance moves the count on, so an answer to an older read of that list is known to
+    // be stale; other lists have their own count and are never invalidated by it.
+    function shoppingDetailReadOf(id) {
+      return state.shoppingDetailReads[id] || 0;
+    }
+
+    function beginShoppingDetailRead(id) {
+      state.shoppingDetailReads[id] = shoppingDetailReadOf(id) + 1;
+      return state.shoppingDetailReads[id];
+    }
+
+    function invalidateShoppingDetailReads(id) {
+      if (typeof id === "string" && id !== "") {
+        state.shoppingDetailReads[id] = shoppingDetailReadOf(id) + 1;
+      }
+    }
+
+    function rememberShoppingSummary(detail) {
+      var summary = shoppingSummaryOf(detail);
+      var others = state.shopping.lists.filter(function (item) {
+        return item.id !== summary.id;
+      });
+      state.shopping.lists = sortShoppingSummaries([summary].concat(others));
+      if (state.shopping.status === "loading" || state.shopping.status === "error") {
+        state.shopping.status = "ready"; // (a read in flight is now stale and will be discarded)
+        state.shopping.error = null;
+      }
+      shoppingListsRead++; // a list read begun before this change may not put the old set back
+    }
+
+    function dropShoppingSummary(id) {
+      state.shopping.lists = state.shopping.lists.filter(function (item) {
+        return item.id !== id;
+      });
+      if (state.shopping.status === "loading" || state.shopping.status === "error") {
+        state.shopping.status = "ready";
+        state.shopping.error = null;
+      }
+      shoppingListsRead++;
+    }
+
+    function shoppingItemById(detail, itemId) {
+      if (!detail || !detail.item) {
+        return null;
+      }
+      for (var i = 0; i < detail.item.items.length; i++) {
+        if (detail.item.items[i].id === itemId) {
+          return detail.item.items[i];
+        }
+      }
+      return null;
+    }
+
+    function currentShoppingDetail() {
+      var shopping = state.shopping;
+      var detail = shopping.detail;
+      if (
+        shopping.currentId !== null &&
+        detail !== null &&
+        detail.status === "ready" &&
+        detail.item !== null &&
+        detail.item.id === shopping.currentId
+      ) {
+        return detail;
+      }
+      return null;
+    }
+
+    function replaceShoppingItem(detail, item) {
+      var items = detail.item.items;
+      for (var i = 0; i < items.length; i++) {
+        if (items[i].id === item.id) {
+          items[i] = item;
+          return;
+        }
+      }
+      items.push(item);
+      items.sort(function (left, right) {
+        return left.position - right.position;
+      });
+    }
+
+    // One write per list at a time. A second one is refused ("busy") instead of being
+    // allowed to overlap the first -- the controls are drawn from this same guard -- and a
+    // list whose write is unsettled cannot be opened again meanwhile. A write starts by
+    // invalidating the reads of that list that began before it; its own answer is never
+    // judged by a read's generation, so a read or a navigation can no longer swallow it.
+    function shoppingMutationBusy(detail) {
+      return detail !== null && (detail.mutation !== null || shoppingMutations[detail.id] === true);
+    }
+
+    function beginShoppingMutation(detail, kind) {
+      if (detail === null || shoppingMutationBusy(detail)) {
+        return false;
+      }
+      shoppingMutations[detail.id] = true;
+      detail.mutation = { kind: kind };
+      invalidateShoppingDetailReads(detail.id);
+      return true;
+    }
+
+    function endShoppingMutation(detail) {
+      if (detail !== null) {
+        delete shoppingMutations[detail.id];
+        detail.mutation = null;
+      }
+    }
+
+    // The open state of the list a write was issued for, when it is still what the page
+    // shows. A write's answer always belongs to its own list: if the person opened another
+    // list meanwhile, the answer is applied to the list's own (detached) state and to its
+    // summary by id, never to the other list's.
+    function shoppingLiveDetail(id) {
+      var detail = state.shopping.detail;
+      if (detail !== null && detail.item !== null && detail.item.id === id && detail.status === "ready") {
+        return detail;
+      }
+      return null;
+    }
+
+    function shoppingOutcomeDetail(detail) {
+      var live = shoppingLiveDetail(detail.id);
+      return live !== null ? live : detail;
+    }
+
+    function applyShoppingItem(detail, server) {
+      var target = shoppingOutcomeDetail(detail);
+      replaceShoppingItem(target, server);
+      target.item.updatedAt = server.updatedAt;
+      rememberShoppingSummary(target.item);
+    }
+
+    function removeShoppingItem(detail, itemId) {
+      var target = shoppingOutcomeDetail(detail);
+      target.item.items = target.item.items.filter(function (entry) {
+        return entry.id !== itemId;
+      });
+      rememberShoppingSummary(target.item);
+    }
+
+    function applyShoppingDetail(detail, found) {
+      detail.status = "ready";
+      detail.item = found;
+      detail.error = null;
+      if (detail.removing && !shoppingItemById(detail, detail.removing.id)) {
+        detail.removing = null;
+      }
+      if (detail.editor && !shoppingItemById(detail, detail.editor.id)) {
+        detail.editor = null;
+      }
+    }
+
+    function shoppingDetailGone(id) {
+      dropShoppingSummary(id);
+      if (state.shopping.currentId === id) {
+        state.shopping.currentId = null;
+        state.shopping.detail = null;
+      }
+      state.shopping.notice = { kind: "error", text: TEXT.shoppingListGone };
+      invalidateShoppingDetailReads(id);
+      emit();
+    }
+
+    function shoppingDraftBusy() {
+      var draft = state.shopping.draft;
+      return Boolean(draft && (draft.phase === "saving" || draft.phase === "uncertain"));
+    }
+
+    // The phases in which the draft still holds work that would be lost with the page: it can
+    // still be saved (ready, rejected, reused), its save is out (saving), or its save ended
+    // without an answer and is retried with the same key (uncertain). A terminal draft (its
+    // list was deleted elsewhere, or its recipe could not be read) holds nothing a save could
+    // still make.
+    function shoppingDraftUnsaved(phase) {
+      return (
+        phase === "ready" ||
+        phase === "rejected" ||
+        phase === "reused" ||
+        phase === "saving" ||
+        phase === "uncertain"
+      );
+    }
+
+    // A draft is the person's unsaved choice of what is already at home. Only a marked
+    // ingredient is a modification: an untouched draft may be left without a question, unless
+    // its save is out or its answer was lost. A save that is out, or whose answer was lost, is
+    // unsaved work even with nothing marked: leaving then would take the key and the frozen
+    // payload that are the only way to learn whether the list was made. A confirmed save (the
+    // draft is gone) and an explicit discard (the draft is gone) end it.
+    function shoppingDraftDirty() {
+      var draft = state.shopping.draft;
+      if (draft === null || !shoppingDraftUnsaved(draft.phase)) {
+        return false;
+      }
+      if (shoppingDraftBusy()) {
+        return true; // a save is out, or its answer was lost: that work is not only its marks
+      }
+      for (var i = 0; i < draft.atHome.length; i++) {
+        if (draft.atHome[i] === true) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    // The saved lists, read whenever the person returns to «Покупки».
+    async function loadShoppingLists() {
+      var shopping = state.shopping;
+      if (state.screen !== "app" || state.gate || shopping.status === "loading") {
+        return false;
+      }
+      var mine = epoch;
+      var read = ++shoppingListsRead;
+      shopping.status = "loading";
+      shopping.error = null;
+      emit();
+      var response = await http("GET", "/api/shopping-lists", { timeoutMs: READ_TIMEOUT_MS });
+      if (mine !== epoch || read !== shoppingListsRead) {
+        return false;
+      }
+      var found = classifyRead(response, "shopping_list_not_found");
+      if (found.type === "ok") {
+        var items = normalizeShoppingLists(found.body);
+        if (items !== null) {
+          shopping.lists = sortShoppingSummaries(items);
+          shopping.status = "ready";
+          shopping.error = null;
+          var open = shopping.currentId;
+          if (
+            open !== null &&
+            shopping.detail !== null &&
+            shopping.detail.status === "ready" &&
+            shopping.detail.mutation === null &&
+            !items.some(function (item) {
+              return item.id === open;
+            })
+          ) {
+            shoppingDetailGone(open); // removed in another tab or on another device
+            return true;
+          }
+          emit();
+          return true;
+        }
+        found = { type: "unavailable", text: TEXT.unexpected, correlationId: null };
+      }
+      if (found.type === "auth") {
+        handleAuthLost();
+        return false;
+      }
+      shopping.status = "error";
+      shopping.error = { text: found.text || TEXT.shoppingFailed, correlationId: found.correlationId || null };
+      emit();
+      return false;
+    }
+
+    async function openShoppingList(rawId) {
+      var id = typeof rawId === "string" ? rawId.toLowerCase() : "";
+      if (state.screen !== "app" || state.gate || !UUID_PATTERN.test(id)) {
+        return { ok: false, reason: "invalid" };
+      }
+      if (shoppingDraftBusy()) {
+        return { ok: false, reason: "busy" };
+      }
+      if (shoppingMutations[id] === true) {
+        return { ok: false, reason: "busy" }; // a write of this list is not settled yet
+      }
+      var mine = epoch;
+      var shopping = state.shopping;
+      state.section = "shopping";
+      shopping.draft = null; // the person chose a saved list instead of the draft: no list was made
+      shopping.notice = null;
+      shopping.currentId = id;
+      shopping.detail = freshShoppingDetail(id);
+      var detail = shopping.detail;
+      var read = beginShoppingDetailRead(id);
+      emit();
+      var response = await http("GET", "/api/shopping-lists/" + id, { timeoutMs: READ_TIMEOUT_MS });
+      if (mine !== epoch || shopping.detail !== detail || shoppingDetailReadOf(id) !== read) {
+        return { ok: false, reason: "stale" };
+      }
+      var found = classifyRead(response, "shopping_list_not_found");
+      if (found.type === "ok") {
+        var item = normalizeShoppingDetail(found.body);
+        if (item !== null && item.id === id) {
+          applyShoppingDetail(detail, item);
+          rememberShoppingSummary(item);
+          emit();
+          return { ok: true };
+        }
+        found = { type: "unavailable", text: TEXT.unexpected, correlationId: null };
+      }
+      if (found.type === "auth") {
+        handleAuthLost();
+        return { ok: false, reason: "auth" };
+      }
+      if (found.type === "not_found") {
+        shoppingDetailGone(id);
+        return { ok: false, reason: "gone" };
+      }
+      detail.status = "error";
+      detail.error = { text: found.text || TEXT.shoppingListFailed, correlationId: found.correlationId || null };
+      emit();
+      return { ok: false, reason: "failed" };
+    }
+
+    function closeShoppingList() {
+      invalidateShoppingDetailReads(state.shopping.currentId);
+      state.shopping.currentId = null;
+      state.shopping.detail = null;
+      state.shopping.notice = null;
+      emit();
+      return true;
+    }
+
+    function reloadShoppingList() {
+      var detail = state.shopping.detail;
+      if (!detail) {
+        return Promise.resolve(false);
+      }
+      return openShoppingList(detail.id);
+    }
+
+    // The open list read again in the background, without putting it into "loading": a list
+    // changed on another device shows its current items when the person returns to it. A draft,
+    // an inline edit, a question or a write that is under way is never overwritten.
+    async function refreshOpenShoppingList() {
+      var shopping = state.shopping;
+      var detail = shopping.detail;
+      var id = shopping.currentId;
+      if (
+        id === null ||
+        detail === null ||
+        detail.status !== "ready" ||
+        shopping.draft !== null ||
+        detail.editor !== null ||
+        detail.adding !== null ||
+        detail.removing !== null ||
+        detail.deleting !== null ||
+        detail.statusBusy ||
+        detail.mutation !== null
+      ) {
+        return false;
+      }
+      var mine = epoch;
+      var read = beginShoppingDetailRead(id);
+      var response = await http("GET", "/api/shopping-lists/" + id, { timeoutMs: READ_TIMEOUT_MS });
+      if (mine !== epoch || state.shopping.detail !== detail || shoppingDetailReadOf(id) !== read) {
+        return false;
+      }
+      var found = classifyRead(response, "shopping_list_not_found");
+      if (found.type === "ok") {
+        var item = normalizeShoppingDetail(found.body);
+        if (item !== null && item.id === id) {
+          applyShoppingDetail(detail, item);
+          rememberShoppingSummary(item);
+          emit();
+          return true;
+        }
+        return false;
+      }
+      if (found.type === "auth") {
+        handleAuthLost();
+        return false;
+      }
+      if (found.type === "not_found") {
+        shoppingDetailGone(id);
+        return false;
+      }
+      return false; // a failed background read is not an error shown over a readable list
+    }
+
+    // The server's current state of the open list, read after an unclear write. It never puts
+    // the list into "loading" and never touches a draft.
+    async function reconcileShoppingDetail(detail) {
+      if (!detail || state.shopping.detail !== detail || detail.status !== "ready") {
+        return false;
+      }
+      var id = detail.id;
+      var mine = epoch;
+      var read = beginShoppingDetailRead(id);
+      var response = await http("GET", "/api/shopping-lists/" + id, { timeoutMs: READ_TIMEOUT_MS });
+      if (mine !== epoch || state.shopping.detail !== detail || shoppingDetailReadOf(id) !== read) {
+        return false;
+      }
+      var found = classifyRead(response, "shopping_list_not_found");
+      if (found.type === "ok") {
+        var item = normalizeShoppingDetail(found.body);
+        if (item !== null && item.id === id) {
+          applyShoppingDetail(detail, item);
+          rememberShoppingSummary(item);
+          emit();
+          return true;
+        }
+        return false;
+      }
+      if (found.type === "auth") {
+        handleAuthLost();
+        return false;
+      }
+      if (found.type === "not_found") {
+        shoppingDetailGone(id);
+        return false;
+      }
+      return false;
+    }
+
+    // --- the draft of a recipe -------------------------------------------------------------------
+
+    function draftIngredients(recipe) {
+      return recipe.ingredients.map(function (ingredient) {
+        return { name: ingredient.name, amount: ingredient.amount };
+      });
+    }
+
+    function beginDraft(source, originSection, title, servings, ingredients) {
+      var draft = {
+        phase: "ready",
+        originSection: originSection,
+        source: source,
+        title: title,
+        servings: servings || "",
+        ingredients: ingredients,
+        atHome: ingredients.map(function () {
+          return false;
+        }),
+        key: null,
+        payload: null,
+        error: null,
+        code: null,
+      };
+      state.section = "shopping";
+      state.shopping.draft = draft;
+      invalidateShoppingDetailReads(state.shopping.currentId);
+      state.shopping.currentId = null;
+      state.shopping.detail = null;
+      state.shopping.notice = null;
+      emit();
+      return draft;
+    }
+
+    async function readDraftRecipe(draft) {
+      var source = draft.source;
+      var mine = epoch;
+      draft.phase = "loading";
+      draft.error = null;
+      emit();
+      var response = await http(
+        "GET",
+        "/api/conversations/" + source.conversationId + "/messages/" + source.messageId + "/recipes/" + source.recipeIndex,
+        { timeoutMs: READ_TIMEOUT_MS }
+      );
+      if (mine !== epoch || state.shopping.draft !== draft) {
+        return { ok: false, reason: "stale" };
+      }
+      var found = classifyRecipeRead(response);
+      if (found.type === "ok") {
+        var recipe = normalizeRecipeRead(found.body, source.conversationId, source.messageId, source.recipeIndex);
+        if (recipe !== null) {
+          draft.title = recipe.title;
+          draft.servings = recipe.servings;
+          draft.ingredients = draftIngredients(recipe);
+          draft.atHome = draft.ingredients.map(function () {
+            return false;
+          });
+          draft.phase = "ready";
+          draft.error = null;
+          emit();
+          return { ok: true };
+        }
+        found = { type: "unavailable", text: TEXT.unexpected, correlationId: null };
+      }
+      if (found.type === "auth") {
+        handleAuthLost();
+        return { ok: false, reason: "auth" };
+      }
+      if (found.type === "gone") {
+        draft.phase = "load_gone";
+        draft.error = { text: found.text || TEXT.shoppingDraftFailed, correlationId: found.correlationId || null };
+        emit();
+        return { ok: false, reason: "gone" };
+      }
+      draft.phase = "load_error";
+      draft.error = { text: found.text || TEXT.shoppingDraftFailed, correlationId: found.correlationId || null };
+      emit();
+      return { ok: false, reason: "failed" };
+    }
+
+    // «Что купить?» under a structured recipe of an answer: the recipe is read from the stored
+    // rows it was rendered from, never re-parsed from the prose.
+    async function beginShoppingDraftFromRecipe(conversationId, messageId, recipeIndex) {
+      if (state.screen !== "app" || state.gate) {
+        return { ok: false, reason: "not_ready" };
+      }
+      if (
+        typeof conversationId !== "string" ||
+        !UUID_PATTERN.test(conversationId) ||
+        !isCount(messageId) ||
+        messageId < 1 ||
+        !isCount(recipeIndex) ||
+        recipeIndex < 0 ||
+        recipeIndex >= MAX_RECIPES_PER_MESSAGE
+      ) {
+        return { ok: false, reason: "invalid" };
+      }
+      if (shoppingDraftBusy()) {
+        return { ok: false, reason: "busy" };
+      }
+      var origin = state.section === "favorites" ? "favorites" : "chats";
+      var draft = beginDraft(
+        {
+          kind: "message",
+          conversationId: conversationId.toLowerCase(),
+          messageId: messageId,
+          recipeIndex: recipeIndex,
+        },
+        origin,
+        "",
+        "",
+        []
+      );
+      return readDraftRecipe(draft);
+    }
+
+    // «Что купить?» inside a structured recipe opened from Favorites: the detail that is on the
+    // screen is the source, and its version is sent with the creation.
+    function beginShoppingDraftFromFavorite() {
+      var item = currentDetailItem();
+      if (state.screen !== "app" || state.gate || item === null || item.kind !== "structured") {
+        return { ok: false, reason: "not_ready" };
+      }
+      if (state.favorites.editor !== null) {
+        return { ok: false, reason: "editing" };
+      }
+      if (shoppingDraftBusy()) {
+        return { ok: false, reason: "busy" };
+      }
+      beginDraft(
+        { kind: "favorite", favoriteId: item.id, expectedVersion: item.version },
+        "favorites",
+        item.title,
+        item.servings,
+        draftIngredients(item)
+      );
+      return { ok: true };
+    }
+
+    function reloadShoppingDraft() {
+      var draft = state.shopping.draft;
+      if (draft === null || draft.source.kind !== "message" || draft.phase !== "load_error") {
+        return Promise.resolve({ ok: false, reason: "not_ready" });
+      }
+      return readDraftRecipe(draft);
+    }
+
+    function toggleShoppingDraftAtHome(position, atHome) {
+      var draft = state.shopping.draft;
+      if (
+        draft === null ||
+        (draft.phase !== "ready" && draft.phase !== "rejected" && draft.phase !== "reused") ||
+        !isCount(position) ||
+        position < 0 ||
+        position >= draft.ingredients.length
+      ) {
+        return false;
+      }
+      draft.atHome[position] = atHome === true;
+      emit();
+      return true;
+    }
+
+    function cancelShoppingDraft() {
+      var draft = state.shopping.draft;
+      if (draft === null) {
+        return { ok: false, reason: "none" };
+      }
+      if (draft.phase === "saving") {
+        return { ok: false, reason: "busy" };
+      }
+      var origin = draft.originSection;
+      state.shopping.draft = null;
+      state.section = origin;
+      emit();
+      return { ok: true, origin: origin };
+    }
+
+    function creationPayload(draft) {
+      var states = [];
+      for (var position = 0; position < draft.ingredients.length; position++) {
+        if (draft.atHome[position] === true) {
+          states.push({ position: position, state: "at_home" });
+        }
+      }
+      if (draft.source.kind === "message") {
+        return {
+          source: "message",
+          conversation_id: draft.source.conversationId,
+          message_id: draft.source.messageId,
+          recipe_index: draft.source.recipeIndex,
+          item_states: states,
+        };
+      }
+      return {
+        source: "favorite",
+        favorite_id: draft.source.favoriteId,
+        expected_version: draft.source.expectedVersion,
+        item_states: states,
+      };
+    }
+
+    function uncertainDraftText(draft, reason) {
+      if (reason === "timeout") {
+        return TEXT.shoppingTimeout;
+      }
+      if (reason === "server") {
+        return TEXT.shoppingUncertainServer;
+      }
+      return TEXT.shoppingUncertain;
+    }
+
+    async function submitShoppingDraft(draft, key, payload) {
+      var mine = epoch;
+      draft.phase = "saving";
+      draft.error = null;
+      draft.code = null;
+      emit();
+      var response = await http("POST", "/api/shopping-lists", {
+        headers: { "Idempotency-Key": key },
+        json: payload,
+        timeoutMs: READ_TIMEOUT_MS,
+      });
+      if (mine !== epoch || state.shopping.draft !== draft) {
+        return { ok: false, reason: "stale" };
+      }
+      var outcome = classifyShoppingCreate(response);
+      if (outcome.type === "auth") {
+        handleAuthLost();
+        return { ok: false, reason: "auth" };
+      }
+      if (outcome.type === "saved") {
+        var detail = outcome.detail;
+        state.shopping.draft = null;
+        state.shopping.notice = null;
+        state.shopping.currentId = detail.id;
+        state.shopping.detail = freshShoppingDetail(detail.id);
+        state.shopping.detail.status = "ready";
+        state.shopping.detail.item = detail;
+        invalidateShoppingDetailReads(detail.id);
+        rememberShoppingSummary(detail);
+        announce(TEXT.shoppingSaved);
+        emit();
+        return { ok: true, id: detail.id, created: detail.created };
+      }
+      if (outcome.type === "reused") {
+        draft.phase = "reused";
+        draft.code = "shopping_list_key_reused";
+        draft.error = { text: TEXT.shoppingKeyReused, correlationId: outcome.correlationId || null };
+        emit();
+        return { ok: false, reason: "reused" };
+      }
+      if (outcome.type === "deleted") {
+        draft.phase = "deleted";
+        draft.code = "shopping_list_deleted";
+        draft.error = { text: TEXT.shoppingDeletedElsewhere, correlationId: outcome.correlationId || null };
+        emit();
+        return { ok: false, reason: "deleted" };
+      }
+      if (outcome.type === "rejected") {
+        draft.phase = "rejected";
+        draft.code = outcome.code || null;
+        draft.error = {
+          text:
+            outcome.code === "favorite_conflict"
+              ? TEXT.shoppingFavoriteConflict
+              : outcome.text || TEXT.unexpected,
+          correlationId: outcome.correlationId || null,
+        };
+        emit();
+        return { ok: false, reason: "rejected" };
+      }
+      draft.phase = "uncertain";
+      draft.error = {
+        text: uncertainDraftText(draft, outcome.reason),
+        correlationId: outcome.correlationId || null,
+      };
+      emit();
+      return { ok: false, reason: "uncertain" };
+    }
+
+    function saveShoppingDraft() {
+      var draft = state.shopping.draft;
+      if (state.screen !== "app" || state.gate) {
+        return Promise.resolve({ ok: false, reason: "not_ready" });
+      }
+      if (draft === null || draft.phase !== "ready") {
+        return Promise.resolve({ ok: false, reason: "not_ready" });
+      }
+      var key;
+      try {
+        key = newIdempotencyKey(cryptoApi);
+      } catch (ignored) {
+        draft.error = { text: TEXT.noCrypto, correlationId: null };
+        emit();
+        return Promise.resolve({ ok: false, reason: "no_crypto" });
+      }
+      draft.key = key;
+      draft.payload = creationPayload(draft);
+      return submitShoppingDraft(draft, key, draft.payload);
+    }
+
+    // The same key and the same frozen payload again: the only way to learn what became of a
+    // save whose answer was not received. A new list is never made twice by it.
+    function retryShoppingDraft() {
+      var draft = state.shopping.draft;
+      if (draft === null || draft.phase !== "uncertain" || !draft.key || !draft.payload) {
+        return Promise.resolve({ ok: false, reason: "not_ready" });
+      }
+      return submitShoppingDraft(draft, draft.key, draft.payload);
+    }
+
+    // After a refused key (or a full account), a NEW save made by the person's own click: a new
+    // key and the payload as the draft is now. Nothing here happens by itself.
+    function saveShoppingDraftWithNewKey() {
+      var draft = state.shopping.draft;
+      if (draft === null) {
+        return Promise.resolve({ ok: false, reason: "not_ready" });
+      }
+      var allowed =
+        draft.phase === "reused" || (draft.phase === "rejected" && draft.code === "shopping_lists_full");
+      if (!allowed) {
+        return Promise.resolve({ ok: false, reason: "not_ready" });
+      }
+      var key;
+      try {
+        key = newIdempotencyKey(cryptoApi);
+      } catch (ignored) {
+        draft.error = { text: TEXT.noCrypto, correlationId: null };
+        emit();
+        return Promise.resolve({ ok: false, reason: "no_crypto" });
+      }
+      draft.key = key;
+      draft.payload = creationPayload(draft);
+      return submitShoppingDraft(draft, key, draft.payload);
+    }
+
+    // --- the items of a saved list -----------------------------------------------------------------
+    // Every write is one conditional request after the server's list lock; the page applies it
+    // optimistically, and a failure either takes the change back or reconciles with what the
+    // server actually has.
+
+    function checkedItemText(rawName, rawAmount) {
+      var name = trimLikeServer(typeof rawName === "string" ? rawName : "");
+      var amount = trimLikeServer(typeof rawAmount === "string" ? rawAmount : "");
+      if (!name) {
+        return { ok: false, text: TEXT.itemRequired };
+      }
+      if (countCodePoints(name) > MAX_SHOPPING_NAME) {
+        return { ok: false, text: TEXT.itemNameTooLong };
+      }
+      if (!validItemText(name)) {
+        return { ok: false, text: TEXT.itemBadCharacters };
+      }
+      if (amount) {
+        if (countCodePoints(amount) > MAX_SHOPPING_AMOUNT) {
+          return { ok: false, text: TEXT.itemAmountTooLong };
+        }
+        if (!validItemText(amount)) {
+          return { ok: false, text: TEXT.itemBadCharacters };
+        }
+      }
+      return { ok: true, name: name, amount: amount ? amount : null };
+    }
+
+    async function setShoppingItemState(itemId, itemState) {
+      var detail = currentShoppingDetail();
+      if (detail === null || detail.item.status !== "active") {
+        return { ok: false, reason: "not_ready" };
+      }
+      if (!SHOPPING_STATES[itemState]) {
+        return { ok: false, reason: "invalid" };
+      }
+      var item = shoppingItemById(detail, itemId);
+      if (item === null) {
+        return { ok: false, reason: "invalid" };
+      }
+      if (item.pending !== undefined && item.pending !== null) {
+        return { ok: false, reason: "busy" };
+      }
+      if (item.state === itemState) {
+        return { ok: true, reason: "same" };
+      }
+      if (!beginShoppingMutation(detail, "state")) {
+        return { ok: false, reason: "busy" };
+      }
+      var previous = item.state;
+      var mine = epoch;
+      detail.actionError = null;
+      item.pending = itemState;
+      item.state = itemState;
+      emit();
+      var response = await http(
+        "PATCH",
+        "/api/shopping-lists/" + detail.id + "/items/" + itemId,
+        { json: { state: itemState }, timeoutMs: READ_TIMEOUT_MS }
+      );
+      if (mine !== epoch) {
+        endShoppingMutation(detail);
+        return { ok: false, reason: "stale" };
+      }
+      var outcome = classifyShoppingWrite(response);
+      if (outcome.type === "auth") {
+        endShoppingMutation(detail);
+        handleAuthLost();
+        return { ok: false, reason: "auth" };
+      }
+      if (outcome.type === "ok") {
+        var server = normalizeShoppingItem(outcome.body);
+        if (server !== null && server.id === itemId) {
+          applyShoppingItem(detail, server);
+          announce(TEXT.itemUpdated);
+          endShoppingMutation(detail);
+          emit();
+          return { ok: true };
+        }
+        outcome = { type: "uncertain", text: TEXT.unexpected, correlationId: null };
+      }
+      item.state = previous;
+      item.pending = null;
+      if (outcome.type === "not_found" && outcome.code === "shopping_list_not_found") {
+        endShoppingMutation(detail);
+        shoppingDetailGone(detail.id);
+        return { ok: false, reason: "gone" };
+      }
+      detail.actionError = {
+        text:
+          outcome.type === "completed"
+            ? LogicMessage("shopping_list_completed")
+            : outcome.text || TEXT.itemStateFailed,
+        correlationId: outcome.correlationId || null,
+      };
+      emit();
+      if (outcome.type === "completed" || outcome.type === "uncertain" || outcome.type === "not_found") {
+        await reconcileShoppingDetail(detail);
+      }
+      endShoppingMutation(detail);
+      emit();
+      return { ok: false, reason: outcome.type };
+    }
+
+    function LogicMessage(code) {
+      return messageForCode(code) || TEXT.itemStateFailed;
+    }
+
+    function startShoppingItemEdit(itemId) {
+      var detail = currentShoppingDetail();
+      if (
+        detail === null ||
+        detail.item.status !== "active" ||
+        shoppingMutationBusy(detail) ||
+        detail.editor !== null ||
+        detail.adding !== null
+      ) {
+        return false;
+      }
+      var item = shoppingItemById(detail, itemId);
+      if (item === null) {
+        return false;
+      }
+      detail.removing = null;
+      detail.editor = {
+        id: item.id,
+        phase: "editing",
+        draft: { name: item.name, amount: item.amount || "" },
+        error: null,
+      };
+      detail.actionError = null;
+      emit();
+      return true;
+    }
+
+    function syncShoppingItemEdit(raw) {
+      var detail = state.shopping.detail;
+      var editor = detail ? detail.editor : null;
+      if (editor === null || editor.phase === "saving") {
+        return false;
+      }
+      raw = isObject(raw) ? raw : {};
+      editor.draft = {
+        name: typeof raw.name === "string" ? raw.name : editor.draft.name,
+        amount: typeof raw.amount === "string" ? raw.amount : editor.draft.amount,
+      };
+      return true;
+    }
+
+    function cancelShoppingItemEdit() {
+      var detail = state.shopping.detail;
+      if (!detail || detail.editor === null || detail.editor.phase === "saving") {
+        return false;
+      }
+      detail.editor = null;
+      emit();
+      return true;
+    }
+
+    async function saveShoppingItemEdit(raw) {
+      var detail = currentShoppingDetail();
+      var editor = detail ? detail.editor : null;
+      if (detail === null || editor === null || editor.phase === "saving" || detail.item.status !== "active") {
+        return { ok: false, reason: "not_ready" };
+      }
+      syncShoppingItemEdit(raw);
+      var checked = checkedItemText(editor.draft.name, editor.draft.amount);
+      if (!checked.ok) {
+        editor.error = { text: checked.text, correlationId: null };
+        emit();
+        return { ok: false, reason: "invalid" };
+      }
+      if (!beginShoppingMutation(detail, "edit")) {
+        return { ok: false, reason: "busy" };
+      }
+      var mine = epoch;
+      editor.phase = "saving";
+      editor.error = null;
+      emit();
+      var response = await http(
+        "PATCH",
+        "/api/shopping-lists/" + detail.id + "/items/" + editor.id,
+        { json: { name: checked.name, amount: checked.amount }, timeoutMs: READ_TIMEOUT_MS }
+      );
+      if (mine !== epoch) {
+        endShoppingMutation(detail);
+        return { ok: false, reason: "stale" };
+      }
+      var outcome = classifyShoppingWrite(response);
+      if (outcome.type === "auth") {
+        endShoppingMutation(detail);
+        handleAuthLost();
+        return { ok: false, reason: "auth" };
+      }
+      if (outcome.type === "ok") {
+        var server = normalizeShoppingItem(outcome.body);
+        if (server !== null && server.id === editor.id) {
+          applyShoppingItem(detail, server);
+          detail.editor = null;
+          announce(TEXT.itemSaved);
+          endShoppingMutation(detail);
+          emit();
+          return { ok: true, id: server.id };
+        }
+        outcome = { type: "uncertain", text: TEXT.unexpected, correlationId: null };
+      }
+      if (outcome.type === "not_found" && outcome.code === "shopping_list_not_found") {
+        detail.editor = null;
+        endShoppingMutation(detail);
+        shoppingDetailGone(detail.id);
+        return { ok: false, reason: "gone" };
+      }
+      editor.phase = "editing";
+      editor.error = {
+        text: outcome.type === "completed" ? LogicMessage("shopping_list_completed") : outcome.text || TEXT.itemEditFailed,
+        correlationId: outcome.correlationId || null,
+      };
+      emit();
+      if (outcome.type === "completed" || outcome.type === "uncertain" || outcome.type === "not_found") {
+        await reconcileShoppingDetail(detail);
+      }
+      endShoppingMutation(detail);
+      emit();
+      return { ok: false, reason: outcome.type };
+    }
+
+    function beginShoppingItemAdd() {
+      var detail = currentShoppingDetail();
+      if (
+        detail === null ||
+        detail.item.status !== "active" ||
+        shoppingMutationBusy(detail) ||
+        detail.adding !== null ||
+        detail.editor !== null ||
+        detail.removing !== null ||
+        detail.deleting !== null
+      ) {
+        return false;
+      }
+      detail.removing = null;
+      detail.adding = { phase: "editing", name: "", amount: "", error: null };
+      detail.actionError = null;
+      emit();
+      return true;
+    }
+
+    function syncShoppingItemAdd(raw) {
+      var detail = state.shopping.detail;
+      var adding = detail ? detail.adding : null;
+      if (adding === null || adding.phase === "saving") {
+        return false;
+      }
+      raw = isObject(raw) ? raw : {};
+      adding.name = typeof raw.name === "string" ? raw.name : adding.name;
+      adding.amount = typeof raw.amount === "string" ? raw.amount : adding.amount;
+      return true;
+    }
+
+    function cancelShoppingItemAdd() {
+      var detail = state.shopping.detail;
+      if (!detail || detail.adding === null || detail.adding.phase === "saving") {
+        return false;
+      }
+      detail.adding = null;
+      emit();
+      return true;
+    }
+
+    // The item the server now holds that was not there before this add and matches what was
+    // typed: only an authoritative read that names it that way closes the form. A read that
+    // does not name it proves nothing (the first request may still be on its way), so the
+    // form stays and only the person's own click sends another POST.
+    function shoppingAddedItem(detail, beforeIds, checked) {
+      var items = detail.item === null ? [] : detail.item.items;
+      for (var i = 0; i < items.length; i++) {
+        var entry = items[i];
+        if (beforeIds.indexOf(entry.id) !== -1) {
+          continue;
+        }
+        if (entry.name === checked.name && entry.amount === checked.amount) {
+          return entry;
+        }
+      }
+      return null;
+    }
+
+    async function saveShoppingItemAdd(raw) {
+      var detail = currentShoppingDetail();
+      if (
+        detail === null ||
+        detail.item.status !== "active" ||
+        detail.adding === null ||
+        detail.adding.phase === "saving"
+      ) {
+        return { ok: false, reason: "not_ready" };
+      }
+      syncShoppingItemAdd(raw);
+      var adding = detail.adding;
+      var checked = checkedItemText(adding.name, adding.amount);
+      if (!checked.ok) {
+        adding.error = { text: checked.text, correlationId: null };
+        emit();
+        return { ok: false, reason: "invalid" };
+      }
+      if (!beginShoppingMutation(detail, "add")) {
+        return { ok: false, reason: "busy" };
+      }
+      var beforeIds = detail.item.items.map(function (entry) {
+        return entry.id;
+      });
+      var mine = epoch;
+      adding.phase = "saving";
+      adding.error = null;
+      emit();
+      var response = await http(
+        "POST",
+        "/api/shopping-lists/" + detail.id + "/items",
+        { json: { name: checked.name, amount: checked.amount }, timeoutMs: READ_TIMEOUT_MS }
+      );
+      if (mine !== epoch) {
+        endShoppingMutation(detail);
+        return { ok: false, reason: "stale" };
+      }
+      var outcome = classifyShoppingWrite(response);
+      if (outcome.type === "auth") {
+        endShoppingMutation(detail);
+        handleAuthLost();
+        return { ok: false, reason: "auth" };
+      }
+      if (outcome.type === "ok") {
+        var server = normalizeShoppingItem(outcome.body);
+        if (server !== null) {
+          applyShoppingItem(detail, server);
+          detail.adding = null;
+          announce(TEXT.itemAdded);
+          endShoppingMutation(detail);
+          emit();
+          return { ok: true, id: server.id };
+        }
+        outcome = { type: "uncertain", text: TEXT.unexpected, correlationId: null };
+      }
+      if (outcome.type === "not_found" && outcome.code === "shopping_list_not_found") {
+        detail.adding = null;
+        endShoppingMutation(detail);
+        shoppingDetailGone(detail.id);
+        return { ok: false, reason: "gone" };
+      }
+      if (outcome.type === "uncertain") {
+        // The product may or may not have been added. The form keeps what was typed; the
+        // list is read again, and only if that answer names the new item does the form close.
+        // Nothing is sent again by itself: a second POST is the person's explicit choice.
+        adding.phase = "uncertain";
+        adding.error = { text: TEXT.addItemUncertain, correlationId: outcome.correlationId || null };
+        emit();
+        await reconcileShoppingDetail(detail);
+        var added = shoppingAddedItem(detail, beforeIds, checked);
+        if (added !== null) {
+          detail.adding = null;
+          announce(TEXT.itemAdded);
+          endShoppingMutation(detail);
+          emit();
+          return { ok: true, id: added.id, reconciled: true };
+        }
+        endShoppingMutation(detail);
+        emit();
+        return { ok: false, reason: "uncertain" };
+      }
+      adding.phase = "editing";
+      adding.error = {
+        text: outcome.type === "completed" ? LogicMessage("shopping_list_completed") : outcome.text || TEXT.addItemFailed,
+        correlationId: outcome.correlationId || null,
+      };
+      emit();
+      if (outcome.type === "completed" || outcome.type === "not_found") {
+        await reconcileShoppingDetail(detail);
+      }
+      endShoppingMutation(detail);
+      emit();
+      return { ok: false, reason: outcome.type };
+    }
+
+    function askDeleteShoppingItem(itemId) {
+      var detail = currentShoppingDetail();
+      if (detail === null || detail.item.status !== "active" || shoppingMutationBusy(detail)) {
+        return false;
+      }
+      if (detail.removing !== null && detail.removing.phase === "deleting") {
+        return false;
+      }
+      if (shoppingItemById(detail, itemId) === null) {
+        return false;
+      }
+      detail.editor = null;
+      detail.removing = { id: itemId, phase: "asking", error: null };
+      detail.actionError = null;
+      emit();
+      return true;
+    }
+
+    function cancelDeleteShoppingItem() {
+      var detail = state.shopping.detail;
+      if (!detail || detail.removing === null || detail.removing.phase === "deleting") {
+        return false;
+      }
+      detail.removing = null;
+      emit();
+      return true;
+    }
+
+    async function deleteShoppingItem() {
+      var detail = currentShoppingDetail();
+      var removing = detail ? detail.removing : null;
+      if (detail === null || removing === null || removing.phase === "deleting") {
+        return { ok: false, reason: "not_asked" };
+      }
+      var item = shoppingItemById(detail, removing.id);
+      if (item === null) {
+        detail.removing = null;
+        emit();
+        return { ok: false, reason: "invalid" };
+      }
+      if (!beginShoppingMutation(detail, "remove")) {
+        return { ok: false, reason: "busy" };
+      }
+      var mine = epoch;
+      removing.phase = "deleting";
+      removing.error = null;
+      emit();
+      var response = await http(
+        "DELETE",
+        "/api/shopping-lists/" + detail.id + "/items/" + removing.id,
+        { timeoutMs: READ_TIMEOUT_MS }
+      );
+      if (mine !== epoch) {
+        endShoppingMutation(detail);
+        return { ok: false, reason: "stale" };
+      }
+      var outcome = classifyShoppingWrite(response);
+      if (outcome.type === "auth") {
+        endShoppingMutation(detail);
+        handleAuthLost();
+        return { ok: false, reason: "auth" };
+      }
+      if (outcome.type === "removed" || outcome.type === "not_found") {
+        if (outcome.type === "not_found" && outcome.code === "shopping_list_not_found") {
+          endShoppingMutation(detail);
+          shoppingDetailGone(detail.id);
+          return { ok: false, reason: "gone" };
+        }
+        removeShoppingItem(detail, removing.id);
+        detail.removing = null;
+        announce(TEXT.itemRemoved);
+        endShoppingMutation(detail);
+        emit();
+        return { ok: true };
+      }
+      removing.phase = "error";
+      removing.error = {
+        text: outcome.type === "completed" ? LogicMessage("shopping_list_completed") : outcome.text || TEXT.itemRemoveFailed,
+        correlationId: outcome.correlationId || null,
+      };
+      emit();
+      if (outcome.type === "completed" || outcome.type === "uncertain") {
+        await reconcileShoppingDetail(detail);
+      }
+      endShoppingMutation(detail);
+      emit();
+      return { ok: false, reason: outcome.type };
+    }
+
+    async function setShoppingListStatus(status) {
+      var detail = currentShoppingDetail();
+      if (
+        detail === null ||
+        detail.statusBusy ||
+        shoppingMutationBusy(detail) ||
+        detail.editor !== null ||
+        // An unresolved addition (no write in flight: its POST is settled as "uncertain")
+        // must not hold a completed list hostage: it keeps its own form, and the list can
+        // be returned to work. Only an addition that is actually being sent blocks this.
+        (detail.adding !== null && detail.adding.phase === "saving") ||
+        detail.removing !== null ||
+        detail.deleting !== null
+      ) {
+        return { ok: false, reason: "not_ready" };
+      }
+      if (!SHOPPING_STATUSES[status] || detail.item.status === status) {
+        return { ok: false, reason: "invalid" };
+      }
+      if (!beginShoppingMutation(detail, "status")) {
+        return { ok: false, reason: "busy" };
+      }
+      var mine = epoch;
+      var target = detail;
+      detail.statusBusy = true;
+      detail.actionError = null;
+      emit();
+      var response = await http(
+        "PATCH",
+        "/api/shopping-lists/" + detail.id,
+        { json: { status: status }, timeoutMs: READ_TIMEOUT_MS }
+      );
+      if (mine !== epoch) {
+        endShoppingMutation(detail);
+        return { ok: false, reason: "stale" };
+      }
+      detail.statusBusy = false;
+      var outcome = classifyShoppingWrite(response);
+      if (outcome.type === "auth") {
+        endShoppingMutation(detail);
+        handleAuthLost();
+        return { ok: false, reason: "auth" };
+      }
+      if (outcome.type === "ok") {
+        var item = normalizeShoppingDetail(outcome.body);
+        if (item !== null && item.id === detail.id) {
+          target = shoppingOutcomeDetail(detail);
+          applyShoppingDetail(target, item);
+          rememberShoppingSummary(target.item);
+          announce(status === "completed" ? TEXT.listCompletedNow : TEXT.listReopened);
+          endShoppingMutation(detail);
+          emit();
+          return { ok: true };
+        }
+        outcome = { type: "uncertain", text: TEXT.unexpected, correlationId: null };
+      }
+      if (outcome.type === "not_found") {
+        endShoppingMutation(detail);
+        shoppingDetailGone(detail.id);
+        return { ok: false, reason: "gone" };
+      }
+      target = shoppingOutcomeDetail(detail);
+      target.actionError = {
+        text:
+          status === "completed"
+            ? TEXT.completeListFailed
+            : TEXT.reopenListFailed,
+        correlationId: outcome.correlationId || null,
+      };
+      emit();
+      if (outcome.type === "uncertain") {
+        await reconcileShoppingDetail(detail);
+      }
+      endShoppingMutation(detail);
+      emit();
+      return { ok: false, reason: outcome.type };
+    }
+
+    function askDeleteShoppingList() {
+      var detail = currentShoppingDetail();
+      if (
+        detail === null ||
+        shoppingMutationBusy(detail) ||
+        detail.editor !== null ||
+        detail.adding !== null ||
+        detail.removing !== null
+      ) {
+        return false;
+      }
+      if (detail.deleting !== null && detail.deleting.phase === "deleting") {
+        return false;
+      }
+      detail.deleting = { phase: "asking", error: null };
+      detail.actionError = null;
+      emit();
+      return true;
+    }
+
+    function cancelDeleteShoppingList() {
+      var detail = state.shopping.detail;
+      if (!detail || detail.deleting === null || detail.deleting.phase === "deleting") {
+        return false;
+      }
+      detail.deleting = null;
+      emit();
+      return true;
+    }
+
+    async function deleteShoppingList() {
+      var detail = currentShoppingDetail();
+      var deleting = detail ? detail.deleting : null;
+      if (detail === null || deleting === null || deleting.phase === "deleting") {
+        return { ok: false, reason: "not_asked" };
+      }
+      if (!beginShoppingMutation(detail, "delete")) {
+        return { ok: false, reason: "busy" };
+      }
+      var mine = epoch;
+      var id = detail.id;
+      deleting.phase = "deleting";
+      deleting.error = null;
+      emit();
+      var response = await http("DELETE", "/api/shopping-lists/" + id, {
+        timeoutMs: READ_TIMEOUT_MS,
+      });
+      if (mine !== epoch) {
+        endShoppingMutation(detail);
+        return { ok: false, reason: "stale" };
+      }
+      var outcome = classifyShoppingWrite(response);
+      if (outcome.type === "auth") {
+        endShoppingMutation(detail);
+        handleAuthLost();
+        return { ok: false, reason: "auth" };
+      }
+      if (outcome.type === "removed" || outcome.type === "not_found") {
+        // The confirmation is the server's, whatever the page has shown since: the summary
+        // goes by the list's own id, and a list whose detail has been replaced meanwhile is
+        // still removed (only a detail of another list is left alone).
+        dropShoppingSummary(id);
+        if (state.shopping.currentId === id) {
+          state.shopping.currentId = null;
+          state.shopping.detail = null;
+          state.shopping.notice = null;
+        }
+        // A read of the deleted list that began before this answer cannot put it back. Only
+        // that list is moved on: a read of another list that is under way -- the list the
+        // person has navigated to meanwhile, say -- is not made stale by this deletion.
+        invalidateShoppingDetailReads(id);
+        announce(TEXT.listDeleted);
+        endShoppingMutation(detail);
+        emit();
+        return { ok: true };
+      }
+      deleting.phase = "error";
+      deleting.error = { text: outcome.text || TEXT.deleteListFailed, correlationId: outcome.correlationId || null };
+      emit();
+      if (outcome.type === "uncertain") {
+        await reconcileShoppingDetail(detail);
+      }
+      endShoppingMutation(detail);
+      emit();
+      return { ok: false, reason: outcome.type };
+    }
+
     // --- everything else ------------------------------------------------------------------------------
 
     // Leaving. The moment the person asks, they have left as far as this page is concerned: the
@@ -3678,6 +5554,178 @@
       return { status: favorites.status, error: favorites.error, items: items, current: current };
     }
 
+    // --- the shopping lists as the page draws them ---------------------------------------------------
+
+    var SHOPPING_GROUPS = ["unchecked", "at_home", "purchased"];
+
+    function shoppingItemView(item) {
+      return {
+        id: item.id,
+        position: item.position,
+        name: item.name,
+        amount: item.amount,
+        state: item.state,
+        pending: item.pending || null,
+      };
+    }
+
+    function shoppingDraftView(draft, now) {
+      var atHome = 0;
+      var ingredients = [];
+      for (var i = 0; i < draft.ingredients.length; i++) {
+        if (draft.atHome[i] === true) {
+          atHome++;
+        }
+        ingredients.push({
+          position: i,
+          name: draft.ingredients[i].name,
+          amount: draft.ingredients[i].amount,
+          atHome: draft.atHome[i] === true,
+        });
+      }
+      var editable = draft.phase === "ready" || draft.phase === "rejected" || draft.phase === "reused";
+      var canSaveNew =
+        draft.phase === "reused" ||
+        (draft.phase === "rejected" && draft.code === "shopping_lists_full");
+      return {
+        phase: draft.phase,
+        title: draft.title,
+        servings: draft.servings,
+        ingredients: ingredients,
+        total: draft.ingredients.length,
+        atHome: atHome,
+        remaining: draft.ingredients.length - atHome,
+        instruction: TEXT.shoppingDraftInstruction,
+        editable: editable,
+        canSave: draft.phase === "ready",
+        saving: draft.phase === "saving",
+        canRetry: draft.phase === "uncertain" || draft.phase === "load_error",
+        retryLabel: draft.phase === "load_error" ? TEXT.retry : TEXT.shoppingRetrySave,
+        canSaveNew: canSaveNew,
+        saveNewLabel: draft.phase === "reused" ? TEXT.shoppingSaveNew : TEXT.shoppingSaveAgain,
+        canCancel: draft.phase !== "saving",
+        terminal: draft.phase === "deleted" || draft.phase === "load_gone",
+        error: draft.error,
+      };
+    }
+
+    function shoppingDetailView(now) {
+      var shopping = state.shopping;
+      var detail = shopping.detail;
+      if (shopping.currentId === null || detail === null || detail.id !== shopping.currentId) {
+        return null;
+      }
+      var item = detail.item;
+      var listed = shopping.lists.filter(function (entry) {
+        return entry.id === detail.id;
+      })[0];
+      var view = {
+        id: detail.id,
+        status: detail.status,
+        error: detail.error,
+        title: item ? item.title : listed ? listed.title : "",
+        listStatus: item ? item.status : null,
+        meta:
+          item && item.updatedAt !== null
+            ? fill(TEXT.listUpdated, { when: formatMoment(item.updatedAt, now) })
+            : "",
+        counts: null,
+        progress: "",
+        groups: [],
+        itemCount: 0,
+        readOnly: item ? item.status === "completed" : false,
+        statusBusy: detail.statusBusy,
+        // A write of this list is unsettled, reconciliation included: every conflicting
+        // control is drawn from this same guard.
+        busy: detail.mutation !== null,
+        actionError: detail.actionError,
+        editor: null,
+        adding: null,
+        removing: null,
+        deleting: detail.deleting ? { phase: detail.deleting.phase, error: detail.deleting.error } : null,
+      };
+      if (item) {
+        var counts = shoppingCounts(item.items);
+        view.counts = counts;
+        view.itemCount = counts.total;
+        view.progress = fill(TEXT.progress, { purchased: counts.purchased, total: counts.total });
+        SHOPPING_GROUPS.forEach(function (stateName) {
+          var members = item.items.filter(function (entry) {
+            return entry.state === stateName;
+          });
+          if (members.length) {
+            view.groups.push({
+              state: stateName,
+              title: stateName === "unchecked" ? TEXT.toBuy : stateName === "at_home" ? TEXT.atHome : TEXT.bought,
+              count: members.length,
+              items: members.map(shoppingItemView),
+            });
+          }
+        });
+      }
+      if (detail.editor) {
+        view.editor = {
+          id: detail.editor.id,
+          phase: detail.editor.phase,
+          error: detail.editor.error,
+          draft: {
+            name: detail.editor.draft.name,
+            amount: detail.editor.draft.amount,
+          },
+        };
+      }
+      if (detail.adding) {
+        view.adding = {
+          phase: detail.adding.phase,
+          error: detail.adding.error,
+          draft: { name: detail.adding.name, amount: detail.adding.amount },
+        };
+      }
+      if (detail.removing) {
+        view.removing = {
+          id: detail.removing.id,
+          phase: detail.removing.phase,
+          error: detail.removing.error,
+        };
+      }
+      return view;
+    }
+
+    function shoppingView(now) {
+      var shopping = state.shopping;
+      var lists = shopping.lists.map(function (item) {
+        var meta = [
+          fill(TEXT.progress, { purchased: item.counts.purchased, total: item.counts.total }),
+          item.status === "completed" ? TEXT.listCompleted : TEXT.listActive,
+        ];
+        if (item.updatedAt !== null) {
+          meta.push(formatMoment(item.updatedAt, now));
+        }
+        return {
+          id: item.id,
+          title: item.title,
+          meta: meta.join(" · "),
+          current: item.id === shopping.currentId,
+        };
+      });
+      var current = shoppingDetailView(now);
+      var draft = shopping.draft === null ? null : shoppingDraftView(shopping.draft, now);
+      var title = draft !== null ? TEXT.shoppingDraftTitle : current !== null && current.title ? current.title : TEXT.shoppingTitle;
+      return {
+        status: shopping.status,
+        error: shopping.error,
+        notice: shopping.notice,
+        title: title,
+        lists: lists,
+        current: current,
+        draft: draft,
+        // The lists whose write is unsettled: their sidebar entries are not opened again
+        // until the write (and its reconciliation) has settled.
+        blocked: Object.keys(shoppingMutations),
+        empty: shopping.status === "ready" && lists.length === 0,
+      };
+    }
+
     function buildTimeline(thread, turn, now) {
       var items = [];
       var messages = thread ? thread.messages : [];
@@ -3753,6 +5801,17 @@
         banner: null,
         section: "chats",
         favorites: { status: "idle", error: null, items: [], current: null },
+        shopping: {
+          status: "idle",
+          error: null,
+          notice: null,
+          title: TEXT.shoppingTitle,
+          lists: [],
+          current: null,
+          draft: null,
+          blocked: [],
+          empty: false,
+        },
         currentId: null,
         busy: false,
         maxLength: maxLength,
@@ -3787,6 +5846,7 @@
         banner: state.banner,
         section: state.section,
         favorites: favoritesView(now),
+        shopping: shoppingView(now),
         currentId: state.currentId,
         busy: false,
         maxLength: maxLength,
@@ -3927,6 +5987,64 @@
       cancelRemoveFavorite: cancelRemoveFavorite,
       removeFavorite: function () {
         return track(removeFavorite());
+      },
+      // The shopping lists.
+      reloadShoppingLists: function () {
+        return track(loadShoppingLists());
+      },
+      beginShoppingDraftFromRecipe: function (conversationId, messageId, recipeIndex) {
+        return track(beginShoppingDraftFromRecipe(conversationId, messageId, recipeIndex));
+      },
+      beginShoppingDraftFromFavorite: beginShoppingDraftFromFavorite,
+      reloadShoppingDraft: function () {
+        return track(reloadShoppingDraft());
+      },
+      toggleShoppingDraftAtHome: toggleShoppingDraftAtHome,
+      shoppingDraftDirty: shoppingDraftDirty,
+      saveShoppingDraft: function () {
+        return track(saveShoppingDraft());
+      },
+      retryShoppingDraft: function () {
+        return track(retryShoppingDraft());
+      },
+      saveShoppingDraftWithNewKey: function () {
+        return track(saveShoppingDraftWithNewKey());
+      },
+      cancelShoppingDraft: cancelShoppingDraft,
+      openShoppingList: function (id) {
+        return track(openShoppingList(id));
+      },
+      closeShoppingList: closeShoppingList,
+      reloadShoppingList: function () {
+        return track(reloadShoppingList());
+      },
+      setShoppingItemState: function (itemId, state) {
+        return track(setShoppingItemState(itemId, state));
+      },
+      startShoppingItemEdit: startShoppingItemEdit,
+      syncShoppingItemEdit: syncShoppingItemEdit,
+      cancelShoppingItemEdit: cancelShoppingItemEdit,
+      saveShoppingItemEdit: function (draft) {
+        return track(saveShoppingItemEdit(draft));
+      },
+      beginShoppingItemAdd: beginShoppingItemAdd,
+      syncShoppingItemAdd: syncShoppingItemAdd,
+      cancelShoppingItemAdd: cancelShoppingItemAdd,
+      saveShoppingItemAdd: function (draft) {
+        return track(saveShoppingItemAdd(draft));
+      },
+      askDeleteShoppingItem: askDeleteShoppingItem,
+      cancelDeleteShoppingItem: cancelDeleteShoppingItem,
+      deleteShoppingItem: function () {
+        return track(deleteShoppingItem());
+      },
+      setShoppingListStatus: function (status) {
+        return track(setShoppingListStatus(status));
+      },
+      askDeleteShoppingList: askDeleteShoppingList,
+      cancelDeleteShoppingList: cancelDeleteShoppingList,
+      deleteShoppingList: function () {
+        return track(deleteShoppingList());
       },
       recheck: recheck,
       recover: recover,

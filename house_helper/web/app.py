@@ -37,8 +37,10 @@ Its pairing routes (telegram_api.py) are always routed and answer 503 without it
 it is stopped first, before the runner and the database it uses. `bot_transport` replaces the
 network to the Bot API in tests.
 
-The favorites API (favorites_api.py) is always routed as well: it needs no assistant, only the
-database and a signed-in user.
+The favorites API (favorites_api.py) and the shopping-list API (shopping_api.py) are
+always routed as well: they need no assistant, only the database and a signed-in user.
+The shopping-list API copies a complete ingredient snapshot from a stored recipe or a
+structured favorite; it makes no provider call and parses no prose.
 
 The page (ui.py) is always served too: `GET /` and the few files under /static. It is
 public and static -- it holds nothing of anyone's, and every byte of user data it shows
@@ -66,6 +68,7 @@ from house_helper.web import (
     favorites_api,
     health,
     invite_auth,
+    shopping_api,
     telegram_api,
     ui,
 )
@@ -226,6 +229,7 @@ def create_app(
     app.include_router(invite_auth.router)
     app.include_router(chat_api.router)
     app.include_router(favorites_api.router)
+    app.include_router(shopping_api.router)
     app.include_router(telegram_api.router)
     app.include_router(ui.router)
     return app
