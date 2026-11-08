@@ -675,6 +675,10 @@ async def test_two_selections_at_once_are_serialized_and_the_last_one_wins(tmp_p
             earlier = asyncio.ensure_future(
                 t.click(MOTHER, f"{tc.DIALOGS_SELECT_PREFIX}:{UUID(first).hex}:0")
             )
+            # A click does its own database read (and acknowledgement) before it reaches
+            # the chat lock, so two clicks started together can arrive in either order.
+            # Queue the first one first: "the last one" is the last to ask for the lock.
+            await until(in_line(t, MOTHER, 2))  # the test and the earlier click
             later = asyncio.ensure_future(
                 t.click(MOTHER, f"{tc.DIALOGS_SELECT_PREFIX}:{UUID(second).hex}:0")
             )
@@ -682,7 +686,7 @@ async def test_two_selections_at_once_are_serialized_and_the_last_one_wins(tmp_p
 
         await asyncio.gather(earlier, later)
 
-        assert selection(t).conversation_id == UUID(second)  # both ran, in the order they came
+        assert selection(t).conversation_id == UUID(second)  # both ran, in the order they queued
         confirmations = [text for text in t.bot.texts(MOTHER) if text.startswith("🗂")]
         assert len(confirmations) == 2
         assert [entry["text"] for entry in t.bot.answered] == ["", ""]  # both acknowledged
