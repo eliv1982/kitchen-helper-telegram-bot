@@ -153,6 +153,7 @@ def test_the_application_exposes_health_sign_in_chat_the_page_and_nothing_else(t
         "/api/conversations/{conversation_id}/messages/{message_id}/recipes/{position}": ["get"],
         "/api/favorites": ["get", "post"],
         "/api/favorites/{favorite_id}": ["delete", "get", "patch"],
+        "/api/profile": ["get", "patch"],
         "/api/shopping-lists": ["get", "post"],
         "/api/shopping-lists/{list_id}": ["delete", "get", "patch"],
         "/api/shopping-lists/{list_id}/items": ["post"],
@@ -417,7 +418,7 @@ async def test_starting_and_stopping_leaves_a_migrated_database_as_it_was(tmp_pa
     upgrade_database(engine)
     engine.dispose()
     before = _snapshot(target)
-    assert before[1] == [("0012_shopping_lists",)]
+    assert before[1] == [("0013_user_text_size",)]
 
     async with serving(create_app(settings_for(target))) as client:
         await client.get("/healthz")

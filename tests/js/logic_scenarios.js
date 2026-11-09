@@ -63,6 +63,7 @@ scenario("boot_opens_the_most_recent_conversation", async () => {
     "GET /auth/me",
     "GET /api/conversations?limit=50",
     "GET /api/favorites",
+    "GET /api/profile",
     `GET /api/conversations/${CONV_B}/messages?limit=50`,
   ]);
   assert.equal(view.list.items.length, 2);
@@ -1436,11 +1437,15 @@ scenario("a_history_shows_each_status_and_an_unknown_or_malformed_page_is_not_tr
 
 scenario("every_text_the_page_makes_is_russian", async () => {
   const latin = /[A-Za-z]/;
-  // Placeholders are filled in; "JSON" and the product name "Telegram" are the words the server's own
-  // catalogue writes in Latin.
-  const stripPlaceholders = (value) => value.replace(/\{\w+\}/g, "").replace(/JSON|Telegram/g, "");
+  // Placeholders are filled in; "JSON", the product name "Telegram" and the provider's own
+  // name "OpenAI" are the words written in Latin, as everyone writes them.
+  const stripPlaceholders = (value) =>
+    value.replace(/\{\w+\}/g, "").replace(/JSON|Telegram|OpenAI/g, "");
   for (const [name, value] of Object.entries({ ...Logic.TEXT, ...Logic.CODE_MESSAGES })) {
     const shown = stripPlaceholders(value);
+    if (shown === "") {
+      continue; // a proper name alone: the identity method's label
+    }
     assert.ok(/[А-Яа-яЁё]/.test(shown), `${name} has no Russian`);
     assert.ok(!latin.test(shown), `${name} has Latin letters: ${shown}`);
   }
@@ -2198,7 +2203,8 @@ scenario("a_different_person_on_coming_back_never_sees_the_last_ones_conversatio
   const since = env.net.log.slice(aboutAnna);
   assert.deepEqual(since.filter((r) => r.url.includes(CONV_A)), []);
   assert.deepEqual(since.map((r) => `${r.method} ${r.url.split("?")[0]}`), [
-    "GET /auth/me", "GET /auth/me", "GET /api/conversations", "GET /api/favorites", `GET /api/conversations/${CONV_B}/messages`,
+    "GET /auth/me", "GET /auth/me", "GET /api/conversations", "GET /api/favorites", "GET /api/profile",
+    `GET /api/conversations/${CONV_B}/messages`,
   ]);
 });
 
@@ -6453,6 +6459,434 @@ scenario("a_read_of_the_previous_account_never_lands_in_the_next_ones_page", asy
   await env.settle();
   assert.equal(changed.ok, true);
   assert.equal(env.view().shopping.current.counts.purchased, 1, "a write works after the reset");
+});
+
+// ============================================================================================
+// The profile
+// ============================================================================================
+
+scenario("the_profile_is_read_on_the_way_in_and_carries_its_two_settings_and_the_ways_in", async () => {
+  const env = makeEnv().signedIn([]);
+  env.net.route(
+    "GET",
+    "/api/profile",
+    H.profileBody("Елена", "large", [
+      H.loginMethod("telegram"),
+      H.loginMethod("email", "revoked", "elena@example.com"),
+    ])
+  );
+
+  const view = await env.boot();
+
+  assert.equal(view.screen, "app");
+  assert.equal(view.profile.status, "ready");
+  assert.equal(view.profile.loaded, true);
+  assert.equal(view.profile.displayName, "Елена");
+  assert.equal(view.profile.textSize, "large");
+  assert.deepEqual(view.profile.loginMethods, [
+    { provider: "telegram", address: null, status: "active" },
+    { provider: "email", address: "elena@example.com", status: "revoked" },
+  ]);
+  assert.equal(view.profile.saving, false);
+});
+
+scenario("a_profile_that_cannot_be_read_does_not_hold_up_the_conversations", async () => {
+  const env = makeEnv().signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Старый вопрос"), message(2, "assistant", "Старый ответ")]),
+  });
+  env.net.route("GET", "/api/profile", fail(), H.profileBody("Елена", "large"));
+
+  const view = await env.boot();
+
+  assert.equal(view.screen, "app");
+  assert.equal(view.list.status, "ready");
+  assert.equal(view.currentId, CONV_A);
+  assert.equal(view.thread.items.length, 2);
+  assert.equal(view.profile.status, "error");
+  assert.equal(view.profile.loaded, false);
+  assert.equal(view.profile.textSize, "normal", "the browser's own size is the fallback");
+  assert.ok(/[А-Яа-я]/.test(view.profile.error.text));
+
+  await env.ctl.reloadProfile();
+  await env.settle();
+
+  assert.equal(env.view().profile.status, "ready");
+  assert.equal(env.view().profile.textSize, "large");
+  assert.equal(env.view().profile.error, null);
+});
+
+scenario("a_profile_read_that_loses_the_session_follows_the_same_auth_loss_flow", async () => {
+  const env = makeEnv().signedIn([]);
+  env.net.route("GET", "/api/profile", notAuthenticated());
+
+  const view = await env.boot();
+
+  assert.equal(view.screen, "login");
+  assert.equal(view.notice.text, Logic.TEXT.authExpired);
+  assert.equal(view.profile.textSize, "normal");
+  assert.equal(view.profile.loaded, false);
+});
+
+scenario("a_profile_answer_that_is_not_the_applications_is_an_error_in_that_pane_only", async () => {
+  const env = makeEnv().signedIn([]);
+  env.net.route("GET", "/api/profile", json(200, { display_name: "Елена", text_size: "huge", login_methods: [] }));
+
+  const view = await env.boot();
+
+  assert.equal(view.screen, "app");
+  assert.equal(view.profile.status, "error");
+  assert.equal(view.profile.loaded, false);
+  assert.equal(view.profile.textSize, "normal");
+});
+
+scenario("saving_the_profile_sends_its_two_own_fields_and_updates_the_view", async () => {
+  const env = makeEnv().signedIn([]);
+  await env.boot();
+  env.net.route("PATCH", "/api/profile", H.profileBody("Иван", "large"));
+
+  const result = await env.ctl.saveProfile({ displayName: "  Иван  ", textSize: "large" });
+  await env.settle();
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(env.net.requests("PATCH", "/api/profile")[0].body, {
+    display_name: "Иван",
+    text_size: "large",
+  });
+  const view = env.view();
+  assert.equal(view.profile.displayName, "Иван");
+  assert.equal(view.profile.textSize, "large");
+  assert.deepEqual(view.profile.notice, { kind: "ok", text: Logic.TEXT.profileSaved });
+  assert.equal(view.profile.fieldError, null);
+  assert.ok(env.announced.includes(Logic.TEXT.profileSaved));
+});
+
+scenario("a_profile_name_is_checked_before_anything_is_sent", async () => {
+  const env = makeEnv().signedIn([]);
+  await env.boot();
+  const asked = env.net.log.length;
+
+  for (const value of ["", "   ", "x".repeat(201), "😀".repeat(201), "a​b", "a‮b", "a\nb", "a\u0007b"]) {
+    const result = await env.ctl.saveProfile({ displayName: value, textSize: "normal" });
+    assert.deepEqual([result.ok, result.reason], [false, "invalid"], JSON.stringify(value));
+    assert.ok(/[А-Яа-я]/.test(env.view().profile.fieldError), JSON.stringify(value));
+  }
+
+  assert.equal(env.net.requests("PATCH", "/api/profile").length, 0);
+  assert.equal(env.net.log.length, asked, "nothing was asked");
+});
+
+scenario("a_name_the_server_refuses_is_shown_under_the_name_field", async () => {
+  const env = makeEnv().signedIn([]);
+  await env.boot();
+  env.net.route("PATCH", "/api/profile", apiError(400, "invalid_display_name"));
+
+  const result = await env.ctl.saveProfile({ displayName: "Иван", textSize: "normal" });
+  await env.settle();
+
+  assert.deepEqual([result.ok, result.reason], [false, "rejected"]);
+  assert.equal(env.view().profile.fieldError, Logic.CODE_MESSAGES.invalid_display_name);
+  assert.equal(env.view().profile.notice, null);
+});
+
+scenario("a_profile_size_the_server_refuses_is_a_notice_not_a_name_error", async () => {
+  const env = makeEnv().signedIn([]);
+  await env.boot();
+  env.net.route("PATCH", "/api/profile", apiError(400, "invalid_text_size"));
+
+  const result = await env.ctl.saveProfile({ displayName: "Иван", textSize: "large" });
+  await env.settle();
+
+  assert.deepEqual([result.ok, result.reason], [false, "rejected"]);
+  assert.equal(env.view().profile.fieldError, null);
+  assert.deepEqual(env.view().profile.notice.kind, "error");
+  assert.equal(env.view().profile.notice.text, Logic.CODE_MESSAGES.invalid_text_size);
+});
+
+scenario("a_profile_save_that_loses_the_session_follows_the_same_auth_loss_flow", async () => {
+  const env = makeEnv().signedIn([]);
+  await env.boot();
+  env.net.route("PATCH", "/api/profile", notAuthenticated());
+
+  const result = await env.ctl.saveProfile({ displayName: "Иван", textSize: "large" });
+  await env.settle();
+
+  assert.deepEqual([result.ok, result.reason], [false, "auth"]);
+  assert.equal(env.view().screen, "login");
+  assert.equal(env.view().profile.textSize, "normal");
+  assert.equal(env.view().profile.loaded, false);
+});
+
+scenario("opening_the_profile_reads_it_again_and_a_failed_read_keeps_the_last_known_one", async () => {
+  const env = makeEnv().signedIn([]);
+  env.net.route("GET", "/api/profile", H.profileBody("Елена", "large"), fail());
+  await env.boot();
+  const asked = env.net.requests("GET", "/api/profile").length;
+
+  env.ctl.showSection("profile");
+  await env.settle();
+  env.ctl.showSection("chats");
+  env.ctl.showSection("profile");
+  await env.settle();
+
+  assert.equal(env.net.requests("GET", "/api/profile").length, asked + 2);
+  assert.equal(env.view().section, "profile");
+  assert.equal(env.view().profile.status, "error");
+  assert.equal(env.view().profile.displayName, "Елена", "what was known stays readable");
+  assert.equal(env.view().profile.textSize, "large");
+});
+
+scenario("another_person_never_gets_the_last_ones_profile", async () => {
+  const env = makeEnv().signedIn([]);
+  env.net.route("GET", "/api/profile", H.profileBody("Анна", "large"));
+  await env.boot();
+  assert.equal(env.view().profile.displayName, "Анна");
+
+  signInAs(env, USER_B, []);
+  env.net.route("GET", "/api/profile", H.profileBody("Борис", "normal"));
+  env.ctl.recheck();
+  await env.settle();
+
+  assert.equal(env.view().screen, "app");
+  assert.equal(env.view().profile.displayName, "Борис");
+  assert.equal(env.view().profile.textSize, "normal");
+  assert.ok(!JSON.stringify(env.view().profile).includes("Анна"));
+});
+
+// A read that was already out when a save was accepted answers with the server's values from
+// before that save: it must not put them back over the saved ones (or over the save's message).
+scenario("a_profile_read_that_was_out_before_a_save_cannot_put_the_old_values_back", async () => {
+  const env = makeEnv().signedIn([]);
+  await env.boot();
+
+  const readReached = deferred();
+  const releaseRead = deferred();
+  env.net.route(
+    "GET",
+    "/api/profile",
+    async () => {
+      readReached.resolve();
+      await releaseRead.promise;
+      return H.profileBody("Елена", "normal"); // what the server said before the save
+    }
+  );
+  const reading = env.ctl.reloadProfile();
+  await readReached.promise;
+  assert.equal(env.view().profile.status, "loading");
+
+  env.net.route("PATCH", "/api/profile", H.profileBody("Иван", "large"));
+  const saved = await env.ctl.saveProfile({ displayName: "Иван", textSize: "large" });
+  await flush();
+  assert.deepEqual(
+    [saved.ok, env.view().profile.displayName, env.view().profile.textSize],
+    [true, "Иван", "large"]
+  );
+
+  releaseRead.resolve();
+  assert.equal(await reading, false, "the held answer is older than the save and is discarded");
+  await env.settle();
+
+  const view = env.view();
+  assert.equal(view.profile.status, "ready");
+  assert.equal(view.profile.displayName, "Иван", "the read may not restore what the save replaced");
+  assert.equal(view.profile.textSize, "large");
+  assert.deepEqual(
+    view.profile.notice,
+    { kind: "ok", text: Logic.TEXT.profileSaved },
+    "the save's message stays with the values it saved"
+  );
+  assert.equal(view.profile.draft, null);
+});
+
+// A read begun while the save is still pending may be answered from either side of the
+// server's write. Whatever it says, it may not replace the values the save made true.
+scenario("a_profile_read_begun_while_a_save_is_pending_cannot_replace_the_saved_values", async () => {
+  const env = makeEnv().signedIn([]);
+  await env.boot();
+
+  const patchReached = deferred();
+  const releasePatch = deferred();
+  env.net.route(
+    "PATCH",
+    "/api/profile",
+    async () => {
+      patchReached.resolve();
+      await releasePatch.promise;
+      return H.profileBody("Иван", "large");
+    }
+  );
+  const saving = env.ctl.saveProfile({ displayName: "Иван", textSize: "large" });
+  await patchReached.promise;
+  assert.equal(env.view().profile.saving, true);
+
+  const readReached = deferred();
+  const releaseRead = deferred();
+  env.net.route(
+    "GET",
+    "/api/profile",
+    async () => {
+      readReached.resolve();
+      await releaseRead.promise;
+      return H.profileBody("Елена", "normal"); // the answer the server made before the write
+    }
+  );
+  const reading = env.ctl.reloadProfile();
+  await readReached.promise;
+
+  releasePatch.resolve();
+  assert.equal((await saving).ok, true);
+  await flush();
+  assert.deepEqual(
+    [env.view().profile.displayName, env.view().profile.textSize],
+    ["Иван", "large"]
+  );
+
+  releaseRead.resolve();
+  assert.equal(await reading, false, "the read began before the save was accepted");
+  await env.settle();
+
+  const view = env.view();
+  assert.equal(view.profile.status, "ready");
+  assert.equal(view.profile.displayName, "Иван", "the pending save's values stay");
+  assert.equal(view.profile.textSize, "large");
+  assert.deepEqual(view.profile.notice, { kind: "ok", text: Logic.TEXT.profileSaved });
+});
+
+// Two reads overlap and answer in the opposite order: only the newer one may be shown, so an
+// older answer cannot regress the pane to a snapshot the newer one has already replaced.
+scenario("overlapping_profile_reads_apply_only_the_newest_answer", async () => {
+  const env = makeEnv().signedIn([]);
+  await env.boot();
+
+  const firstReached = deferred();
+  const releaseFirst = deferred();
+  const secondReached = deferred();
+  const releaseSecond = deferred();
+  env.net.route(
+    "GET",
+    "/api/profile",
+    async () => {
+      firstReached.resolve();
+      await releaseFirst.promise;
+      return H.profileBody("Первый", "normal");
+    },
+    async () => {
+      secondReached.resolve();
+      await releaseSecond.promise;
+      return H.profileBody("Второй", "large");
+    }
+  );
+
+  const first = env.ctl.reloadProfile();
+  await firstReached.promise;
+  const second = env.ctl.reloadProfile();
+  await secondReached.promise;
+
+  releaseSecond.resolve();
+  assert.equal(await second, true);
+  await flush();
+  assert.deepEqual(
+    [env.view().profile.displayName, env.view().profile.textSize],
+    ["Второй", "large"]
+  );
+
+  releaseFirst.resolve();
+  assert.equal(await first, false, "the older answer arrived last and is not the authority");
+  await env.settle();
+
+  const view = env.view();
+  assert.equal(view.profile.status, "ready");
+  assert.equal(view.profile.displayName, "Второй", "the older snapshot must not come back");
+  assert.equal(view.profile.textSize, "large");
+});
+
+// A save that fails changes nothing on the server, so it neither changes the values nor
+// blocks a later read; what was typed stays in the draft for a retry until a read replaces it.
+scenario("a_failed_profile_save_leaves_the_values_and_a_fresh_read_still_applies", async () => {
+  const env = makeEnv().signedIn([]);
+  await env.boot();
+  env.net.route("PATCH", "/api/profile", fail());
+
+  const failed = await env.ctl.saveProfile({ displayName: "Иван", textSize: "large" });
+  await flush();
+
+  assert.deepEqual([failed.ok, failed.reason], [false, "unavailable"]);
+  assert.equal(env.view().profile.displayName, "Елена");
+  assert.equal(env.view().profile.textSize, "normal");
+  assert.deepEqual(env.view().profile.draft, { displayName: "Иван", textSize: "large" });
+  assert.equal(env.view().profile.notice.kind, "error");
+
+  env.net.route("GET", "/api/profile", H.profileBody("Пётр", "large"));
+  const reloaded = await env.ctl.reloadProfile();
+  await env.settle();
+
+  assert.equal(reloaded, true);
+  const view = env.view();
+  assert.equal(view.profile.status, "ready");
+  assert.equal(view.profile.displayName, "Пётр");
+  assert.equal(view.profile.textSize, "large");
+  assert.equal(view.profile.error, null);
+  assert.equal(view.profile.notice, null);
+  assert.equal(view.profile.draft, null);
+});
+
+// The ordering above only discards answers that are stale; a read that is still the newest
+// keeps the existing auth-loss flow: a 401 ends the session and takes the profile with it.
+scenario("a_profile_read_begun_after_a_save_still_ends_the_session_on_401", async () => {
+  const env = makeEnv().signedIn([]);
+  await env.boot();
+  env.net.route("PATCH", "/api/profile", H.profileBody("Иван", "large"));
+  assert.equal((await env.ctl.saveProfile({ displayName: "Иван", textSize: "large" })).ok, true);
+  await flush();
+  assert.equal(env.view().profile.displayName, "Иван");
+
+  env.net.route("GET", "/api/profile", notAuthenticated());
+  assert.equal(await env.ctl.reloadProfile(), false);
+  await env.settle();
+
+  const view = env.view();
+  assert.equal(view.screen, "login");
+  assert.equal(view.notice.text, Logic.TEXT.authExpired);
+  assert.equal(view.profile.loaded, false);
+  assert.equal(view.profile.displayName, null);
+});
+
+scenario("logging_out_after_a_profile_save_still_leaves_nothing_of_the_profile", async () => {
+  const env = makeEnv().signedIn([]);
+  await env.boot();
+  env.net.route("PATCH", "/api/profile", H.profileBody("Иван", "large"));
+  assert.equal((await env.ctl.saveProfile({ displayName: "Иван", textSize: "large" })).ok, true);
+  await flush();
+  assert.equal(env.view().profile.displayName, "Иван");
+
+  env.net.route("POST", "/auth/logout", text(204, null));
+  assert.equal(await env.ctl.logout(), true);
+  await env.settle();
+
+  const view = env.view();
+  assert.equal(view.screen, "login");
+  assert.equal(view.notice.text, Logic.TEXT.loggedOut);
+  assert.equal(view.profile.loaded, false);
+  assert.equal(view.profile.displayName, null);
+  assert.ok(!JSON.stringify(view.profile).includes("Иван"));
+});
+
+// The explanation of the data is checked against the lifecycle tests/test_admin_retention.py
+// verifies: messages and their photos go one by one, RETENTION_DAYS after their own creation;
+// a conversation is not deleted for being old, and an old one with a newer message stays.
+scenario("the_profile_data_note_describes_message_retention_and_conversation_cleanup", async () => {
+  const messages = Logic.TEXT.profileDataMessages;
+  const recipes = Logic.TEXT.profileDataRecipes;
+
+  assert.match(messages, /Сообщения и фотографии к ним хранятся 365 дней с момента создания/);
+  assert.match(messages, /Разговор не удаляется только из-за возраста/);
+  assert.match(messages, /старый разговор, в котором есть более новые сообщения, остается/);
+  assert.match(messages, /не осталось сообщений и им не пользовались 365 дней/);
+  assert.doesNotMatch(messages, /^Разговоры, сообщения и фотографии к ним хранятся/);
+
+  assert.match(recipes, /Ответы помощника с рецептами — это сообщения/);
+  assert.match(recipes, /каждый хранится 365 дней с момента создания/);
+  assert.match(recipes, /даже если сам разговор остается/);
+  assert.match(recipes, /[Рр]ецепты, сохраненные в избранное, хранятся, пока вы сами их не удалите/);
 });
 
 module.exports = scenarios;

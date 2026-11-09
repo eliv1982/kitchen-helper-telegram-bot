@@ -293,6 +293,7 @@ def test_lists_of_values_fit_their_columns():
         ShoppingListSourceKind,
         ShoppingListStatus,
         TelegramUpdateAdmissionKind,
+        TextSize,
         TurnStatus,
     )
 
@@ -303,7 +304,9 @@ def test_lists_of_values_fit_their_columns():
     admissions = Base.metadata.tables["telegram_update_admissions"]
     lists = Base.metadata.tables["shopping_lists"]
     items = Base.metadata.tables["shopping_list_items"]
+    users = Base.metadata.tables["users"]
 
+    assert max(len(r.value) for r in TextSize) <= users.c.text_size.type.length
     assert max(len(r.value) for r in MessageRole) <= messages.c.role.type.length
     assert max(len(r.value) for r in TurnStatus) <= turns.c.status.type.length
     assert max(len(r.value) for r in FailureKind) <= turns.c.failure_kind.type.length

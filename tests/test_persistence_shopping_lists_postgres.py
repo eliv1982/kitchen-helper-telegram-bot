@@ -147,7 +147,7 @@ def test_a_populated_0011_database_upgrades_and_downgrades_on_postgres(pg_run):
                     )
 
             before = snapshot()
-            upgrade_database(engine)
+            upgrade_database(engine, "0012_shopping_lists")
 
             with factory() as db:
                 assert db.execute(sa.text("SELECT version_num FROM alembic_version")).scalar() == (

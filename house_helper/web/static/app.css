@@ -58,6 +58,15 @@ html {
   -webkit-text-size-adjust: 100%;
 }
 
+/* The profile's text size (users.text_size, applied by app.js only while the signed-in
+   application is in front). rem sizes are relative to this: 120% makes every part of the
+   application -- text, controls and the gaps between them -- a fifth larger together,
+   instead of enlarging words that then no longer fit their boxes. The sign-in, setup and
+   failure screens never carry the attribute. */
+html[data-text-size="large"] {
+  font-size: 120%;
+}
+
 body {
   margin: 0;
   background: var(--bg);
@@ -360,9 +369,11 @@ textarea[aria-invalid="true"] {
 
 .brand {
   flex: 1;
+  min-width: 0;
   margin: 0;
   font-size: 1.15rem;
   font-weight: 700;
+  overflow-wrap: anywhere;
 }
 
 .burger {
@@ -556,6 +567,7 @@ textarea[aria-invalid="true"] {
 
 .tab {
   flex: 1;
+  min-width: 0;
   min-height: 2.75rem;
   padding: 0.5rem 0.35rem;
   border: 2px solid var(--blue);
@@ -565,6 +577,7 @@ textarea[aria-invalid="true"] {
   font: inherit;
   font-size: 0.95rem;
   font-weight: 600;
+  overflow-wrap: anywhere;
   cursor: pointer;
 }
 
@@ -1306,6 +1319,159 @@ textarea[aria-invalid="true"] {
   }
 }
 
+/* --- the profile ----------------------------------------------------------------------- */
+
+/* The entry point stays at the foot of the side column, under the panels and the Telegram
+   account (if any), and the pane it opens is read in the same column as a recipe. */
+.profile-open {
+  flex: none;
+  margin-top: 0.75rem;
+}
+
+/* The button stays in the column while its pane is open: a darker ground and an inset
+   ring say so, as the pressed tab does for the other three sections. */
+.profile-open[aria-pressed="true"] {
+  background: var(--green-dark);
+  box-shadow: inset 0 0 0 2px var(--on-color);
+}
+
+.profile-body {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  padding: 1rem var(--recipe-gutter);
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.profile-content {
+  width: 100%;
+  max-width: var(--recipe-column);
+  margin: 0 auto;
+}
+
+.profile-section {
+  margin: 0 0 1.75rem;
+}
+
+.profile-section h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1.15rem;
+}
+
+.profile-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin: 0 0 1.1rem;
+}
+
+.profile-field input[type="text"] {
+  width: 100%;
+  min-width: 0;
+  min-height: 2.75rem;
+  padding: 0.55rem 0.75rem;
+  border: 2px solid var(--field-edge);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+}
+
+.profile-field input[type="text"][readonly] {
+  background: var(--pale);
+}
+
+.profile-field input[type="text"][aria-invalid="true"] {
+  border-color: var(--red);
+}
+
+.profile-fieldset {
+  min-width: 0;
+  margin: 0 0 1.1rem;
+  padding: 0;
+  border: 0;
+}
+
+.profile-fieldset legend {
+  margin-bottom: 0.35rem;
+  font-weight: 600;
+}
+
+.profile-choice {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  min-height: 2.75rem;
+  font-weight: 400;
+}
+
+.profile-choice input {
+  flex: none;
+  width: 1.25rem;
+  height: 1.25rem;
+  accent-color: var(--green);
+}
+
+.profile-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.profile-methods {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.profile-method {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+  padding: 0.55rem 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.profile-method-name {
+  overflow-wrap: anywhere;
+  font-weight: 600;
+}
+
+.profile-method-address {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+}
+
+.profile-badge {
+  flex: none;
+  padding: 0.15rem 0.55rem;
+  border: 1px solid;
+  border-radius: 999px;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.profile-badge-active {
+  border-color: var(--green);
+  background: var(--green-pale);
+  color: var(--green-dark);
+}
+
+.profile-badge-revoked {
+  border-color: var(--red);
+  background: var(--red-pale);
+  color: var(--red-dark);
+}
+
+.profile-data p {
+  max-width: 46rem;
+}
+
 .only-narrow {
   display: none;
 }
@@ -1323,6 +1489,13 @@ textarea[aria-invalid="true"] {
   display: flex;
   align-items: flex-end;
   gap: 0.6rem;
+}
+
+/* The textarea may shrink below its character-based intrinsic width: at the large text
+   size on a 320 px screen the send button would otherwise push the row wider than the
+   page (and the application clips what sticks out). */
+.composer-row textarea {
+  min-width: 0;
 }
 
 .btn-send {
@@ -1414,6 +1587,35 @@ textarea[aria-invalid="true"] {
 @media (hover: none) {
   .hint-keys {
     display: none;
+  }
+}
+
+/* At the large size on the narrowest screens the top bar takes two rows: the menu and
+   "Выйти" share the first, and the product's name gets the whole second one, centred.
+   Left on one row, the name would be squeezed into a column of single letters between
+   the two buttons (seen in a real browser at 320 px). */
+@media (max-width: 30rem) {
+  html[data-text-size="large"] .topbar {
+    flex-wrap: wrap;
+    justify-content: space-between;
+  }
+
+  html[data-text-size="large"] .brand {
+    order: 3;
+    flex: 1 1 100%;
+    overflow-wrap: normal;
+    text-align: center;
+  }
+
+  /* Three labels in the narrowest drawer at the large size would otherwise break inside
+     the words ("Разгов оры"): they take two rows instead, whole. */
+  html[data-text-size="large"] .tabs {
+    flex-wrap: wrap;
+  }
+
+  html[data-text-size="large"] .tab {
+    flex: 1 1 45%;
+    overflow-wrap: normal;
   }
 }
 

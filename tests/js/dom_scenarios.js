@@ -1489,7 +1489,7 @@ scenario("the_script_never_sets_a_handler_a_style_a_link_or_an_address_on_anythi
   for (const name of names) {
     assert.ok(!/^on/i.test(name) && !["style", "href", "src", "srcdoc", "action", "formaction", "target"].includes(name), name);
   }
-  assert.deepEqual([...names].sort().filter((n) => !["aria-busy", "aria-current", "aria-disabled", "aria-hidden", "aria-invalid", "aria-expanded", "aria-label", "aria-pressed", "data-drawer", "data-id", "datetime", "role", "tabindex", "type"].includes(n)), []);
+  assert.deepEqual([...names].sort().filter((n) => !["aria-busy", "aria-current", "aria-describedby", "aria-disabled", "aria-hidden", "aria-invalid", "aria-expanded", "aria-label", "aria-live", "aria-pressed", "autocapitalize", "autocomplete", "autocorrect", "data-drawer", "data-focus", "data-id", "datetime", "for", "id", "name", "novalidate", "role", "spellcheck", "tabindex", "type", "value"].includes(n)), []);
   assert.deepEqual(page.doc.root.byTag("script").length, 2);
 });
 
@@ -4003,6 +4003,211 @@ scenario("a_session_that_ends_takes_the_shopping_lists_and_drafts_off_the_page",
   assert.equal(page.el("shopping-title").textContent, "");
   assert.ok(!page.root().includes("Борщ"));
   assert.ok(!page.root().includes("мясо"));
+});
+
+// ============================================================================================
+// The profile
+// ============================================================================================
+
+scenario("the_profile_button_opens_its_own_pane_with_the_form_the_ways_in_and_the_data_note", async () => {
+  const page = await open();
+  assert.equal(page.visible("profile"), false);
+
+  page.el("profile-open").click();
+  await page.settle();
+  await page.settle();
+
+  assert.equal(page.visible("screen-app"), true);
+  assert.equal(page.visible("profile"), true);
+  assert.equal(page.visible("chat"), false);
+  assert.equal(page.visible("recipe"), false);
+  assert.equal(page.visible("shopping"), false);
+  assert.equal(page.el("profile-open").getAttribute("aria-pressed"), "true");
+  assert.equal(page.el("profile-title").textContent, "Профиль");
+  assert.equal(page.doc.activeElement, page.el("profile-title"));
+
+  const body = page.el("profile-body");
+  assert.equal(page.el("profile-name").value, "Елена");
+  const radios = body.find((element) => element.getAttribute("type") === "radio");
+  assert.deepEqual(radios.map((radio) => radio.getAttribute("value")), ["normal", "large"]);
+  assert.equal(radios[0].checked, true);
+  assert.equal(body.buttons("Сохранить").length, 1);
+  assert.ok(body.textContent.includes("Отображаемое имя"));
+  assert.ok(body.textContent.includes("Способы входа"));
+  assert.ok(body.textContent.includes("Telegram") && body.textContent.includes("Активен"));
+  assert.ok(body.textContent.includes("Ваши данные"));
+  assert.ok(body.textContent.includes("365"));
+  assert.ok(body.textContent.includes("OpenAI"));
+  assert.ok(body.textContent.includes("избранное"));
+  assert.ok(body.textContent.includes("списки покупок"));
+});
+
+scenario("the_large_text_size_is_applied_to_the_signed_in_page_and_comes_off_on_the_way_out", async () => {
+  const page = await open((env) => {
+    env.signedIn([]);
+    env.net.route("GET", "/api/profile", H.profileBody("Елена", "large"));
+  });
+  await page.settle();
+
+  assert.equal(page.doc.documentElement.getAttribute("data-text-size"), "large");
+  page.el("profile-open").click();
+  await page.settle();
+  const large = page
+    .el("profile-body")
+    .find((element) => element.getAttribute("type") === "radio" && element.getAttribute("value") === "large")[0];
+  assert.equal(large.checked, true);
+
+  page.env.net.route("POST", "/auth/logout", text(204, null));
+  page.el("logout").click();
+  await page.settle();
+  await page.settle();
+
+  assert.equal(page.visible("screen-login"), true);
+  assert.equal(page.doc.documentElement.getAttribute("data-text-size"), null);
+});
+
+scenario("a_profile_that_cannot_be_read_leaves_the_conversations_working", async () => {
+  const page = await open((env) => {
+    signedInWith([conversation(CONV_A, 0, "Старый разговор")], {
+      [CONV_A]: historyBody(CONV_A, [message(1, "user", "Старый вопрос"), message(2, "assistant", "Старый ответ")]),
+    })(env);
+    env.net.route("GET", "/api/profile", fail(), fail(), H.profileBody("Елена", "normal"));
+  });
+  await page.env.ctl.idle();
+  await page.settle();
+
+  assert.equal(page.visible("screen-app"), true);
+  assert.ok(page.el("conversation-list").textContent.includes("Старый разговор"));
+  assert.equal(page.el("composer-input").readOnly, false);
+
+  page.env.net.route("POST", URL_A, turnBody(CONV_A, 3, "Новый вопрос", 4, "Ответ"));
+  await page.send("Новый вопрос");
+  assert.ok(page.articleTexts().some((text) => text.includes("Ответ")));
+
+  page.el("profile-open").click();
+  await page.settle();
+  await page.settle();
+  assert.equal(page.visible("profile"), true);
+  assert.ok(page.el("profile-body").textContent.includes(Logic.TEXT.network));
+  assert.ok(page.el("profile-body").textContent.includes(Logic.TEXT.profileOthersWork));
+  assert.equal(page.el("profile-body").buttons("Повторить").length, 1);
+
+  page.el("profile-body").buttons("Повторить")[0].click();
+  await page.settle();
+  await page.settle();
+  assert.equal(page.el("profile-name").value, "Елена");
+  assert.ok(!page.el("profile-body").textContent.includes(Logic.TEXT.profileFailed));
+});
+
+scenario("saving_the_profile_draws_the_answer_and_a_refused_name_stays_under_its_field", async () => {
+  const page = await open();
+  page.el("profile-open").click();
+  await page.settle();
+  await page.settle();
+
+  const body = page.el("profile-body");
+  page.editField(page.el("profile-name"), "  Иван  ");
+  const large = body.find(
+    (element) => element.getAttribute("type") === "radio" && element.getAttribute("value") === "large"
+  )[0];
+  large.checked = true;
+  assert.equal(
+    page.el("profile-body").find(
+      (element) => element.getAttribute("type") === "radio" && element.getAttribute("value") === "large"
+    )[0].checked,
+    true
+  );
+  page.env.net.route("PATCH", "/api/profile", H.profileBody("Иван", "large"));
+  large.closest("form").buttons("Сохранить")[0].click();
+  await page.settle();
+  await page.settle();
+
+  const requests = page.env.net.requests("PATCH", "/api/profile");
+  assert.deepEqual(requests[0].body, { display_name: "Иван", text_size: "large" });
+  assert.equal(page.el("profile-name").value, "Иван");
+  assert.ok(page.el("profile-body").textContent.includes(Logic.TEXT.profileSaved));
+  assert.equal(page.doc.documentElement.getAttribute("data-text-size"), "large");
+  assert.equal(
+    page.el("profile-body").find(
+      (element) => element.getAttribute("type") === "radio" && element.getAttribute("value") === "large"
+    )[0].checked,
+    true
+  );
+
+  page.env.net.route("PATCH", "/api/profile", apiError(400, "invalid_display_name"));
+  page.editField(page.el("profile-name"), "Иван");
+  page.el("profile-body").buttons("Сохранить")[0].click();
+  await page.settle();
+  await page.settle();
+
+  assert.ok(page.el("profile-body").textContent.includes(Logic.CODE_MESSAGES.invalid_display_name));
+  assert.equal(page.el("profile-name").getAttribute("aria-invalid"), "true");
+  assert.equal(page.el("profile-body").buttons("Сохранить").length, 1);
+  assert.ok(!page.el("profile-body").textContent.includes(Logic.TEXT.profileSaved));
+});
+
+scenario("a_revoked_identity_is_drawn_as_revoked_and_no_telegram_subject_is", async () => {
+  const page = await open((env) => {
+    env.signedIn([]);
+    env.net.route(
+      "GET",
+      "/api/profile",
+      H.profileBody("Елена", "normal", [
+        H.loginMethod("telegram", "revoked"),
+        H.loginMethod("email", "active", "cook@example.com"),
+      ])
+    );
+  });
+  page.el("profile-open").click();
+  await page.settle();
+  await page.settle();
+
+  const body = page.el("profile-body");
+  assert.ok(body.textContent.includes("Telegram"));
+  assert.ok(body.textContent.includes(Logic.TEXT.profileLoginEmail));
+  assert.ok(body.textContent.includes("cook@example.com"));
+  assert.ok(body.textContent.includes(Logic.TEXT.profileStatusRevoked));
+  assert.ok(body.textContent.includes(Logic.TEXT.profileStatusActive));
+  assert.ok(!body.textContent.includes("1234123412341234123"));
+  assert.equal(body.byClass("profile-badge-revoked").length, 1);
+  assert.equal(body.byClass("profile-badge-active").length, 1);
+});
+
+scenario("a_profile_name_and_address_are_text_not_markup", async () => {
+  const page = await open((env) => {
+    env.signedIn([]);
+    env.net.route(
+      "GET",
+      "/api/profile",
+      H.profileBody(HOSTILE, "normal", [H.loginMethod("email", "active", HOSTILE)])
+    );
+  });
+  page.el("profile-open").click();
+  await page.settle();
+  await page.settle();
+
+  assert.equal(page.el("profile-name").value, HOSTILE);
+  assert.ok(page.el("profile-body").textContent.includes(HOSTILE));
+  assert.equal(page.doc.root.byTag("img").length, 0);
+  assert.equal(page.doc.root.byTag("svg").length, 0);
+  assert.equal(page.doc.root.byTag("script").length, 2, "only the two the server wrote");
+});
+
+scenario("a_profile_save_that_cannot_be_confirmed_is_a_notice_and_keeps_what_was_typed", async () => {
+  const page = await open();
+  page.el("profile-open").click();
+  await page.settle();
+  await page.settle();
+  page.editField(page.el("profile-name"), "Новое имя");
+  page.env.net.route("PATCH", "/api/profile", fail());
+
+  page.el("profile-body").buttons("Сохранить")[0].click();
+  await page.settle();
+  await page.settle();
+
+  assert.equal(page.el("profile-name").value, "Новое имя");
+  assert.ok(page.el("profile-body").textContent.includes(Logic.TEXT.network));
+  assert.equal(page.el("profile-body").buttons("Сохранить").length, 1, "the form is still there");
 });
 
 module.exports = { scenarios, useShell, useNoLoginShell };

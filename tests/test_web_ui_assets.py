@@ -108,12 +108,13 @@ def test_the_user_id_is_kept_to_tell_whose_page_it_is_and_is_never_sent():
     # only to know whose page and whose record it is. It is sent nowhere: no request line mentions it, the
     # bodies are the message text, nothing, the conversation, message and optional recipe position of an
     # answer to keep, the editable fields of a favorite, a shopping item's state/name/amount or list status,
-    # the source and initial states of a shopping list, and the e-mail address, and the headers are the
-    # idempotency keys alone.
+    # the source and initial states of a shopping list, the profile's two own fields, and the e-mail address,
+    # and the headers are the idempotency keys alone.
     for line in code.splitlines():
         if re.search(r"http\(|json:|headers|\.body|Idempotency", line):
             assert not re.search(r"principal|userId|owner|user_id", line), line
     assert re.findall(r"json:\s*(\{[^}]*\})", code) == [
+        "{ display_name: prepared.text, text_size: size }",
         "{ text: turn.text }",
         "{}",
         "{ state: itemState }",
@@ -272,9 +273,12 @@ def test_every_rule_that_sets_both_a_colour_and_a_background_keeps_the_contrast(
 
 def test_touch_targets_are_at_least_44_css_pixels():
     rules = _merged_rules()
-    root_size = 16  # rem: nothing here changes the browser's default
+    root_size = 16  # the browser's default, which the normal text size keeps
 
-    assert not re.search(r"html\s*\{[^}]*font-size", CSS)
+    # The normal size changes nothing; the profile's large mode only grows every rem, so
+    # these targets can get larger and never smaller.
+    assert not re.search(r"^\s*html\s*\{[^}]*font-size", CSS, re.MULTILINE)
+    assert re.search(r'html\[data-text-size="large"\]\s*\{\s*font-size:\s*120%;', CSS)
     for selector in (".btn", ".chip", "input[type=\"email\"], textarea"):
         height = rules[selector]["min-height"]
         assert height.endswith("rem") and float(height[:-3]) * root_size >= 44, selector
@@ -290,6 +294,10 @@ def test_touch_targets_are_at_least_44_css_pixels():
     assert float(rules[".shop-state"]["min-height"][:-3]) * root_size >= 44
     assert float(rules['.shop-field input[type="text"]']["min-height"][:-3]) * root_size >= 44
     assert float(rules[".tab"]["min-height"][:-3]) * root_size >= 44
+    # The profile's choices are whole rows too, and its name field and save button use the
+    # same button and field sizes as the rest.
+    assert float(rules[".profile-choice"]["min-height"][:-3]) * root_size >= 44
+    assert float(rules['.profile-field input[type="text"]']["min-height"][:-3]) * root_size >= 44
 
 
 def test_keyboard_focus_is_visible_and_motion_and_hidden_are_handled():
@@ -352,10 +360,55 @@ def test_the_side_column_keeps_its_top_and_its_foot_and_scrolls_the_list_between
     assert rules[".sidebar"]["display"] == "flex" and rules[".sidebar"]["flex-direction"] == "column"
     assert rules[".conv-list"]["overflow-y"] == "auto" and rules[".conv-list"]["min-height"] == "0"
     assert rules[".telegram"]["flex"] == "none" and rules[".tabs"]["flex"] == "none"
+    assert rules[".profile-open"]["flex"] == "none"
     html = ui.render_shell(telegram=True, email=True)
-    # The tabs, the button for a new conversation and the list are in this order, and Telegram comes after them.
-    order = [html.index(marker) for marker in ('id="tab-chats"', 'id="new-conversation"', 'id="conversation-list"', 'id="telegram"')]
+    # The tabs, the button for a new conversation and the list are in this order; Telegram
+    # comes after them, and the profile's entry point closes the column.
+    order = [
+        html.index(marker)
+        for marker in (
+            'id="tab-chats"',
+            'id="new-conversation"',
+            'id="conversation-list"',
+            'id="telegram"',
+            'id="profile-open"',
+        )
+    ]
     assert order == sorted(order)
+
+
+def test_the_profile_pane_and_the_large_text_size_wrap_instead_of_scrolling_sideways():
+    rules = _merged_rules()
+
+    # The pane scrolls down only: a long name, an address or a status badge wraps inside
+    # its row at every width, including 320 px with the large size.
+    assert rules[".profile-body"]["overflow-x"] == "hidden"
+    assert rules[".profile-body"]["overflow-y"] == "auto"
+    assert rules[".profile-body"]["min-height"] == "0"
+    assert rules[".profile-content"]["max-width"] == "var(--recipe-column)"
+    assert rules[".profile-method"]["flex-wrap"] == "wrap"
+    assert rules[".profile-method-name"]["overflow-wrap"] == "anywhere"
+    assert rules[".profile-method-address"]["overflow-wrap"] == "anywhere"
+    # The three tabs of the side column may break a long word rather than push it wider,
+    # and the composer's field may shrink below its character width beside the send button.
+    assert rules[".tab"]["min-width"] == "0" and rules[".tab"]["overflow-wrap"] == "anywhere"
+    assert rules[".composer-row textarea"]["min-width"] == "0"
+    assert rules[".brand"]["overflow-wrap"] == "anywhere"
+    # At the large size on a 320 px screen the top bar wraps instead of squeezing the
+    # product's name into a column of single letters: the buttons share the first row
+    # and the name is the full second row.
+    large_topbar = rules['html[data-text-size="large"] .topbar']
+    large_brand = rules['html[data-text-size="large"] .brand']
+    assert large_topbar["flex-wrap"] == "wrap"
+    assert large_brand["order"] == "3"
+    assert large_brand["flex"] == "1 1 100%"
+    assert large_brand["overflow-wrap"] == "normal"
+    # The three section labels take two rows at this size, whole, rather than breaking
+    # inside their words.
+    assert rules['html[data-text-size="large"] .tabs']["flex-wrap"] == "wrap"
+    assert rules['html[data-text-size="large"] .tab']["overflow-wrap"] == "normal"
+    # The profile button says its pane is open (the tabs have the same kind of state).
+    assert rules['.profile-open[aria-pressed="true"]']["background"] == "var(--green-dark)"
 
 
 def test_the_long_telegram_text_is_in_a_details_and_what_matters_at_a_glance_is_not():

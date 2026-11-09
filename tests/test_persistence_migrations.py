@@ -77,7 +77,8 @@ ATTACHMENTS = "0009_message_attachments"
 RECIPES = "0010_structured_recipe_favorites"
 TELEGRAM_ACTIVE = "0011_telegram_active_selection"
 SHOPPING = "0012_shopping_lists"
-HEAD = SHOPPING
+PROFILE = "0013_user_text_size"
+HEAD = PROFILE
 # alembic_version.version_num is VARCHAR(32); a longer identifier fails the upgrade on
 # PostgreSQL with SQLSTATE 22001 (character varying(32), value too long).
 MAX_REVISION_LENGTH = 32
@@ -115,6 +116,7 @@ def test_the_history_is_one_line_with_one_head():
     assert too_long == []  # every id fits alembic_version.version_num (VARCHAR(32))
     assert [revision.revision for revision in script.walk_revisions()] == [
         HEAD,
+        SHOPPING,
         TELEGRAM_ACTIVE,
         RECIPES,
         ATTACHMENTS,
@@ -127,7 +129,8 @@ def test_the_history_is_one_line_with_one_head():
         PROVENANCE,
         INITIAL,
     ]
-    assert script.get_revision(HEAD).down_revision == TELEGRAM_ACTIVE
+    assert script.get_revision(HEAD).down_revision == SHOPPING
+    assert script.get_revision(SHOPPING).down_revision == TELEGRAM_ACTIVE
     assert script.get_revision(TELEGRAM_ACTIVE).down_revision == RECIPES
     assert script.get_revision(RECIPES).down_revision == ATTACHMENTS
     assert script.get_revision(ATTACHMENTS).down_revision == TELEGRAM
@@ -653,7 +656,11 @@ def _r3b2_database(engine) -> dict:
 def _rows_of(engine, table: str, omit: tuple[str, ...] = ()) -> list:
     with engine.connect() as connection:
         result = connection.exec_driver_sql(f"SELECT * FROM {table}")
-        keep = [i for i, name in enumerate(result.keys()) if name not in omit]
+        # The tests that use this compare a schema older than 0013 against itself after a
+        # later upgrade; users.text_size (0013) is not theirs to compare (its own migration
+        # test does that), and it may not exist on the older side at all.
+        names = set(omit) | ({"text_size"} if table == "users" else set())
+        keep = [i for i, name in enumerate(result.keys()) if name not in names]
         return sorted(([row[i] for i in keep] for row in result.all()), key=repr)
 
 
@@ -1100,10 +1107,18 @@ def _r4c_database(engine) -> dict:
 
 def _snapshot_of(engine, tables) -> dict[str, list]:
     with engine.connect() as connection:
-        return {
-            table: sorted(connection.exec_driver_sql(f"SELECT * FROM {table}").all(), key=repr)
-            for table in sorted(tables)
-        }
+        snapshot = {}
+        for table in sorted(tables):
+            result = connection.exec_driver_sql(f"SELECT * FROM {table}")
+            # See _rows_of: a snapshot of an older revision does not compare the column
+            # 0013 adds (its own migration test covers it), so the same rows stay equal
+            # after an upgrade that includes it.
+            names = set(result.keys()) - ({"text_size"} if table == "users" else set())
+            keep = [i for i, name in enumerate(result.keys()) if name in names]
+            snapshot[table] = sorted(
+                ([row[i] for i in keep] for row in result.all()), key=repr
+            )
+        return snapshot
 
 
 def test_the_oidc_state_migration_adds_one_nullable_column_and_changes_no_row(empty_engine):
@@ -1262,8 +1277,12 @@ def _offline_sql(direction: str) -> str:
         command.downgrade(config, f"{ATTACHMENTS}:{TELEGRAM}", sql=True)
     elif direction == "down_from_recipes":
         command.downgrade(config, f"{RECIPES}:{ATTACHMENTS}", sql=True)
+    elif direction == "down_from_shopping":
+        command.downgrade(config, f"{SHOPPING}:{TELEGRAM_ACTIVE}", sql=True)
+    elif direction == "down_from_shopping_to_recipes":
+        command.downgrade(config, f"{SHOPPING}:{RECIPES}", sql=True)
     elif direction == "down_from_head":
-        command.downgrade(config, f"{HEAD}:{RECIPES}", sql=True)
+        command.downgrade(config, f"{HEAD}:{SHOPPING}", sql=True)
     else:
         command.downgrade(config, f"{HEAD}:base", sql=True)
     return config.output_buffer.getvalue()
@@ -1289,6 +1308,9 @@ def test_the_upgrade_renders_as_postgresql_sql():
     assert "%" not in sql  # a doubled percent sign would make the offline SQL unrunnable
     assert f"INSERT INTO alembic_version (version_num) VALUES ('{INITIAL}')" in sql
     assert f"UPDATE alembic_version SET version_num='{HEAD}'" in sql
+    assert "ALTER TABLE users ADD COLUMN text_size VARCHAR(16) DEFAULT 'normal' NOT NULL" in sql
+    assert "CHECK (length(text_size) <= 16)" in sql
+    assert "CHECK (text_size IN ('normal', 'large'))" in sql
     assert sql.count("CREATE INDEX") == 25 and sql.count("CREATE UNIQUE INDEX") == 3
 
 

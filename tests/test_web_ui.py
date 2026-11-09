@@ -281,9 +281,29 @@ def test_the_shopping_tab_is_a_third_section_with_its_own_panel_and_pane():
         html.index('id="shopping"'),
     ]
     assert order == sorted(order)
-    assert page.by_id("sidebar")["aria-label"] == "Разговоры, избранное и покупки"
+    assert page.by_id("sidebar")["aria-label"] == "Разговоры, избранное, покупки и профиль"
     # The heading the destination shows is «Мои покупки»; the script draws it from its own
     # words (tests/test_web_ui_logic.py checks those).
+
+
+def test_the_profile_is_a_button_at_the_foot_of_the_sidebar_and_its_own_pane():
+    page = shell_for(telegram=True, email=True)
+    html = ui.render_shell(telegram=True, email=True)
+    button = page.by_id("profile-open")
+    pane = page.by_id("profile")
+
+    assert button["type"] == "button"
+    assert button["aria-pressed"] == "false"
+    assert button["aria-controls"] == "profile"
+    assert button["class"] == "btn btn-secondary btn-block profile-open"
+    assert pane["aria-labelledby"] == "profile-title"
+    assert "hidden" in pane  # the script shows it; nothing else does
+    assert page.by_id("profile-title")["tabindex"] == "-1"
+    assert page.by_id("profile-body")["tabindex"] == "0"
+    # After the three sections and the Telegram panel: an entry point of its own, not a
+    # fourth tab squeezed into the row of three.
+    assert html.index('id="telegram"') < html.index('id="profile-open"') < html.index('id="profile"')
+    assert 'id="tab-profile"' not in html
 
 
 def test_the_help_entry_opens_a_modal_dialog_beside_the_conversation_title_that_starts_closed():

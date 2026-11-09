@@ -113,6 +113,8 @@
   var MAX_EDIT_STEP = 1000; // the protocol's MAX_STEP_LENGTH
   var MAX_EDIT_TEXT = 100000; // the server's MAX_FAVORITE_TEXT_LENGTH
   var MAX_EDIT_NOTES = 2000; // the server's MAX_FAVORITE_NOTES_LENGTH
+  var MAX_PROFILE_NAME = 200; // the server's users.display_name width, in code points
+  var TEXT_SIZE_VALUES = { normal: true, large: true }; // the server's TextSize values
   var MAX_SHOPPING_ITEMS = 200; // the server's shopping_lists.ITEMS_LIMIT
   var MAX_SHOPPING_NAME = 200; // the server's shopping_lists.MAX_NAME_LENGTH
   var MAX_SHOPPING_AMOUNT = 100; // the server's shopping_lists.MAX_AMOUNT_LENGTH
@@ -416,6 +418,51 @@
     editReload: "Загрузить заново",
     editOverwrite: "Сохранить поверх",
     editUnsaved: "В рецепте есть несохраненные изменения. Уйти без сохранения?",
+    // The profile: the name, the text size, the ways in, and the explanation of the data.
+    profileTab: "Профиль",
+    profileLoading: "Загружаем профиль…",
+    profileFailed: "Не удалось загрузить профиль.",
+    profileOthersWork: "Остальные разделы работают: разговоры, избранное и покупки доступны.",
+    profileNameLabel: "Отображаемое имя",
+    profileNameHint: "От 1 до 200 символов. Невидимые и управляющие символы не допускаются.",
+    profileNameEmpty: "Введите имя.",
+    profileNameTooLong: "Имя слишком длинное (максимум 200 символов).",
+    profileNameBadChars: "В имени есть невидимые или управляющие символы.",
+    profileTextSizeLabel: "Размер текста",
+    profileSizeNormal: "Обычный",
+    profileSizeLarge: "Крупный (120%)",
+    profileSave: "Сохранить",
+    profileSaving: "Сохраняем…",
+    profileSaved: "Профиль сохранен.",
+    profileSaveFailed: "Не удалось сохранить профиль. Попробуйте еще раз.",
+    profileLoginTitle: "Способы входа",
+    profileLoginHint: "Здесь показаны способы входа, которые уже использовались в этом аккаунте.",
+    profileLoginEmpty: "Способы входа появятся здесь после первого входа.",
+    profileLoginTelegram: "Telegram",
+    profileLoginEmail: "Электронная почта",
+    profileLoginOther: "Другой способ",
+    profileStatusActive: "Активен",
+    profileStatusRevoked: "Отозван",
+    profileDataTitle: "Ваши данные",
+    profileDataMessages:
+      "Сообщения и фотографии к ним хранятся 365 дней с момента создания, после чего " +
+      "автоматическая очистка удаляет их. Разговор не удаляется только из-за возраста: " +
+      "старый разговор, в котором есть более новые сообщения, остается. Очистка удаляет " +
+      "разговор, только когда в нем не осталось сообщений и им не пользовались 365 дней.",
+    profileDataRecipes:
+      "Ответы помощника с рецептами — это сообщения: каждый хранится 365 дней с момента " +
+      "создания и удаляется автоматически, даже если сам разговор остается. " +
+      "Рецепты, сохраненные в избранное, хранятся, пока вы сами их не удалите.",
+    profileDataShopping:
+      "Списки покупок автоматически не удаляются: они хранятся, пока вы сами их не удалите.",
+    profileDataOpenAI:
+      "Чтобы ответить, помощник отправляет в OpenAI сообщения текущего разговора и фотографии к ним. " +
+      "Профиль, избранное и списки покупок в OpenAI не отправляются.",
+    profileDataDelete:
+      "Разговор можно удалить в меню рядом с его названием, рецепт — в избранном, " +
+      "список покупок — в разделе «Покупки». Удаленное восстановить нельзя.",
+    profileDataProfile:
+      "Имя и размер текста хранятся на сервере в вашем профиле.",
   };
 
   // What the server says for each of its error codes (house_helper/web/diagnostics.py).
@@ -436,6 +483,9 @@
     invalid_message_text: "В сообщении есть недопустимые символы.",
     message_too_long: "Сообщение слишком длинное (максимум {max_length} символов). Сократите его и отправьте снова.",
     invalid_query: "Параметры запроса указаны неверно.",
+    invalid_display_name:
+      "Имя должно быть непустым, не длиннее 200 символов и без невидимых или управляющих символов.",
+    invalid_text_size: "Не удалось сохранить размер текста. Выберите «Обычный» или «Крупный».",
     not_authenticated: "Войдите в аккаунт, чтобы продолжить.",
     conversation_not_found: "Разговор не найден.",
     message_not_found: "Этот ответ не найден: возможно, он уже удален.",
@@ -514,6 +564,10 @@
   // A control character other than tab, newline and carriage return, and DEL..C1: refused
   // by the server (they cannot be stored everywhere).
   var CONTROL_CHARACTER = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/;
+  // A display name may hold no character of Unicode category C at all: not tab or
+  // newline (a name is one line), not a zero-width or bidirectional mark, not a
+  // surrogate, a private-use or an unassigned character (persistence.profile).
+  var PROFILE_CONTROL = /\p{C}/u;
 
   function trimLikeServer(text) {
     return String(text).replace(LEADING_SPACE, "").replace(TRAILING_SPACE, "");
@@ -606,6 +660,24 @@
       };
     }
     return { ok: true, text: text, count: count, max: limit };
+  }
+
+  // The display name's checks, as the server makes them (persistence.profile): trimmed,
+  // not empty, at most 200 code points, and no Unicode category C character. The server
+  // stays the authority; this only saves a round trip and words the refusal at once.
+  function prepareProfileName(raw) {
+    var text = trimLikeServer(typeof raw === "string" ? raw : "");
+    var count = countCodePoints(text);
+    if (!text) {
+      return { ok: false, reason: "empty", message: TEXT.profileNameEmpty, count: count };
+    }
+    if (count > MAX_PROFILE_NAME) {
+      return { ok: false, reason: "too_long", message: TEXT.profileNameTooLong, count: count };
+    }
+    if (PROFILE_CONTROL.test(text)) {
+      return { ok: false, reason: "characters", message: TEXT.profileNameBadChars, count: count };
+    }
+    return { ok: true, text: text, count: count };
   }
 
   // --- idempotency keys -----------------------------------------------------------------------
@@ -914,6 +986,54 @@
       items.push(conversation);
     }
     return { items: items, hasMore: body.has_more };
+  }
+
+  // --- the profile: the account's settings and the ways it has signed in --------------------------------
+
+  // One sign-in method as the server names it. The address is the person's own email
+  // address (the server sends it for an email identity and for no other); the Telegram
+  // subject is deliberately not part of the answer, so there is nothing here to hide.
+  function normalizeLoginMethod(item) {
+    if (
+      !isObject(item) ||
+      (item.provider !== "telegram" && item.provider !== "email") ||
+      (item.status !== "active" && item.status !== "revoked")
+    ) {
+      return null;
+    }
+    if (item.address !== null && item.address !== undefined && typeof item.address !== "string") {
+      return null;
+    }
+    return {
+      provider: item.provider,
+      address: item.provider === "email" && typeof item.address === "string" ? item.address : null,
+      status: item.status,
+    };
+  }
+
+  function normalizeProfile(body) {
+    if (!isObject(body)) {
+      return null;
+    }
+    var name = body.display_name === undefined ? null : body.display_name;
+    if (name !== null && (typeof name !== "string" || name.length > 4096)) {
+      return null;
+    }
+    if (!Object.prototype.hasOwnProperty.call(TEXT_SIZE_VALUES, body.text_size)) {
+      return null;
+    }
+    if (!Array.isArray(body.login_methods)) {
+      return null;
+    }
+    var methods = [];
+    for (var i = 0; i < body.login_methods.length; i++) {
+      var method = normalizeLoginMethod(body.login_methods[i]);
+      if (method === null) {
+        return null;
+      }
+      methods.push(method);
+    }
+    return { displayName: name, textSize: body.text_size, loginMethods: methods };
   }
 
   // --- favorites: what the server says about the recipes a person kept ---------------------------------
@@ -1789,6 +1909,11 @@
     // Counts the beginnings of list reads: an answer to an older read never replaces the answer
     // of a newer one (a deletion starts a fresh read, which a reload may in turn overtake).
     var listRead = 0;
+    // Orders the profile's reads and saves. An answer to an older read never replaces the answer
+    // of a newer one, and a read that was out before a save was accepted must not put back the
+    // values that save replaced (its answer may have been made before the change, or before the
+    // save was known). A save that fails changes nothing, so the reads that are out stay valid.
+    var profileRevision = 0;
     // The same for the shopping lists: an older read of the list or of one list's items never
     // replaces a newer answer, and a write, a deletion or a disappearance makes every read of
     // that list that began before it stale. The detail reads are counted per list (the counts
@@ -1871,13 +1996,36 @@
       };
     }
 
+    // What the page knows of the profile. `loaded` distinguishes "nothing has been read
+    // yet" from a profile whose display name is null; `saving` is one PATCH under way;
+    // `notice` is what the last save said, and `fieldError` the name's own refusal.
+    function freshProfile() {
+      return {
+        status: "idle",
+        loaded: false,
+        error: null,
+        displayName: null,
+        textSize: "normal",
+        loginMethods: [],
+        saving: false,
+        notice: null,
+        fieldError: null,
+        // What is in the form while it has not been saved: the exact text and the chosen
+        // size, kept here so a redraw (a failure, a retry) does not lose the person's work.
+        // A successful read or save replaces it with the server's values.
+        draft: null,
+      };
+    }
+
     function freshState(screen) {
       return {
         screen: screen,
-        // Which part of the app is in front: the conversations, the favorites or the shopping lists.
+        // Which part of the app is in front: the conversations, the favorites, the shopping
+        // lists or the profile.
         section: "chats",
         favorites: freshFavorites(),
         shopping: freshShopping(),
+        profile: freshProfile(),
         // The detail reads of the shopping lists, by list id. They belong to one page of one
         // person: a new state (another start, another sign-in) begins them from nothing, so
         // nothing of an earlier account's reads is kept or added to.
@@ -2214,6 +2362,9 @@
       if (state.favorites.status === "idle") {
         track(loadFavorites()); // (asked for while it was held back)
       }
+      if (state.profile.status === "idle") {
+        track(loadProfile()); // (the same for the profile)
+      }
       // Returning to the page while «Покупки» is in front reads the server again. A draft is
       // never touched (and is not even a reason to read over it): it is the person's unsaved work.
       if (state.section === "shopping" && state.shopping.draft === null) {
@@ -2321,6 +2472,7 @@
         return;
       }
       track(loadFavorites()); // (beside the conversation: a slow or failed list does not hold it up)
+      track(loadProfile()); // (and so does a slow or failed profile: the rest of the page is already usable)
       var first = chooseInitialConversation();
       if (first !== null) {
         await selectConversation(first);
@@ -2331,6 +2483,150 @@
       // without a word (the history shows whether it arrived).
       if (mine === epoch && expiredRecords > 0 && state.banner === null) {
         state.banner = { kind: "info", text: TEXT.expiredRecords, correlationId: null };
+        emit();
+      }
+    }
+
+    // --- the profile -------------------------------------------------------------------------
+
+    // A failed read is a failure of this pane only: the conversations, the favorites and the
+    // shopping lists are already loaded and keep working. A 401 is the session ending, which
+    // is the same flow everywhere (handleAuthLost): nothing of the person stays in the page.
+    async function loadProfile() {
+      if (state.screen !== "app" || state.gate) {
+        return false;
+      }
+      var mine = epoch;
+      var revision = ++profileRevision;
+      state.profile.status = "loading";
+      state.profile.error = null;
+      state.profile.notice = null;
+      state.profile.fieldError = null;
+      state.profile.draft = null; // a fresh read is the authority on what the form shows
+      emit();
+      var response = await http("GET", "/api/profile", { timeoutMs: READ_TIMEOUT_MS });
+      if (mine !== epoch || revision !== profileRevision) {
+        return false; // a newer read, or a save the server accepted, is the authority now
+      }
+      var found = classifyRead(response);
+      if (found.type === "ok") {
+        var profile = normalizeProfile(found.body);
+        if (profile !== null) {
+          applyProfile(profile);
+          state.profile.status = "ready";
+          state.profile.error = null;
+          emit();
+          return true;
+        }
+        found = { type: "unavailable", text: TEXT.unexpected, correlationId: null };
+      }
+      if (found.type === "auth") {
+        handleAuthLost();
+        return false;
+      }
+      state.profile.status = "error";
+      state.profile.error = { text: found.text || TEXT.profileFailed, correlationId: found.correlationId || null };
+      emit();
+      return false;
+    }
+
+    function applyProfile(profile) {
+      state.profile.loaded = true;
+      state.profile.displayName = profile.displayName;
+      state.profile.textSize = profile.textSize;
+      state.profile.loginMethods = profile.loginMethods;
+    }
+
+    // The name and the size as one save. The name is checked here (trimmed, non-empty, at
+    // most 200 code points, no category C character) so a refusal is immediate; the server
+    // checks it again and is the authority. The size is one of the two values the page drew.
+    async function saveProfile(draft) {
+      if (state.screen !== "app" || state.gate || state.profile.saving) {
+        return { ok: false, reason: "busy" };
+      }
+      var size = draft && TEXT_SIZE_VALUES[draft.textSize] ? draft.textSize : state.profile.textSize;
+      // Keep what the person typed (not the trimmed form) across any redraw of the pane,
+      // including a refusal, until it is saved or a fresh read replaces it.
+      state.profile.draft = {
+        displayName: draft && typeof draft.displayName === "string" ? draft.displayName : "",
+        textSize: size,
+      };
+      var prepared = prepareProfileName(draft ? draft.displayName : "");
+      state.profile.notice = null;
+      state.profile.fieldError = prepared.ok ? null : prepared.message;
+      if (!prepared.ok) {
+        emit();
+        return { ok: false, reason: "invalid" };
+      }
+      var mine = epoch;
+      state.profile.saving = true;
+      emit();
+      var response = await http("PATCH", "/api/profile", {
+        json: { display_name: prepared.text, text_size: size },
+        timeoutMs: READ_TIMEOUT_MS,
+      });
+      if (mine !== epoch) {
+        return { ok: false, reason: "stale" };
+      }
+      state.profile.saving = false;
+      if (response.status === 401) {
+        handleAuthLost();
+        return { ok: false, reason: "auth" };
+      }
+      var error = readApiError(response);
+      if (response.status === 200 && response.jsonOk && isObject(response.json)) {
+        var profile = normalizeProfile(response.json);
+        if (profile !== null) {
+          // The server's answer is what the save made true: every profile read that is still
+          // out (one begun while the save was pending included) is now older than it.
+          profileRevision++;
+          applyProfile(profile);
+          state.profile.status = "ready";
+          state.profile.error = null;
+          state.profile.fieldError = null;
+          state.profile.draft = null; // the server's values are the form now
+          state.profile.notice = { kind: "ok", text: TEXT.profileSaved };
+          announce(TEXT.profileSaved);
+          emit();
+          return { ok: true };
+        }
+      }
+      if (response.kind === "http" && response.status >= 400 && response.status < 500 && error) {
+        if (error.code === "invalid_display_name") {
+          state.profile.fieldError = error.message || TEXT.profileNameBadChars;
+          state.profile.notice = null;
+        } else {
+          state.profile.fieldError = null;
+          state.profile.notice = {
+            kind: "error",
+            text: error.message || TEXT.profileSaveFailed,
+            correlationId: error.correlationId,
+          };
+        }
+        emit();
+        return { ok: false, reason: "rejected" };
+      }
+      state.profile.fieldError = null;
+      state.profile.notice = {
+        kind: "error",
+        text: unavailableText(response, error),
+        correlationId: error ? error.correlationId : null,
+      };
+      emit();
+      return { ok: false, reason: "unavailable" };
+    }
+
+    function syncProfileDraft(draft) {
+      state.profile.draft = {
+        displayName: draft && typeof draft.displayName === "string" ? draft.displayName : "",
+        textSize: draft && TEXT_SIZE_VALUES[draft.textSize] ? draft.textSize : state.profile.textSize,
+      };
+    }
+
+    function clearProfileNotice() {
+      if (state.profile.notice !== null || state.profile.fieldError !== null) {
+        state.profile.notice = null;
+        state.profile.fieldError = null;
         emit();
       }
     }
@@ -3234,7 +3530,11 @@
     // in another tab or on another device shows up. The saved shopping lists are read the
     // same way; an open list is read again beside them, and a draft is never touched.
     function showSection(name) {
-      if (state.screen !== "app" || state.gate || (name !== "chats" && name !== "favorites" && name !== "shopping")) {
+      if (
+        state.screen !== "app" ||
+        state.gate ||
+        (name !== "chats" && name !== "favorites" && name !== "shopping" && name !== "profile")
+      ) {
         return;
       }
       state.section = name;
@@ -3246,6 +3546,9 @@
       if (name === "shopping") {
         track(loadShoppingLists());
         track(refreshOpenShoppingList());
+      }
+      if (name === "profile" && state.profile.status !== "loading") {
+        track(loadProfile());
       }
     }
 
@@ -5726,6 +6029,26 @@
       };
     }
 
+    function profileView() {
+      var profile = state.profile;
+      return {
+        status: profile.status,
+        loaded: profile.loaded,
+        error: profile.error,
+        displayName: profile.displayName,
+        textSize: profile.textSize,
+        loginMethods: profile.loginMethods.map(function (method) {
+          return { provider: method.provider, address: method.address, status: method.status };
+        }),
+        saving: profile.saving,
+        notice: profile.notice,
+        fieldError: profile.fieldError,
+        draft: profile.draft
+          ? { displayName: profile.draft.displayName, textSize: profile.draft.textSize }
+          : null,
+      };
+    }
+
     function buildTimeline(thread, turn, now) {
       var items = [];
       var messages = thread ? thread.messages : [];
@@ -5812,6 +6135,20 @@
           blocked: [],
           empty: false,
         },
+        // Nothing of the profile is shown while the page does not know whose it is (and the
+        // large text size comes off with it: drawScreens only applies the attribute to the app).
+        profile: {
+          status: "idle",
+          loaded: false,
+          error: null,
+          displayName: null,
+          textSize: "normal",
+          loginMethods: [],
+          saving: false,
+          notice: null,
+          fieldError: null,
+          draft: null,
+        },
         currentId: null,
         busy: false,
         maxLength: maxLength,
@@ -5847,6 +6184,7 @@
         section: state.section,
         favorites: favoritesView(now),
         shopping: shoppingView(now),
+        profile: profileView(),
         currentId: state.currentId,
         busy: false,
         maxLength: maxLength,
@@ -5988,6 +6326,15 @@
       removeFavorite: function () {
         return track(removeFavorite());
       },
+      // The profile.
+      reloadProfile: function () {
+        return track(loadProfile());
+      },
+      saveProfile: function (draft) {
+        return track(saveProfile(draft));
+      },
+      syncProfileDraft: syncProfileDraft,
+      clearProfileNotice: clearProfileNotice,
       // The shopping lists.
       reloadShoppingLists: function () {
         return track(loadShoppingLists());
@@ -6463,6 +6810,7 @@
 
   return {
     MAX_MESSAGE_LENGTH: MAX_MESSAGE_LENGTH,
+    MAX_PROFILE_NAME: MAX_PROFILE_NAME,
     PAGE_SIZE: PAGE_SIZE,
     STORAGE_KEY: STORAGE_KEY,
     TEXT: TEXT,

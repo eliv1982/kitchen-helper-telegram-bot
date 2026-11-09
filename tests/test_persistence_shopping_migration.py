@@ -40,6 +40,7 @@ from tests.persistence_support import (
     utc,
 )
 from tests.test_persistence_migrations import (
+    SHOPPING,
     TELEGRAM_ACTIVE,
     _fingerprint,
     _offline_sql,
@@ -103,9 +104,9 @@ def test_0012_adds_three_empty_tables_and_changes_no_other_row(engine):
     assert _version(engine) == [TELEGRAM_ACTIVE]
     assert {table for table, rows in before.items() if rows} == SEEDED_TABLES
 
-    upgrade_database(engine)
+    upgrade_database(engine, SHOPPING)
 
-    assert _version(engine) == ["0012_shopping_lists"]
+    assert _version(engine) == [SHOPPING]
     assert _tables(engine) == TABLES | {"alembic_version"}
     assert _snapshot_of(engine, TABLES - SHOPPING_TABLES) == before  # every old row
     with engine.connect() as connection:

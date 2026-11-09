@@ -413,6 +413,19 @@ const me = (seconds = 86400, userId = USER_A) =>
   });
 const notAuthenticated = () => json(401, { detail: "not_authenticated" });
 
+// The profile, in the shape of the real API (tests/test_web_profile.py checks it).
+function loginMethod(provider, status = "active", address = null) {
+  return { provider, address, status };
+}
+
+function profileBody(displayName = "Елена", textSize = "normal", methods = []) {
+  return json(200, {
+    display_name: displayName,
+    text_size: textSize,
+    login_methods: methods.length ? methods : [loginMethod("telegram")],
+  });
+}
+
 // --- the environment of one scenario ----------------------------------------------------------------
 
 const environments = [];
@@ -424,6 +437,8 @@ function makeEnv(options = {}) {
   const crypto = options.crypto === undefined ? fakeCrypto() : options.crypto;
   // Whoever signs in has no favorites unless a scenario says so (a later route is asked first).
   net.route("GET", "/api/favorites", favoritesBody([]));
+  // ...and a plain profile: one active Telegram identity, the normal text size.
+  net.route("GET", "/api/profile", profileBody());
   // ...and the bot is not configured unless a scenario says so (the panel then draws nothing).
   net.route("GET", "/api/telegram", json(200, { enabled: false, linked: false }));
   const changes = { count: 0 };
@@ -531,6 +546,8 @@ module.exports = {
   apiError,
   busy,
   me,
+  loginMethod,
+  profileBody,
   USER_A,
   USER_B,
   notAuthenticated,

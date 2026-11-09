@@ -138,11 +138,33 @@ journeys.first_conversation = async ({ base, cookie }) => {
   assert.equal(view.list.items[0].label, "Как варить борщ?", "named by its first message");
   assert.equal(view.currentId, view.list.items[0].id);
   assert.deepEqual(p.net.log.map((r) => `${r.method} ${r.url.replace(/[0-9a-f-]{36}/, "<id>")}`), [
-    "GET /auth/me", "GET /api/conversations?limit=50", "GET /api/favorites", "POST /api/conversations",
-    "POST /api/conversations/<id>/messages",
+    "GET /auth/me", "GET /api/conversations?limit=50", "GET /api/favorites", "GET /api/profile",
+    "POST /api/conversations", "POST /api/conversations/<id>/messages",
   ]);
   assert.ok(p.net.log.every((r) => r.status === null || r.status < 300), JSON.stringify(p.net.log));
   return { conversation: view.currentId };
+};
+
+journeys.profile_survives_a_reload_and_its_text_size_is_the_servers = async ({ base, cookie }) => {
+  const first = page(base, cookie);
+  let view = await first.boot();
+
+  assert.equal(view.profile.status, "ready");
+  assert.equal(typeof view.profile.displayName, "string");
+  assert.equal(view.profile.textSize, "normal");
+  assert.deepEqual(view.profile.loginMethods, [{ provider: "telegram", address: null, status: "active" }]);
+
+  const saved = await first.ctl.saveProfile({ displayName: "  Иван  ", textSize: "large" });
+  assert.deepEqual(saved, { ok: true });
+  assert.equal(first.view().profile.displayName, "Иван", "trimmed by the server and read back from it");
+  assert.equal(first.view().profile.textSize, "large");
+
+  const reloaded = page(base, cookie); // a new tab: the profile is the account's
+  view = await reloaded.boot();
+  assert.equal(view.profile.displayName, "Иван");
+  assert.equal(view.profile.textSize, "large");
+  assert.deepEqual(view.profile.loginMethods, [{ provider: "telegram", address: null, status: "active" }]);
+  return {};
 };
 
 journeys.reload_restores_the_history_and_the_list = async ({ base, cookie }) => {

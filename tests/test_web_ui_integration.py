@@ -201,6 +201,7 @@ NAMES = _names()
 # message that the network made the page send twice is asked once and stored once.
 EXPECTED = {
     "first_conversation": (Counter({"Как варить борщ?": 1}), (1, 1)),
+    "profile_survives_a_reload_and_its_text_size_is_the_servers": (Counter(), (0, 0)),
     "reload_restores_the_history_and_the_list": (Counter({"Первый вопрос": 1, "Второй вопрос": 1}), (2, 2)),
     "paging_through_a_long_history": (Counter({f"вопрос {i}": 1 for i in range(1, 31)}), (30, 30)),
     "a_lost_answer_is_seen_in_the_history_and_confirmed_by_the_same_key_without_a_second_run": (

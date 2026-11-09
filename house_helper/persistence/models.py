@@ -210,6 +210,19 @@ class AllowlistProvider(str, enum.Enum):
     EMAIL = "email"  # subject: a verified address, normalized (backup login)
 
 
+class TextSize(str, enum.Enum):
+    """How large the signed-in web application draws its text.
+
+    NORMAL is 100% and LARGE is 120% of the browser's own size. The preference is a
+    person's own (users.text_size, migration 0013) and is applied only to the
+    authenticated application: the sign-in screens, the invitation pages and the
+    email pages are drawn at the browser's size, whoever is signed in.
+    """
+
+    NORMAL = "normal"
+    LARGE = "large"
+
+
 class TurnStatus(str, enum.Enum):
     """Where a turn request is in its life. The transitions are not enforced
     here (that is the turn-processing increment); the database only guarantees
@@ -295,10 +308,29 @@ _BIGINT_ID = sa.BigInteger().with_variant(sa.Integer(), "sqlite")
 
 class User(Base):
     __tablename__ = "users"
-    __table_args__ = (_max_length("display_name", 200),)
+    # text_size's default is the database's (see the column): do not ask for it in the
+    # INSERT's RETURNING clause, so a row can also be written to a schema older than
+    # 0013, where the column does not exist (the migration tests do that).
+    __mapper_args__ = {"eager_defaults": False}
+    __table_args__ = (
+        _max_length("display_name", 200),
+        _max_length("text_size", 16),
+        sa.CheckConstraint(_in_list("text_size", TextSize), name="text_size_valid"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     display_name: Mapped[Optional[str]] = mapped_column(sa.String(200))
+    # No Python-side default on purpose: an INSERT that does not name the column lets
+    # the database supply 'normal'. That is what makes an older schema (before 0013)
+    # usable with today's models in the migration tests: the column simply is not
+    # there, and a row can still be inserted. The application never relies on reading
+    # the attribute before the row has been fetched (persistence.profile reads it).
+    # deferred: an ordinary read of a user (authentication, the admin status command)
+    # does not select the column at all. That keeps the model usable against a schema
+    # older than 0013 in the migration tests, and it costs the profile one small SELECT.
+    text_size: Mapped[str] = mapped_column(
+        sa.String(16), server_default=sa.text("'normal'"), deferred=True
+    )
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
     disabled_at: Mapped[Optional[datetime]]

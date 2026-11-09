@@ -46,7 +46,13 @@ process.stdin.on("end", () => {
       answer = { titles: request.texts.map((text) => Logic.deriveTitle(text)) };
       break;
     case "texts":
-      answer = { TEXT: Logic.TEXT, CODE_MESSAGES: Logic.CODE_MESSAGES, MAX: Logic.MAX_MESSAGE_LENGTH, PAGE_SIZE: Logic.PAGE_SIZE };
+      answer = {
+        TEXT: Logic.TEXT,
+        CODE_MESSAGES: Logic.CODE_MESSAGES,
+        MAX: Logic.MAX_MESSAGE_LENGTH,
+        MAX_PROFILE_NAME: Logic.MAX_PROFILE_NAME,
+        PAGE_SIZE: Logic.PAGE_SIZE,
+      };
       break;
     default:
       throw new Error("unknown task " + request.task);

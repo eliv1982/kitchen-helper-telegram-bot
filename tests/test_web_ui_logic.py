@@ -215,9 +215,12 @@ def test_the_page_names_a_conversation_exactly_as_the_server_does():
 
 
 def test_the_pages_limits_are_the_servers():
+    from house_helper.persistence.profile import MAX_DISPLAY_NAME_LENGTH
+
     facts = _crosscheck("texts")
 
     assert facts["MAX"] == MAX_INPUT_LENGTH == 2000
+    assert facts["MAX_PROFILE_NAME"] == MAX_DISPLAY_NAME_LENGTH == 200
     assert facts["PAGE_SIZE"] == DEFAULT_LIST_LIMIT
 
 
@@ -231,3 +234,28 @@ def test_every_error_the_server_can_name_has_the_same_words_in_the_page():
     assert set(words) - set(CATALOGUE) == {
         "temporarily_unavailable", "login_unavailable", "invalid_email", "server_error", "storage_unavailable",
     }
+
+
+def test_the_profile_data_note_explains_the_retention_the_purge_applies():
+    from house_helper.persistence.base import RETENTION_DAYS
+
+    text = _crosscheck("texts")["TEXT"]
+    messages, recipes = text["profileDataMessages"], text["profileDataRecipes"]
+
+    # tests/test_admin_retention.py verifies the lifecycle these sentences describe: messages
+    # and their photos expire one by one RETENTION_DAYS after their own creation, an old
+    # conversation with a newer message survives, and a conversation itself goes only when it
+    # is empty and has seen no activity for RETENTION_DAYS.
+    day = f"{RETENTION_DAYS} дней"
+    assert f"Сообщения и фотографии к ним хранятся {day} с момента создания" in messages
+    assert "Разговор не удаляется только из-за возраста" in messages
+    assert "есть более новые сообщения, остается" in messages
+    assert f"не осталось сообщений и им не пользовались {day}" in messages
+    assert not messages.startswith("Разговоры,"), "the old claim that conversations expire by age"
+
+    # A recipe reply is an assistant message: it goes on the message's own deadline while the
+    # conversation may stay. A favorite is a copy with no deadline.
+    assert "с рецептами — это сообщения" in recipes
+    assert f"каждый хранится {day} с момента создания" in recipes
+    assert "даже если сам разговор остается" in recipes
+    assert "Рецепты, сохраненные в избранное, хранятся, пока вы сами их не удалите." in recipes

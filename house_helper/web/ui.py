@@ -164,7 +164,7 @@ _SHELL = """\
     <button id="logout" class="btn btn-onblue" type="button">Выйти</button>
   </header>
   <div class="workspace">
-    <nav id="sidebar" class="sidebar" aria-label="Разговоры, избранное и покупки">
+    <nav id="sidebar" class="sidebar" aria-label="Разговоры, избранное, покупки и профиль">
       <div class="tabs" role="group" aria-label="Раздел">
         <button id="tab-chats" class="tab" type="button" aria-pressed="true">Разговоры</button>
         <button id="tab-favorites" class="tab" type="button" aria-pressed="false">Избранное</button>
@@ -202,6 +202,8 @@ _SHELL = """\
           <p id="telegram-privacy" class="hint"></p>
         </details>
       </section>
+      <button id="profile-open" class="btn btn-secondary btn-block profile-open" type="button"
+              aria-pressed="false" aria-controls="profile">Профиль</button>
     </nav>
     <div id="backdrop" class="backdrop" hidden></div>
     <main id="chat" class="chat" aria-labelledby="chat-title" hidden>
@@ -243,6 +245,10 @@ _SHELL = """\
     <section id="shopping" class="chat shopping" aria-labelledby="shopping-title" hidden>
       <h1 id="shopping-title" class="chat-title" tabindex="-1"></h1>
       <div id="shopping-body" class="shopping-body" tabindex="0"></div>
+    </section>
+    <section id="profile" class="chat profile" aria-labelledby="profile-title" hidden>
+      <h1 id="profile-title" class="chat-title" tabindex="-1"></h1>
+      <div id="profile-body" class="profile-body" tabindex="0"></div>
     </section>
   </div>
 </div>

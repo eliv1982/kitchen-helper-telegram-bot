@@ -57,9 +57,13 @@
     tabChats: byId("tab-chats"),
     tabFavorites: byId("tab-favorites"),
     tabShopping: byId("tab-shopping"),
+    profileOpen: byId("profile-open"),
     panelChats: byId("panel-chats"),
     panelFavorites: byId("panel-favorites"),
     panelShopping: byId("panel-shopping"),
+    profile: byId("profile"),
+    profileTitle: byId("profile-title"),
+    profileBody: byId("profile-body"),
     newConversation: byId("new-conversation"),
     listStatus: byId("list-status"),
     listRetry: byId("list-retry"),
@@ -264,6 +268,20 @@
     return true;
   }
 
+  // The one thing the profile changes outside its own pane: the size of the whole signed-in
+  // application. It is a rem base, so every text, control and gap grows together.
+  function applyTextSize(size) {
+    var root = document.documentElement || document.body;
+    if (!root) {
+      return;
+    }
+    if (size === "large") {
+      root.setAttribute("data-text-size", "large");
+    } else {
+      root.removeAttribute("data-text-size");
+    }
+  }
+
   var lastScreen = null;
   var lastView = null;
   // What the person had typed, kept here (not in the page) while the signed-in page is held back to ask
@@ -277,6 +295,10 @@
     region("screen", { screen: view.screen, notice: view.notice, failure: view.failure, generation: view.generation }, function (data) {
       drawScreens(data);
     });
+    // The profile's text size is applied to the signed-in application and nowhere else: the
+    // attribute goes on <html> (every rem size is relative to it) and comes off on the way
+    // to any other screen, so the sign-in and failure screens keep the browser's own size.
+    region("textSize", view.screen === "app" ? view.profile.textSize : "normal", applyTextSize);
     if (view.screen === "app" && !telegramShown) {
       telegramShown = true;
       telegram.start();
@@ -295,6 +317,7 @@
         items: view.list.items,
       }, drawList);
       region("favoriteList", { status: view.favorites.status, error: view.favorites.error, items: view.favorites.items }, drawFavoriteList);
+      region("profile", view.profile, drawProfile);
       // (The state of the list matters to the pane only while no recipe is open: it then says what to do.)
       var open = view.favorites.current !== null;
       region(
@@ -409,6 +432,10 @@
       if (!els.recipe.hidden) {
         els.recipeTitle.focus();
       }
+    } else if (wanted === "profile") {
+      if (!els.profile.hidden) {
+        els.profileTitle.focus();
+      }
     } else if (wanted !== null && focusNodes[wanted]) {
       focusNodes[wanted].focus();
     }
@@ -430,6 +457,7 @@
     els.app.hidden = screen !== "app";
     els.chat.hidden = screen !== "app";
     els.shopping.hidden = screen !== "app";
+    els.profile.hidden = screen !== "app";
     els.gate.setAttribute("aria-busy", waiting ? "true" : "false");
 
     if (waiting) {
@@ -481,6 +509,7 @@
         clear(els.recipeBody);
         clear(els.shoppingList);
         clear(els.shoppingBody);
+        clear(els.profileBody);
         clear(els.chatDelete);
         closeChatMenu(false);
         setHelp(false, false);
@@ -495,6 +524,8 @@
         els.shoppingTitle.textContent = "";
         els.shoppingStatus.textContent = "";
         els.shoppingRetry.hidden = true;
+        els.profileTitle.textContent = "";
+        drawn.profile = null;
         lastRecipeId = null;
         lastShoppingKey = null;
         wantFocus = null;
@@ -918,15 +949,18 @@
     var chats = section === "chats";
     var favorites = section === "favorites";
     var shopping = section === "shopping";
+    var profile = section === "profile";
     els.tabChats.setAttribute("aria-pressed", chats ? "true" : "false");
     els.tabFavorites.setAttribute("aria-pressed", favorites ? "true" : "false");
     els.tabShopping.setAttribute("aria-pressed", shopping ? "true" : "false");
+    els.profileOpen.setAttribute("aria-pressed", profile ? "true" : "false");
     els.panelChats.hidden = !chats;
     els.panelFavorites.hidden = !favorites;
     els.panelShopping.hidden = !shopping;
     els.chat.hidden = !chats;
     els.recipe.hidden = !favorites;
     els.shopping.hidden = !shopping;
+    els.profile.hidden = !profile;
   }
 
   function drawFavoriteList(list) {
@@ -1688,6 +1722,257 @@
     form.appendChild(buttons);
     return form;
   }
+
+  // The profile -----------------------------------------------------------------------------------
+
+  function profileLoadingLine(text) {
+    return h("p", { class: "loading" }, [
+      h("span", { class: "spinner", "aria-hidden": "true" }),
+      document.createTextNode(text),
+    ]);
+  }
+
+  function profileErrorNotice(error, fallback) {
+    var box = h("div");
+    box.appendChild(h("p", { class: "notice notice-error", role: "alert", text: error ? error.text : fallback }));
+    if (error && error.correlationId) {
+      box.appendChild(h("p", { class: "hint", text: Logic.TEXT.correlation.replace("{id}", error.correlationId) }));
+    }
+    return box;
+  }
+
+  function profileRetry(onRetry) {
+    var button = action(Logic.TEXT.retry, "btn-primary", onRetry, false);
+    button.setAttribute("data-focus", "profile-retry");
+    return button;
+  }
+
+  function profileNameCount(value) {
+    return Logic.countCodePoints(Logic.trimLikeServer(value)) + " / " + Logic.MAX_PROFILE_NAME;
+  }
+
+  function profileLoginName(method) {
+    if (method.provider === "telegram") {
+      return Logic.TEXT.profileLoginTelegram;
+    }
+    if (method.provider === "email") {
+      return Logic.TEXT.profileLoginEmail;
+    }
+    return Logic.TEXT.profileLoginOther;
+  }
+
+  function drawProfile(profile) {
+    els.profileTitle.textContent = Logic.TEXT.profileTab;
+    var box = els.profileBody;
+    var focused =
+      within(document.activeElement, box) && document.activeElement
+        ? document.activeElement.getAttribute("data-focus")
+        : null;
+    var scroll = box.scrollTop;
+    clear(box);
+    var content = h("div", { class: "profile-content" });
+    box.appendChild(content);
+
+    if (!profile.loaded && (profile.status === "idle" || profile.status === "loading")) {
+      content.appendChild(profileLoadingLine(Logic.TEXT.profileLoading));
+      box.scrollTop = scroll;
+      return;
+    }
+    if (!profile.loaded && profile.status === "error") {
+      content.appendChild(profileErrorNotice(profile.error, Logic.TEXT.profileFailed));
+      content.appendChild(h("p", { class: "hint", text: Logic.TEXT.profileOthersWork }));
+      content.appendChild(profileRetry(profileReload));
+      box.scrollTop = scroll;
+      return;
+    }
+
+    if (profile.status === "error") {
+      content.appendChild(profileErrorNotice(profile.error, Logic.TEXT.profileFailed));
+      content.appendChild(profileRetry(profileReload));
+    }
+    if (profile.notice) {
+      var noticeClass = profile.notice.kind === "error" ? "notice notice-error" : "notice notice-ok";
+      content.appendChild(
+        h("p", {
+          class: noticeClass,
+          role: profile.notice.kind === "error" ? "alert" : "status",
+          text: profile.notice.text,
+        })
+      );
+      if (profile.notice.kind === "error" && profile.notice.correlationId) {
+        content.appendChild(
+          h("p", { class: "hint", text: Logic.TEXT.correlation.replace("{id}", profile.notice.correlationId) })
+        );
+      }
+      if (profile.notice.kind === "error" && lastView && lastView.section === "profile") {
+        alertText(profile.notice.text);
+      }
+    }
+    content.appendChild(profileForm(profile));
+    content.appendChild(profileLoginMethods(profile));
+    content.appendChild(profileData());
+    box.scrollTop = scroll;
+    if (focused) {
+      var again = findByFocus(box, focused);
+      if (again) {
+        again.focus();
+      }
+    }
+  }
+
+  function profileReload() {
+    controller.reloadProfile();
+  }
+
+  function profileForm(profile) {
+    var saving = profile.saving;
+    var shownName = profile.draft ? profile.draft.displayName : profile.displayName || "";
+    var shownSize = profile.draft ? profile.draft.textSize : profile.textSize;
+    var form = h("form", { class: "profile-form", novalidate: true, "aria-label": Logic.TEXT.profileTab });
+    var nameInput = h("input", {
+      id: "profile-name",
+      type: "text",
+      value: shownName,
+      readonly: saving,
+      autocomplete: "off",
+      autocapitalize: "words",
+      autocorrect: "off",
+      spellcheck: "false",
+      "data-focus": "profile-name",
+      "aria-describedby": profile.fieldError ? "profile-name-hint profile-name-error" : "profile-name-hint",
+    });
+    if (profile.fieldError) {
+      nameInput.setAttribute("aria-invalid", "true");
+    }
+    // The count is a convenience beside the field, not a live region: announcing every
+    // keystroke would talk over the person writing their name (the composer's counter is
+    // hidden from a screen reader for the same reason).
+    var count = h("span", { id: "profile-name-count", class: "hint", "aria-hidden": "true", text: profileNameCount(shownName) });
+    nameInput.addEventListener("input", function () {
+      count.textContent = profileNameCount(nameInput.value);
+      controller.syncProfileDraft(collect());
+      controller.clearProfileNotice();
+    });
+    var nameField = h("label", { class: "profile-field", for: "profile-name" }, [
+      h("span", { class: "edit-label", text: Logic.TEXT.profileNameLabel }),
+      nameInput,
+      h("span", { id: "profile-name-hint", class: "hint" }, [
+        document.createTextNode(Logic.TEXT.profileNameHint + " "),
+        count,
+      ]),
+    ]);
+    if (profile.fieldError) {
+      nameField.appendChild(h("span", { id: "profile-name-error", class: "field-error", role: "alert", text: profile.fieldError }));
+    }
+    form.appendChild(nameField);
+
+    function choice(value, labelText, checked) {
+      var input = h("input", {
+        type: "radio",
+        name: "text-size",
+        value: value,
+        disabled: saving,
+        "data-focus": "profile-size-" + value,
+      });
+      input.checked = checked;
+      input.addEventListener("change", function () {
+        controller.syncProfileDraft(collect());
+        controller.clearProfileNotice();
+      });
+      // The whole label is the control's target; the input is what says which one is chosen.
+      return { input: input, label: h("label", { class: "profile-choice" }, [input, h("span", { text: labelText })]) };
+    }
+
+    var normal = choice("normal", Logic.TEXT.profileSizeNormal, shownSize !== "large");
+    var large = choice("large", Logic.TEXT.profileSizeLarge, shownSize === "large");
+    form.appendChild(
+      h("fieldset", { class: "profile-fieldset" }, [
+        h("legend", { text: Logic.TEXT.profileTextSizeLabel }),
+        normal.label,
+        large.label,
+      ])
+    );
+
+    function collect() {
+      return { displayName: nameInput.value, textSize: large.input.checked ? "large" : "normal" };
+    }
+
+    form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      if (saving) {
+        return;
+      }
+      controller.saveProfile(collect()).then(function (result) {
+        if (result && !result.ok && result.reason === "invalid") {
+          nameInput.focus();
+        }
+      });
+    });
+
+    var actions = h("div", { class: "profile-actions" });
+    var save = h("button", {
+      class: "btn " + (saving ? "btn-quiet" : "btn-primary"),
+      type: "submit",
+      text: saving ? Logic.TEXT.profileSaving : Logic.TEXT.profileSave,
+      disabled: saving,
+      "aria-disabled": saving ? "true" : false,
+      "data-focus": "profile-save",
+    });
+    actions.appendChild(save);
+    form.appendChild(actions);
+    return form;
+  }
+
+  function profileLoginMethods(profile) {
+    var section = h("section", { class: "profile-section" }, [
+      h("h2", { text: Logic.TEXT.profileLoginTitle }),
+      h("p", { class: "hint", text: Logic.TEXT.profileLoginHint }),
+    ]);
+    if (!profile.loginMethods.length) {
+      section.appendChild(h("p", { class: "hint", text: Logic.TEXT.profileLoginEmpty }));
+      return section;
+    }
+    var methods = h("ul", { class: "profile-methods" });
+    profile.loginMethods.forEach(function (method) {
+      var revoked = method.status === "revoked";
+      var row = h("li", { class: "profile-method" }, [
+        h("span", { class: "profile-method-name", text: profileLoginName(method) }),
+        method.provider === "email" && method.address
+          ? h("span", { class: "profile-method-address", text: method.address })
+          : null,
+        h("span", {
+          class: "profile-badge " + (revoked ? "profile-badge-revoked" : "profile-badge-active"),
+          text: revoked ? Logic.TEXT.profileStatusRevoked : Logic.TEXT.profileStatusActive,
+        }),
+      ]);
+      methods.appendChild(row);
+    });
+    section.appendChild(methods);
+    return section;
+  }
+
+  function profileData() {
+    var section = h("section", { class: "profile-section profile-data" }, [
+      h("h2", { text: Logic.TEXT.profileDataTitle }),
+    ]);
+    [
+      Logic.TEXT.profileDataMessages,
+      Logic.TEXT.profileDataRecipes,
+      Logic.TEXT.profileDataShopping,
+      Logic.TEXT.profileDataOpenAI,
+      Logic.TEXT.profileDataDelete,
+      Logic.TEXT.profileDataProfile,
+    ].forEach(function (text) {
+      section.appendChild(h("p", { text: text }));
+    });
+    return section;
+  }
+
+  els.profileOpen.addEventListener("click", function () {
+    setDrawer(false, false);
+    wantFocus = "profile";
+    controller.showSection("profile");
+  });
 
   // Opening a saved list (or beginning another draft) gives up a modified shopping draft:
   // ask first, unless the browser has nobody to ask (the call is best effort), as for an
@@ -2703,13 +2988,16 @@
     els.chat.inert = isOpen;
     els.recipe.inert = isOpen;
     els.shopping.inert = isOpen;
+    els.profile.inert = isOpen;
     if (isOpen) {
       var activeTab =
         els.tabShopping.getAttribute("aria-pressed") === "true"
           ? els.tabShopping
           : els.tabFavorites.getAttribute("aria-pressed") === "true"
             ? els.tabFavorites
-            : els.tabChats;
+            : els.profileOpen.getAttribute("aria-pressed") === "true"
+              ? els.profileOpen
+              : els.tabChats;
       activeTab.focus();
     } else if (restoreFocus) {
       els.drawerToggle.focus();

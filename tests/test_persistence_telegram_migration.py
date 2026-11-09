@@ -25,6 +25,7 @@ from tests.test_persistence_migrations import (
     HEAD,
     LATER,
     RECIPES,
+    SHOPPING,
     TELEGRAM,
     TELEGRAM_ACTIVE,
     _fingerprint,
@@ -340,7 +341,7 @@ def test_the_two_revisions_render_as_postgresql_sql_that_only_creates_tables_and
         ),
         (
             TELEGRAM_ACTIVE,
-            HEAD,
+            SHOPPING,
             ["shopping_lists", "shopping_list_items", "shopping_list_requests"],
             2,
         ),
@@ -365,7 +366,7 @@ def test_the_two_revisions_render_as_postgresql_sql_that_only_creates_tables_and
         "DROP TABLE telegram_link_codes",
         "DROP TABLE telegram_links",
     ]
-    down = _offline_sql("down_from_head")
+    down = _offline_sql("down_from_shopping_to_recipes")
     uncommented = re.sub(r"^--.*$", "", down, flags=re.MULTILINE)
     assert re.findall(r"^DROP [^;]*", uncommented, re.MULTILINE) == [
         "DROP INDEX ix_shopping_list_requests_list_id",

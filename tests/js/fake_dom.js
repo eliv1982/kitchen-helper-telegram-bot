@@ -201,6 +201,7 @@ class FakeDocument {
     this.activeElement = null;
     this.visibilityState = "visible";
     this.body = null;
+    this.documentElement = null;
   }
 
   createElement(tag) {
@@ -251,6 +252,7 @@ function parseShell(html) {
       stack[stack.length - 1].appendChild(element);
       if (!VOID.has(opening.toLowerCase()) && !/\/>$/.test(whole)) stack.push(element);
       if (opening.toLowerCase() === "body") document.body = element;
+      if (opening.toLowerCase() === "html") document.documentElement = element;
     } else if (text !== undefined) {
       stack[stack.length - 1].appendChild(new FakeText(decode(text)));
     }
