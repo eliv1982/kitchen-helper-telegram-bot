@@ -6487,6 +6487,7 @@ scenario("the_profile_is_read_on_the_way_in_and_carries_its_two_settings_and_the
     { provider: "telegram", address: null, status: "active" },
     { provider: "email", address: "elena@example.com", status: "revoked" },
   ]);
+  assert.equal(view.profile.editing, false, "the pane opens on the saved values");
   assert.equal(view.profile.saving, false);
 });
 
@@ -6542,12 +6543,14 @@ scenario("a_profile_answer_that_is_not_the_applications_is_an_error_in_that_pane
 scenario("saving_the_profile_sends_its_two_own_fields_and_updates_the_view", async () => {
   const env = makeEnv().signedIn([]);
   await env.boot();
+  env.ctl.beginProfileEdit();
+  assert.equal(env.view().profile.editing, true);
   env.net.route("PATCH", "/api/profile", H.profileBody("Иван", "large"));
 
   const result = await env.ctl.saveProfile({ displayName: "  Иван  ", textSize: "large" });
   await env.settle();
 
-  assert.equal(result.ok, true);
+  assert.deepEqual(result, { ok: true });
   assert.deepEqual(env.net.requests("PATCH", "/api/profile")[0].body, {
     display_name: "Иван",
     text_size: "large",
@@ -6557,7 +6560,51 @@ scenario("saving_the_profile_sends_its_two_own_fields_and_updates_the_view", asy
   assert.equal(view.profile.textSize, "large");
   assert.deepEqual(view.profile.notice, { kind: "ok", text: Logic.TEXT.profileSaved });
   assert.equal(view.profile.fieldError, null);
+  assert.equal(view.profile.editing, false, "a successful save returns to the saved values");
+  assert.equal(view.profile.draft, null);
   assert.ok(env.announced.includes(Logic.TEXT.profileSaved));
+});
+
+scenario("an_unchanged_profile_form_sends_no_patch_and_returns_to_the_saved_values", async () => {
+  const env = makeEnv().signedIn([]);
+  env.net.route("GET", "/api/profile", H.profileBody("Елена", "normal"));
+  await env.boot();
+  const asked = env.net.log.length;
+
+  env.ctl.beginProfileEdit();
+  assert.equal(env.view().profile.editing, true);
+  // Space around the saved name is not a change: the server trims it away.
+  const result = await env.ctl.saveProfile({ displayName: "  Елена  ", textSize: "normal" });
+  await env.settle();
+
+  assert.deepEqual(result, { ok: true, unchanged: true });
+  assert.equal(env.net.requests("PATCH", "/api/profile").length, 0, "nothing was written");
+  assert.equal(env.net.log.length, asked, "nothing was asked");
+  const view = env.view();
+  assert.equal(view.profile.editing, false);
+  assert.equal(view.profile.draft, null);
+  assert.equal(view.profile.notice, null, "no save is claimed");
+  assert.equal(view.profile.displayName, "Елена");
+  assert.equal(view.profile.textSize, "normal");
+});
+
+scenario("a_failed_profile_save_leaves_the_form_open_with_what_was_typed", async () => {
+  const env = makeEnv().signedIn([]);
+  env.net.route("GET", "/api/profile", H.profileBody("Елена", "normal"));
+  await env.boot();
+  env.net.route("PATCH", "/api/profile", fail());
+
+  env.ctl.beginProfileEdit();
+  const result = await env.ctl.saveProfile({ displayName: "Новое имя", textSize: "large" });
+  await env.settle();
+
+  assert.deepEqual([result.ok, result.reason], [false, "unavailable"]);
+  const view = env.view();
+  assert.equal(view.profile.editing, true, "the form stays open");
+  assert.deepEqual(view.profile.draft, { displayName: "Новое имя", textSize: "large" });
+  assert.equal(view.profile.textSize, "normal", "the unsaved size is not applied");
+  assert.equal(view.profile.displayName, "Елена", "the saved name is unchanged");
+  assert.equal(view.profile.notice.kind, "error");
 });
 
 scenario("a_profile_name_is_checked_before_anything_is_sent", async () => {
@@ -6569,6 +6616,7 @@ scenario("a_profile_name_is_checked_before_anything_is_sent", async () => {
     const result = await env.ctl.saveProfile({ displayName: value, textSize: "normal" });
     assert.deepEqual([result.ok, result.reason], [false, "invalid"], JSON.stringify(value));
     assert.ok(/[А-Яа-я]/.test(env.view().profile.fieldError), JSON.stringify(value));
+    assert.equal(env.view().profile.editing, true, "a refusal keeps the form open");
   }
 
   assert.equal(env.net.requests("PATCH", "/api/profile").length, 0);
@@ -6586,6 +6634,7 @@ scenario("a_name_the_server_refuses_is_shown_under_the_name_field", async () => 
   assert.deepEqual([result.ok, result.reason], [false, "rejected"]);
   assert.equal(env.view().profile.fieldError, Logic.CODE_MESSAGES.invalid_display_name);
   assert.equal(env.view().profile.notice, null);
+  assert.equal(env.view().profile.editing, true);
 });
 
 scenario("a_profile_size_the_server_refuses_is_a_notice_not_a_name_error", async () => {
@@ -6600,6 +6649,7 @@ scenario("a_profile_size_the_server_refuses_is_a_notice_not_a_name_error", async
   assert.equal(env.view().profile.fieldError, null);
   assert.deepEqual(env.view().profile.notice.kind, "error");
   assert.equal(env.view().profile.notice.text, Logic.CODE_MESSAGES.invalid_text_size);
+  assert.equal(env.view().profile.editing, true);
 });
 
 scenario("a_profile_save_that_loses_the_session_follows_the_same_auth_loss_flow", async () => {
@@ -6614,6 +6664,7 @@ scenario("a_profile_save_that_loses_the_session_follows_the_same_auth_loss_flow"
   assert.equal(env.view().screen, "login");
   assert.equal(env.view().profile.textSize, "normal");
   assert.equal(env.view().profile.loaded, false);
+  assert.equal(env.view().profile.editing, false);
 });
 
 scenario("opening_the_profile_reads_it_again_and_a_failed_read_keeps_the_last_known_one", async () => {
@@ -6633,6 +6684,7 @@ scenario("opening_the_profile_reads_it_again_and_a_failed_read_keeps_the_last_kn
   assert.equal(env.view().profile.status, "error");
   assert.equal(env.view().profile.displayName, "Елена", "what was known stays readable");
   assert.equal(env.view().profile.textSize, "large");
+  assert.equal(env.view().profile.editing, false, "returning to the pane shows the saved values");
 });
 
 scenario("another_person_never_gets_the_last_ones_profile", async () => {
@@ -6649,6 +6701,7 @@ scenario("another_person_never_gets_the_last_ones_profile", async () => {
   assert.equal(env.view().screen, "app");
   assert.equal(env.view().profile.displayName, "Борис");
   assert.equal(env.view().profile.textSize, "normal");
+  assert.equal(env.view().profile.editing, false);
   assert.ok(!JSON.stringify(env.view().profile).includes("Анна"));
 });
 
@@ -6695,6 +6748,7 @@ scenario("a_profile_read_that_was_out_before_a_save_cannot_put_the_old_values_ba
     "the save's message stays with the values it saved"
   );
   assert.equal(view.profile.draft, null);
+  assert.equal(view.profile.editing, false);
 });
 
 // A read begun while the save is still pending may be answered from either side of the
@@ -6749,6 +6803,7 @@ scenario("a_profile_read_begun_while_a_save_is_pending_cannot_replace_the_saved_
   assert.equal(view.profile.displayName, "Иван", "the pending save's values stay");
   assert.equal(view.profile.textSize, "large");
   assert.deepEqual(view.profile.notice, { kind: "ok", text: Logic.TEXT.profileSaved });
+  assert.equal(view.profile.editing, false);
 });
 
 // Two reads overlap and answer in the opposite order: only the newer one may be shown, so an
@@ -6827,6 +6882,7 @@ scenario("a_failed_profile_save_leaves_the_values_and_a_fresh_read_still_applies
   assert.equal(view.profile.error, null);
   assert.equal(view.profile.notice, null);
   assert.equal(view.profile.draft, null);
+  assert.equal(view.profile.editing, false, "a fresh read shows the saved values");
 });
 
 // The ordering above only discards answers that are stale; a read that is still the newest

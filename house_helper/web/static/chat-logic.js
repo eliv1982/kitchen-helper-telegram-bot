@@ -424,6 +424,7 @@
     profileFailed: "Не удалось загрузить профиль.",
     profileOthersWork: "Остальные разделы работают: разговоры, избранное и покупки доступны.",
     profileNameLabel: "Отображаемое имя",
+    profileNameNotSet: "Имя не задано",
     profileNameHint: "От 1 до 200 символов. Невидимые и управляющие символы не допускаются.",
     profileNameEmpty: "Введите имя.",
     profileNameTooLong: "Имя слишком длинное (максимум 200 символов).",
@@ -431,6 +432,7 @@
     profileTextSizeLabel: "Размер текста",
     profileSizeNormal: "Обычный",
     profileSizeLarge: "Крупный (120%)",
+    profileEdit: "Изменить",
     profileSave: "Сохранить",
     profileSaving: "Сохраняем…",
     profileSaved: "Профиль сохранен.",
@@ -1997,8 +1999,9 @@
     }
 
     // What the page knows of the profile. `loaded` distinguishes "nothing has been read
-    // yet" from a profile whose display name is null; `saving` is one PATCH under way;
-    // `notice` is what the last save said, and `fieldError` the name's own refusal.
+    // yet" from a profile whose display name is null; `editing` says whether the pane shows
+    // the form or the saved values; `saving` is one PATCH under way; `notice` is what the
+    // last save said, and `fieldError` the name's own refusal.
     function freshProfile() {
       return {
         status: "idle",
@@ -2007,6 +2010,9 @@
         displayName: null,
         textSize: "normal",
         loginMethods: [],
+        // False on the way in and after every fresh read: the pane opens on the saved values,
+        // and only «Изменить» opens the form. A refused or failed save leaves it true.
+        editing: false,
         saving: false,
         notice: null,
         fieldError: null,
@@ -2502,7 +2508,13 @@
       state.profile.error = null;
       state.profile.notice = null;
       state.profile.fieldError = null;
-      state.profile.draft = null; // a fresh read is the authority on what the form shows
+      // A fresh read is the authority on the saved values, so the pane it draws shows them
+      // rather than a form. A save under way is the exception: its own answer decides, and
+      // the form (with what was typed) stays until it does.
+      if (!state.profile.saving) {
+        state.profile.editing = false;
+        state.profile.draft = null;
+      }
       emit();
       var response = await http("GET", "/api/profile", { timeoutMs: READ_TIMEOUT_MS });
       if (mine !== epoch || revision !== profileRevision) {
@@ -2537,6 +2549,24 @@
       state.profile.loginMethods = profile.loginMethods;
     }
 
+    // The form's way in: the saved values are shown until the person asks to change them.
+    function beginProfileEdit() {
+      if (
+        state.screen !== "app" ||
+        state.gate ||
+        !state.profile.loaded ||
+        state.profile.editing ||
+        state.profile.saving
+      ) {
+        return;
+      }
+      state.profile.editing = true;
+      state.profile.draft = null; // the form starts from the saved values
+      state.profile.notice = null; // a previous save's message is about values already shown
+      state.profile.fieldError = null;
+      emit();
+    }
+
     // The name and the size as one save. The name is checked here (trimmed, non-empty, at
     // most 200 code points, no category C character) so a refusal is immediate; the server
     // checks it again and is the authority. The size is one of the two values the page drew.
@@ -2545,8 +2575,9 @@
         return { ok: false, reason: "busy" };
       }
       var size = draft && TEXT_SIZE_VALUES[draft.textSize] ? draft.textSize : state.profile.textSize;
-      // Keep what the person typed (not the trimmed form) across any redraw of the pane,
-      // including a refusal, until it is saved or a fresh read replaces it.
+      // A refusal or a failed save leaves the form exactly where it was, with what the person
+      // typed (not the trimmed form), until a save succeeds or a fresh read replaces it.
+      state.profile.editing = true;
       state.profile.draft = {
         displayName: draft && typeof draft.displayName === "string" ? draft.displayName : "",
         textSize: size,
@@ -2557,6 +2588,15 @@
       if (!prepared.ok) {
         emit();
         return { ok: false, reason: "invalid" };
+      }
+      // A form that still holds the saved values has nothing to save: no PATCH is sent, no
+      // message claims a save that did not happen, and the pane returns to those values.
+      var savedName = state.profile.displayName === null ? "" : state.profile.displayName;
+      if (prepared.text === savedName && size === state.profile.textSize) {
+        state.profile.draft = null;
+        state.profile.editing = false;
+        emit();
+        return { ok: true, unchanged: true };
       }
       var mine = epoch;
       state.profile.saving = true;
@@ -2584,7 +2624,8 @@
           state.profile.status = "ready";
           state.profile.error = null;
           state.profile.fieldError = null;
-          state.profile.draft = null; // the server's values are the form now
+          state.profile.draft = null; // the server's values are what the pane shows now
+          state.profile.editing = false; // the save is done: back to the values, read-only
           state.profile.notice = { kind: "ok", text: TEXT.profileSaved };
           announce(TEXT.profileSaved);
           emit();
@@ -6040,6 +6081,7 @@
         loginMethods: profile.loginMethods.map(function (method) {
           return { provider: method.provider, address: method.address, status: method.status };
         }),
+        editing: profile.editing,
         saving: profile.saving,
         notice: profile.notice,
         fieldError: profile.fieldError,
@@ -6330,6 +6372,7 @@
       reloadProfile: function () {
         return track(loadProfile());
       },
+      beginProfileEdit: beginProfileEdit,
       saveProfile: function (draft) {
         return track(saveProfile(draft));
       },

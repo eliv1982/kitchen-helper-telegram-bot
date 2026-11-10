@@ -350,8 +350,10 @@ def test_the_shopping_pane_scrolls_inside_the_window_and_long_names_wrap():
     # A long product name or amount wraps inside its row: no horizontal scrolling.
     assert rules[".shop-check-text"]["overflow-wrap"] == "anywhere"
     assert ".shop-item-controls" in rules and rules[".shop-item-controls"]["flex-wrap"] == "wrap"
-    # The three tabs fit the desktop side column without pushing it wider.
-    assert rules[".tab"]["flex"] == "1"
+    # The three tabs share the desktop side column equally (one base .tab rule; the narrow
+    # drawer's wrap rule comes later in the file).
+    tab_rules = [declarations for selector, declarations in _rules() if selector == ".tab"]
+    assert tab_rules[0]["flex"] == "1"
 
 
 def test_the_side_column_keeps_its_top_and_its_foot_and_scrolls_the_list_between_them():
@@ -389,9 +391,15 @@ def test_the_profile_pane_and_the_large_text_size_wrap_instead_of_scrolling_side
     assert rules[".profile-method"]["flex-wrap"] == "wrap"
     assert rules[".profile-method-name"]["overflow-wrap"] == "anywhere"
     assert rules[".profile-method-address"]["overflow-wrap"] == "anywhere"
-    # The three tabs of the side column may break a long word rather than push it wider,
+    # The compact view of the saved settings wraps a long name or value inside its row too.
+    assert rules[".profile-value"]["flex-wrap"] == "wrap"
+    assert rules[".profile-value dd"]["overflow-wrap"] == "anywhere"
+    # The three tabs never break a label inside a word: the label's own width is the floor,
     # and the composer's field may shrink below its character width beside the send button.
-    assert rules[".tab"]["min-width"] == "0" and rules[".tab"]["overflow-wrap"] == "anywhere"
+    assert rules[".tab"]["min-width"] == "max-content"
+    assert rules[".tab"]["white-space"] == "nowrap"
+    assert rules[".tab"]["overflow-wrap"] == "normal"
+    assert not re.search(r"\.tab\s*\{[^}]*overflow-wrap:\s*anywhere", CSS)
     assert rules[".composer-row textarea"]["min-width"] == "0"
     assert rules[".brand"]["overflow-wrap"] == "anywhere"
     # At the large size on a 320 px screen the top bar wraps instead of squeezing the
@@ -403,12 +411,47 @@ def test_the_profile_pane_and_the_large_text_size_wrap_instead_of_scrolling_side
     assert large_brand["order"] == "3"
     assert large_brand["flex"] == "1 1 100%"
     assert large_brand["overflow-wrap"] == "normal"
-    # The three section labels take two rows at this size, whole, rather than breaking
-    # inside their words.
-    assert rules['html[data-text-size="large"] .tabs']["flex-wrap"] == "wrap"
-    assert rules['html[data-text-size="large"] .tab']["overflow-wrap"] == "normal"
     # The profile button says its pane is open (the tabs have the same kind of state).
     assert rules['.profile-open[aria-pressed="true"]']["background"] == "var(--green-dark)"
+
+
+def test_the_three_section_labels_fit_the_side_column_on_one_line():
+    """KH-PROFILE-01A-FIX-01: «Разговоры», «Избранное», «Покупки» on one line, at both sizes.
+
+    The labels have no break point inside a word, so the only thing that keeps them on one
+    line is room. A real-browser measurement is the budget (Chrome 156, Windows, the system
+    font: the widest label is «Избранное», 80 px at the tab's 15.2 px semibold; at the large
+    size the same label at 18.24 px is 96 px). The equal share of the desktop column must
+    leave a margin over that at the normal root size and at the profile's 120%, because a
+    fallback font may be slightly wider. The narrow drawer wraps whole buttons instead
+    (asserted by its own later rule), so this budget is the desktop row's.
+    """
+    rules = _merged_rules()
+
+    def rem(value: str) -> float:
+        assert value.endswith("rem"), value
+        return float(value[:-3])
+
+    workspace = [declarations for selector, declarations in _rules() if selector == ".workspace"][0]
+    sidebar = float(workspace["grid-template-columns"].split()[0].removesuffix("rem"))
+    side_padding = 2 * rem(rules[".sidebar"]["padding"])
+    gap = rem(rules[".tabs"]["gap"])
+    tab_padding = 2 * rem(rules[".tab"]["padding"].split()[1])
+    borders = 2 * float(re.search(r"([\d.]+)px", rules[".tab"]["border"]).group(1))
+
+    def tab_content(root_px: float) -> float:
+        share = (sidebar - side_padding - 2 * gap) / 3 * root_px
+        return share - tab_padding * root_px - borders
+
+    # Six percent of headroom over the measured label, at the normal and at the large root size.
+    assert tab_content(16) >= 80 * 1.06, tab_content(16)
+    assert tab_content(19.2) >= 96 * 1.06, tab_content(19.2)
+    # Equal thirds on the desktop row.
+    assert [declarations for selector, declarations in _rules() if selector == ".tab"][0]["flex"] == "1"
+    # In the drawer the row wraps whole buttons, never a word: two equal tabs and the third
+    # on its own line when three do not fit, all three in one row when they do.
+    assert re.search(r"\.tabs\s*\{\s*flex-wrap:\s*wrap;", CSS)
+    assert re.search(r"\.tab\s*\{\s*flex:\s*1 1 30%;", CSS)
 
 
 def test_the_long_telegram_text_is_in_a_details_and_what_matters_at_a_glance_is_not():

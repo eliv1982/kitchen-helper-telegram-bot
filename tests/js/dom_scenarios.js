@@ -4009,7 +4009,7 @@ scenario("a_session_that_ends_takes_the_shopping_lists_and_drafts_off_the_page",
 // The profile
 // ============================================================================================
 
-scenario("the_profile_button_opens_its_own_pane_with_the_form_the_ways_in_and_the_data_note", async () => {
+scenario("the_profile_button_opens_its_own_pane_with_the_saved_values_the_ways_in_and_the_data_note", async () => {
   const page = await open();
   assert.equal(page.visible("profile"), false);
 
@@ -4026,12 +4026,18 @@ scenario("the_profile_button_opens_its_own_pane_with_the_form_the_ways_in_and_th
   assert.equal(page.el("profile-title").textContent, "Профиль");
   assert.equal(page.doc.activeElement, page.el("profile-title"));
 
+  // The saved settings are values to read, not fields to edit: «Изменить» is the way in.
   const body = page.el("profile-body");
-  assert.equal(page.el("profile-name").value, "Елена");
-  const radios = body.find((element) => element.getAttribute("type") === "radio");
-  assert.deepEqual(radios.map((radio) => radio.getAttribute("value")), ["normal", "large"]);
-  assert.equal(radios[0].checked, true);
-  assert.equal(body.buttons("Сохранить").length, 1);
+  assert.ok(body.textContent.includes("Елена"));
+  assert.ok(body.textContent.includes(Logic.TEXT.profileSizeNormal));
+  assert.equal(
+    body.byTag("input").length,
+    0,
+    "no name field and no text-size choice before «Изменить»"
+  );
+  assert.equal(body.buttons(Logic.TEXT.profileEdit).length, 1);
+  assert.equal(body.buttons(Logic.TEXT.profileSave).length, 0);
+  assert.equal(body.buttons(Logic.TEXT.profileEdit)[0].getAttribute("type"), "button");
   assert.ok(body.textContent.includes("Отображаемое имя"));
   assert.ok(body.textContent.includes("Способы входа"));
   assert.ok(body.textContent.includes("Telegram") && body.textContent.includes("Активен"));
@@ -4040,6 +4046,18 @@ scenario("the_profile_button_opens_its_own_pane_with_the_form_the_ways_in_and_th
   assert.ok(body.textContent.includes("OpenAI"));
   assert.ok(body.textContent.includes("избранное"));
   assert.ok(body.textContent.includes("списки покупок"));
+
+  // «Изменить» opens the form on the saved values, and the keyboard goes to the name.
+  body.buttons(Logic.TEXT.profileEdit)[0].click();
+  await page.settle();
+
+  assert.equal(page.el("profile-name").value, "Елена");
+  const radios = page.el("profile-body").find((element) => element.getAttribute("type") === "radio");
+  assert.deepEqual(radios.map((radio) => radio.getAttribute("value")), ["normal", "large"]);
+  assert.equal(radios[0].checked, true);
+  assert.equal(page.el("profile-body").buttons(Logic.TEXT.profileSave).length, 1);
+  assert.equal(page.el("profile-body").buttons(Logic.TEXT.profileEdit).length, 0);
+  assert.equal(page.doc.activeElement, page.el("profile-name"));
 });
 
 scenario("the_large_text_size_is_applied_to_the_signed_in_page_and_comes_off_on_the_way_out", async () => {
@@ -4051,6 +4069,9 @@ scenario("the_large_text_size_is_applied_to_the_signed_in_page_and_comes_off_on_
 
   assert.equal(page.doc.documentElement.getAttribute("data-text-size"), "large");
   page.el("profile-open").click();
+  await page.settle();
+  assert.ok(page.el("profile-body").textContent.includes(Logic.TEXT.profileSizeLarge));
+  page.el("profile-body").buttons(Logic.TEXT.profileEdit)[0].click();
   await page.settle();
   const large = page
     .el("profile-body")
@@ -4095,54 +4116,150 @@ scenario("a_profile_that_cannot_be_read_leaves_the_conversations_working", async
   page.el("profile-body").buttons("Повторить")[0].click();
   await page.settle();
   await page.settle();
-  assert.equal(page.el("profile-name").value, "Елена");
+  assert.ok(page.el("profile-body").textContent.includes("Елена"));
+  assert.equal(page.el("profile-body").byTag("input").length, 0, "the pane opens on the saved values");
   assert.ok(!page.el("profile-body").textContent.includes(Logic.TEXT.profileFailed));
 });
 
-scenario("saving_the_profile_draws_the_answer_and_a_refused_name_stays_under_its_field", async () => {
+scenario("saving_returns_to_the_saved_values_and_izmenit_opens_the_form_again", async () => {
   const page = await open();
   page.el("profile-open").click();
   await page.settle();
   await page.settle();
 
-  const body = page.el("profile-body");
+  // First change: the name is trimmed by the server, the size becomes large.
+  page.el("profile-body").buttons(Logic.TEXT.profileEdit)[0].click();
+  await page.settle();
   page.editField(page.el("profile-name"), "  Иван  ");
-  const large = body.find(
-    (element) => element.getAttribute("type") === "radio" && element.getAttribute("value") === "large"
-  )[0];
+  const large = page
+    .el("profile-body")
+    .find((element) => element.getAttribute("type") === "radio" && element.getAttribute("value") === "large")[0];
   large.checked = true;
-  assert.equal(
-    page.el("profile-body").find(
-      (element) => element.getAttribute("type") === "radio" && element.getAttribute("value") === "large"
-    )[0].checked,
-    true
-  );
+  large.fire("change");
   page.env.net.route("PATCH", "/api/profile", H.profileBody("Иван", "large"));
-  large.closest("form").buttons("Сохранить")[0].click();
+  const saveButton = page.el("profile-body").buttons(Logic.TEXT.profileSave)[0];
+  saveButton.focus(); // a real click leaves the keyboard on the button
+  saveButton.click();
   await page.settle();
   await page.settle();
 
   const requests = page.env.net.requests("PATCH", "/api/profile");
+  assert.equal(requests.length, 1);
   assert.deepEqual(requests[0].body, { display_name: "Иван", text_size: "large" });
-  assert.equal(page.el("profile-name").value, "Иван");
-  assert.ok(page.el("profile-body").textContent.includes(Logic.TEXT.profileSaved));
-  assert.equal(page.doc.documentElement.getAttribute("data-text-size"), "large");
-  assert.equal(
-    page.el("profile-body").find(
-      (element) => element.getAttribute("type") === "radio" && element.getAttribute("value") === "large"
-    )[0].checked,
-    true
-  );
 
-  page.env.net.route("PATCH", "/api/profile", apiError(400, "invalid_display_name"));
+  // The answer is what the pane shows: the saved values, the save's message, «Изменить» back.
+  const body = page.el("profile-body");
+  assert.ok(body.textContent.includes(Logic.TEXT.profileSaved));
+  assert.ok(body.textContent.includes("Иван"));
+  assert.ok(body.textContent.includes(Logic.TEXT.profileSizeLarge));
+  assert.equal(page.el("profile-body").byTag("input").length, 0, "the form is closed");
+  assert.equal(body.buttons(Logic.TEXT.profileSave).length, 0);
+  assert.equal(body.buttons(Logic.TEXT.profileEdit).length, 1);
+  assert.equal(page.doc.documentElement.getAttribute("data-text-size"), "large");
+  assert.equal(page.doc.activeElement, body.buttons(Logic.TEXT.profileEdit)[0], "the keyboard stays in the pane");
+
+  // Reopening the form shows the saved values, and a second change is a second save.
+  body.buttons(Logic.TEXT.profileEdit)[0].click();
+  await page.settle();
+  assert.equal(page.el("profile-name").value, "Иван");
+  const largeAgain = page
+    .el("profile-body")
+    .find((element) => element.getAttribute("type") === "radio" && element.getAttribute("value") === "large")[0];
+  assert.equal(largeAgain.checked, true);
+  assert.ok(!page.el("profile-body").textContent.includes(Logic.TEXT.profileSaved), "the old message is gone");
+
+  page.editField(page.el("profile-name"), "Иван Петров");
+  // The mini DOM does not group radios: uncheck the other one as the browser would.
+  largeAgain.checked = false;
+  const normalAgain = page
+    .el("profile-body")
+    .find((element) => element.getAttribute("type") === "radio" && element.getAttribute("value") === "normal")[0];
+  normalAgain.checked = true;
+  normalAgain.fire("change");
+  page.env.net.route("PATCH", "/api/profile", H.profileBody("Иван Петров", "normal"));
+  page.el("profile-body").buttons(Logic.TEXT.profileSave)[0].click();
+  await page.settle();
+  await page.settle();
+
+  assert.equal(page.env.net.requests("PATCH", "/api/profile").length, 2);
+  assert.deepEqual(page.env.net.requests("PATCH", "/api/profile")[1].body, {
+    display_name: "Иван Петров",
+    text_size: "normal",
+  });
+  assert.ok(page.el("profile-body").textContent.includes("Иван Петров"));
+  assert.ok(page.el("profile-body").textContent.includes(Logic.TEXT.profileSizeNormal));
+  assert.equal(page.doc.documentElement.getAttribute("data-text-size"), null);
+});
+
+scenario("a_form_that_holds_the_saved_values_sends_no_patch_and_returns_to_them", async () => {
+  const page = await open();
+  page.el("profile-open").click();
+  await page.settle();
+  await page.settle();
+  page.el("profile-body").buttons(Logic.TEXT.profileEdit)[0].click();
+  await page.settle();
+
+  // Space around the saved name is not a change: the server would trim it away.
+  page.editField(page.el("profile-name"), "  Елена  ");
+  page.el("profile-body").buttons(Logic.TEXT.profileSave)[0].click();
+  await page.settle();
+  await page.settle();
+
+  assert.equal(page.env.net.requests("PATCH", "/api/profile").length, 0, "nothing was written");
+  assert.equal(page.el("profile-body").byTag("input").length, 0, "the form closed on the unchanged values");
+  assert.ok(page.el("profile-body").textContent.includes("Елена"));
+  assert.ok(!page.el("profile-body").textContent.includes(Logic.TEXT.profileSaved), "no save is claimed");
+  assert.equal(page.el("profile-body").buttons(Logic.TEXT.profileEdit).length, 1);
+});
+
+scenario("a_failed_save_keeps_the_form_and_what_was_typed_and_applies_nothing", async () => {
+  const page = await open();
+  page.el("profile-open").click();
+  await page.settle();
+  await page.settle();
+  page.el("profile-body").buttons(Logic.TEXT.profileEdit)[0].click();
+  await page.settle();
+  page.editField(page.el("profile-name"), "Новое имя");
+  const large = page
+    .el("profile-body")
+    .find((element) => element.getAttribute("type") === "radio" && element.getAttribute("value") === "large")[0];
+  large.checked = true;
+  large.fire("change");
+  page.env.net.route("PATCH", "/api/profile", fail());
+
+  page.el("profile-body").buttons(Logic.TEXT.profileSave)[0].click();
+  await page.settle();
+  await page.settle();
+
+  assert.equal(page.el("profile-name").value, "Новое имя", "the typing is kept");
+  const radios = page.el("profile-body").find((element) => element.getAttribute("type") === "radio");
+  assert.equal(radios.find((radio) => radio.getAttribute("value") === "large").checked, true);
+  assert.ok(page.el("profile-body").textContent.includes(Logic.TEXT.network));
+  assert.equal(page.el("profile-body").buttons(Logic.TEXT.profileSave).length, 1, "the form is still there");
+  assert.equal(page.el("profile-body").buttons(Logic.TEXT.profileEdit).length, 0);
+  assert.equal(page.doc.documentElement.getAttribute("data-text-size"), null, "an unsaved size is not applied");
+  assert.ok(!page.el("profile-body").textContent.includes(Logic.TEXT.profileSaved));
+});
+
+scenario("a_refused_name_stays_under_its_field_and_the_form_stays_open", async () => {
+  const page = await open();
+  page.el("profile-open").click();
+  await page.settle();
+  await page.settle();
+  page.el("profile-body").buttons(Logic.TEXT.profileEdit)[0].click();
+  await page.settle();
   page.editField(page.el("profile-name"), "Иван");
-  page.el("profile-body").buttons("Сохранить")[0].click();
+  page.env.net.route("PATCH", "/api/profile", apiError(400, "invalid_display_name"));
+
+  page.el("profile-body").buttons(Logic.TEXT.profileSave)[0].click();
   await page.settle();
   await page.settle();
 
   assert.ok(page.el("profile-body").textContent.includes(Logic.CODE_MESSAGES.invalid_display_name));
   assert.equal(page.el("profile-name").getAttribute("aria-invalid"), "true");
-  assert.equal(page.el("profile-body").buttons("Сохранить").length, 1);
+  assert.equal(page.el("profile-name").value, "Иван");
+  assert.equal(page.el("profile-body").buttons(Logic.TEXT.profileSave).length, 1);
+  assert.equal(page.el("profile-body").buttons(Logic.TEXT.profileEdit).length, 0);
   assert.ok(!page.el("profile-body").textContent.includes(Logic.TEXT.profileSaved));
 });
 
@@ -4186,28 +4303,35 @@ scenario("a_profile_name_and_address_are_text_not_markup", async () => {
   await page.settle();
   await page.settle();
 
-  assert.equal(page.el("profile-name").value, HOSTILE);
-  assert.ok(page.el("profile-body").textContent.includes(HOSTILE));
+  assert.ok(page.el("profile-body").textContent.includes(HOSTILE), "the saved name is read as text");
   assert.equal(page.doc.root.byTag("img").length, 0);
   assert.equal(page.doc.root.byTag("svg").length, 0);
   assert.equal(page.doc.root.byTag("script").length, 2, "only the two the server wrote");
+
+  page.el("profile-body").buttons(Logic.TEXT.profileEdit)[0].click();
+  await page.settle();
+  assert.equal(page.el("profile-name").value, HOSTILE);
+  assert.equal(page.doc.root.byTag("img").length, 0);
+  assert.equal(page.doc.root.byTag("svg").length, 0);
 });
 
-scenario("a_profile_save_that_cannot_be_confirmed_is_a_notice_and_keeps_what_was_typed", async () => {
-  const page = await open();
+scenario("a_name_that_was_never_set_is_a_note_and_the_form_opens_empty", async () => {
+  const page = await open((env) => {
+    env.signedIn([]);
+    env.net.route("GET", "/api/profile", H.profileBody(null, "normal"));
+  });
   page.el("profile-open").click();
   await page.settle();
   await page.settle();
-  page.editField(page.el("profile-name"), "Новое имя");
-  page.env.net.route("PATCH", "/api/profile", fail());
 
-  page.el("profile-body").buttons("Сохранить")[0].click();
-  await page.settle();
-  await page.settle();
+  const body = page.el("profile-body");
+  assert.ok(body.textContent.includes(Logic.TEXT.profileNameNotSet));
+  assert.equal(body.byClass("profile-not-set").length, 1);
+  assert.ok(!body.textContent.includes("null"));
 
-  assert.equal(page.el("profile-name").value, "Новое имя");
-  assert.ok(page.el("profile-body").textContent.includes(Logic.TEXT.network));
-  assert.equal(page.el("profile-body").buttons("Сохранить").length, 1, "the form is still there");
+  body.buttons(Logic.TEXT.profileEdit)[0].click();
+  await page.settle();
+  assert.equal(page.el("profile-name").value, "");
 });
 
 module.exports = { scenarios, useShell, useNoLoginShell };

@@ -153,16 +153,21 @@ journeys.profile_survives_a_reload_and_its_text_size_is_the_servers = async ({ b
   assert.equal(typeof view.profile.displayName, "string");
   assert.equal(view.profile.textSize, "normal");
   assert.deepEqual(view.profile.loginMethods, [{ provider: "telegram", address: null, status: "active" }]);
+  assert.equal(view.profile.editing, false, "the pane opens on the saved values");
 
+  first.ctl.beginProfileEdit();
+  assert.equal(first.view().profile.editing, true);
   const saved = await first.ctl.saveProfile({ displayName: "  Иван  ", textSize: "large" });
   assert.deepEqual(saved, { ok: true });
   assert.equal(first.view().profile.displayName, "Иван", "trimmed by the server and read back from it");
   assert.equal(first.view().profile.textSize, "large");
+  assert.equal(first.view().profile.editing, false, "a successful save returns to the saved values");
 
   const reloaded = page(base, cookie); // a new tab: the profile is the account's
   view = await reloaded.boot();
   assert.equal(view.profile.displayName, "Иван");
   assert.equal(view.profile.textSize, "large");
+  assert.equal(view.profile.editing, false, "a reload opens on the saved values too");
   assert.deepEqual(view.profile.loginMethods, [{ provider: "telegram", address: null, status: "active" }]);
   return {};
 };

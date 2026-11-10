@@ -405,11 +405,12 @@ textarea[aria-invalid="true"] {
 .workspace {
   display: grid;
   flex: 1;
-  grid-template-columns: 19rem minmax(0, 1fr);
+  /* 21rem: room for the three section labels on one line at both text sizes (see .tab). */
+  grid-template-columns: 21rem minmax(0, 1fr);
   min-height: 0;
 }
 
-/* The side column is laid out top to bottom: the two tabs and (under "Разговоры") the button for a new
+/* The side column is laid out top to bottom: the three tabs and (under "Разговоры") the button for a new
    conversation stay where they are, the list under them is what scrolls, and the Telegram panel stays
    at the foot, small. The column itself scrolls only when the window is too short for all of that. */
 .sidebar {
@@ -557,19 +558,24 @@ textarea[aria-invalid="true"] {
   font-weight: 400;
 }
 
-/* The two parts of the sidebar: the conversations and the favorites. */
+/* The three parts of the sidebar, side by side and equal in width. A label is never broken
+   inside a word: at the desktop width times three labels fit together (the column is sized
+   for that; tests/test_web_ui_assets.py keeps the budget), and where they cannot, the row
+   itself wraps whole buttons onto another line (the narrow media query below). */
 .tabs {
   display: flex;
   flex: none;
-  gap: 0.35rem;
+  gap: 0.25rem;
   margin-bottom: 0.9rem;
 }
 
 .tab {
   flex: 1;
-  min-width: 0;
+  /* The label's own width is the floor: an equal share may grow a tab, never squeeze its
+     words. With `white-space: nowrap` this is what keeps a label on one line. */
+  min-width: max-content;
   min-height: 2.75rem;
-  padding: 0.5rem 0.35rem;
+  padding: 0.5rem 0.25rem;
   border: 2px solid var(--blue);
   border-radius: var(--radius);
   background: var(--surface);
@@ -577,7 +583,8 @@ textarea[aria-invalid="true"] {
   font: inherit;
   font-size: 0.95rem;
   font-weight: 600;
-  overflow-wrap: anywhere;
+  white-space: nowrap;
+  overflow-wrap: normal;
   cursor: pointer;
 }
 
@@ -1351,6 +1358,44 @@ textarea[aria-invalid="true"] {
   margin: 0 auto;
 }
 
+/* The saved settings as the pane opens: values to read, with «Изменить» the only way into
+   the form. A draft is never drawn here, so nothing looks saved before the server said so. */
+.profile-summary,
+.profile-form {
+  margin: 0 0 1.75rem;
+}
+
+.profile-values {
+  margin: 0 0 1.1rem;
+}
+
+.profile-value {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.15rem 0.75rem;
+  min-width: 0;
+  padding: 0.55rem 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.profile-value dt {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.profile-value dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-weight: 600;
+}
+
+/* A name that was never set is a note, not a value: it reads in the same muted tone as its label. */
+.profile-value .profile-not-set {
+  color: var(--muted);
+  font-weight: 400;
+}
+
 .profile-section {
   margin: 0 0 1.75rem;
 }
@@ -1546,6 +1591,18 @@ textarea[aria-invalid="true"] {
     grid-template-columns: minmax(0, 1fr);
   }
 
+  /* In the drawer the three labels share the row while they fit together (equal thirds,
+     because the floor is 30% and each tab grows from there). Where they do not -- the
+     narrowest phone, or any phone at the large size -- the row wraps whole buttons onto a
+     second line instead of breaking a word. No tab is ever narrower than its label. */
+  .tabs {
+    flex-wrap: wrap;
+  }
+
+  .tab {
+    flex: 1 1 30%;
+  }
+
   .sidebar {
     position: fixed;
     top: 0;
@@ -1606,30 +1663,12 @@ textarea[aria-invalid="true"] {
     overflow-wrap: normal;
     text-align: center;
   }
-
-  /* Three labels in the narrowest drawer at the large size would otherwise break inside
-     the words ("Разгов оры"): they take two rows instead, whole. */
-  html[data-text-size="large"] .tabs {
-    flex-wrap: wrap;
-  }
-
-  html[data-text-size="large"] .tab {
-    flex: 1 1 45%;
-    overflow-wrap: normal;
-  }
 }
 
 @media (max-width: 26rem) {
   .btn {
     padding-right: 0.8rem;
     padding-left: 0.8rem;
-  }
-
-  /* Three tabs in the narrowest drawer: the words stay on one line. */
-  .tab {
-    padding-right: 0.25rem;
-    padding-left: 0.25rem;
-    font-size: 0.9rem;
   }
 
   .messages {

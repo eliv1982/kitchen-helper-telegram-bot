@@ -436,6 +436,14 @@
       if (!els.profile.hidden) {
         els.profileTitle.focus();
       }
+    } else if (wanted === "profile-name") {
+      // The form «Изменить» draws: its name field is the first thing to work in.
+      if (!els.profile.hidden) {
+        var nameInput = findByFocus(els.profileBody, "profile-name");
+        if (nameInput) {
+          nameInput.focus();
+        }
+      }
     } else if (wanted !== null && focusNodes[wanted]) {
       focusNodes[wanted].focus();
     }
@@ -1808,7 +1816,7 @@
         alertText(profile.notice.text);
       }
     }
-    content.appendChild(profileForm(profile));
+    content.appendChild(profile.editing ? profileForm(profile) : profileSummary(profile));
     content.appendChild(profileLoginMethods(profile));
     content.appendChild(profileData());
     box.scrollTop = scroll;
@@ -1816,12 +1824,50 @@
       var again = findByFocus(box, focused);
       if (again) {
         again.focus();
+      } else {
+        // The focused control was the one whose action changed the pane's mode (or the form
+        // that a successful save replaced): keep the keyboard in the pane, on the control
+        // that now does that work.
+        var next = findByFocus(box, profile.editing ? "profile-name" : "profile-edit");
+        if (next) {
+          next.focus();
+        }
       }
     }
   }
 
   function profileReload() {
     controller.reloadProfile();
+  }
+
+  function profileBeginEdit() {
+    wantFocus = "profile-name"; // the form is drawn by this change, so its field is focused then
+    controller.beginProfileEdit();
+  }
+
+  // The saved settings, as the pane opens. Only values the server returned are drawn here:
+  // a draft exists only inside the form, so nothing here can look saved before it is.
+  function profileSummary(profile) {
+    var values = h("dl", { class: "profile-values" });
+    function row(label, value, missing) {
+      values.appendChild(
+        h("div", { class: "profile-value" }, [
+          h("dt", { text: label }),
+          h("dd", missing ? { class: "profile-not-set", text: value } : { text: value }),
+        ])
+      );
+    }
+    row(Logic.TEXT.profileNameLabel, profile.displayName || Logic.TEXT.profileNameNotSet, !profile.displayName);
+    row(
+      Logic.TEXT.profileTextSizeLabel,
+      profile.textSize === "large" ? Logic.TEXT.profileSizeLarge : Logic.TEXT.profileSizeNormal,
+      false
+    );
+    var section = h("div", { class: "profile-summary" }, [values]);
+    var edit = action(Logic.TEXT.profileEdit, "btn-primary", profileBeginEdit);
+    edit.setAttribute("data-focus", "profile-edit");
+    section.appendChild(edit);
+    return section;
   }
 
   function profileForm(profile) {
