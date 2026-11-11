@@ -114,7 +114,6 @@ def test_the_user_id_is_kept_to_tell_whose_page_it_is_and_is_never_sent():
         if re.search(r"http\(|json:|headers|\.body|Idempotency", line):
             assert not re.search(r"principal|userId|owner|user_id", line), line
     assert re.findall(r"json:\s*(\{[^}]*\})", code) == [
-        "{ display_name: prepared.text, text_size: size }",
         "{ text: turn.text }",
         "{}",
         "{ state: itemState }",

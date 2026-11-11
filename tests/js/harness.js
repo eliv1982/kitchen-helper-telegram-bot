@@ -418,10 +418,35 @@ function loginMethod(provider, status = "active", address = null) {
   return { provider, address, status };
 }
 
-function profileBody(displayName = "Елена", textSize = "normal", methods = []) {
+const MEASURE_LIMITS = {
+  glass_ml: { min: 50, max: 1000, def: 250 },
+  teaspoon_ml: { min: 1, max: 20, def: 5 },
+  tablespoon_ml: { min: 5, max: 50, def: 15 },
+};
+
+// The additive measures object of the profile answer: the system defaults unless an
+// override is named ({glass_ml: 240}).
+function profileMeasures(overrides = {}) {
+  const measures = {};
+  for (const name of Object.keys(MEASURE_LIMITS)) {
+    const limit = MEASURE_LIMITS[name];
+    const override = overrides[name] === undefined ? null : overrides[name];
+    measures[name] = {
+      override,
+      effective: override === null ? limit.def : override,
+      default: limit.def,
+      min: limit.min,
+      max: limit.max,
+    };
+  }
+  return measures;
+}
+
+function profileBody(displayName = "Елена", textSize = "normal", methods = [], overrides = {}) {
   return json(200, {
     display_name: displayName,
     text_size: textSize,
+    measures: profileMeasures(overrides),
     login_methods: methods.length ? methods : [loginMethod("telegram")],
   });
 }
@@ -548,6 +573,7 @@ module.exports = {
   me,
   loginMethod,
   profileBody,
+  profileMeasures,
   USER_A,
   USER_B,
   notAuthenticated,

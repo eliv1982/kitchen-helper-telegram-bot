@@ -368,6 +368,43 @@ async def test_a_stale_version_is_a_conflict_and_changes_nothing(tmp_path):
         assert (found["title"], found["version"]) == ("Первый", 2)
 
 
+async def test_a_version_one_draft_cannot_overwrite_another_devices_ingredients(tmp_path):
+    """The stale-editor case the page guards against, on the server's side.
+
+    A draft opened on version 1 is saved after another device made version 2 with its own
+    ingredients. The save names version 1, so it is refused as a conflict and the other
+    device's change is exactly what remains stored.
+    """
+    async with chat_app(tmp_path, ScriptedBackend(default=ANSWER)) as chat:
+        _, _, favorite = await structured_favorite(chat)
+        assert favorite["version"] == 1
+
+        other_ingredients = [
+            {"name": "свёкла", "amount": "9 шт."},
+            {"name": "капуста", "amount": "300 г"},
+        ]
+        other = await patch(
+            chat,
+            favorite["id"],
+            {"expected_version": 1, "title": "Борщ соседки", "ingredients": other_ingredients},
+        )
+        assert other.status_code == 200, other.text
+        assert other.json()["version"] == 2
+
+        # The editor that was opened on version 1 still holds the original ingredients.
+        stale = await patch(
+            chat,
+            favorite["id"],
+            {"expected_version": 1, "title": "Мой борщ", "ingredients": BORSH["ingredients"]},
+        )
+
+        assert stale.status_code == 409
+        assert error_of(stale)["detail"] == "favorite_conflict"
+        found = (await chat.client.get(f"/api/favorites/{favorite['id']}")).json()
+        assert (found["title"], found["version"]) == ("Борщ соседки", 2)
+        assert found["ingredients"] == other_ingredients, "the other device's change is preserved"
+
+
 async def test_the_fields_of_the_other_kind_are_refused(tmp_path):
     async with chat_app(tmp_path, ScriptedBackend(default=ANSWER)) as chat:
         conversation, _, answer = await answered(chat)

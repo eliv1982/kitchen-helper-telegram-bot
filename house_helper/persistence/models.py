@@ -316,6 +316,20 @@ class User(Base):
         _max_length("display_name", 200),
         _max_length("text_size", 16),
         sa.CheckConstraint(_in_list("text_size", TextSize), name="text_size_valid"),
+        # A NULL override means "the system default applies"; each range is the approved
+        # personal one (D18/D19). The three are independent: no rule relates them.
+        sa.CheckConstraint(
+            "measure_glass_ml IS NULL OR measure_glass_ml BETWEEN 50 AND 1000",
+            name="measure_glass_ml_range",
+        ),
+        sa.CheckConstraint(
+            "measure_teaspoon_ml IS NULL OR measure_teaspoon_ml BETWEEN 1 AND 20",
+            name="measure_teaspoon_ml_range",
+        ),
+        sa.CheckConstraint(
+            "measure_tablespoon_ml IS NULL OR measure_tablespoon_ml BETWEEN 5 AND 50",
+            name="measure_tablespoon_ml_range",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
@@ -330,6 +344,22 @@ class User(Base):
     # older than 0013 in the migration tests, and it costs the profile one small SELECT.
     text_size: Mapped[str] = mapped_column(
         sa.String(16), server_default=sa.text("'normal'"), deferred=True
+    )
+    # A person's own household capacities in millilitres (migration 0014, D18/D19). NULL
+    # means the system default (250/5/15 mL); nothing seeds a value. They are target
+    # measures only and never interpret a source recipe. Deferred for the same reason as
+    # text_size: a row can be read against a schema older than 0014 in the migration tests.
+    # The server default is NULL itself: an INSERT that does not name these columns omits
+    # them (so a row can still be written to a schema older than 0014), and a row without a
+    # choice reads back as "the system default applies".
+    measure_glass_ml: Mapped[Optional[int]] = mapped_column(
+        sa.Integer, server_default=sa.text("NULL"), deferred=True
+    )
+    measure_teaspoon_ml: Mapped[Optional[int]] = mapped_column(
+        sa.Integer, server_default=sa.text("NULL"), deferred=True
+    )
+    measure_tablespoon_ml: Mapped[Optional[int]] = mapped_column(
+        sa.Integer, server_default=sa.text("NULL"), deferred=True
     )
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)

@@ -214,7 +214,7 @@ def test_the_text_size_migration_adds_one_column_and_changes_no_other_value(prof
     before = _snapshot(profile_engine)
     assert _version(profile_engine) == [SHOPPING]
 
-    upgrade_database(profile_engine)
+    upgrade_database(profile_engine, PROFILE)
 
     assert _version(profile_engine) == [PROFILE]
     assert _tables(profile_engine) == TABLES | {"alembic_version"}
@@ -260,7 +260,7 @@ def test_the_migration_does_not_rebuild_users_and_so_cascades_nothing(profile_en
         }
     assert before["users"] == 2 and before["shopping_lists"] == 1
 
-    upgrade_database(profile_engine)
+    upgrade_database(profile_engine, PROFILE)
 
     with profile_engine.connect() as connection:
         after = {
@@ -272,7 +272,7 @@ def test_the_migration_does_not_rebuild_users_and_so_cascades_nothing(profile_en
 
 
 def test_the_column_defaults_and_its_closed_list_are_the_database_rules(profile_engine):
-    upgrade_database(profile_engine)
+    upgrade_database(profile_engine, PROFILE)
     with create_session_factory(profile_engine)() as db, db.begin():
         user = new_user(db, display_name="Кто-то")
 
@@ -297,7 +297,7 @@ def test_downgrading_drops_only_the_column_and_restores_the_0012_schema(tmp_path
     try:
         found = _database_at_0012(migrated)
         upgrade_database(pristine, SHOPPING)
-        upgrade_database(migrated)
+        upgrade_database(migrated, PROFILE)
         with create_session_factory(migrated)() as db, db.begin():
             db.get(User, found["elena"]).text_size = "large"
         before = _snapshot(migrated)
@@ -314,7 +314,7 @@ def test_downgrading_drops_only_the_column_and_restores_the_0012_schema(tmp_path
             assert connection.exec_driver_sql("PRAGMA foreign_key_check").all() == []
             assert connection.exec_driver_sql("PRAGMA integrity_check").scalars().all() == ["ok"]
 
-        upgrade_database(migrated)  # and forward again: the choice is gone, the default is back
+        upgrade_database(migrated, PROFILE)  # forward again: the choice is gone, the default is back
         with create_session_factory(migrated)() as db:
             assert db.get(User, found["elena"]).text_size == "normal"
             assert db.get(User, found["elena"]).display_name == "Елена"
@@ -324,7 +324,7 @@ def test_downgrading_drops_only_the_column_and_restores_the_0012_schema(tmp_path
 
 
 def test_the_profile_revision_renders_as_plain_postgresql_alters():
-    up, down = _offline_sql("up"), _offline_sql("down_from_head")
+    up, down = _offline_sql("up"), _offline_sql("down_from_profile")
     revision = up.split(f"Running upgrade {SHOPPING} -> {PROFILE}")[1].split("-- Running upgrade")[0]
 
     statements = [re.sub(r"\s+", " ", part.strip()) for part in revision.split(";")]

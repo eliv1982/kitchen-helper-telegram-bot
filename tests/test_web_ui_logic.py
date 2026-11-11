@@ -21,6 +21,7 @@ These tests do not run a browser: the drawing (app.js) is checked statically
 """
 
 import json
+import math
 import random
 import shutil
 import subprocess
@@ -215,13 +216,115 @@ def test_the_page_names_a_conversation_exactly_as_the_server_does():
 
 
 def test_the_pages_limits_are_the_servers():
-    from house_helper.persistence.profile import MAX_DISPLAY_NAME_LENGTH
+    from house_helper.persistence.profile import (
+        MAX_DISPLAY_NAME_LENGTH,
+        MEASURE_DEFAULTS,
+        MEASURE_RANGES,
+    )
 
     facts = _crosscheck("texts")
 
     assert facts["MAX"] == MAX_INPUT_LENGTH == 2000
     assert facts["MAX_PROFILE_NAME"] == MAX_DISPLAY_NAME_LENGTH == 200
     assert facts["PAGE_SIZE"] == DEFAULT_LIST_LIMIT
+    # KH-F01-B1: the page checks the profile read against these, and the form against them
+    # before a PATCH; the server's own tables come from core.measures.
+    assert facts["MEASURE_LIMITS"] == {
+        name: {
+            "min": MEASURE_RANGES[name][0],
+            "max": MEASURE_RANGES[name][1],
+            "def": MEASURE_DEFAULTS[name],
+        }
+        for name in ("glass_ml", "teaspoon_ml", "tablespoon_ml")
+    }
+
+
+# --- KH-F01-B1: the page's fractions and Russian unit forms -----------------------------------
+
+_VULGAR = {
+    2: {1: "½"},
+    3: {1: "⅓", 2: "⅔"},
+    4: {1: "¼", 2: "½", 3: "¾"},
+    6: {1: "⅙", 5: "⅚"},
+    8: {1: "⅛", 3: "⅜", 5: "⅝", 7: "⅞"},
+}
+_HUNDREDTHS = {5: 20, 10: 10, 20: 5, 25: 4, 50: 2, 100: 1}
+_UNIT_FORMS = {
+    "glass": {
+        "one": "ваш стакан",
+        "few": "ваших стакана",
+        "many": "ваших стаканов",
+        "fraction": "вашего стакана",
+    },
+    "teaspoon": {
+        "one": "ваша чайная ложка",
+        "few": "ваших чайных ложки",
+        "many": "ваших чайных ложек",
+        "fraction": "вашей чайной ложки",
+    },
+    "tablespoon": {
+        "one": "ваша столовая ложка",
+        "few": "ваших столовых ложки",
+        "many": "ваших столовых ложек",
+        "fraction": "вашей столовой ложки",
+    },
+}
+
+
+def _reference_measure(numerator: int, denominator: int, unit: str) -> str:
+    """The formatter written independently of chat-logic.js, for the crosscheck."""
+    if denominator < 1 or numerator < 0:
+        return None
+    divisor = math.gcd(numerator, denominator) or 1
+    n, d = numerator // divisor, denominator // divisor
+    if d == 1:
+        amount = str(n)
+    else:
+        whole, rest = divmod(n, d)
+        if rest in _VULGAR.get(d, {}):
+            amount = (str(whole) if whole else "") + _VULGAR[d][rest]
+        elif d in _HUNDREDTHS:
+            hundredths = n * _HUNDREDTHS[d]
+            integer, tail = divmod(hundredths, 100)
+            if tail == 0:
+                amount = str(integer)
+            else:
+                digits = f"{tail:02d}".rstrip("0")
+                amount = f"{integer},{digits}"
+        else:
+            amount = f"{n}/{d}"
+    if d != 1:
+        form = "fraction"
+    else:
+        last_two = n % 100
+        if 11 <= last_two <= 14:
+            form = "many"
+        elif n % 10 == 1:
+            form = "one"
+        elif 2 <= n % 10 <= 4:
+            form = "few"
+        else:
+            form = "many"
+    return f"{amount} {_UNIT_FORMS[unit][form]}"
+
+
+def test_the_page_formats_every_practical_fraction_and_unit_as_the_server_side_reference_does():
+    values = [
+        [numerator, denominator, unit]
+        for unit in ("glass", "teaspoon", "tablespoon")
+        for denominator in list(range(1, 13)) + [20, 25, 50, 100]
+        for numerator in range(0, 13)
+    ]
+    formatted = _crosscheck("fractions", values=values)["formatted"]
+
+    assert len(formatted) == len(values) == 3 * 16 * 13
+    expected = [_reference_measure(*value) for value in values]
+    assert formatted == expected
+    # The owner's examples are in the set and are what the page words.
+    assert _reference_measure(4, 5, "glass") == "0,8 вашего стакана"
+    assert _reference_measure(3, 2, "tablespoon") == "1½ вашей столовой ложки"
+    assert _reference_measure(5, 4, "teaspoon") == "1¼ вашей чайной ложки"
+    assert _reference_measure(19, 20, "glass") == "0,95 вашего стакана"
 
 
 def test_every_error_the_server_can_name_has_the_same_words_in_the_page():

@@ -78,7 +78,8 @@ RECIPES = "0010_structured_recipe_favorites"
 TELEGRAM_ACTIVE = "0011_telegram_active_selection"
 SHOPPING = "0012_shopping_lists"
 PROFILE = "0013_user_text_size"
-HEAD = PROFILE
+MEASURES = "0014_user_measure_overrides"
+HEAD = MEASURES
 # alembic_version.version_num is VARCHAR(32); a longer identifier fails the upgrade on
 # PostgreSQL with SQLSTATE 22001 (character varying(32), value too long).
 MAX_REVISION_LENGTH = 32
@@ -116,6 +117,7 @@ def test_the_history_is_one_line_with_one_head():
     assert too_long == []  # every id fits alembic_version.version_num (VARCHAR(32))
     assert [revision.revision for revision in script.walk_revisions()] == [
         HEAD,
+        PROFILE,
         SHOPPING,
         TELEGRAM_ACTIVE,
         RECIPES,
@@ -129,7 +131,8 @@ def test_the_history_is_one_line_with_one_head():
         PROVENANCE,
         INITIAL,
     ]
-    assert script.get_revision(HEAD).down_revision == SHOPPING
+    assert script.get_revision(HEAD).down_revision == PROFILE
+    assert script.get_revision(PROFILE).down_revision == SHOPPING
     assert script.get_revision(SHOPPING).down_revision == TELEGRAM_ACTIVE
     assert script.get_revision(TELEGRAM_ACTIVE).down_revision == RECIPES
     assert script.get_revision(RECIPES).down_revision == ATTACHMENTS
@@ -657,9 +660,14 @@ def _rows_of(engine, table: str, omit: tuple[str, ...] = ()) -> list:
     with engine.connect() as connection:
         result = connection.exec_driver_sql(f"SELECT * FROM {table}")
         # The tests that use this compare a schema older than 0013 against itself after a
-        # later upgrade; users.text_size (0013) is not theirs to compare (its own migration
-        # test does that), and it may not exist on the older side at all.
-        names = set(omit) | ({"text_size"} if table == "users" else set())
+        # later upgrade; users.text_size (0013) and the three measure columns (0014) are not
+        # theirs to compare (their own migration tests do that), and they may not exist on
+        # the older side at all.
+        names = set(omit) | (
+            {"text_size", "measure_glass_ml", "measure_teaspoon_ml", "measure_tablespoon_ml"}
+            if table == "users"
+            else set()
+        )
         keep = [i for i, name in enumerate(result.keys()) if name not in names]
         return sorted(([row[i] for i in keep] for row in result.all()), key=repr)
 
@@ -1110,10 +1118,14 @@ def _snapshot_of(engine, tables) -> dict[str, list]:
         snapshot = {}
         for table in sorted(tables):
             result = connection.exec_driver_sql(f"SELECT * FROM {table}")
-            # See _rows_of: a snapshot of an older revision does not compare the column
-            # 0013 adds (its own migration test covers it), so the same rows stay equal
-            # after an upgrade that includes it.
-            names = set(result.keys()) - ({"text_size"} if table == "users" else set())
+            # See _rows_of: a snapshot of an older revision does not compare the columns
+            # 0013 and 0014 add (their own migration tests cover them), so the same rows
+            # stay equal after an upgrade that includes them.
+            names = set(result.keys()) - (
+                {"text_size", "measure_glass_ml", "measure_teaspoon_ml", "measure_tablespoon_ml"}
+                if table == "users"
+                else set()
+            )
             keep = [i for i, name in enumerate(result.keys()) if name in names]
             snapshot[table] = sorted(
                 ([row[i] for i in keep] for row in result.all()), key=repr
@@ -1282,7 +1294,9 @@ def _offline_sql(direction: str) -> str:
     elif direction == "down_from_shopping_to_recipes":
         command.downgrade(config, f"{SHOPPING}:{RECIPES}", sql=True)
     elif direction == "down_from_head":
-        command.downgrade(config, f"{HEAD}:{SHOPPING}", sql=True)
+        command.downgrade(config, f"{HEAD}:{PROFILE}", sql=True)
+    elif direction == "down_from_profile":
+        command.downgrade(config, f"{PROFILE}:{SHOPPING}", sql=True)
     else:
         command.downgrade(config, f"{HEAD}:base", sql=True)
     return config.output_buffer.getvalue()

@@ -17,6 +17,19 @@ in the request is never read. A favorite that does not exist, belongs to somebod
 not even a UUID is the same 404 "favorite_not_found" for every route; a conversation that is
 not the user's (or not a UUID) is the same 404 "conversation_not_found" as in the chat API.
 
+Household measures (KH-F01-B1). The detail body carries an additive `measures` object
+(measure_targets.measure_block): the signed-in person's resolved target capacities, the
+ingredient positions whose amount is a quantified volume, their conversion status and
+reason, exact rational numerators and denominators, the practical rounded value when one
+passed the 5% gate, whether the conversion is identical to the source, and what the page
+should present. A GET may carry `?source_glass_ml=<50..1000>` to clarify an undeclared
+source glass; an invalid value is the catalogue's invalid_measure, and the clarification
+affects only this answer (nothing is stored). Clarification metadata says whether an
+amount still contains an undeclared source glass. A conversion that cannot be built does
+not fail the recipe: `measures` is null and the detail is served normally. The block is
+read-only: no conversion read writes to a favorite, recipe, ingredient or shopping list.
+The same block is in the PATCH answer, with no clarification parameter.
+
 Keeping an answer (POST). The body is {"conversation_id", "message_id"} and, optionally,
 "recipe_index" (0 to MAX_RECIPES_PER_REPLY - 1). Without it, the old behaviour is exactly
 preserved: the whole assistant answer is copied as text. With it, only that structured
@@ -70,6 +83,7 @@ Recipe to store. It never deletes or rewrites a stored row, and the schema guard
 0010: disabling a feature is not a downgrade.
 """
 
+import re
 from typing import Any, Optional
 from uuid import UUID
 
@@ -81,10 +95,11 @@ from house_helper.core.recipes import (
     MAX_RECIPES_PER_REPLY,
     MAX_TITLE_LENGTH,
 )
-from house_helper.persistence import favorites
+from house_helper.persistence import favorites, profile as profile_store
 from house_helper.persistence.authn import AuthenticatedSession
 from house_helper.persistence.models import MAX_FAVORITE_NOTES_LENGTH
 from house_helper.persistence.conversations import ConversationNotFound
+from house_helper.web import measure_targets
 from house_helper.web.chat_api import (
     _UUID,
     ChatRoute,
@@ -147,7 +162,9 @@ def _ingredient_json(item: Any) -> dict[str, str]:
     return {"name": item.name, "amount": item.amount}
 
 
-def _detail_json(found: favorites.FavoriteDetail) -> dict[str, Any]:
+def _detail_json(
+    found: favorites.FavoriteDetail, measures: Optional[dict[str, Any]]
+) -> dict[str, Any]:
     return {
         "id": str(found.id),
         "title": found.title,
@@ -166,7 +183,60 @@ def _detail_json(found: favorites.FavoriteDetail) -> dict[str, Any]:
             else [_ingredient_json(item) for item in found.ingredients]
         ),
         "steps": None if found.steps is None else list(found.steps),
+        "measures": measures,
     }
+
+
+# A clarification is a whole number of millilitres; leading zeros are harmless, and the
+# value is checked against the same approved fence as a declared source glass.
+_SOURCE_GLASS_TEXT = re.compile(r"[0-9]{1,4}")
+
+
+def _source_glass(request: Request) -> Optional[int]:
+    """The optional ?source_glass_ml= clarification, validated, or None.
+
+    A repeated parameter, a value that is not digits, or one outside 50--1000 mL is
+    invalid_measure. Only the detail GET accepts it; it is never read from a body and is
+    never persisted.
+    """
+    values = request.query_params.getlist("source_glass_ml")
+    if not values:
+        return None
+    if len(values) != 1 or _SOURCE_GLASS_TEXT.fullmatch(values[0]) is None:
+        raise ApiError("invalid_measure")
+    value = int(values[0])
+    if not 50 <= value <= 1000:
+        raise ApiError("invalid_measure")
+    return value
+
+
+def _measures_block(
+    session: Any,
+    user_id: UUID,
+    found: favorites.FavoriteDetail,
+    *,
+    source_glass_ml: Optional[int] = None,
+) -> Optional[dict[str, Any]]:
+    """The person's target measures applied to this favorite's ingredients.
+
+    The target capacities are read from the signed-in person's own profile (never from
+    the request). A conversion failure is confined to this block: the caller still serves
+    the readable recipe, with `measures` null.
+    """
+    profile = profile_store.get_profile(session, user_id)
+    target = measure_targets.volumes(
+        profile.measures.glass_ml,
+        profile.measures.teaspoon_ml,
+        profile.measures.tablespoon_ml,
+    )
+    amounts = [item.amount for item in found.ingredients or ()]
+    try:
+        return measure_targets.measure_block(
+            amounts, target, source_glass_ml=source_glass_ml
+        )
+    except Exception:
+        # The recipe itself is still readable; only its conversion section is missing.
+        return None
 
 
 def _kept_answer(document: dict) -> tuple[UUID, int, Optional[int]]:
@@ -269,40 +339,54 @@ async def edit_favorite(
         await _read_json_object(request, limit=MAX_EDIT_BODY)
     )
     now = request.app.state.clock()
-    try:
-        updated = await database.run(
-            lambda session: favorites.update_favorite(
-                session,
-                current.user_id,
-                wanted,
-                expected_version=expected_version,
-                changes=changes,
-                now=now,
-            )
+
+    def edited(session):
+        updated = favorites.update_favorite(
+            session,
+            current.user_id,
+            wanted,
+            expected_version=expected_version,
+            changes=changes,
+            now=now,
         )
+        return updated, _measures_block(session, current.user_id, updated)
+
+    try:
+        updated, measures = await database.run(edited)
     except favorites.FavoriteNotFound:
         raise ApiError("favorite_not_found") from None
     except favorites.FavoriteConflict:
         raise ApiError("favorite_conflict") from None
     except favorites.InvalidFavorite:
         raise ApiError("invalid_request", category="InvalidFavoriteField") from None
-    return JSONResponse(_detail_json(updated))
+    except profile_store.ProfileNotFound:
+        raise ApiError("not_authenticated") from None
+    return JSONResponse(_detail_json(updated, measures))
 
 
 @router.get("/favorites/{favorite_id}")
 async def read_favorite(
     favorite_id: str,
+    request: Request,
     current: AuthenticatedSession = Depends(authenticated),
     database: WebDatabase = Depends(get_database),
 ) -> Response:
     wanted = _favorite_id(favorite_id)
-    try:
-        found = await database.run(
-            lambda session: favorites.get_favorite(session, current.user_id, wanted)
+    source_glass_ml = _source_glass(request)
+
+    def detail(session):
+        found = favorites.get_favorite(session, current.user_id, wanted)
+        return found, _measures_block(
+            session, current.user_id, found, source_glass_ml=source_glass_ml
         )
+
+    try:
+        found, measures = await database.run(detail)
     except favorites.FavoriteNotFound:
         raise ApiError("favorite_not_found") from None
-    return JSONResponse(_detail_json(found))
+    except profile_store.ProfileNotFound:
+        raise ApiError("not_authenticated") from None
+    return JSONResponse(_detail_json(found, measures))
 
 
 @router.delete("/favorites/{favorite_id}")

@@ -248,7 +248,7 @@ def test_the_head_is_the_one_the_migrations_in_the_repository_end_with(db_url):
             ]
     finally:
         engine.dispose()
-    assert repository_head() == "0013_user_text_size"
+    assert repository_head() == "0014_user_measure_overrides"
 
 
 @pytest.mark.parametrize(

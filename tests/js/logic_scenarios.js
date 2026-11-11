@@ -1441,13 +1441,28 @@ scenario("every_text_the_page_makes_is_russian", async () => {
   // name "OpenAI" are the words written in Latin, as everyone writes them.
   const stripPlaceholders = (value) =>
     value.replace(/\{\w+\}/g, "").replace(/JSON|Telegram|OpenAI/g, "");
-  for (const [name, value] of Object.entries({ ...Logic.TEXT, ...Logic.CODE_MESSAGES })) {
+  const check = (name, value) => {
+    if (value && typeof value === "object") {
+      for (const [key, nested] of Object.entries(value)) {
+        check(`${name}.${key}`, nested);
+      }
+      return;
+    }
+    if (typeof value !== "string") {
+      return;
+    }
     const shown = stripPlaceholders(value);
     if (shown === "") {
-      continue; // a proper name alone: the identity method's label
+      return; // a proper name alone: the identity method's label
+    }
+    if (!/[A-Za-zА-Яа-яЁё]/.test(shown)) {
+      return; // a symbol-only template such as the approximation marker
     }
     assert.ok(/[А-Яа-яЁё]/.test(shown), `${name} has no Russian`);
     assert.ok(!latin.test(shown), `${name} has Latin letters: ${shown}`);
+  };
+  for (const [name, value] of Object.entries({ ...Logic.TEXT, ...Logic.CODE_MESSAGES })) {
+    check(name, value);
   }
   const env = makeEnv().signedIn([conversation(CONV_A, 0)]);
   const view = await env.boot();
@@ -6601,7 +6616,11 @@ scenario("a_failed_profile_save_leaves_the_form_open_with_what_was_typed", async
   assert.deepEqual([result.ok, result.reason], [false, "unavailable"]);
   const view = env.view();
   assert.equal(view.profile.editing, true, "the form stays open");
-  assert.deepEqual(view.profile.draft, { displayName: "Новое имя", textSize: "large" });
+  assert.deepEqual(view.profile.draft, {
+    displayName: "Новое имя",
+    textSize: "large",
+    measures: { glass_ml: "", teaspoon_ml: "", tablespoon_ml: "" },
+  });
   assert.equal(view.profile.textSize, "normal", "the unsaved size is not applied");
   assert.equal(view.profile.displayName, "Елена", "the saved name is unchanged");
   assert.equal(view.profile.notice.kind, "error");
@@ -6867,7 +6886,11 @@ scenario("a_failed_profile_save_leaves_the_values_and_a_fresh_read_still_applies
   assert.deepEqual([failed.ok, failed.reason], [false, "unavailable"]);
   assert.equal(env.view().profile.displayName, "Елена");
   assert.equal(env.view().profile.textSize, "normal");
-  assert.deepEqual(env.view().profile.draft, { displayName: "Иван", textSize: "large" });
+  assert.deepEqual(env.view().profile.draft, {
+    displayName: "Иван",
+    textSize: "large",
+    measures: { glass_ml: "", teaspoon_ml: "", tablespoon_ml: "" },
+  });
   assert.equal(env.view().profile.notice.kind, "error");
 
   env.net.route("GET", "/api/profile", H.profileBody("Пётр", "large"));
@@ -6943,6 +6966,1063 @@ scenario("the_profile_data_note_describes_message_retention_and_conversation_cle
   assert.match(recipes, /каждый хранится 365 дней с момента создания/);
   assert.match(recipes, /даже если сам разговор остается/);
   assert.match(recipes, /[Рр]ецепты, сохраненные в избранное, хранятся, пока вы сами их не удалите/);
+});
+
+// ============================================================================================
+// KH-F01-B1: the profile's household measures
+// ============================================================================================
+
+scenario("the_profile_read_carries_the_three_measures_with_their_effective_values", async () => {
+  const env = makeEnv().signedIn([]);
+  env.net.route("GET", "/api/profile", H.profileBody("Елена", "normal", [], { glass_ml: 240 }));
+
+  const view = await env.boot();
+
+  assert.deepEqual(view.profile.measures, {
+    glass_ml: { override: 240, effective: 240, defaultMl: 250, min: 50, max: 1000 },
+    teaspoon_ml: { override: null, effective: 5, defaultMl: 5, min: 1, max: 20 },
+    tablespoon_ml: { override: null, effective: 15, defaultMl: 15, min: 5, max: 50 },
+  });
+});
+
+scenario("a_profile_answer_with_an_unusable_measures_block_is_not_shown", async () => {
+  const good = () => H.profileBody("Елена", "normal", []).body;
+  const cases = [];
+  const missing = good();
+  delete missing.measures;
+  cases.push(missing);
+  cases.push({ ...good(), measures: null });
+  cases.push({ ...good(), measures: H.profileMeasures({ glass_ml: 40 }) });
+  cases.push({
+    ...good(),
+    measures: {
+      ...H.profileMeasures(),
+      glass_ml: { override: 240, effective: 250, default: 250, min: 50, max: 1000 },
+    },
+  });
+  cases.push({
+    ...good(),
+    measures: { ...H.profileMeasures(), glass_ml: { override: null, effective: 250, default: 300, min: 50, max: 1000 } },
+  });
+  cases.push({
+    ...good(),
+    measures: { ...H.profileMeasures(), glass_ml: { override: "240", effective: 240, default: 250, min: 50, max: 1000 } },
+  });
+
+  for (const body of cases) {
+    const env = makeEnv().signedIn([]);
+    env.net.route("GET", "/api/profile", H.json(200, body));
+    const view = await env.boot();
+    assert.equal(view.profile.status, "error", JSON.stringify(body.measures));
+    assert.equal(view.profile.loaded, false);
+    assert.equal(view.profile.measures, null);
+  }
+});
+
+scenario("only_the_changed_profile_fields_are_sent", async () => {
+  const env = makeEnv().signedIn([]);
+  await env.boot();
+  env.ctl.beginProfileEdit();
+  env.net.route("PATCH", "/api/profile", H.profileBody("Елена", "normal", [], { glass_ml: 240 }));
+
+  const result = await env.ctl.saveProfile({
+    displayName: "Елена",
+    textSize: "normal",
+    measures: { glass_ml: "240", teaspoon_ml: "", tablespoon_ml: "" },
+  });
+  await env.settle();
+
+  assert.deepEqual(result, { ok: true });
+  assert.deepEqual(env.net.requests("PATCH", "/api/profile")[0].body, {
+    measures: { glass_ml: 240 },
+  });
+  assert.equal(env.view().profile.measures.glass_ml.effective, 240);
+});
+
+scenario("changing_the_name_and_one_measure_sends_only_those_two_fields", async () => {
+  const env = makeEnv().signedIn([]);
+  await env.boot();
+  env.ctl.beginProfileEdit();
+  env.net.route(
+    "PATCH",
+    "/api/profile",
+    H.profileBody("Иван", "normal", [], { tablespoon_ml: 20 })
+  );
+
+  const result = await env.ctl.saveProfile({
+    displayName: "Иван",
+    textSize: "normal",
+    measures: { glass_ml: "", teaspoon_ml: "", tablespoon_ml: "20" },
+  });
+  await env.settle();
+
+  assert.deepEqual(result, { ok: true });
+  assert.deepEqual(env.net.requests("PATCH", "/api/profile")[0].body, {
+    display_name: "Иван",
+    measures: { tablespoon_ml: 20 },
+  });
+});
+
+scenario("an_empty_measure_field_restores_that_default", async () => {
+  const env = makeEnv().signedIn([]);
+  env.net.route("GET", "/api/profile", H.profileBody("Елена", "normal", [], { glass_ml: 240 }));
+  await env.boot();
+  env.ctl.beginProfileEdit();
+  env.net.route("PATCH", "/api/profile", H.profileBody("Елена", "normal"));
+
+  const result = await env.ctl.saveProfile({
+    displayName: "Елена",
+    textSize: "normal",
+    measures: { glass_ml: "", teaspoon_ml: "", tablespoon_ml: "" },
+  });
+  await env.settle();
+
+  assert.deepEqual(result, { ok: true });
+  assert.deepEqual(env.net.requests("PATCH", "/api/profile")[0].body, {
+    measures: { glass_ml: null },
+  });
+  assert.equal(env.view().profile.measures.glass_ml.override, null);
+});
+
+scenario("a_measure_field_that_only_looks_different_sends_no_patch", async () => {
+  const env = makeEnv().signedIn([]);
+  env.net.route("GET", "/api/profile", H.profileBody("Елена", "normal", [], { glass_ml: 240 }));
+  await env.boot();
+  const asked = env.net.log.length;
+  env.ctl.beginProfileEdit();
+
+  // "0240" is the same whole-millilitre value as the saved 240.
+  const result = await env.ctl.saveProfile({
+    displayName: "Елена",
+    textSize: "normal",
+    measures: { glass_ml: "0240", teaspoon_ml: "", tablespoon_ml: "" },
+  });
+  await env.settle();
+
+  assert.deepEqual(result, { ok: true, unchanged: true });
+  assert.equal(env.net.requests("PATCH", "/api/profile").length, 0);
+  assert.equal(env.net.log.length, asked);
+  assert.equal(env.view().profile.editing, false);
+});
+
+scenario("an_unusable_measure_is_refused_before_anything_is_sent_and_the_draft_stays", async () => {
+  const env = makeEnv().signedIn([]);
+  await env.boot();
+  env.ctl.beginProfileEdit();
+  const asked = env.net.log.length;
+
+  for (const value of ["1.5", "abc", "49", "1001", "-5", "1e3", " 2 4 "]) {
+    const result = await env.ctl.saveProfile({
+      displayName: "Новое имя",
+      textSize: "normal",
+      measures: { glass_ml: value, teaspoon_ml: "", tablespoon_ml: "" },
+    });
+    assert.deepEqual([result.ok, result.reason], [false, "invalid"], value);
+    const view = env.view();
+    assert.ok(/[А-Яа-я]/.test(view.profile.measureError), value);
+    assert.equal(view.profile.editing, true);
+    assert.equal(view.profile.draft.displayName, "Новое имя", "the name typed is kept too");
+    assert.equal(view.profile.draft.measures.glass_ml, value);
+  }
+
+  assert.equal(env.net.requests("PATCH", "/api/profile").length, 0);
+  assert.equal(env.net.log.length, asked);
+});
+
+scenario("a_measure_the_server_refuses_is_a_measure_error_and_the_draft_stays", async () => {
+  const env = makeEnv().signedIn([]);
+  await env.boot();
+  env.ctl.beginProfileEdit();
+  env.net.route("PATCH", "/api/profile", H.apiError(400, "invalid_measure"));
+
+  const result = await env.ctl.saveProfile({
+    displayName: "Елена",
+    textSize: "normal",
+    measures: { glass_ml: "240", teaspoon_ml: "", tablespoon_ml: "" },
+  });
+  await env.settle();
+
+  assert.deepEqual([result.ok, result.reason], [false, "rejected"]);
+  const view = env.view();
+  assert.equal(view.profile.measureError, Logic.CODE_MESSAGES.invalid_measure);
+  assert.equal(view.profile.fieldError, null);
+  assert.equal(view.profile.editing, true);
+  assert.equal(view.profile.draft.measures.glass_ml, "240");
+  assert.equal(view.profile.measures.glass_ml.override, null);
+});
+
+scenario("the_page_words_a_fraction_and_its_personal_unit_correctly", async () => {
+  assert.equal(Logic.formatMeasure(4, 5, "glass"), "0,8 вашего стакана");
+  assert.equal(Logic.formatMeasure(19, 20, "glass"), "0,95 вашего стакана");
+  assert.equal(Logic.formatMeasure(1, 4, "glass"), "¼ вашего стакана");
+  assert.equal(Logic.formatMeasure(3, 2, "tablespoon"), "1½ вашей столовой ложки");
+  assert.equal(Logic.formatMeasure(5, 4, "teaspoon"), "1¼ вашей чайной ложки");
+  assert.equal(Logic.formatMeasure(1, 1, "glass"), "1 ваш стакан");
+  assert.equal(Logic.formatMeasure(2, 1, "glass"), "2 ваших стакана");
+  assert.equal(Logic.formatMeasure(5, 1, "glass"), "5 ваших стаканов");
+  assert.equal(Logic.formatMeasure(11, 1, "glass"), "11 ваших стаканов");
+  assert.equal(Logic.formatMeasure(21, 1, "glass"), "21 ваш стакан");
+  assert.equal(Logic.formatMeasure(44, 25, "glass"), "1,76 вашего стакана");
+  assert.equal(Logic.formatMeasure(1, 0, "glass"), null, "a zero denominator is not a value");
+  assert.equal(Logic.formatMeasure(1, 2, "cup"), null, "an unknown unit is not invented");
+});
+
+// ============================================================================================
+// KH-F01-B1: the favorite detail's measures block
+// ============================================================================================
+
+function measuresBlock(extra = {}) {
+  return {
+    target: { glass_ml: 250, teaspoon_ml: 5, tablespoon_ml: 15 },
+    source_glass_ml: null,
+    source_glass_required: true,
+    ingredients: [
+      {
+        position: 0,
+        source: "1 стакан",
+        source_kind: "household",
+        target_unit: "glass",
+        status: "clarification_required",
+        reason: "glass_size_required",
+        exact: null,
+        rounded: null,
+        identical: false,
+        presentation: "none",
+      },
+    ],
+    ...extra,
+  };
+}
+
+async function withMeasuredFavorite(block = measuresBlock(), extra = {}) {
+  const item = structuredFavoriteItem({ measures: block, ...extra });
+  const env = makeEnv({ structuredRecipes: true }).signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что?"), structuredAnswer()]),
+  });
+  env.net.route("GET", FAVORITES_URL, H.favoritesBody([item]));
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(item, STRUCTURED_TEXT));
+  await env.boot();
+  await env.ctl.openFavorite(H.FAV_1);
+  await env.settle();
+  return { env, item };
+}
+
+scenario("a_structured_favorite_carries_the_conversion_block_as_the_page_reads_it", async () => {
+  const block = measuresBlock({
+    ingredients: [
+      {
+        position: 0,
+        source: "1 стакан 200 мл",
+        source_kind: "household",
+        target_unit: "glass",
+        status: "nominal_household",
+        reason: "converted",
+        exact: { numerator: 4, denominator: 5 },
+        rounded: null,
+        identical: false,
+        presentation: "exact",
+      },
+      {
+        position: 1,
+        source: "2 ст. л.",
+        source_kind: "household",
+        target_unit: "tablespoon",
+        status: "nominal_household",
+        reason: "converted",
+        exact: { numerator: 3, denominator: 2 },
+        rounded: { numerator: 3, denominator: 2, relative_error: { numerator: 0, denominator: 1 } },
+        identical: false,
+        presentation: "rounded",
+      },
+    ],
+  });
+  const { env } = await withMeasuredFavorite(block, { ingredients: BORSH_RECIPE.ingredients });
+
+  const current = env.view().favorites.current;
+  assert.equal(current.status, "ready");
+  assert.equal(current.measures.target.glass_ml, 250);
+  assert.equal(current.measures.sourceGlassRequired, true);
+  assert.deepEqual(current.measures.ingredients, [
+    {
+      position: 0,
+      source: "1 стакан 200 мл",
+      sourceKind: "household",
+      targetUnit: "glass",
+      status: "nominal_household",
+      reason: "converted",
+      exact: { numerator: 4, denominator: 5 },
+      rounded: null,
+      identical: false,
+      presentation: "exact",
+    },
+    {
+      position: 1,
+      source: "2 ст. л.",
+      sourceKind: "household",
+      targetUnit: "tablespoon",
+      status: "nominal_household",
+      reason: "converted",
+      exact: { numerator: 3, denominator: 2 },
+      rounded: {
+        numerator: 3,
+        denominator: 2,
+        relativeError: { numerator: 0, denominator: 1 },
+      },
+      identical: false,
+      presentation: "rounded",
+    },
+  ]);
+  // The original stored amounts are untouched.
+  assert.deepEqual(current.ingredients, BORSH_RECIPE.ingredients);
+});
+
+scenario("a_malformed_conversion_block_is_ignored_and_the_recipe_stays_readable", async () => {
+  const broken = [
+    "not an object",
+    { target: { glass_ml: 250, teaspoon_ml: 5 }, source_glass_required: false, ingredients: [] },
+    { target: { glass_ml: 250, teaspoon_ml: 5, tablespoon_ml: 15 }, source_glass_required: "yes", ingredients: [] },
+    {
+      ...measuresBlock(),
+      ingredients: [
+        {
+          ...measuresBlock().ingredients[0],
+          exact: { numerator: 1.5, denominator: 2 },
+          presentation: "exact",
+        },
+      ],
+    },
+    {
+      ...measuresBlock(),
+      ingredients: [
+        {
+          ...measuresBlock().ingredients[0],
+          position: 5, // beyond the two ingredients of the recipe
+        },
+      ],
+    },
+  ];
+  for (const block of broken) {
+    const { env } = await withMeasuredFavorite(block, { ingredients: BORSH_RECIPE.ingredients });
+    const current = env.view().favorites.current;
+    assert.equal(current.status, "ready", JSON.stringify(block));
+    assert.equal(current.measures, null, JSON.stringify(block));
+    assert.deepEqual(current.ingredients, BORSH_RECIPE.ingredients);
+  }
+});
+
+scenario("a_source_glass_choice_is_a_query_parameter_kept_for_the_open_recipe_only", async () => {
+  const first = structuredFavoriteItem({ measures: measuresBlock() });
+  const second = H.structuredFavorite(H.FAV_2, 2, "Уха", 1, 0, {
+    servings: null,
+    ingredients: UKHA_RECIPE.ingredients,
+    steps: UKHA_RECIPE.steps,
+    version: 1,
+    measures: measuresBlock({ source_glass_required: false, ingredients: [] }),
+  });
+  const env = makeEnv({ structuredRecipes: true }).signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что?"), structuredAnswer()]),
+  });
+  env.net.route("GET", FAVORITES_URL, H.favoritesBody([first, second]));
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(first, STRUCTURED_TEXT));
+  env.net.route("GET", FAV_URL_2, H.favoriteDetail(second, "Уха"));
+  await env.boot();
+  await env.ctl.openFavorite(H.FAV_1);
+  await env.settle();
+  assert.equal(env.view().favorites.current.sourceGlass, null);
+
+  const chosen = structuredFavoriteItem({
+    measures: measuresBlock({ source_glass_ml: 200 }),
+  });
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(chosen, STRUCTURED_TEXT));
+  await env.ctl.setSourceGlass(200);
+  await env.settle();
+
+  assert.equal(
+    env.net.requests("GET", FAV_URL_1).slice(-1)[0].url,
+    FAV_URL_1 + "?source_glass_ml=200"
+  );
+  assert.equal(env.view().favorites.current.measures.sourceGlassMl, 200);
+  assert.equal(env.view().favorites.current.sourceGlass, 200);
+
+  // Returning to the section refreshes the same recipe with the same choice.
+  env.ctl.showSection("favorites");
+  await env.settle();
+  assert.equal(
+    env.net.requests("GET", FAV_URL_1).slice(-1)[0].url,
+    FAV_URL_1 + "?source_glass_ml=200"
+  );
+
+  // A different recipe starts without a choice.
+  await env.ctl.openFavorite(H.FAV_2);
+  await env.settle();
+  assert.equal(env.view().favorites.current.sourceGlass, null);
+  assert.equal(env.net.requests("GET", FAV_URL_2).slice(-1)[0].url, FAV_URL_2);
+});
+
+scenario("an_unusable_source_glass_choice_is_refused_without_a_request", async () => {
+  const { env } = await withMeasuredFavorite();
+  const asked = env.net.log.length;
+
+  for (const value of ["49", "1001", "", "abc", "200.5", "-5"]) {
+    const result = await env.ctl.setSourceGlass(value);
+    assert.deepEqual(result, { ok: false, reason: "invalid" }, value);
+  }
+
+  assert.equal(env.net.log.length, asked);
+  assert.equal(env.view().favorites.current.sourceGlass, null);
+});
+
+// A confirmed clarification and the block calculated for it: four fifths of the person's
+// 250 mL glass, which is what "1 стакан" means once the source is said to be 200 mL.
+function convertedGlassBlock(glass, extra = {}) {
+  return measuresBlock({
+    source_glass_ml: glass,
+    ingredients: [
+      {
+        position: 0,
+        source: "1 стакан",
+        source_kind: "household",
+        target_unit: "glass",
+        status: "nominal_household",
+        reason: "converted",
+        exact: { numerator: 4, denominator: 5 },
+        rounded: null,
+        identical: false,
+        presentation: "exact",
+      },
+    ],
+    ...extra,
+  });
+}
+
+function chosenFavorite(block, extra = {}) {
+  return structuredFavoriteItem({ measures: block, ...extra });
+}
+
+async function withConfirmedGlass(glass = 200) {
+  const { env } = await withMeasuredFavorite();
+  const chosen = chosenFavorite(convertedGlassBlock(glass));
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(chosen, STRUCTURED_TEXT));
+  assert.deepEqual(await env.ctl.setSourceGlass(glass), { ok: true });
+  await env.settle();
+  return env;
+}
+
+scenario("a_new_source_glass_choice_replaces_the_confirmed_one_with_its_own_block", async () => {
+  const env = await withConfirmedGlass(200);
+  let current = env.view().favorites.current;
+  assert.equal(current.sourceGlass, 200);
+  assert.equal(current.measures.sourceGlassMl, 200);
+  assert.deepEqual(current.measures.ingredients[0].exact, { numerator: 4, denominator: 5 });
+  assert.equal(current.sourceGlassPending, null);
+  assert.equal(current.sourceGlassError, null);
+
+  // 250 mL is exactly the person's glass: the new block says so (identity, nothing to
+  // repeat), and the 200 mL conversion must not remain beside the new choice.
+  const second = chosenFavorite(
+    measuresBlock({
+      source_glass_ml: 250,
+      ingredients: [
+        {
+          position: 0,
+          source: "1 стакан",
+          source_kind: "household",
+          target_unit: "glass",
+          status: "nominal_household",
+          reason: "converted",
+          exact: { numerator: 1, denominator: 1 },
+          rounded: null,
+          identical: true,
+          presentation: "none",
+        },
+      ],
+    })
+  );
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(second, STRUCTURED_TEXT));
+  assert.deepEqual(await env.ctl.setSourceGlass(250), { ok: true });
+  await env.settle();
+
+  current = env.view().favorites.current;
+  assert.equal(current.sourceGlass, 250);
+  assert.equal(current.measures.sourceGlassMl, 250);
+  assert.equal(current.measures.ingredients[0].identical, true);
+  assert.equal(current.sourceGlassPending, null);
+  assert.equal(current.sourceGlassError, null);
+  assert.equal(
+    env.net.requests("GET", FAV_URL_1).slice(-1)[0].url,
+    FAV_URL_1 + "?source_glass_ml=250"
+  );
+});
+
+scenario("a_failed_source_glass_choice_keeps_the_confirmed_one_and_says_so", async () => {
+  const env = await withConfirmedGlass(200);
+  env.net.route("GET", FAV_URL_1, fail());
+
+  assert.deepEqual(await env.ctl.setSourceGlass(250), { ok: false, reason: "failed" });
+  await env.settle();
+
+  const current = env.view().favorites.current;
+  assert.equal(current.status, "ready");
+  // The confirmed choice and its conversion are exactly as they were: nothing shows 250
+  // beside a block calculated for 200.
+  assert.equal(current.sourceGlass, 200);
+  assert.equal(current.measures.sourceGlassMl, 200);
+  assert.deepEqual(current.measures.ingredients[0].exact, { numerator: 4, denominator: 5 });
+  assert.equal(current.sourceGlassPending, null);
+  assert.equal(current.sourceGlassError.value, 250);
+  assert.equal(current.sourceGlassError.text, Logic.TEXT.sourceGlassFailed);
+  assert.equal(current.sourceGlassError.correlationId, null);
+});
+
+scenario("a_failed_source_glass_choice_can_be_asked_for_again", async () => {
+  const env = await withConfirmedGlass(200);
+  env.net.route("GET", FAV_URL_1, fail());
+  assert.deepEqual(await env.ctl.setSourceGlass(250), { ok: false, reason: "failed" });
+  await env.settle();
+  assert.equal(env.view().favorites.current.sourceGlassError.value, 250);
+
+  const second = chosenFavorite(convertedGlassBlock(250));
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(second, STRUCTURED_TEXT));
+  assert.deepEqual(await env.ctl.setSourceGlass(250), { ok: true });
+  await env.settle();
+
+  const current = env.view().favorites.current;
+  assert.equal(current.sourceGlass, 250);
+  assert.equal(current.measures.sourceGlassMl, 250);
+  assert.equal(current.sourceGlassPending, null);
+  assert.equal(current.sourceGlassError, null);
+});
+
+scenario("only_the_newest_source_glass_answer_is_applied_whatever_answers_arrive", async () => {
+  const { env } = await withMeasuredFavorite();
+  const older = deferred();
+  const newer = deferred();
+  env.net.route("GET", FAV_URL_1, () => older.promise, () => newer.promise);
+
+  const olderAsk = env.ctl.setSourceGlass(200);
+  await flush();
+  const newerAsk = env.ctl.setSourceGlass(250);
+  await flush();
+  let current = env.view().favorites.current;
+  assert.equal(current.sourceGlass, null, "nothing is confirmed while the answers are out");
+  assert.equal(current.sourceGlassPending, 250, "the newest choice is the pending one");
+
+  // The answer for the older choice arrives first: it must not become the card, even for
+  // a moment, and the newer answer must still be the one that is applied.
+  older.resolve(H.favoriteDetail(chosenFavorite(convertedGlassBlock(200)), STRUCTURED_TEXT));
+  await flush();
+  current = env.view().favorites.current;
+  assert.equal(current.sourceGlass, null);
+  assert.equal(current.sourceGlassPending, 250);
+
+  newer.resolve(H.favoriteDetail(chosenFavorite(convertedGlassBlock(250)), STRUCTURED_TEXT));
+  await flush();
+  current = env.view().favorites.current;
+  assert.equal(current.sourceGlass, 250);
+  assert.equal(current.measures.sourceGlassMl, 250);
+  assert.equal(current.sourceGlassPending, null);
+
+  assert.deepEqual(await olderAsk, { ok: false, reason: "stale" });
+  assert.deepEqual(await newerAsk, { ok: true });
+  await env.settle();
+});
+
+scenario("a_source_glass_answer_for_a_recipe_that_was_left_changes_nothing", async () => {
+  const { env } = await withMeasuredFavorite();
+  const second = H.structuredFavorite(H.FAV_2, 2, "Уха", 1, 0, {
+    servings: null,
+    ingredients: UKHA_RECIPE.ingredients,
+    steps: UKHA_RECIPE.steps,
+    version: 1,
+    measures: measuresBlock({ source_glass_required: false, ingredients: [] }),
+  });
+  env.net.route("GET", FAV_URL_2, H.favoriteDetail(second, "Уха"));
+  const answer = deferred();
+  env.net.route("GET", FAV_URL_1, () => answer.promise);
+
+  const asked = env.ctl.setSourceGlass(200);
+  await flush();
+  await env.ctl.openFavorite(H.FAV_2); // (the first recipe's read is still out)
+  answer.resolve(H.favoriteDetail(chosenFavorite(convertedGlassBlock(200)), STRUCTURED_TEXT));
+  await flush();
+
+  const current = env.view().favorites.current;
+  assert.equal(current.id, H.FAV_2);
+  assert.equal(current.sourceGlass, null, "a choice belongs to the recipe it was made for");
+  assert.equal(current.measures.sourceGlassMl, null);
+  assert.deepEqual(await asked, { ok: false, reason: "stale" });
+  await env.settle();
+});
+
+// --- KH-F01-B1 remediation: an edit keeps the confirmed clarification -------------------------
+
+scenario("an_edited_title_keeps_the_confirmed_source_glass_conversion", async () => {
+  const env = await withConfirmedGlass(200);
+  env.ctl.beginEditFavorite();
+  const draft = Object.assign({}, env.view().favorites.current.editor.draft, {
+    title: "Борщ по-домашнему",
+  });
+  const updated = chosenFavorite(measuresBlock(), { title: draft.title, version: 4 });
+  const refreshed = chosenFavorite(convertedGlassBlock(200), { title: draft.title, version: 4 });
+  env.net.route("PATCH", FAV_URL_1, H.favoriteDetail(updated, STRUCTURED_TEXT));
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(refreshed, STRUCTURED_TEXT));
+
+  assert.deepEqual(await env.ctl.saveFavoriteEdit(draft), { ok: true });
+  await env.settle();
+
+  // The edit itself was sent exactly as before, with no measure or clarification field.
+  assert.deepEqual(env.net.requests("PATCH", FAV_URL_1)[0].body, {
+    expected_version: 3,
+    title: "Борщ по-домашнему",
+    notes: "Больше укропа.",
+    servings: "4 порции",
+    ingredients: BORSH_RECIPE.ingredients,
+    steps: BORSH_RECIPE.steps,
+  });
+  // The detail was read again with the confirmed choice, not with the edit's own block.
+  assert.equal(
+    env.net.requests("GET", FAV_URL_1).slice(-1)[0].url,
+    FAV_URL_1 + "?source_glass_ml=200"
+  );
+  const current = env.view().favorites.current;
+  assert.equal(current.title, "Борщ по-домашнему");
+  assert.equal(current.version, 4);
+  assert.equal(current.sourceGlass, 200);
+  assert.equal(current.measures.sourceGlassMl, 200);
+  assert.deepEqual(current.measures.ingredients[0].exact, { numerator: 4, denominator: 5 });
+  assert.equal(current.measuresError, null);
+  assert.equal(current.measuresPending, false);
+});
+
+scenario("an_edited_ingredient_amount_keeps_the_confirmed_source_glass_conversion", async () => {
+  const env = await withConfirmedGlass(200);
+  env.ctl.beginEditFavorite();
+  const ingredients = [
+    { name: "свекла", amount: "1 стакан" },
+    { name: "капуста", amount: "300 г" },
+  ];
+  const draft = Object.assign({}, env.view().favorites.current.editor.draft, { ingredients });
+  const updated = chosenFavorite(measuresBlock(), { ingredients, version: 4 });
+  const refreshed = chosenFavorite(convertedGlassBlock(200), { ingredients, version: 4 });
+  env.net.route("PATCH", FAV_URL_1, H.favoriteDetail(updated, STRUCTURED_TEXT));
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(refreshed, STRUCTURED_TEXT));
+
+  assert.deepEqual(await env.ctl.saveFavoriteEdit(draft), { ok: true });
+  await env.settle();
+
+  assert.deepEqual(env.net.requests("PATCH", FAV_URL_1)[0].body.ingredients, ingredients);
+  const current = env.view().favorites.current;
+  assert.deepEqual(current.ingredients, ingredients);
+  assert.equal(current.sourceGlass, 200);
+  assert.equal(current.measures.sourceGlassMl, 200);
+  assert.deepEqual(current.measures.ingredients[0].exact, { numerator: 4, denominator: 5 });
+});
+
+scenario("a_failed_post_save_conversion_read_shows_no_stale_hint_and_can_be_retried", async () => {
+  const env = await withConfirmedGlass(200);
+  env.ctl.beginEditFavorite();
+  const draft = Object.assign({}, env.view().favorites.current.editor.draft, {
+    title: "Борщ по-домашнему",
+  });
+  // The edit's answer was calculated without the confirmed clarification (the real PATCH
+  // does not take one); it must not be drawn as this card's conversion.
+  const updated = chosenFavorite(measuresBlock(), { title: draft.title, version: 4 });
+  env.net.route("PATCH", FAV_URL_1, H.favoriteDetail(updated, STRUCTURED_TEXT));
+  env.net.route("GET", FAV_URL_1, fail());
+
+  assert.deepEqual(await env.ctl.saveFavoriteEdit(draft), { ok: true }, "the edit itself is saved");
+  await env.settle();
+
+  let current = env.view().favorites.current;
+  assert.equal(current.status, "ready");
+  assert.equal(current.title, "Борщ по-домашнему");
+  assert.equal(current.version, 4);
+  assert.equal(current.measures, null, "no conversion is drawn from an unconfirmed context");
+  assert.equal(current.measuresPending, false);
+  assert.equal(current.measuresError.text, Logic.TEXT.measuresRefreshFailed);
+  assert.equal(current.sourceGlass, 200, "the confirmed choice is kept for the retry");
+
+  // "Повторить" reads the card again with that choice; no other hint is invented.
+  const refreshed = chosenFavorite(convertedGlassBlock(200), { title: draft.title, version: 4 });
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(refreshed, STRUCTURED_TEXT));
+  assert.equal(await env.ctl.retryFavoriteConversion(), true);
+  await env.settle();
+
+  current = env.view().favorites.current;
+  assert.equal(current.title, "Борщ по-домашнему");
+  assert.equal(current.measures.sourceGlassMl, 200);
+  assert.deepEqual(current.measures.ingredients[0].exact, { numerator: 4, denominator: 5 });
+  assert.equal(current.measuresPending, false);
+  assert.equal(current.measuresError, null);
+  assert.equal(
+    env.net.requests("GET", FAV_URL_1).slice(-1)[0].url,
+    FAV_URL_1 + "?source_glass_ml=200"
+  );
+});
+
+scenario("a_post_save_conversion_answer_cannot_change_a_recipe_opened_meanwhile", async () => {
+  const env = await withConfirmedGlass(200);
+  const second = H.structuredFavorite(H.FAV_2, 2, "Уха", 1, 0, {
+    servings: null,
+    ingredients: UKHA_RECIPE.ingredients,
+    steps: UKHA_RECIPE.steps,
+    version: 1,
+    measures: measuresBlock({ source_glass_required: false, ingredients: [] }),
+  });
+  env.net.route("GET", FAV_URL_2, H.favoriteDetail(second, "Уха"));
+  env.ctl.beginEditFavorite();
+  const draft = Object.assign({}, env.view().favorites.current.editor.draft, {
+    title: "Борщ по-домашнему",
+  });
+  const updated = chosenFavorite(measuresBlock(), { title: draft.title, version: 4 });
+  env.net.route("PATCH", FAV_URL_1, H.favoriteDetail(updated, STRUCTURED_TEXT));
+  const answer = deferred();
+  env.net.route("GET", FAV_URL_1, () => answer.promise);
+
+  const saving = env.ctl.saveFavoriteEdit(draft);
+  await flush();
+  await env.ctl.openFavorite(H.FAV_2); // the first recipe is left while its read is out
+  answer.resolve(
+    H.favoriteDetail(
+      chosenFavorite(convertedGlassBlock(200), { title: draft.title, version: 4 }),
+      STRUCTURED_TEXT
+    )
+  );
+  await flush();
+
+  const current = env.view().favorites.current;
+  assert.equal(current.id, H.FAV_2);
+  assert.equal(current.sourceGlass, null);
+  assert.equal(current.measures.sourceGlassMl, null);
+  assert.deepEqual(await saving, { ok: true }, "the edit itself was saved");
+  await env.settle();
+});
+
+scenario("a_confirmed_source_glass_is_still_temporary_and_belongs_to_one_recipe", async () => {
+  const env = await withConfirmedGlass(200);
+  env.ctl.beginEditFavorite();
+  const draft = Object.assign({}, env.view().favorites.current.editor.draft, {
+    title: "Борщ по-домашнему",
+  });
+  const updated = chosenFavorite(measuresBlock(), { title: draft.title, version: 4 });
+  const refreshed = chosenFavorite(convertedGlassBlock(200), { title: draft.title, version: 4 });
+  env.net.route("PATCH", FAV_URL_1, H.favoriteDetail(updated, STRUCTURED_TEXT));
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(refreshed, STRUCTURED_TEXT));
+  await env.ctl.saveFavoriteEdit(draft);
+  await env.settle();
+
+  const second = H.structuredFavorite(H.FAV_2, 2, "Уха", 1, 0, {
+    servings: null,
+    ingredients: UKHA_RECIPE.ingredients,
+    steps: UKHA_RECIPE.steps,
+    version: 1,
+    measures: measuresBlock({ source_glass_required: false, ingredients: [] }),
+  });
+  env.net.route("GET", FAV_URL_2, H.favoriteDetail(second, "Уха"));
+  await env.ctl.openFavorite(H.FAV_2);
+  await env.settle();
+
+  const current = env.view().favorites.current;
+  assert.equal(current.sourceGlass, null);
+  assert.equal(current.measures.sourceGlassMl, null);
+  assert.equal(env.net.requests("GET", FAV_URL_2).slice(-1)[0].url, FAV_URL_2);
+  // Nothing was written to the profile, the recipe or the browser by the choice or the save.
+  assert.equal(env.net.requests("PATCH", "/api/profile").length, 0);
+});
+
+// --- KH-F01-B1 remediation: a conversion block must agree with itself -------------------------
+
+scenario("a_conversion_that_contradicts_its_own_status_is_ignored_whole", async () => {
+  const contradictory = [
+    {
+      status: "unsupported",
+      reason: "source_not_quantified",
+      exact: { numerator: 99, denominator: 1 },
+      rounded: null,
+      identical: false,
+      presentation: "exact",
+    },
+    {
+      status: "ambiguous",
+      reason: "source_not_quantified",
+      exact: null,
+      rounded: { numerator: 99, denominator: 1, relative_error: { numerator: 0, denominator: 1 } },
+      identical: false,
+      presentation: "rounded",
+    },
+    {
+      status: "clarification_required",
+      reason: "glass_size_required",
+      exact: { numerator: 99, denominator: 1 },
+      rounded: null,
+      identical: false,
+      presentation: "none",
+    },
+    {
+      status: "unresolved",
+      reason: "source_not_quantified",
+      exact: null,
+      rounded: null,
+      identical: true,
+      presentation: "none",
+    },
+  ];
+  for (const item of contradictory) {
+    const block = measuresBlock({
+      ingredients: [{ position: 0, source: "1 стакан", source_kind: "household", target_unit: "glass", ...item }],
+    });
+    const { env } = await withMeasuredFavorite(block);
+    const current = env.view().favorites.current;
+    assert.equal(current.status, "ready", JSON.stringify(item));
+    assert.equal(current.measures, null, JSON.stringify(item));
+    assert.deepEqual(current.ingredients, BORSH_RECIPE.ingredients);
+  }
+});
+
+scenario("a_successful_conversion_block_is_still_read_as_before", async () => {
+  const env = await withConfirmedGlass(200);
+  const current = env.view().favorites.current;
+  assert.equal(current.status, "ready");
+  assert.equal(current.measures.sourceGlassMl, 200);
+  assert.deepEqual(current.measures.ingredients[0].exact, { numerator: 4, denominator: 5 });
+  assert.equal(current.measures.ingredients[0].status, "nominal_household");
+});
+
+scenario("an_open_answer_whose_block_names_another_clarification_keeps_the_recipe_without_hints", async () => {
+  // No ?source_glass_ml was sent, so a block that echoes 200 belongs to another context:
+  // the recipe is drawn, its conversion is not.
+  const { env } = await withMeasuredFavorite(convertedGlassBlock(200));
+  const current = env.view().favorites.current;
+  assert.equal(current.status, "ready");
+  assert.equal(current.measures, null);
+  assert.deepEqual(current.ingredients, BORSH_RECIPE.ingredients);
+});
+
+// --- KH-F01-B1 remediation 02: an editor keeps its own baseline version ---------------------
+
+scenario("an_editor_keeps_its_base_version_when_a_pending_source_glass_answer_arrives", async () => {
+  const env = await withConfirmedGlass(200);
+  const pending = deferred();
+  env.net.route("GET", FAV_URL_1, () => pending.promise);
+
+  const asked = env.ctl.setSourceGlass(250);
+  await flush();
+  assert.equal(env.view().favorites.current.sourceGlassPending, 250);
+
+  assert.equal(env.ctl.beginEditFavorite(), true);
+  let current = env.view().favorites.current;
+  assert.equal(current.version, 3);
+  assert.equal(current.editor.baseVersion, 3);
+  assert.equal(current.sourceGlassPending, null, "the pending read is abandoned with the editor's baseline");
+  const draftBefore = JSON.parse(JSON.stringify(current.editor.draft));
+
+  // The answer that was out carries a version another device made meanwhile.
+  pending.resolve(
+    H.favoriteDetail(
+      chosenFavorite(convertedGlassBlock(250), {
+        title: "Борщ, изменённый в другом месте",
+        ingredients: [{ name: "свекла", amount: "9 шт." }],
+        version: 4,
+      }),
+      STRUCTURED_TEXT
+    )
+  );
+  await flush();
+
+  current = env.view().favorites.current;
+  assert.deepEqual(await asked, { ok: false, reason: "stale" });
+  assert.equal(current.version, 3, "the card under the draft was not replaced");
+  assert.equal(current.title, "Борщ");
+  assert.equal(current.sourceGlass, 200, "the confirmed choice is untouched");
+  assert.equal(current.measures.sourceGlassMl, 200, "its block is still the 200 mL one");
+  assert.deepEqual(current.measures.ingredients[0].exact, { numerator: 4, denominator: 5 });
+  assert.deepEqual(current.editor.draft, draftBefore, "the draft is exactly as it was opened");
+  assert.equal(current.editor.baseVersion, 3);
+
+  // Cancelling gives the card back exactly as the draft was based on, still consistent.
+  assert.equal(env.ctl.cancelEditFavorite(), true);
+  current = env.view().favorites.current;
+  assert.equal(current.editor, null);
+  assert.equal(current.version, 3);
+  assert.equal(current.sourceGlass, 200);
+  assert.equal(current.measures.sourceGlassMl, 200);
+  assert.deepEqual(current.measures.ingredients[0].exact, { numerator: 4, denominator: 5 });
+});
+
+scenario("a_stale_draft_is_saved_with_the_version_it_started_from_and_the_conflict_keeps_it", async () => {
+  const env = await withConfirmedGlass(200);
+  const pending = deferred();
+  env.net.route("GET", FAV_URL_1, () => pending.promise);
+  const asked = env.ctl.setSourceGlass(250);
+  await flush();
+  assert.equal(env.ctl.beginEditFavorite(), true);
+  pending.resolve(
+    H.favoriteDetail(
+      chosenFavorite(convertedGlassBlock(250), {
+        title: "Борщ, изменённый в другом месте",
+        ingredients: [{ name: "свекла", amount: "9 шт." }],
+        version: 4,
+      }),
+      STRUCTURED_TEXT
+    )
+  );
+  await flush();
+  assert.deepEqual(await asked, { ok: false, reason: "stale" });
+
+  const draft = Object.assign({}, env.view().favorites.current.editor.draft, { title: "Мой борщ" });
+  env.net.route("PATCH", FAV_URL_1, apiError(409, "favorite_conflict"));
+  assert.deepEqual(await env.ctl.saveFavoriteEdit(draft), { ok: false, reason: "conflict" });
+
+  const sent = env.net.requests("PATCH", FAV_URL_1)[0].body;
+  assert.equal(sent.expected_version, 3, "the draft names the version it was opened on, never a later one");
+  assert.equal(sent.title, "Мой борщ");
+
+  let current = env.view().favorites.current;
+  assert.equal(current.editor.phase, "conflict");
+  assert.deepEqual(current.editor.draft, draft, "the unsaved draft is kept");
+  assert.equal(current.editor.error.text, Logic.TEXT.editConflict);
+
+  // A reload finds the other device's change, intact, and no draft of ours is written.
+  const changed = chosenFavorite(convertedGlassBlock(200), {
+    title: "Борщ, изменённый в другом месте",
+    ingredients: [{ name: "свекла", amount: "9 шт." }],
+    version: 4,
+  });
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(changed, STRUCTURED_TEXT));
+  await env.ctl.reloadFavoriteAfterConflict();
+  await env.settle();
+
+  current = env.view().favorites.current;
+  assert.equal(current.editor, null);
+  assert.equal(current.version, 4);
+  assert.equal(current.title, "Борщ, изменённый в другом месте");
+  assert.deepEqual(current.ingredients, [{ name: "свекла", amount: "9 шт." }]);
+  assert.equal(env.net.requests("PATCH", FAV_URL_1).length, 1, "the stale draft was never stored");
+});
+
+scenario("a_source_glass_choice_cannot_be_started_while_an_editor_is_open", async () => {
+  const env = await withConfirmedGlass(200);
+  env.ctl.beginEditFavorite();
+  const asked = env.net.log.length;
+
+  assert.deepEqual(await env.ctl.setSourceGlass(250), { ok: false, reason: "editing" });
+  assert.deepEqual(await env.ctl.setSourceGlass("300"), { ok: false, reason: "editing" });
+  assert.equal(env.net.log.length, asked, "no read is started over an open draft");
+
+  let current = env.view().favorites.current;
+  assert.equal(current.sourceGlass, 200);
+  assert.equal(current.sourceGlassPending, null);
+  assert.equal(current.editor.phase, "editing");
+
+  // Once the draft is given up, the question may be asked again.
+  env.ctl.cancelEditFavorite();
+  const second = chosenFavorite(convertedGlassBlock(250));
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(second, STRUCTURED_TEXT));
+  assert.deepEqual(await env.ctl.setSourceGlass(250), { ok: true });
+  current = env.view().favorites.current;
+  assert.equal(current.sourceGlass, 250);
+  assert.equal(current.measures.sourceGlassMl, 250);
+});
+
+// --- KH-F01-B1 remediation 02: the custom capacity is a draft, not a choice -----------------
+
+scenario("a_custom_capacity_is_a_draft_of_its_own_until_the_server_confirms_it", async () => {
+  const { env } = await withMeasuredFavorite();
+  const asked = env.net.log.length;
+
+  assert.deepEqual(env.ctl.toggleSourceGlassOther(), { open: true, changed: true });
+  let current = env.view().favorites.current;
+  assert.equal(current.sourceGlassOtherOpen, true);
+  assert.equal(current.sourceGlass, null, "opening the field confirms nothing");
+  assert.equal(current.sourceGlassDraft, "");
+  assert.equal(current.measures.sourceGlassMl, null);
+
+  assert.equal(env.ctl.syncSourceGlassDraft("300"), true);
+  current = env.view().favorites.current;
+  assert.equal(current.sourceGlassDraft, "300");
+  assert.equal(current.sourceGlass, null, "typing confirms nothing");
+  assert.equal(current.sourceGlassPending, null);
+  assert.equal(current.measures.sourceGlassMl, null);
+  assert.equal(env.net.log.length, asked, "a draft sends nothing");
+
+  // Any redraw (a session recheck, another control) rebuilds the field from the draft.
+  assert.deepEqual(env.ctl.toggleSourceGlassOther(), { open: false, changed: true });
+  assert.deepEqual(env.ctl.toggleSourceGlassOther(), { open: true, changed: true });
+  current = env.view().favorites.current;
+  assert.equal(current.sourceGlassDraft, "300");
+  assert.equal(current.sourceGlass, null);
+
+  // Only the answer for the typed value makes it the confirmed choice.
+  const chosen = chosenFavorite(convertedGlassBlock(300));
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(chosen, STRUCTURED_TEXT));
+  assert.deepEqual(await env.ctl.setSourceGlass("300"), { ok: true });
+  await env.settle();
+  assert.equal(
+    env.net.requests("GET", FAV_URL_1).slice(-1)[0].url,
+    FAV_URL_1 + "?source_glass_ml=300"
+  );
+  current = env.view().favorites.current;
+  assert.equal(current.sourceGlass, 300);
+  assert.equal(current.measures.sourceGlassMl, 300);
+  assert.equal(current.sourceGlassOtherOpen, true);
+  assert.equal(current.sourceGlassDraft, "300", "the field holds the confirmed capacity");
+
+  // Closing and reopening the disclosure shows that capacity again.
+  assert.deepEqual(env.ctl.toggleSourceGlassOther(), { open: false, changed: true });
+  assert.deepEqual(env.ctl.toggleSourceGlassOther(), { open: true, changed: true });
+  assert.equal(env.view().favorites.current.sourceGlassDraft, "300");
+
+  // A standard capacity is confirmed by its own answer too, and closes the field; the
+  // typed text stays a draft and confirms nothing.
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(chosenFavorite(convertedGlassBlock(200)), STRUCTURED_TEXT));
+  assert.deepEqual(await env.ctl.setSourceGlass(200), { ok: true });
+  current = env.view().favorites.current;
+  assert.equal(current.sourceGlass, 200);
+  assert.equal(current.measures.sourceGlassMl, 200);
+  assert.equal(current.sourceGlassOtherOpen, false);
+  assert.equal(current.sourceGlassDraft, "300");
+  env.ctl.toggleSourceGlassOther();
+  current = env.view().favorites.current;
+  assert.equal(current.sourceGlass, 200, "the draft still confirms nothing beside it");
+  assert.equal(current.measures.sourceGlassMl, 200);
+  assert.equal(current.sourceGlassDraft, "300");
+
+  // A different recipe starts without a confirmed capacity, without a draft and closed.
+  const second = H.structuredFavorite(H.FAV_2, 2, "Уха", 1, 0, {
+    servings: null,
+    ingredients: UKHA_RECIPE.ingredients,
+    steps: UKHA_RECIPE.steps,
+    version: 1,
+    measures: measuresBlock({ source_glass_required: false, ingredients: [] }),
+  });
+  env.net.route("GET", FAV_URL_2, H.favoriteDetail(second, "Уха"));
+  await env.ctl.openFavorite(H.FAV_2);
+  await env.settle();
+  current = env.view().favorites.current;
+  assert.equal(current.sourceGlass, null);
+  assert.equal(current.sourceGlassOtherOpen, false);
+  assert.equal(current.sourceGlassDraft, "");
+});
+
+scenario("a_failed_first_custom_volume_leaves_the_capacity_unconfirmed", async () => {
+  const { env } = await withMeasuredFavorite();
+  assert.deepEqual(env.ctl.toggleSourceGlassOther(), { open: true, changed: true });
+  env.ctl.syncSourceGlassDraft("300");
+  env.net.route("GET", FAV_URL_1, fail());
+
+  assert.deepEqual(await env.ctl.setSourceGlass("300"), { ok: false, reason: "failed" });
+  await env.settle();
+
+  // There was no confirmed capacity before, and there is none now: the draft and the
+  // failure are the only things the card gained.
+  const current = env.view().favorites.current;
+  assert.equal(current.sourceGlass, null);
+  assert.equal(current.measures.sourceGlassMl, null);
+  assert.equal(current.sourceGlassOtherOpen, true);
+  assert.equal(current.sourceGlassDraft, "300");
+  assert.equal(current.sourceGlassError.value, 300);
+  assert.equal(current.sourceGlassError.text, Logic.TEXT.sourceGlassFailed);
+  assert.equal(current.sourceGlassPending, null);
 });
 
 module.exports = scenarios;

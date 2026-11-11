@@ -418,7 +418,7 @@ async def test_starting_and_stopping_leaves_a_migrated_database_as_it_was(tmp_pa
     upgrade_database(engine)
     engine.dispose()
     before = _snapshot(target)
-    assert before[1] == [("0013_user_text_size",)]
+    assert before[1] == [("0014_user_measure_overrides",)]
 
     async with serving(create_app(settings_for(target))) as client:
         await client.get("/healthz")

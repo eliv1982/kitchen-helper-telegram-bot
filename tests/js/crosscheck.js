@@ -45,6 +45,13 @@ process.stdin.on("end", () => {
     case "title":
       answer = { titles: request.texts.map((text) => Logic.deriveTitle(text)) };
       break;
+    case "fractions":
+      answer = {
+        formatted: request.values.map(([numerator, denominator, unit]) =>
+          Logic.formatMeasure(numerator, denominator, unit)
+        ),
+      };
+      break;
     case "texts":
       answer = {
         TEXT: Logic.TEXT,
@@ -52,6 +59,7 @@ process.stdin.on("end", () => {
         MAX: Logic.MAX_MESSAGE_LENGTH,
         MAX_PROFILE_NAME: Logic.MAX_PROFILE_NAME,
         PAGE_SIZE: Logic.PAGE_SIZE,
+        MEASURE_LIMITS: Logic.MEASURE_LIMITS,
       };
       break;
     default:

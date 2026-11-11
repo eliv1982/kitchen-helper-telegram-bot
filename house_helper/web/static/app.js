@@ -444,6 +444,22 @@
           nameInput.focus();
         }
       }
+    } else if (wanted !== null && wanted.indexOf("profile-measure-") === 0) {
+      // A refused measure: the redrawn form puts the keyboard on the field to fix.
+      if (!els.profile.hidden) {
+        var measureInput = findByFocus(els.profileBody, wanted);
+        if (measureInput) {
+          measureInput.focus();
+        }
+      }
+    } else if (wanted !== null && wanted.indexOf("source-glass-") === 0) {
+      // A source glass chosen or repeated: the redrawn question keeps the keyboard on it.
+      if (!els.recipe.hidden) {
+        var glassInput = findByFocus(els.recipeBody, wanted);
+        if (glassInput) {
+          glassInput.focus();
+        }
+      }
     } else if (wanted !== null && focusNodes[wanted]) {
       focusNodes[wanted].focus();
     }
@@ -1816,7 +1832,12 @@
         alertText(profile.notice.text);
       }
     }
-    content.appendChild(profile.editing ? profileForm(profile) : profileSummary(profile));
+    if (profile.editing) {
+      content.appendChild(profileForm(profile));
+    } else {
+      content.appendChild(profileSummary(profile));
+      content.appendChild(profileMeasuresSummary(profile));
+    }
     content.appendChild(profileLoginMethods(profile));
     content.appendChild(profileData());
     box.scrollTop = scroll;
@@ -1845,6 +1866,42 @@
     controller.beginProfileEdit();
   }
 
+  var PROFILE_MEASURES = [
+    ["glass_ml", Logic.TEXT.profileMeasureGlass],
+    ["teaspoon_ml", Logic.TEXT.profileMeasureTeaspoon],
+    ["tablespoon_ml", Logic.TEXT.profileMeasureTablespoon],
+  ];
+
+  // One measure as the pane shows it: the effective volume and whether it is the system
+  // default or the person's own size. The two states are told apart by their words and by
+  // a badge of their own, not by colour alone.
+  function profileMeasureSetting(setting) {
+    var personal = setting.override !== null;
+    return h("dd", null, [
+      h("span", { class: "profile-measure-value", text: setting.effective + " мл" }),
+      h("span", {
+        class: "profile-measure-state " + (personal ? "profile-measure-state-personal" : "profile-measure-state-default"),
+        text: personal ? Logic.TEXT.profileMeasurePersonal : Logic.TEXT.profileMeasureDefault,
+      }),
+    ]);
+  }
+
+  function profileMeasuresSummary(profile) {
+    var values = h("dl", { class: "profile-values profile-measure-values" });
+    PROFILE_MEASURES.forEach(function (entry) {
+      values.appendChild(
+        h("div", { class: "profile-value" }, [
+          h("dt", { text: entry[1] }),
+          profileMeasureSetting(profile.measures[entry[0]]),
+        ])
+      );
+    });
+    return h("section", { class: "profile-section profile-measures-summary" }, [
+      h("h2", { text: Logic.TEXT.profileMeasuresTitle }),
+      values,
+    ]);
+  }
+
   // The saved settings, as the pane opens. Only values the server returned are drawn here:
   // a draft exists only inside the form, so nothing here can look saved before it is.
   function profileSummary(profile) {
@@ -1868,6 +1925,95 @@
     edit.setAttribute("data-focus", "profile-edit");
     section.appendChild(edit);
     return section;
+  }
+
+  // The form's string for one measure: empty when no override is stored, otherwise the
+  // stored whole-millilitre value. A draft (typed but not saved) wins, so a redraw keeps it.
+  function profileMeasureDraft(profile, name) {
+    if (profile.draft) {
+      return profile.draft.measures[name];
+    }
+    var setting = profile.measures[name];
+    return setting.override === null ? "" : String(setting.override);
+  }
+
+  // The three measure fields, inside the same form and the same Save as everything else.
+  // Each field says its approved range and that an empty field means the default, and has
+  // its own way back to the default (which only clears the field; Save is still one action).
+  function profileMeasureFields(profile, saving, collect) {
+    var inputs = [];
+    var fieldset = h("fieldset", { class: "profile-fieldset profile-measures" }, [
+      h("legend", { text: Logic.TEXT.profileMeasuresTitle }),
+    ]);
+    PROFILE_MEASURES.forEach(function (entry) {
+      var name = entry[0];
+      var label = entry[1];
+      var limit = Logic.MEASURE_LIMITS[name];
+      var id = "profile-measure-" + name;
+      var input = h("input", {
+        id: id,
+        type: "text",
+        inputmode: "numeric",
+        pattern: "[0-9]*",
+        value: profileMeasureDraft(profile, name),
+        readonly: saving,
+        autocomplete: "off",
+        autocapitalize: "none",
+        autocorrect: "off",
+        spellcheck: "false",
+        "data-focus": "profile-measure-" + name,
+        "aria-describedby": id + "-hint" + (profile.measureError ? " profile-measures-error" : ""),
+      });
+      if (profile.measureError) {
+        input.setAttribute("aria-invalid", "true");
+      }
+      input.addEventListener("input", function () {
+        controller.syncProfileDraft(collect());
+        controller.clearProfileNotice();
+      });
+      var hint = h("span", {
+        id: id + "-hint",
+        class: "hint",
+        text: Logic.TEXT.profileMeasureHint
+          .replace("{min}", String(limit.min))
+          .replace("{max}", String(limit.max))
+          .replace("{def}", String(limit.def)),
+      });
+      var reset = action(
+        Logic.TEXT.profileMeasureReset,
+        "btn-quiet profile-measure-reset",
+        function () {
+          input.value = "";
+          controller.syncProfileDraft(collect());
+          controller.clearProfileNotice();
+        },
+        Logic.TEXT.profileMeasureResetLabel.replace("{name}", label)
+      );
+      reset.disabled = saving;
+      reset.setAttribute("data-focus", "profile-measure-reset-" + name);
+      inputs.push({ name: name, input: input });
+      fieldset.appendChild(
+        h("div", { class: "profile-measure-field" }, [
+          h("label", { class: "profile-field", for: id }, [
+            h("span", { class: "edit-label", text: label }),
+            input,
+            hint,
+          ]),
+          reset,
+        ])
+      );
+    });
+    if (profile.measureError) {
+      fieldset.appendChild(
+        h("span", {
+          id: "profile-measures-error",
+          class: "field-error",
+          role: "alert",
+          text: profile.measureError,
+        })
+      );
+    }
+    return { node: fieldset, inputs: inputs };
   }
 
   function profileForm(profile) {
@@ -1939,8 +2085,19 @@
       ])
     );
 
+    var measures = profileMeasureFields(profile, saving, collect);
+    form.appendChild(measures.node);
+
     function collect() {
-      return { displayName: nameInput.value, textSize: large.input.checked ? "large" : "normal" };
+      var measureValues = {};
+      measures.inputs.forEach(function (entry) {
+        measureValues[entry.name] = entry.input.value;
+      });
+      return {
+        displayName: nameInput.value,
+        textSize: large.input.checked ? "large" : "normal",
+        measures: measureValues,
+      };
     }
 
     form.addEventListener("submit", function (event) {
@@ -1948,8 +2105,18 @@
       if (saving) {
         return;
       }
-      controller.saveProfile(collect()).then(function (result) {
-        if (result && !result.ok && result.reason === "invalid") {
+      var draft = collect();
+      // Which field the refusal will be about, so the redrawn form can put the keyboard
+      // there: the name first, then the first measure the page itself would refuse.
+      var nameCheck = Logic.prepareProfileName(draft.displayName);
+      var measureCheck = Logic.prepareMeasures(draft.measures);
+      if (!nameCheck.ok) {
+        wantFocus = "profile-name";
+      } else if (!measureCheck.ok) {
+        wantFocus = "profile-measure-" + measureCheck.field;
+      }
+      controller.saveProfile(draft).then(function (result) {
+        if (result && !result.ok && result.reason === "invalid" && nameCheck.ok && measureCheck.ok) {
           nameInput.focus();
         }
       });
@@ -2126,6 +2293,200 @@
     box.scrollTop = scrolled;
   }
 
+  // One ingredient's conversion as the line under it, or null when there is nothing to
+  // show. "Точно" is the exact rational the core computed for the established source and
+  // target capacities (not a claim about a real spoon). The approximation marker appears
+  // only when the practical rounded value actually differs from the exact one.
+  function measureHint(conversion) {
+    if (!conversion || conversion.identical || conversion.presentation === "none") {
+      return null;
+    }
+    // A number is only ever drawn for a conversion the core actually made. The logic
+    // already refuses a block whose status and presentation contradict each other; this
+    // is the last guard before a number becomes words on the page.
+    if (conversion.status !== "exact" && conversion.status !== "nominal_household") {
+      return null;
+    }
+    if (conversion.presentation === "exact") {
+      if (!conversion.exact) {
+        return null;
+      }
+      var exact = Logic.formatMeasure(
+        conversion.exact.numerator,
+        conversion.exact.denominator,
+        conversion.targetUnit
+      );
+      return exact === null ? null : Logic.TEXT.measureExact.replace("{value}", exact);
+    }
+    if (conversion.presentation === "rounded") {
+      if (!conversion.rounded) {
+        return null;
+      }
+      var rounded = Logic.formatMeasure(
+        conversion.rounded.numerator,
+        conversion.rounded.denominator,
+        conversion.targetUnit
+      );
+      if (rounded === null) {
+        return null;
+      }
+      var changed = conversion.rounded.relativeError.numerator !== 0;
+      return changed ? Logic.TEXT.measureApprox.replace("{value}", rounded) : rounded;
+    }
+    return null;
+  }
+
+  // "Which glass does the recipe mean?" -- asked only when an amount contains an
+  // undeclared source glass. Nothing is preselected: the person's own glass is never
+  // assumed to be the recipe's. The answer applies to this recipe's presentation only;
+  // it is not saved to the profile or the recipe.
+  //
+  // The confirmed capacity and the custom field are separate states. A radio is checked
+  // only when the server confirmed that capacity together with the conversion drawn under
+  // it; the custom field is opened by a disclosure button and holds a draft that confirms
+  // nothing until "Применить" has the server's answer. Opening the field or typing into
+  // it therefore never contradicts the conversion on the card.
+  function sourceGlassChooser(current) {
+    var measures = current.measures;
+    // The confirmed choice: its block is the one drawn, so this control never shows a
+    // capacity whose conversion is not the one on the card. A choice under way is named
+    // as pending; the confirmed one stays selected until its answer arrives.
+    var chosen = measures.sourceGlassMl;
+    var custom = chosen !== null && chosen !== 200 && chosen !== 250;
+    var fieldset = h("fieldset", { class: "measure-clarify" }, [
+      h("legend", { text: Logic.TEXT.sourceGlassQuestion }),
+    ]);
+    function option(value, label, id) {
+      var input = h("input", {
+        type: "radio",
+        name: "source-glass-option",
+        value: String(value),
+        id: id,
+        "data-focus": id,
+      });
+      input.checked = chosen === value;
+      input.addEventListener("change", function () {
+        if (input.checked) {
+          wantFocus = id; // the redraw keeps the keyboard on the choice
+          controller.setSourceGlass(value);
+        }
+      });
+      return h("label", { class: "profile-choice", for: id }, [input, h("span", { text: label })]);
+    }
+    fieldset.appendChild(option(200, Logic.TEXT.sourceGlass200, "source-glass-200"));
+    fieldset.appendChild(option(250, Logic.TEXT.sourceGlass250, "source-glass-250"));
+
+    var otherId = "source-glass-other";
+    var panelId = "source-glass-other-panel";
+    var hintId = "source-glass-draft-hint";
+    var open = current.sourceGlassOtherOpen === true;
+    var pending = current.sourceGlassPending !== null;
+
+    var toggle = action(Logic.TEXT.sourceGlassOther, "btn-quiet", function () {
+      var now = controller.toggleSourceGlassOther();
+      // The redraw replaces the disclosure, so the keyboard follows it: into the field it
+      // just opened, or back to the button that closed it.
+      wantFocus = now && now.open ? otherId : "source-glass-other-toggle";
+    });
+    toggle.setAttribute("id", "source-glass-other-toggle");
+    toggle.setAttribute("data-focus", "source-glass-other-toggle");
+    toggle.setAttribute("aria-expanded", open ? "true" : "false");
+    toggle.setAttribute("aria-controls", panelId);
+
+    var otherInput = h("input", {
+      id: otherId,
+      type: "text",
+      inputmode: "numeric",
+      pattern: "[0-9]*",
+      autocomplete: "off",
+      autocapitalize: "none",
+      autocorrect: "off",
+      spellcheck: "false",
+      value: current.sourceGlassDraft,
+      "aria-describedby": "source-glass-hint " + hintId + " source-glass-error",
+      "data-focus": otherId,
+    });
+    var draftHint = h("p", { id: hintId, class: "hint", text: Logic.TEXT.sourceGlassDraftHint });
+    // The hint says what the field is: a draft, not a choice. It is not shown for an empty
+    // field or for the already confirmed capacity (there is nothing left to apply).
+    function syncDraftHint() {
+      var value = otherInput.value;
+      draftHint.hidden = value.trim() === "" || value === (chosen === null ? "" : String(chosen));
+    }
+    otherInput.addEventListener("input", function () {
+      // Kept for the next redraw, not confirmed by existing: typing changes no selection.
+      controller.syncSourceGlassDraft(otherInput.value);
+      syncDraftHint();
+    });
+    syncDraftHint();
+
+    var error = h("span", {
+      id: "source-glass-error",
+      class: "field-error",
+      role: "alert",
+      hidden: true,
+    });
+    var apply = action(Logic.TEXT.sourceGlassApply, "btn-secondary", function () {
+      error.hidden = true;
+      otherInput.removeAttribute("aria-invalid");
+      wantFocus = "source-glass-apply"; // the redraw keeps the keyboard here
+      controller.syncSourceGlassDraft(otherInput.value);
+      var result = controller.setSourceGlass(otherInput.value);
+      if (result && typeof result.then === "function") {
+        result.then(function (outcome) {
+          // Nothing was drawn for a refusal that sent nothing: no redraw is coming to
+          // consume the focus this handler asked for.
+          if (
+            outcome &&
+            (outcome.reason === "invalid" || outcome.reason === "editing" || outcome.reason === "not_ready")
+          ) {
+            wantFocus = null;
+          }
+          // Only an unusable volume is the field's own error; a failed read is said over
+          // the card, with the confirmed choice and its conversion still in place.
+          if (outcome && outcome.reason === "invalid") {
+            error.textContent = Logic.TEXT.sourceGlassInvalid;
+            error.hidden = false;
+            otherInput.setAttribute("aria-invalid", "true");
+            otherInput.focus();
+          }
+        });
+      }
+    });
+    apply.setAttribute("data-focus", "source-glass-apply");
+
+    var panel = h("div", {
+      class: "measure-other",
+      id: panelId,
+      hidden: !open,
+      "aria-busy": pending ? "true" : "false",
+    });
+    panel.appendChild(
+      h("label", { class: "visually-hidden", for: otherId, text: Logic.TEXT.sourceGlassOtherLabel })
+    );
+    panel.appendChild(otherInput);
+    panel.appendChild(apply);
+    panel.appendChild(draftHint);
+
+    fieldset.appendChild(
+      h("div", { class: "measure-other" }, [
+        toggle,
+        // A custom capacity the server confirmed is named as what it is: the field beside
+        // it holds that very value when it is reopened.
+        custom
+          ? h("span", {
+              class: "measure-hint",
+              text: filledText(Logic.TEXT.sourceGlassConfirmed, { value: chosen }),
+            })
+          : null,
+      ])
+    );
+    fieldset.appendChild(panel);
+    fieldset.appendChild(h("p", { id: "source-glass-hint", class: "hint", text: Logic.TEXT.sourceGlassNote }));
+    fieldset.appendChild(error);
+    return fieldset;
+  }
+
   // The card as it was stored: a structured favorite draws its fields (the text is the
   // same content rendered for older clients), a legacy one draws its text exactly as it
   // is. All of it goes into the page as text nodes.
@@ -2140,18 +2501,80 @@
           ])
         );
       }
-      wrapper.appendChild(
-        recipeSection(
-          Logic.TEXT.ingredients,
-          h(
-            "ul",
-            { class: "recipe-list" },
-            current.ingredients.map(function (ingredient) {
-              return h("li", { text: ingredient.name + " — " + ingredient.amount });
-            })
-          )
-        )
+      var conversions = {};
+      if (current.measures && !current.measuresPending) {
+        current.measures.ingredients.forEach(function (conversion) {
+          conversions[conversion.position] = conversion;
+        });
+      }
+      var anyHint = false;
+      var ingredientList = h(
+        "ul",
+        { class: "recipe-list" },
+        current.ingredients.map(function (ingredient, position) {
+          var line = h("span", { class: "recipe-ingredient", text: ingredient.name + " — " + ingredient.amount });
+          var hint = measureHint(conversions[position]);
+          if (hint === null) {
+            return h("li", null, [line]);
+          }
+          anyHint = true;
+          return h("li", { class: "recipe-ingredient-measured" }, [
+            line,
+            h("span", { class: "measure-hint", text: hint }),
+          ]);
+        })
       );
+      var ingredientsBody = anyHint
+        ? h("div", null, [h("p", { class: "measure-caption", text: Logic.TEXT.measuresTitle }), ingredientList])
+        : ingredientList;
+      wrapper.appendChild(recipeSection(Logic.TEXT.ingredients, ingredientsBody));
+      if (current.measures && current.measures.sourceGlassRequired) {
+        wrapper.appendChild(sourceGlassChooser(current));
+      }
+      // A choice under way is named; the confirmed one and its conversion stay on the card
+      // until the server answers for the new one. A failed choice leaves the confirmed one
+      // in place and offers to ask again.
+      if (current.sourceGlassPending !== null) {
+        wrapper.appendChild(
+          h("p", {
+            class: "hint",
+            role: "status",
+            text: Logic.TEXT.sourceGlassPending.replace("{value}", String(current.sourceGlassPending)),
+          })
+        );
+      }
+      if (current.sourceGlassError) {
+        wrapper.appendChild(
+          h("p", { class: "notice notice-error", role: "alert", text: current.sourceGlassError.text })
+        );
+        var retryGlass = action(Logic.TEXT.retry, "btn-secondary", function () {
+          var failed = current.sourceGlassError.value;
+          // The redraw that starts the retry keeps the keyboard on the choice it repeats.
+          wantFocus =
+            failed === 200
+              ? "source-glass-200"
+              : failed === 250
+                ? "source-glass-250"
+                : "source-glass-other";
+          controller.setSourceGlass(failed);
+        });
+        wrapper.appendChild(retryGlass);
+      }
+      // The card was saved but its conversion had to be read again (with the confirmed
+      // choice): until that answer arrives, or after it failed, no old hint is drawn.
+      if (current.measuresPending) {
+        wrapper.appendChild(h("p", { class: "hint", role: "status", text: Logic.TEXT.measuresRefreshPending }));
+      }
+      if (current.measuresError) {
+        wrapper.appendChild(
+          h("p", { class: "notice notice-error", role: "alert", text: current.measuresError.text })
+        );
+        var retryMeasure = action(Logic.TEXT.retry, "btn-secondary", function () {
+          wantFocus = "recipe"; // the redraw replaces this button; the card's title takes the keyboard
+          controller.retryFavoriteConversion();
+        });
+        wrapper.appendChild(retryMeasure);
+      }
       wrapper.appendChild(
         recipeSection(
           Logic.TEXT.steps,

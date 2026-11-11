@@ -71,7 +71,7 @@ pytestmark = pytest.mark.skipif(
 
 NOW = utc(2026, 11, 7, 12)
 PREVIOUS = "0010_structured_recipe_favorites"
-HEAD = "0013_user_text_size"
+HEAD = "0014_user_measure_overrides"
 ACCOUNT = 555000111
 BOT = 123456789
 

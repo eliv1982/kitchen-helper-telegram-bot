@@ -4334,4 +4334,1209 @@ scenario("a_name_that_was_never_set_is_a_note_and_the_form_opens_empty", async (
   assert.equal(page.el("profile-name").value, "");
 });
 
+// ============================================================================================
+// KH-F01-B1: the profile's kitchen measures and the recipe's conversion hints
+// ============================================================================================
+
+scenario("the_profile_shows_the_kitchen_measures_with_their_effective_values_and_states", async () => {
+  const page = await open((env) => {
+    env.signedIn([]);
+    env.net.route("GET", "/api/profile", H.profileBody("Елена", "normal", [], { glass_ml: 240 }));
+  });
+  page.el("profile-open").click();
+  await page.settle();
+  await page.settle();
+
+  const body = page.el("profile-body");
+  assert.ok(body.textContent.includes(Logic.TEXT.profileMeasuresTitle));
+  assert.ok(body.textContent.includes(Logic.TEXT.profileMeasureGlass));
+  assert.ok(body.textContent.includes(Logic.TEXT.profileMeasureTeaspoon));
+  assert.ok(body.textContent.includes(Logic.TEXT.profileMeasureTablespoon));
+  // The person's own glass and the two defaults, each said in words.
+  assert.ok(body.textContent.includes("240 мл"));
+  assert.ok(body.textContent.includes(Logic.TEXT.profileMeasurePersonal));
+  assert.ok(body.textContent.includes(Logic.TEXT.profileMeasureDefault));
+  assert.ok(body.textContent.includes("5 мл") && body.textContent.includes("15 мл"));
+  assert.ok(!body.textContent.includes("250 мл"), "no default value is shown for the overridden glass");
+});
+
+scenario("the_profile_form_edits_the_measures_with_a_number_keyboard_hints_and_reset", async () => {
+  const page = await open((env) => {
+    env.signedIn([]);
+    env.net.route("GET", "/api/profile", H.profileBody("Елена", "normal", [], { glass_ml: 240 }));
+  });
+  page.el("profile-open").click();
+  await page.settle();
+  await page.settle();
+  page.el("profile-body").buttons(Logic.TEXT.profileEdit)[0].click();
+  await page.settle();
+
+  const body = page.el("profile-body");
+  const glass = page.el("profile-measure-glass_ml");
+  assert.equal(glass.value, "240");
+  assert.equal(glass.getAttribute("inputmode"), "numeric");
+  assert.equal(page.el("profile-measure-teaspoon_ml").value, "");
+  assert.equal(page.el("profile-measure-tablespoon_ml").value, "");
+  assert.ok(body.textContent.includes("От 50 до 1000 мл"));
+  assert.ok(body.textContent.includes("От 1 до 20 мл"));
+  assert.ok(body.textContent.includes("От 5 до 50 мл"));
+  // One way back to the default per measure, labelled with the measure it belongs to.
+  assert.equal(body.buttons(Logic.TEXT.profileMeasureReset).length, 3);
+  const reset = body.buttons(Logic.TEXT.profileMeasureReset).find(
+    (button) => button.getAttribute("aria-label") === Logic.TEXT.profileMeasureResetLabel.replace("{name}", Logic.TEXT.profileMeasureGlass)
+  );
+  assert.ok(reset);
+  reset.click();
+  await page.settle();
+  assert.equal(page.el("profile-measure-glass_ml").value, "");
+  assert.equal(page.el("profile-measure-teaspoon_ml").value, "", "only its own field is cleared");
+});
+
+scenario("saving_a_measure_sends_only_that_measure_and_shows_the_saved_state", async () => {
+  const page = await open();
+  page.el("profile-open").click();
+  await page.settle();
+  await page.settle();
+  page.el("profile-body").buttons(Logic.TEXT.profileEdit)[0].click();
+  await page.settle();
+  page.editField(page.el("profile-measure-glass_ml"), "240");
+  page.env.net.route(
+    "PATCH",
+    "/api/profile",
+    H.profileBody("Елена", "normal", [], { glass_ml: 240 })
+  );
+
+  page.el("profile-body").buttons(Logic.TEXT.profileSave)[0].click();
+  await page.settle();
+  await page.settle();
+
+  const requests = page.env.net.requests("PATCH", "/api/profile");
+  assert.equal(requests.length, 1);
+  assert.deepEqual(requests[0].body, { measures: { glass_ml: 240 } });
+  const body = page.el("profile-body");
+  assert.ok(body.textContent.includes("240 мл"));
+  assert.ok(body.textContent.includes(Logic.TEXT.profileMeasurePersonal));
+  assert.equal(body.buttons(Logic.TEXT.profileSave).length, 0, "the form is closed");
+  assert.equal(body.buttons(Logic.TEXT.profileEdit).length, 1);
+});
+
+scenario("saving_an_emptied_measure_restores_its_default", async () => {
+  const page = await open((env) => {
+    env.signedIn([]);
+    env.net.route("GET", "/api/profile", H.profileBody("Елена", "normal", [], { glass_ml: 240 }));
+  });
+  page.el("profile-open").click();
+  await page.settle();
+  await page.settle();
+  page.el("profile-body").buttons(Logic.TEXT.profileEdit)[0].click();
+  await page.settle();
+  page.editField(page.el("profile-measure-glass_ml"), "");
+  page.env.net.route("PATCH", "/api/profile", H.profileBody("Елена", "normal"));
+
+  page.el("profile-body").buttons(Logic.TEXT.profileSave)[0].click();
+  await page.settle();
+  await page.settle();
+
+  assert.deepEqual(page.env.net.requests("PATCH", "/api/profile")[0].body, {
+    measures: { glass_ml: null },
+  });
+  const body = page.el("profile-body");
+  assert.ok(body.textContent.includes("250 мл"));
+  assert.ok(body.textContent.includes(Logic.TEXT.profileMeasureDefault));
+});
+
+scenario("an_unusable_measure_stays_in_the_form_with_its_worded_error", async () => {
+  const page = await open();
+  page.el("profile-open").click();
+  await page.settle();
+  await page.settle();
+  page.el("profile-body").buttons(Logic.TEXT.profileEdit)[0].click();
+  await page.settle();
+  page.editField(page.el("profile-measure-glass_ml"), "49");
+  const asked = page.env.net.log.length;
+
+  page.el("profile-body").buttons(Logic.TEXT.profileSave)[0].click();
+  await page.settle();
+  await page.settle();
+  assert.equal(page.env.net.requests("PATCH", "/api/profile").length, 0);
+  assert.equal(page.env.net.log.length, asked);
+  const body = page.el("profile-body");
+  const message = Logic.TEXT.profileMeasureInvalid.replace("{min}", "50").replace("{max}", "1000");
+  assert.ok(body.textContent.includes(message));
+  const field = page.el("profile-measure-glass_ml");
+  assert.equal(field.value, "49", "what was typed is kept");
+  assert.equal(field.getAttribute("aria-invalid"), "true");
+  assert.equal(page.doc.activeElement, field, "the keyboard goes to the field to fix");
+  assert.equal(body.buttons(Logic.TEXT.profileSave).length, 1, "the form stays open");
+});
+
+const MEASURED_BORSH_INGREDIENTS = [
+  { name: "мука", amount: "1 стакан 200 мл" },
+  { name: "масло", amount: "2 ст. л." },
+  { name: "сода", amount: "2 ч. л." },
+];
+
+function measuredBorshBlock(extra = {}) {
+  return {
+    target: { glass_ml: 250, teaspoon_ml: 6, tablespoon_ml: 15 },
+    source_glass_ml: null,
+    source_glass_required: false,
+    ingredients: [
+      {
+        position: 0,
+        source: "1 стакан 200 мл",
+        source_kind: "household",
+        target_unit: "glass",
+        status: "nominal_household",
+        reason: "converted",
+        exact: { numerator: 4, denominator: 5 },
+        rounded: null,
+        identical: false,
+        presentation: "exact",
+      },
+      {
+        position: 1,
+        source: "2 ст. л.",
+        source_kind: "household",
+        target_unit: "tablespoon",
+        status: "nominal_household",
+        reason: "converted",
+        exact: { numerator: 3, denominator: 2 },
+        rounded: { numerator: 3, denominator: 2, relative_error: { numerator: 0, denominator: 1 } },
+        identical: false,
+        presentation: "rounded",
+      },
+      {
+        position: 2,
+        source: "2 ч. л.",
+        source_kind: "household",
+        target_unit: "teaspoon",
+        status: "nominal_household",
+        reason: "converted",
+        exact: { numerator: 5, denominator: 3 },
+        rounded: { numerator: 7, denominator: 4, relative_error: { numerator: 1, denominator: 20 } },
+        identical: false,
+        presentation: "rounded",
+      },
+    ],
+    ...extra,
+  };
+}
+
+function measuredCard(block, extra = {}) {
+  return (env) => {
+    env.signedIn([conversation(CONV_A, 0)], { [CONV_A]: historyBody(CONV_A, structuredThread()) });
+    const item = structuredFavoriteItem({
+      ingredients: MEASURED_BORSH_INGREDIENTS,
+      measures: block,
+      ...extra,
+    });
+    env.net.route("GET", "/api/favorites", H.favoritesBody([item]));
+    env.net.route("GET", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(item, "Борщ"));
+  };
+}
+
+scenario("a_structured_recipe_shows_the_original_amount_and_its_exact_or_rounded_hint", async () => {
+  const page = await open(measuredCard(measuredBorshBlock()), { structured: true });
+  page.el("tab-favorites").click();
+  await page.settle();
+  page.el("favorite-list").byTag("button")[0].click();
+  await page.settle();
+
+  const body = page.el("recipe-body");
+  // The stored amounts are exactly as they were.
+  assert.ok(body.textContent.includes("мука — 1 стакан 200 мл"));
+  assert.ok(body.textContent.includes("масло — 2 ст. л."));
+  assert.ok(body.textContent.includes("сода — 2 ч. л."));
+  // The exact value is inline, not hidden; the approximation marker appears only where
+  // rounding actually changed the value.
+  assert.ok(body.textContent.includes("В ваших мерах"));
+  assert.ok(body.textContent.includes("Точно: 0,8 вашего стакана"));
+  assert.ok(body.textContent.includes("1½ вашей столовой ложки"));
+  assert.ok(!body.textContent.includes("≈ 1½ вашей столовой ложки"));
+  assert.ok(body.textContent.includes("≈ 1¾ вашей чайной ложки"));
+  // No clarification question: every source glass is declared.
+  assert.ok(!body.textContent.includes(Logic.TEXT.sourceGlassQuestion));
+});
+
+scenario("an_identity_conversion_is_not_repeated_under_the_ingredient", async () => {
+  const block = measuredBorshBlock({
+    ingredients: [
+      {
+        position: 0,
+        source: "2 ст. л.",
+        source_kind: "household",
+        target_unit: "tablespoon",
+        status: "nominal_household",
+        reason: "converted",
+        exact: { numerator: 2, denominator: 1 },
+        rounded: { numerator: 2, denominator: 1, relative_error: { numerator: 0, denominator: 1 } },
+        identical: true,
+        presentation: "none",
+      },
+    ],
+  });
+  const page = await open(measuredCard(block), { structured: true });
+  page.el("tab-favorites").click();
+  await page.settle();
+  page.el("favorite-list").byTag("button")[0].click();
+  await page.settle();
+
+  const body = page.el("recipe-body");
+  assert.ok(body.textContent.includes("масло — 2 ст. л."));
+  assert.ok(!body.textContent.includes("В ваших мерах"));
+  assert.ok(!body.textContent.includes("2 ваших столовых ложки"));
+});
+
+scenario("a_recipe_without_conversion_data_stays_readable", async () => {
+  const page = await open(
+    (env) => {
+      env.signedIn([conversation(CONV_A, 0)], { [CONV_A]: historyBody(CONV_A, structuredThread()) });
+      const item = structuredFavoriteItem({ measures: null });
+      env.net.route("GET", "/api/favorites", H.favoritesBody([item]));
+      env.net.route("GET", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(item, "Борщ"));
+    },
+    { structured: true }
+  );
+  page.el("tab-favorites").click();
+  await page.settle();
+  page.el("favorite-list").byTag("button")[0].click();
+  await page.settle();
+
+  const body = page.el("recipe-body");
+  assert.ok(body.textContent.includes("свекла — 2 шт."));
+  assert.ok(body.textContent.includes("Сварите бульон."));
+  assert.ok(!body.textContent.includes("В ваших мерах"));
+  assert.ok(!body.textContent.includes(Logic.TEXT.sourceGlassQuestion));
+  assert.equal(body.buttons("Редактировать").length, 1);
+});
+
+scenario("the_source_glass_question_offers_200_250_and_another_volume_with_nothing_preselected", async () => {
+  const block = measuredBorshBlock({
+    source_glass_required: true,
+    ingredients: [
+      {
+        position: 0,
+        source: "1 стакан",
+        source_kind: "household",
+        target_unit: "glass",
+        status: "clarification_required",
+        reason: "glass_size_required",
+        exact: null,
+        rounded: null,
+        identical: false,
+        presentation: "none",
+      },
+    ],
+  });
+  const page = await open(measuredCard(block), { structured: true });
+  page.el("tab-favorites").click();
+  await page.settle();
+  page.el("favorite-list").byTag("button")[0].click();
+  await page.settle();
+
+  let body = page.el("recipe-body");
+  assert.ok(body.textContent.includes(Logic.TEXT.sourceGlassQuestion));
+  const radios = [page.el("source-glass-200"), page.el("source-glass-250")];
+  assert.deepEqual(radios.map((radio) => radio.checked), [false, false]);
+  // The custom capacity is a disclosure, not a third radio: nothing is selected by
+  // opening it, and its field starts empty and closed.
+  const toggle = page.el("source-glass-other-toggle");
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  assert.equal(toggle.getAttribute("aria-controls"), "source-glass-other-panel");
+  assert.equal(page.el("source-glass-other-panel").hidden, true);
+  assert.equal(page.el("source-glass-other").value, "");
+
+  // Choosing 200 mL reads the same recipe with the clarification as a query parameter.
+  const chosen = structuredFavoriteItem({
+    ingredients: MEASURED_BORSH_INGREDIENTS,
+    measures: measuredBorshBlock({
+      source_glass_ml: 200,
+      // The real answer keeps saying that an undeclared glass is in the amount (the
+      // clarification is a reading of it, not a replacement of it).
+      source_glass_required: true,
+      ingredients: [
+        {
+          position: 0,
+          source: "1 стакан",
+          source_kind: "household",
+          target_unit: "glass",
+          status: "nominal_household",
+          reason: "converted",
+          exact: { numerator: 4, denominator: 5 },
+          rounded: null,
+          identical: false,
+          presentation: "exact",
+        },
+      ],
+    }),
+  });
+  page.env.net.route("GET", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(chosen, "Борщ"));
+  page.el("source-glass-200").checked = true;
+  page.el("source-glass-200").fire("change");
+  await page.settle();
+  await page.settle();
+
+  assert.ok(
+    page.env.net.requests("GET", `/api/favorites/${H.FAV_1}`).slice(-1)[0].url.endsWith(
+      "?source_glass_ml=200"
+    )
+  );
+  body = page.el("recipe-body");
+  assert.ok(body.textContent.includes("Точно: 0,8 вашего стакана"));
+  assert.equal(page.el("source-glass-200").checked, true, "the choice is kept while the recipe is open");
+});
+
+scenario("another_volume_is_validated_and_only_a_valid_one_is_applied", async () => {
+  const block = measuredBorshBlock({
+    source_glass_required: true,
+    ingredients: [
+      {
+        position: 0,
+        source: "1 стакан",
+        source_kind: "household",
+        target_unit: "glass",
+        status: "clarification_required",
+        reason: "glass_size_required",
+        exact: null,
+        rounded: null,
+        identical: false,
+        presentation: "none",
+      },
+    ],
+  });
+  const page = await open(measuredCard(block), { structured: true });
+  page.el("tab-favorites").click();
+  await page.settle();
+  page.el("favorite-list").byTag("button")[0].click();
+  await page.settle();
+  const asked = page.env.net.log.length;
+
+  page.el("source-glass-other-toggle").click();
+  await page.settle();
+  assert.equal(page.el("source-glass-other-toggle").getAttribute("aria-expanded"), "true");
+  assert.equal(page.el("source-glass-other-panel").hidden, false);
+  page.editField(page.el("source-glass-other"), "49");
+  page.el("recipe-body").buttons(Logic.TEXT.sourceGlassApply)[0].click();
+  await page.settle();
+
+  assert.equal(page.env.net.log.length, asked, "an unusable volume sends nothing");
+  assert.ok(page.el("recipe-body").textContent.includes(Logic.TEXT.sourceGlassInvalid));
+  assert.equal(page.el("source-glass-other").getAttribute("aria-invalid"), "true");
+  assert.deepEqual(
+    [page.el("source-glass-200").checked, page.el("source-glass-250").checked],
+    [false, false],
+    "an unusable custom volume selects nothing"
+  );
+
+  const chosen = structuredFavoriteItem({
+    ingredients: MEASURED_BORSH_INGREDIENTS,
+    measures: measuredBorshBlock({
+      source_glass_ml: 300,
+      // The real answer keeps saying that an undeclared glass is in the amount.
+      source_glass_required: true,
+      ingredients: [
+        {
+          position: 0,
+          source: "1 стакан",
+          source_kind: "household",
+          target_unit: "glass",
+          status: "nominal_household",
+          reason: "converted",
+          exact: { numerator: 6, denominator: 5 },
+          rounded: { numerator: 6, denominator: 5, relative_error: { numerator: 0, denominator: 1 } },
+          identical: false,
+          presentation: "rounded",
+        },
+      ],
+    }),
+  });
+  page.env.net.route("GET", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(chosen, "Борщ"));
+  page.editField(page.el("source-glass-other"), "300");
+  page.el("recipe-body").buttons(Logic.TEXT.sourceGlassApply)[0].click();
+  await page.settle();
+  await page.settle();
+
+  assert.ok(
+    page.env.net.requests("GET", `/api/favorites/${H.FAV_1}`).slice(-1)[0].url.endsWith(
+      "?source_glass_ml=300"
+    )
+  );
+  assert.ok(page.el("recipe-body").textContent.includes("1,2 вашего стакана"));
+  // Only the server's answer makes it a choice: the field keeps the confirmed value and
+  // the disclosure names it, while neither offered radio is selected.
+  assert.deepEqual(
+    [page.el("source-glass-200").checked, page.el("source-glass-250").checked],
+    [false, false]
+  );
+  assert.ok(
+    page.el("recipe-body").textContent.includes(
+      Logic.TEXT.sourceGlassConfirmed.replace("{value}", "300")
+    )
+  );
+  assert.equal(page.el("source-glass-other").value, "300");
+});
+
+scenario("a_source_glass_choice_is_pending_while_its_read_is_out_and_a_failure_keeps_the_confirmed_one", async () => {
+  const block = measuredBorshBlock({
+    source_glass_required: true,
+    ingredients: [
+      {
+        position: 0,
+        source: "1 стакан",
+        source_kind: "household",
+        target_unit: "glass",
+        status: "clarification_required",
+        reason: "glass_size_required",
+        exact: null,
+        rounded: null,
+        identical: false,
+        presentation: "none",
+      },
+    ],
+  });
+  const page = await open(measuredCard(block), { structured: true });
+  page.el("tab-favorites").click();
+  await page.settle();
+  page.el("favorite-list").byTag("button")[0].click();
+  await page.settle();
+
+  const chosen200 = structuredFavoriteItem({
+    ingredients: MEASURED_BORSH_INGREDIENTS,
+    measures: measuredBorshBlock({
+      source_glass_ml: 200,
+      source_glass_required: true,
+      ingredients: [
+        {
+          position: 0,
+          source: "1 стакан",
+          source_kind: "household",
+          target_unit: "glass",
+          status: "nominal_household",
+          reason: "converted",
+          exact: { numerator: 4, denominator: 5 },
+          rounded: null,
+          identical: false,
+          presentation: "exact",
+        },
+      ],
+    }),
+  });
+  page.env.net.route("GET", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(chosen200, "Борщ"));
+  page.el("source-glass-200").checked = true;
+  page.el("source-glass-200").fire("change");
+  await page.settle();
+  assert.equal(page.el("source-glass-200").checked, true);
+  assert.ok(page.el("recipe-body").textContent.includes("Точно: 0,8 вашего стакана"));
+
+  // The next read is slow: the confirmed choice and its conversion stay, and the new
+  // choice is named as pending -- never selected beside the older conversion.
+  const answer = deferred();
+  page.env.net.route("GET", `/api/favorites/${H.FAV_1}`, () => answer.promise);
+  page.el("source-glass-250").checked = true;
+  page.el("source-glass-250").fire("change");
+  await flush();
+
+  let body = page.el("recipe-body");
+  assert.equal(page.el("source-glass-200").checked, true, "the confirmed choice stays selected");
+  assert.equal(page.el("source-glass-250").checked, false, "the pending one is not shown as selected");
+  assert.ok(body.textContent.includes("Точно: 0,8 вашего стакана"), "its conversion stays");
+  assert.ok(body.textContent.includes(Logic.TEXT.sourceGlassPending.replace("{value}", "250")));
+  assert.ok(!body.textContent.includes(Logic.TEXT.sourceGlassFailed));
+
+  // The read fails: the confirmed choice and conversion stay, and the failure is worded
+  // with a way to ask again.
+  answer.resolve(fail());
+  await page.settle();
+  await page.settle();
+
+  body = page.el("recipe-body");
+  assert.equal(page.el("source-glass-200").checked, true);
+  assert.equal(page.el("source-glass-250").checked, false);
+  assert.ok(body.textContent.includes("Точно: 0,8 вашего стакана"));
+  assert.ok(body.textContent.includes(Logic.TEXT.sourceGlassFailed));
+  assert.ok(!body.textContent.includes(Logic.TEXT.sourceGlassPending.replace("{value}", "250")));
+  assert.equal(body.buttons(Logic.TEXT.retry).length, 1);
+
+  // The retry succeeds for 250: its block is drawn with it and no older value remains.
+  const chosen250 = structuredFavoriteItem({
+    ingredients: MEASURED_BORSH_INGREDIENTS,
+    measures: measuredBorshBlock({
+      source_glass_ml: 250,
+      source_glass_required: true,
+      ingredients: [
+        {
+          position: 0,
+          source: "1 стакан",
+          source_kind: "household",
+          target_unit: "glass",
+          status: "nominal_household",
+          reason: "converted",
+          exact: { numerator: 1, denominator: 1 },
+          rounded: null,
+          identical: true,
+          presentation: "none",
+        },
+      ],
+    }),
+  });
+  page.env.net.route("GET", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(chosen250, "Борщ"));
+  page.el("recipe-body").buttons(Logic.TEXT.retry)[0].click();
+  await page.settle();
+  await page.settle();
+
+  body = page.el("recipe-body");
+  assert.equal(page.el("source-glass-250").checked, true);
+  assert.equal(page.el("source-glass-200").checked, false);
+  assert.ok(!body.textContent.includes("Точно: 0,8 вашего стакана"));
+  assert.ok(!body.textContent.includes(Logic.TEXT.sourceGlassFailed));
+});
+
+// --- KH-F01-B1 remediation 02: the custom capacity is a draft, not a choice ----------------
+
+// One glass ingredient converted from a confirmed source capacity, in the shape of the
+// API's block: the numbers only have to be the ones the page draws for that context.
+function sourceGlassBlock(glass, exact = { numerator: 4, denominator: 5 }) {
+  return measuredBorshBlock({
+    source_glass_ml: glass,
+    source_glass_required: true,
+    ingredients: [
+      {
+        position: 0,
+        source: "1 стакан",
+        source_kind: "household",
+        target_unit: "glass",
+        status: "nominal_household",
+        reason: "converted",
+        exact,
+        rounded: null,
+        identical: false,
+        presentation: "exact",
+      },
+    ],
+  });
+}
+
+function clarificationBlock() {
+  return measuredBorshBlock({
+    source_glass_required: true,
+    ingredients: [
+      {
+        position: 0,
+        source: "1 стакан",
+        source_kind: "household",
+        target_unit: "glass",
+        status: "clarification_required",
+        reason: "glass_size_required",
+        exact: null,
+        rounded: null,
+        identical: false,
+        presentation: "none",
+      },
+    ],
+  });
+}
+
+async function openMeasuredCard(block, extra = {}) {
+  const page = await open(measuredCard(block, extra), { structured: true });
+  page.el("tab-favorites").click();
+  await page.settle();
+  page.el("favorite-list").byTag("button")[0].click();
+  await page.settle();
+  return page;
+}
+
+async function confirmSourceGlass(page, glass, exact) {
+  const item = structuredFavoriteItem({
+    ingredients: MEASURED_BORSH_INGREDIENTS,
+    measures: sourceGlassBlock(glass, exact),
+  });
+  page.env.net.route("GET", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(item, "Борщ"));
+  page.el(`source-glass-${glass}`).checked = true;
+  page.el(`source-glass-${glass}`).fire("change");
+  await page.settle();
+  await page.settle();
+}
+
+// The node with this id inside the card as it is drawn now (the document registry also
+// remembers nodes of earlier drawings, so the current card's own subtree is searched).
+function cardNode(page, id) {
+  return page.el("recipe-body").find((node) => node.id === id)[0] || null;
+}
+
+scenario("a_custom_volume_is_a_draft_and_never_unchecks_the_confirmed_choice", async () => {
+  const page = await openMeasuredCard(clarificationBlock());
+  await confirmSourceGlass(page, 200, { numerator: 4, denominator: 5 });
+
+  let body = page.el("recipe-body");
+  assert.equal(page.el("source-glass-200").checked, true);
+  assert.ok(body.textContent.includes("Точно: 0,8 вашего стакана"));
+  const asked = page.env.net.log.length;
+
+  page.el("source-glass-other-toggle").click();
+  await page.settle();
+  body = page.el("recipe-body");
+  assert.equal(page.el("source-glass-other-toggle").getAttribute("aria-expanded"), "true");
+  assert.equal(page.el("source-glass-other-panel").hidden, false);
+  assert.equal(page.doc.activeElement, page.el("source-glass-other"), "the opened field takes the keyboard");
+  assert.equal(page.env.net.log.length, asked, "opening a disclosure sends nothing");
+
+  // Typing a capacity is the person's draft: no selection changes, no conversion changes.
+  page.editField(page.el("source-glass-other"), "300");
+  body = page.el("recipe-body");
+  assert.equal(page.el("source-glass-200").checked, true, "the confirmed choice stays selected");
+  assert.equal(page.el("source-glass-250").checked, false);
+  assert.ok(body.textContent.includes("Точно: 0,8 вашего стакана"), "its conversion stays");
+  const draftHint = page.el("source-glass-draft-hint");
+  assert.equal(draftHint.hidden, false, "the field says what it is: a draft");
+  assert.ok(draftHint.textContent.includes(Logic.TEXT.sourceGlassDraftHint));
+  assert.equal(page.env.net.log.length, asked, "typing sends nothing");
+
+  // An unusable volume is refused in the field and changes no choice either.
+  page.editField(page.el("source-glass-other"), "49");
+  page.el("recipe-body").buttons(Logic.TEXT.sourceGlassApply)[0].click();
+  await page.settle();
+  body = page.el("recipe-body");
+  assert.equal(page.env.net.log.length, asked, "an unusable volume sends nothing");
+  assert.equal(page.el("source-glass-200").checked, true);
+  assert.equal(page.el("source-glass-250").checked, false);
+  assert.ok(body.textContent.includes("Точно: 0,8 вашего стакана"));
+  assert.ok(body.textContent.includes(Logic.TEXT.sourceGlassInvalid));
+  assert.equal(page.el("source-glass-other").getAttribute("aria-invalid"), "true");
+  assert.equal(page.el("source-glass-draft-hint").hidden, false);
+});
+
+scenario("a_custom_volume_becomes_a_choice_only_with_its_own_answer_and_is_shown_when_reopened", async () => {
+  const page = await openMeasuredCard(clarificationBlock());
+  await confirmSourceGlass(page, 200, { numerator: 4, denominator: 5 });
+  page.el("source-glass-other-toggle").click();
+  await page.settle();
+  page.editField(page.el("source-glass-other"), "300");
+
+  const answer = deferred();
+  page.env.net.route("GET", `/api/favorites/${H.FAV_1}`, () => answer.promise);
+  page.el("recipe-body").buttons(Logic.TEXT.sourceGlassApply)[0].click();
+  await flush();
+
+  // The read is out: the confirmed 200 and its conversion stay, and the new value is only
+  // named as pending.
+  let body = page.el("recipe-body");
+  assert.equal(page.el("source-glass-200").checked, true);
+  assert.equal(page.el("source-glass-250").checked, false);
+  assert.ok(body.textContent.includes("Точно: 0,8 вашего стакана"));
+  assert.ok(body.textContent.includes(Logic.TEXT.sourceGlassPending.replace("{value}", "300")));
+  assert.ok(!body.textContent.includes(Logic.TEXT.sourceGlassConfirmed.replace("{value}", "300")));
+  assert.equal(page.el("source-glass-other-panel").getAttribute("aria-busy"), "true");
+  assert.equal(page.el("source-glass-other").value, "300", "the draft stays while it is applied");
+
+  answer.resolve(
+    H.favoriteDetail(
+      structuredFavoriteItem({
+        ingredients: MEASURED_BORSH_INGREDIENTS,
+        measures: sourceGlassBlock(300, { numerator: 6, denominator: 5 }),
+      }),
+      "Борщ"
+    )
+  );
+  await page.settle();
+  await page.settle();
+
+  body = page.el("recipe-body");
+  assert.ok(
+    page.env.net.requests("GET", `/api/favorites/${H.FAV_1}`).slice(-1)[0].url.endsWith(
+      "?source_glass_ml=300"
+    )
+  );
+  assert.equal(page.el("source-glass-200").checked, false);
+  assert.equal(page.el("source-glass-250").checked, false);
+  assert.ok(body.textContent.includes(Logic.TEXT.sourceGlassConfirmed.replace("{value}", "300")));
+  assert.ok(body.textContent.includes("1,2 вашего стакана"));
+  assert.equal(page.el("source-glass-other-panel").hidden, false);
+  assert.equal(page.el("source-glass-other").value, "300");
+  assert.equal(page.el("source-glass-draft-hint").hidden, true, "the field holds the confirmed value");
+
+  // Closing the disclosure leaves the confirmed capacity and its conversion on the card.
+  page.el("source-glass-other-toggle").click();
+  await page.settle();
+  body = page.el("recipe-body");
+  assert.equal(page.el("source-glass-other-toggle").getAttribute("aria-expanded"), "false");
+  assert.equal(page.el("source-glass-other-panel").hidden, true);
+  assert.ok(body.textContent.includes(Logic.TEXT.sourceGlassConfirmed.replace("{value}", "300")));
+  assert.ok(body.textContent.includes("1,2 вашего стакана"));
+
+  // Reopening shows that very capacity in the field, not an empty one.
+  page.el("source-glass-other-toggle").click();
+  await page.settle();
+  assert.equal(page.el("source-glass-other-toggle").getAttribute("aria-expanded"), "true");
+  assert.equal(page.el("source-glass-other").value, "300");
+  assert.equal(page.el("source-glass-draft-hint").hidden, true);
+  assert.equal(page.doc.activeElement, page.el("source-glass-other"));
+});
+
+scenario("a_failed_custom_volume_keeps_the_confirmed_choice_and_the_retry_uses_the_same_value", async () => {
+  const page = await openMeasuredCard(clarificationBlock());
+  await confirmSourceGlass(page, 200, { numerator: 4, denominator: 5 });
+  page.el("source-glass-other-toggle").click();
+  await page.settle();
+
+  page.editField(page.el("source-glass-other"), "300");
+  page.env.net.route("GET", `/api/favorites/${H.FAV_1}`, fail());
+  page.el("recipe-body").buttons(Logic.TEXT.sourceGlassApply)[0].click();
+  await page.settle();
+  await page.settle();
+
+  let body = page.el("recipe-body");
+  assert.equal(page.el("source-glass-200").checked, true, "the confirmed choice is untouched");
+  assert.equal(page.el("source-glass-250").checked, false);
+  assert.ok(body.textContent.includes("Точно: 0,8 вашего стакана"), "its conversion is untouched");
+  assert.ok(body.textContent.includes(Logic.TEXT.sourceGlassFailed));
+  assert.ok(!body.textContent.includes(Logic.TEXT.sourceGlassPending.replace("{value}", "300")));
+  assert.equal(page.el("source-glass-other").value, "300", "the typed value is kept for the retry");
+  assert.equal(page.el("source-glass-other-panel").getAttribute("aria-busy"), "false");
+
+  // The retry asks for the same value, and only its own answer confirms it.
+  page.env.net.route(
+    "GET",
+    `/api/favorites/${H.FAV_1}`,
+    H.favoriteDetail(
+      structuredFavoriteItem({
+        ingredients: MEASURED_BORSH_INGREDIENTS,
+        measures: sourceGlassBlock(300, { numerator: 6, denominator: 5 }),
+      }),
+      "Борщ"
+    )
+  );
+  page.el("recipe-body").buttons(Logic.TEXT.retry)[0].click();
+  await page.settle();
+  await page.settle();
+
+  body = page.el("recipe-body");
+  assert.ok(
+    page.env.net.requests("GET", `/api/favorites/${H.FAV_1}`).slice(-1)[0].url.endsWith(
+      "?source_glass_ml=300"
+    )
+  );
+  assert.equal(page.el("source-glass-200").checked, false);
+  assert.ok(body.textContent.includes(Logic.TEXT.sourceGlassConfirmed.replace("{value}", "300")));
+  assert.ok(body.textContent.includes("1,2 вашего стакана"));
+  assert.ok(!body.textContent.includes(Logic.TEXT.sourceGlassFailed));
+  assert.equal(page.el("source-glass-other").value, "300");
+});
+
+scenario("only_the_newest_source_glass_answer_changes_the_card_whatever_order_answers_arrive", async () => {
+  const page = await openMeasuredCard(clarificationBlock());
+  await confirmSourceGlass(page, 200, { numerator: 4, denominator: 5 });
+
+  const older = deferred();
+  const newer = deferred();
+  page.env.net.route("GET", `/api/favorites/${H.FAV_1}`, () => older.promise, () => newer.promise);
+
+  // 250 mL is asked for; while its read is out the person opens the custom field and asks
+  // for 300 mL. Only the newest answer may become the card.
+  page.el("source-glass-250").checked = true;
+  page.el("source-glass-250").fire("change");
+  await flush();
+  assert.ok(
+    page.el("recipe-body").textContent.includes(Logic.TEXT.sourceGlassPending.replace("{value}", "250"))
+  );
+
+  page.el("source-glass-other-toggle").click();
+  await page.settle();
+  page.editField(page.el("source-glass-other"), "300");
+  page.el("recipe-body").buttons(Logic.TEXT.sourceGlassApply)[0].click();
+  await flush();
+
+  let body = page.el("recipe-body");
+  assert.equal(page.el("source-glass-200").checked, true);
+  assert.ok(body.textContent.includes("Точно: 0,8 вашего стакана"));
+  assert.ok(body.textContent.includes(Logic.TEXT.sourceGlassPending.replace("{value}", "300")));
+
+  // The older answer (250) arrives first: it must not replace the 200 mL card even for a
+  // moment, and the newer request stays the pending one.
+  older.resolve(
+    H.favoriteDetail(
+      structuredFavoriteItem({
+        ingredients: MEASURED_BORSH_INGREDIENTS,
+        measures: sourceGlassBlock(250, { numerator: 1, denominator: 1 }),
+      }),
+      "Борщ"
+    )
+  );
+  await flush();
+  body = page.el("recipe-body");
+  assert.equal(page.el("source-glass-200").checked, true);
+  assert.ok(body.textContent.includes("Точно: 0,8 вашего стакана"));
+  assert.ok(body.textContent.includes(Logic.TEXT.sourceGlassPending.replace("{value}", "300")));
+  assert.ok(!body.textContent.includes(Logic.TEXT.sourceGlassConfirmed.replace("{value}", "250")));
+
+  newer.resolve(
+    H.favoriteDetail(
+      structuredFavoriteItem({
+        ingredients: MEASURED_BORSH_INGREDIENTS,
+        measures: sourceGlassBlock(300, { numerator: 6, denominator: 5 }),
+      }),
+      "Борщ"
+    )
+  );
+  await page.settle();
+  await page.settle();
+
+  body = page.el("recipe-body");
+  assert.equal(page.el("source-glass-200").checked, false);
+  assert.ok(body.textContent.includes(Logic.TEXT.sourceGlassConfirmed.replace("{value}", "300")));
+  assert.ok(body.textContent.includes("1,2 вашего стакана"));
+  assert.ok(!body.textContent.includes(Logic.TEXT.sourceGlassPending.replace("{value}", "300")));
+});
+
+scenario("switching_recipes_while_a_custom_volume_is_pending_changes_nothing_here", async () => {
+  const first = structuredFavoriteItem({
+    ingredients: MEASURED_BORSH_INGREDIENTS,
+    measures: clarificationBlock(),
+  });
+  const second = H.structuredFavorite(H.FAV_2, 2, "Уха", 1, 0, {
+    servings: null,
+    ingredients: [{ name: "рыба", amount: "1 кг" }],
+    steps: ["Сварите."],
+    version: 1,
+    measures: measuredBorshBlock({ source_glass_required: false, ingredients: [] }),
+  });
+  const page = await open(
+    (env) => {
+      env.signedIn([conversation(CONV_A, 0)], { [CONV_A]: historyBody(CONV_A, structuredThread()) });
+      env.net.route("GET", "/api/favorites", H.favoritesBody([first, second]));
+      env.net.route("GET", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(first, "Борщ"));
+      env.net.route("GET", `/api/favorites/${H.FAV_2}`, H.favoriteDetail(second, "Уха"));
+    },
+    { structured: true }
+  );
+  page.el("tab-favorites").click();
+  await page.settle();
+  page.el("favorite-list").byTag("button")[0].click();
+  await page.settle();
+
+  await confirmSourceGlass(page, 200, { numerator: 4, denominator: 5 });
+  page.el("source-glass-other-toggle").click();
+  await page.settle();
+  page.editField(page.el("source-glass-other"), "300");
+  const answer = deferred();
+  page.env.net.route("GET", `/api/favorites/${H.FAV_1}`, () => answer.promise);
+  page.el("recipe-body").buttons(Logic.TEXT.sourceGlassApply)[0].click();
+  await flush();
+  assert.ok(
+    page.el("recipe-body").textContent.includes(Logic.TEXT.sourceGlassPending.replace("{value}", "300"))
+  );
+
+  // Another recipe is opened while the read is out. It starts without any of the first
+  // recipe's clarification or draft.
+  page.el("favorite-list").byTag("button").find((button) => button.textContent.includes("Уха")).click();
+  await page.settle();
+  assert.equal(page.el("recipe-title").textContent, "Уха");
+  assert.equal(cardNode(page, "source-glass-other-toggle"), null, "the other recipe asks no question");
+  assert.equal(cardNode(page, "source-glass-other"), null);
+  assert.ok(!page.el("recipe-body").textContent.includes(Logic.TEXT.sourceGlassQuestion));
+
+  // The answer to the abandoned request cannot reach the card that is open now.
+  answer.resolve(
+    H.favoriteDetail(
+      structuredFavoriteItem({
+        ingredients: MEASURED_BORSH_INGREDIENTS,
+        measures: sourceGlassBlock(300, { numerator: 6, denominator: 5 }),
+      }),
+      "Борщ"
+    )
+  );
+  await flush();
+  assert.equal(page.el("recipe-title").textContent, "Уха");
+  assert.equal(cardNode(page, "source-glass-other-toggle"), null);
+  assert.ok(
+    !page.el("recipe-body").textContent.includes(Logic.TEXT.sourceGlassConfirmed.replace("{value}", "300"))
+  );
+
+  // Returning to the first recipe is a fresh start for its clarification too: the question
+  // is asked again with nothing confirmed, an empty field and the disclosure closed.
+  page.env.net.route("GET", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(first, "Борщ"));
+  page.el("favorite-list").byTag("button").find((button) => button.textContent.includes("Борщ")).click();
+  await page.settle();
+  assert.equal(page.el("recipe-title").textContent, "Борщ");
+  const toggle = cardNode(page, "source-glass-other-toggle");
+  assert.ok(toggle, "the question is asked for the recipe that is open");
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  assert.equal(cardNode(page, "source-glass-other-panel").hidden, true);
+  assert.equal(cardNode(page, "source-glass-other").value, "");
+  assert.equal(cardNode(page, "source-glass-200").checked, false);
+  assert.equal(cardNode(page, "source-glass-250").checked, false);
+  assert.ok(
+    !page.el("recipe-body").textContent.includes(Logic.TEXT.sourceGlassConfirmed.replace("{value}", "300"))
+  );
+});
+
+scenario("the_custom_volume_disclosure_is_labelled_and_keyboard_operable_at_any_width", async () => {
+  for (const narrow of [false, true]) {
+    const page = await open(measuredCard(clarificationBlock()), { structured: true, narrow });
+    page.el("tab-favorites").click();
+    await page.settle();
+    page.el("favorite-list").byTag("button")[0].click();
+    await page.settle();
+
+    const why = "narrow=" + narrow;
+    let toggle = page.el("source-glass-other-toggle");
+    assert.equal(toggle.localName, "button", why);
+    assert.equal(toggle.getAttribute("type"), "button", why);
+    assert.equal(toggle.getAttribute("aria-expanded"), "false", why);
+    assert.equal(toggle.getAttribute("aria-controls"), "source-glass-other-panel", why);
+    assert.equal(page.el("source-glass-other-panel").hidden, true, why);
+
+    // The field has a real label and points at its own explanation and error.
+    const labels = page
+      .el("recipe-body")
+      .byTag("label")
+      .filter((label) => label.getAttribute("for") === "source-glass-other");
+    assert.equal(labels.length, 1, why);
+    assert.ok(labels[0].textContent.includes(Logic.TEXT.sourceGlassOtherLabel), why);
+    const described = page.el("source-glass-other").getAttribute("aria-describedby");
+    assert.ok(described.includes("source-glass-draft-hint"), why);
+    assert.ok(described.includes("source-glass-error"), why);
+
+    // A button is activated by Enter and Space in the browser: the same click path.
+    toggle.click();
+    await page.settle();
+    toggle = page.el("source-glass-other-toggle");
+    assert.equal(toggle.getAttribute("aria-expanded"), "true", why);
+    assert.equal(page.el("source-glass-other-panel").hidden, false, why);
+    assert.equal(page.doc.activeElement, page.el("source-glass-other"), why);
+
+    toggle.click();
+    await page.settle();
+    toggle = page.el("source-glass-other-toggle");
+    assert.equal(toggle.getAttribute("aria-expanded"), "false", why);
+    assert.equal(page.el("source-glass-other-panel").hidden, true, why);
+    assert.equal(page.doc.activeElement, toggle, why);
+  }
+});
+
+// --- KH-F01-B1 remediation 02: an editor keeps its own baseline version ---------------------
+
+scenario("an_editor_opened_while_a_source_glass_read_is_out_keeps_and_saves_its_own_version", async () => {
+  const page = await openMeasuredCard(clarificationBlock());
+  await confirmSourceGlass(page, 200, { numerator: 4, denominator: 5 });
+
+  const pending = deferred();
+  page.env.net.route("GET", `/api/favorites/${H.FAV_1}`, () => pending.promise);
+  page.el("source-glass-250").checked = true;
+  page.el("source-glass-250").fire("change");
+  await flush();
+
+  // The editor is opened while the 250 mL read is still out: its baseline is version 3.
+  page.el("recipe-body").buttons(Logic.TEXT.editAction)[0].click();
+  await page.settle();
+  assert.equal(page.el("recipe-body").byClass("edit-title")[0].value, "Борщ");
+  assert.deepEqual(
+    page.el("recipe-body").byClass("ingredient-name").map((input) => input.value),
+    MEASURED_BORSH_INGREDIENTS.map((ingredient) => ingredient.name)
+  );
+
+  // The answer that was out carries version 4, made on another device. It must not
+  // replace the recipe the draft was opened on.
+  pending.resolve(
+    H.favoriteDetail(
+      structuredFavoriteItem({
+        title: "Борщ, изменённый в другом месте",
+        ingredients: [{ name: "свекла", amount: "9 шт." }],
+        version: 4,
+        measures: sourceGlassBlock(250, { numerator: 1, denominator: 1 }),
+      }),
+      "Борщ, изменённый в другом месте"
+    )
+  );
+  await page.settle();
+  await page.settle();
+  assert.equal(
+    page.el("recipe-body").byClass("edit-title")[0].value,
+    "Борщ",
+    "the version under the draft did not move"
+  );
+  assert.deepEqual(
+    page.el("recipe-body").byClass("ingredient-name").map((input) => input.value),
+    MEASURED_BORSH_INGREDIENTS.map((ingredient) => ingredient.name),
+    "the draft contents are exactly as they were opened"
+  );
+  assert.deepEqual(
+    page.el("recipe-body").byClass("ingredient-amount").map((input) => input.value),
+    MEASURED_BORSH_INGREDIENTS.map((ingredient) => ingredient.amount)
+  );
+
+  // The draft is saved with the version it was opened on. The server refuses it as a
+  // conflict; the draft stays and nothing is overwritten.
+  page.editField(page.el("recipe-body").byClass("edit-title")[0], "Мой борщ");
+  page.env.net.route("PATCH", `/api/favorites/${H.FAV_1}`, apiError(409, "favorite_conflict"));
+  page.el("recipe-body").buttons(Logic.TEXT.editSave)[0].click();
+  await page.settle();
+  await page.settle();
+
+  const sent = page.env.net.requests("PATCH", `/api/favorites/${H.FAV_1}`)[0].body;
+  assert.equal(sent.expected_version, 3, "the stale draft never names version 4");
+  assert.equal(sent.title, "Мой борщ");
+  assert.equal(page.el("recipe-body").byClass("edit-title")[0].value, "Мой борщ");
+  assert.ok(page.el("recipe-body").textContent.includes(Logic.TEXT.editConflict));
+
+  // "Загрузить заново" shows what is stored now: the other device's version, intact.
+  const changed = structuredFavoriteItem({
+    title: "Борщ, изменённый в другом месте",
+    ingredients: [{ name: "свекла", amount: "9 шт." }],
+    version: 4,
+    measures: sourceGlassBlock(200, { numerator: 4, denominator: 5 }),
+  });
+  page.env.net.route(
+    "GET",
+    `/api/favorites/${H.FAV_1}`,
+    H.favoriteDetail(changed, "Борщ, изменённый в другом месте")
+  );
+  page.el("recipe-body").buttons(Logic.TEXT.editReload)[0].click();
+  await page.settle();
+  await page.settle();
+
+  assert.equal(page.el("recipe-title").textContent, "Борщ, изменённый в другом месте");
+  assert.ok(page.el("recipe-body").textContent.includes("свекла — 9 шт."));
+  assert.equal(page.el("recipe-body").buttons(Logic.TEXT.editSave).length, 0, "the editor is closed");
+  assert.ok(
+    page.el("recipe-body").textContent.includes("Точно: 0,8 вашего стакана"),
+    "the confirmed 200 mL choice belongs to the reloaded version"
+  );
+});
+
+scenario("a_saved_edit_whose_conversion_read_fails_shows_the_saved_recipe_without_a_stale_hint", async () => {
+  const block = measuredBorshBlock({
+    source_glass_required: true,
+    ingredients: [
+      {
+        position: 0,
+        source: "1 стакан",
+        source_kind: "household",
+        target_unit: "glass",
+        status: "clarification_required",
+        reason: "glass_size_required",
+        exact: null,
+        rounded: null,
+        identical: false,
+        presentation: "none",
+      },
+    ],
+  });
+  const page = await open(measuredCard(block), { structured: true });
+  page.el("tab-favorites").click();
+  await page.settle();
+  page.el("favorite-list").byTag("button")[0].click();
+  await page.settle();
+
+  const chosen200 = structuredFavoriteItem({
+    ingredients: MEASURED_BORSH_INGREDIENTS,
+    measures: measuredBorshBlock({
+      source_glass_ml: 200,
+      source_glass_required: true,
+      ingredients: [
+        {
+          position: 0,
+          source: "1 стакан",
+          source_kind: "household",
+          target_unit: "glass",
+          status: "nominal_household",
+          reason: "converted",
+          exact: { numerator: 4, denominator: 5 },
+          rounded: null,
+          identical: false,
+          presentation: "exact",
+        },
+      ],
+    }),
+  });
+  page.env.net.route("GET", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(chosen200, "Борщ"));
+  page.el("source-glass-200").checked = true;
+  page.el("source-glass-200").fire("change");
+  await page.settle();
+  assert.ok(page.el("recipe-body").textContent.includes("Точно: 0,8 вашего стакана"));
+
+  page.el("recipe-body").buttons(Logic.TEXT.editAction)[0].click();
+  await page.settle();
+  page.el("recipe-body").byClass("edit-title")[0].value = "Борщ по-домашнему";
+  const updated = structuredFavoriteItem({
+    title: "Борщ по-домашнему",
+    ingredients: MEASURED_BORSH_INGREDIENTS,
+    version: 4,
+    measures: measuredBorshBlock(), // the edit's own block, without the clarification
+  });
+  page.env.net.route(
+    "PATCH",
+    `/api/favorites/${H.FAV_1}`,
+    H.favoriteDetail(updated, "Борщ по-домашнему")
+  );
+  page.env.net.route("GET", `/api/favorites/${H.FAV_1}`, fail());
+  page.el("recipe-body").buttons(Logic.TEXT.editSave)[0].click();
+  await page.settle();
+  await page.settle();
+
+  // The edit is on the card, but no conversion is drawn from the unconfirmed block.
+  let body = page.el("recipe-body");
+  assert.equal(page.el("recipe-title").textContent, "Борщ по-домашнему");
+  assert.ok(body.textContent.includes("мука — 1 стакан 200 мл"));
+  assert.ok(!body.textContent.includes("Точно: 0,8 вашего стакана"));
+  assert.ok(body.textContent.includes(Logic.TEXT.measuresRefreshFailed));
+  assert.equal(body.buttons(Logic.TEXT.retry).length, 1);
+
+  // "Повторить" reads the card again with the confirmed choice.
+  const refreshed = structuredFavoriteItem({
+    title: "Борщ по-домашнему",
+    ingredients: MEASURED_BORSH_INGREDIENTS,
+    version: 4,
+    measures: chosen200.measures,
+  });
+  page.env.net.route(
+    "GET",
+    `/api/favorites/${H.FAV_1}`,
+    H.favoriteDetail(refreshed, "Борщ по-домашнему")
+  );
+  page.el("recipe-body").buttons(Logic.TEXT.retry)[0].click();
+  await page.settle();
+  await page.settle();
+
+  body = page.el("recipe-body");
+  assert.ok(body.textContent.includes("Точно: 0,8 вашего стакана"));
+  assert.ok(!body.textContent.includes(Logic.TEXT.measuresRefreshFailed));
+  assert.ok(
+    page.env.net.requests("GET", `/api/favorites/${H.FAV_1}`).slice(-1)[0].url.endsWith(
+      "?source_glass_ml=200"
+    )
+  );
+});
+
+scenario("a_conversion_that_contradicts_its_own_status_draws_no_number_and_the_recipe_stays", async () => {
+  const block = measuredBorshBlock({
+    source_glass_required: true,
+    ingredients: [
+      {
+        position: 0,
+        source: "1 стакан",
+        source_kind: "household",
+        target_unit: "glass",
+        status: "unsupported",
+        reason: "source_not_quantified",
+        exact: { numerator: 99, denominator: 1 },
+        rounded: null,
+        identical: false,
+        presentation: "exact",
+      },
+    ],
+  });
+  const page = await open(measuredCard(block), { structured: true });
+  page.el("tab-favorites").click();
+  await page.settle();
+  page.el("favorite-list").byTag("button")[0].click();
+  await page.settle();
+
+  const body = page.el("recipe-body");
+  assert.ok(body.textContent.includes("мука — 1 стакан 200 мл"));
+  assert.ok(!body.textContent.includes("Точно: 99"));
+  assert.ok(!body.textContent.includes("В ваших мерах"));
+  assert.ok(!body.textContent.includes(Logic.TEXT.sourceGlassQuestion));
+});
+
 module.exports = { scenarios, useShell, useNoLoginShell };

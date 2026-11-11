@@ -1,10 +1,11 @@
-"""A person's profile: their display name, their text size, and the ways they sign in.
+"""A person's profile: their display name, their text size, their household measures,
+and the ways they sign in.
 
 The profile is the account's own small set of settings, not a second identity. It reuses
 users.display_name (the 200-character column every user already has; migration 0013 adds
-users.text_size) and it never says who the request is for: every function takes the user
-id of the server-side session and finds a row only through it. There is no user id in a
-request body and nothing here reads one.
+users.text_size, migration 0014 the three measure columns) and it never says who the
+request is for: every function takes the user id of the server-side session and finds a
+row only through it. There is no user id in a request body and nothing here reads one.
 
 Display name. Trimmed, 1 to 200 Unicode code points, and no character of Unicode
 category C (control, format -- zero-width and bidirectional marks included -- surrogate,
@@ -18,6 +19,14 @@ Text size. One of TextSize: 'normal' (100%) or 'large' (120%). It is applied by 
 to the authenticated application only. The database's CHECK is the closed list; the
 application validates before writing so a bad request is refused with a clear error
 rather than a database failure.
+
+Household measures. Three independent, optional capacities in whole millilitres (D18/D19):
+glass 50--1000 (system default 250), teaspoon 1--20 (default 5) and tablespoon 5--50
+(default 15). NULL removes the override and restores the default; nothing is seeded, and
+a value equal to the default may be stored explicitly (it is still that person's choice).
+They are target measures for presenting a converted recipe and never interpret a source
+recipe. The ranges come from core.measures (the one place the approved numbers live), the
+database repeats them as CHECKs, and this module validates a whole change before writing.
 
 Sign-in methods. Read, never written here: the identity_links of the user, each joined to
 its allowlist entry to tell an active identity from a revoked one. Only identities that
@@ -43,6 +52,17 @@ from uuid import UUID
 import sqlalchemy as sa
 from sqlalchemy.orm import Session as OrmSession
 
+from house_helper.core.measures import (
+    GLASS_ML_MAX,
+    GLASS_ML_MIN,
+    SYSTEM_GLASS_ML,
+    SYSTEM_TABLESPOON_ML,
+    SYSTEM_TEASPOON_ML,
+    TABLESPOON_ML_MAX,
+    TABLESPOON_ML_MIN,
+    TEASPOON_ML_MAX,
+    TEASPOON_ML_MIN,
+)
 from house_helper.persistence.models import (
     AllowlistEntry,
     AllowlistProvider,
@@ -56,6 +76,25 @@ MAX_DISPLAY_NAME_LENGTH = 200
 
 # Which text sizes exist. The database has the same closed list as a CHECK.
 TEXT_SIZE_VALUES = frozenset(member.value for member in TextSize)
+
+# The three personal household measures (D18/D19). The names are the API's own; the
+# ranges and defaults are core.measures' product constants, never repeated as literals.
+MEASURE_FIELDS = ("glass_ml", "teaspoon_ml", "tablespoon_ml")
+MEASURE_RANGES = {
+    "glass_ml": (int(GLASS_ML_MIN), int(GLASS_ML_MAX)),
+    "teaspoon_ml": (int(TEASPOON_ML_MIN), int(TEASPOON_ML_MAX)),
+    "tablespoon_ml": (int(TABLESPOON_ML_MIN), int(TABLESPOON_ML_MAX)),
+}
+MEASURE_DEFAULTS = {
+    "glass_ml": int(SYSTEM_GLASS_ML),
+    "teaspoon_ml": int(SYSTEM_TEASPOON_ML),
+    "tablespoon_ml": int(SYSTEM_TABLESPOON_ML),
+}
+MEASURE_COLUMNS = {
+    "glass_ml": "measure_glass_ml",
+    "teaspoon_ml": "measure_teaspoon_ml",
+    "tablespoon_ml": "measure_tablespoon_ml",
+}
 
 # The status a sign-in method is reported with.
 LOGIN_ACTIVE = "active"
@@ -79,6 +118,24 @@ class InvalidTextSize(ValueError):
     """The text size is not one of TEXT_SIZE_VALUES."""
 
 
+class InvalidMeasure(ValueError):
+    """A household measure is not a whole millilitre within its approved range, and None
+    (which removes the override) is the only other value it may take."""
+
+
+@dataclass(frozen=True)
+class MeasureOverrides:
+    """A person's three optional household capacities, in whole millilitres.
+
+    None means no personal value: the system default applies (250/5/15 mL). The three are
+    stored and read independently, and no rule relates one to another.
+    """
+
+    glass_ml: Optional[int]
+    teaspoon_ml: Optional[int]
+    tablespoon_ml: Optional[int]
+
+
 @dataclass(frozen=True)
 class LoginMethod:
     """One way the account has signed in, as the profile shows it.
@@ -95,10 +152,11 @@ class LoginMethod:
 
 @dataclass(frozen=True)
 class ProfileView:
-    """What the profile API answers: the two editable settings and the ways in."""
+    """What the profile API answers: the editable settings and the ways in."""
 
     display_name: Optional[str]
     text_size: str
+    measures: MeasureOverrides
     login_methods: tuple[LoginMethod, ...]
 
 
@@ -137,12 +195,42 @@ def normalize_text_size(raw: str) -> str:
     return raw
 
 
+def normalize_measure(name: str, raw: Any) -> Optional[int]:
+    """One household capacity as it is stored, or InvalidMeasure.
+
+    None removes the override. Anything else must be a whole number of millilitres within
+    that measure's approved inclusive range: a bool (which is an int subclass), a float, a
+    string, an array or an out-of-range value is refused, never clamped or rounded.
+    """
+    if name not in MEASURE_FIELDS:
+        raise ValueError(f"unknown measure {name!r}")
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise InvalidMeasure(f"{name} must be a whole number of millilitres or None")
+    minimum, maximum = MEASURE_RANGES[name]
+    if not minimum <= raw <= maximum:
+        raise InvalidMeasure(f"{name} must be within {minimum} and {maximum}")
+    return raw
+
+
+def normalize_measures(raw: Any) -> dict[str, Optional[int]]:
+    """A mapping of measure names to values, every one validated before any is used.
+
+    An unknown name is refused here too (the API refuses it as a malformed request
+    before this point); leaving a name out means "keep that setting as it is".
+    """
+    if not isinstance(raw, dict):
+        raise InvalidMeasure("measures must be an object")
+    unknown = set(raw) - set(MEASURE_FIELDS)
+    if unknown:
+        raise InvalidMeasure(f"unknown measure {sorted(unknown)[0]!r}")
+    return {name: normalize_measure(name, value) for name, value in raw.items()}
+
+
 def get_profile(session: OrmSession, user_id: UUID) -> ProfileView:
     """The profile of `user_id`, read through the session's user id and nothing else."""
-    user = session.get(User, user_id)
-    if user is None:
-        raise ProfileNotFound(str(user_id))
-    return _view(session, user)
+    return _view(session, user_id)
 
 
 def update_profile(
@@ -151,19 +239,26 @@ def update_profile(
     *,
     display_name: Any = _UNSET,
     text_size: Any = _UNSET,
+    measures: Any = _UNSET,
     now: datetime,
 ) -> ProfileView:
     """Change the fields that are given (at least one), and return the profile.
 
     Ownership is the UPDATE's own WHERE: there is no separate read-check-write step. A
-    field that is not named keeps its value. Raises InvalidDisplayName / InvalidTextSize
-    before writing, and ProfileNotFound when the user does not exist.
+    field that is not named keeps its value; a measure named with None removes its
+    override. Every value is validated before the one UPDATE (InvalidMeasure included), so
+    a change with one bad field writes nothing at all. Raises InvalidDisplayName /
+    InvalidTextSize / InvalidMeasure before writing, and ProfileNotFound when the user
+    does not exist.
     """
     values: dict[str, Any] = {}
     if display_name is not _UNSET:
         values["display_name"] = normalize_display_name(display_name)
     if text_size is not _UNSET:
         values["text_size"] = normalize_text_size(text_size)
+    if measures is not _UNSET:
+        for name, value in normalize_measures(measures).items():
+            values[MEASURE_COLUMNS[name]] = value
     if not values:
         raise ValueError("an update must name at least one field")
     values["updated_at"] = now
@@ -172,19 +267,37 @@ def update_profile(
     )
     if result.rowcount != 1:
         raise ProfileNotFound(str(user_id))
-    # The row may already be in this session's identity map (the profile's caller may
-    # have read it): read it again from the database so the answer is the new values.
-    user = session.get(User, user_id, populate_existing=True)
-    if user is None:  # (not reachable after a one-row UPDATE; kept for the type checker)
+    return _view(session, user_id)
+
+
+def _view(session: OrmSession, user_id: UUID) -> ProfileView:
+    """The profile as one small SELECT by user id.
+
+    The four settings columns are selected explicitly (text_size and the three measure
+    columns are deferred on the model), so this is one read and does not depend on an ORM
+    object having been loaded first.
+    """
+    row = session.execute(
+        sa.select(
+            User.display_name,
+            User.text_size,
+            User.measure_glass_ml,
+            User.measure_teaspoon_ml,
+            User.measure_tablespoon_ml,
+        ).where(User.id == user_id)
+    ).first()
+    if row is None:
         raise ProfileNotFound(str(user_id))
-    return _view(session, user)
-
-
-def _view(session: OrmSession, user: User) -> ProfileView:
+    display_name, text_size, glass_ml, teaspoon_ml, tablespoon_ml = row
     return ProfileView(
-        display_name=user.display_name,
-        text_size=user.text_size or TextSize.NORMAL.value,
-        login_methods=_login_methods(session, user.id),
+        display_name=display_name,
+        text_size=text_size or TextSize.NORMAL.value,
+        measures=MeasureOverrides(
+            glass_ml=glass_ml,
+            teaspoon_ml=teaspoon_ml,
+            tablespoon_ml=tablespoon_ml,
+        ),
+        login_methods=_login_methods(session, user_id),
     )
 
 

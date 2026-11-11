@@ -16,10 +16,14 @@ from house_helper.persistence.profile import (
     LOGIN_ACTIVE,
     LOGIN_REVOKED,
     InvalidDisplayName,
+    InvalidMeasure,
     InvalidTextSize,
+    MeasureOverrides,
     ProfileNotFound,
     get_profile,
     normalize_display_name,
+    normalize_measure,
+    normalize_measures,
     normalize_text_size,
     update_profile,
 )
@@ -90,6 +94,54 @@ def test_any_other_text_size_is_refused(value):
         normalize_text_size(value)
 
 
+# --- the household measures (KH-F01-B1) ----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "minimum", "maximum"),
+    [
+        ("glass_ml", 50, 1000),
+        ("teaspoon_ml", 1, 20),
+        ("tablespoon_ml", 5, 50),
+    ],
+)
+def test_a_measure_is_a_whole_millilitre_inside_its_own_range(name, minimum, maximum):
+    assert normalize_measure(name, minimum) == minimum
+    assert normalize_measure(name, maximum) == maximum
+    assert normalize_measure(name, None) is None
+    for value in (minimum - 1, maximum + 1, 0, -1, 1.5, True, False, "240", [240], {"ml": 240}):
+        with pytest.raises(InvalidMeasure):
+            normalize_measure(name, value)
+
+
+def test_the_three_measure_ranges_and_defaults_are_the_core_product_constants():
+    from house_helper.core import measures as core
+
+    assert profile.MEASURE_RANGES == {
+        "glass_ml": (int(core.GLASS_ML_MIN), int(core.GLASS_ML_MAX)),
+        "teaspoon_ml": (int(core.TEASPOON_ML_MIN), int(core.TEASPOON_ML_MAX)),
+        "tablespoon_ml": (int(core.TABLESPOON_ML_MIN), int(core.TABLESPOON_ML_MAX)),
+    }
+    assert profile.MEASURE_DEFAULTS == {
+        "glass_ml": int(core.SYSTEM_GLASS_ML),
+        "teaspoon_ml": int(core.SYSTEM_TEASPOON_ML),
+        "tablespoon_ml": int(core.SYSTEM_TABLESPOON_ML),
+    }
+
+
+def test_a_measures_change_validates_every_value_before_any_is_used():
+    assert normalize_measures({"glass_ml": 240, "teaspoon_ml": None}) == {
+        "glass_ml": 240,
+        "teaspoon_ml": None,
+    }
+    with pytest.raises(InvalidMeasure):
+        normalize_measures({"glass_ml": 240, "teaspoon_ml": 0})
+    with pytest.raises(InvalidMeasure):
+        normalize_measures({"cup_ml": 240})
+    with pytest.raises(InvalidMeasure):
+        normalize_measures([])
+
+
 # --- reading and writing -------------------------------------------------------------
 
 
@@ -99,6 +151,64 @@ def test_a_new_user_has_the_normal_text_size(session):
     assert session.refresh(user) is None
     assert user.text_size == TextSize.NORMAL.value
     assert user.display_name == "Елена"
+
+
+def test_a_new_user_has_no_measure_overrides(session):
+    user = new_user(session, display_name="Елена")
+
+    profile = get_profile(session, user.id)
+
+    assert profile.measures == MeasureOverrides(
+        glass_ml=None, teaspoon_ml=None, tablespoon_ml=None
+    )
+    assert session.get(User, user.id).measure_glass_ml is None
+    assert session.get(User, user.id).measure_teaspoon_ml is None
+    assert session.get(User, user.id).measure_tablespoon_ml is None
+
+
+def test_the_measures_are_written_independently_and_none_removes_one(session):
+    elena = new_user(session, display_name="Елена")
+
+    changed = update_profile(
+        session,
+        elena.id,
+        measures={"glass_ml": 240, "teaspoon_ml": 6, "tablespoon_ml": 20},
+        now=NOW,
+    )
+    restored = update_profile(session, elena.id, measures={"teaspoon_ml": None}, now=NOW)
+
+    assert changed.measures == MeasureOverrides(240, 6, 20)
+    assert restored.measures == MeasureOverrides(240, None, 20)
+    assert get_profile(session, elena.id) == restored
+    assert session.get(User, elena.id).measure_glass_ml == 240
+    assert session.get(User, elena.id).measure_teaspoon_ml is None
+    assert session.get(User, elena.id).measure_tablespoon_ml == 20
+
+
+def test_an_invalid_measure_is_refused_before_the_write_and_touches_nothing(session):
+    elena = new_user(session, display_name="Елена")
+
+    with pytest.raises(InvalidMeasure):
+        update_profile(
+            session,
+            elena.id,
+            measures={"glass_ml": 240, "teaspoon_ml": 0},
+            now=NOW,
+        )
+
+    assert get_profile(session, elena.id).measures == MeasureOverrides(None, None, None)
+    assert session.get(User, elena.id).measure_glass_ml is None
+
+
+def test_the_database_refuses_a_measure_outside_its_range(session):
+    elena = new_user(session, display_name="Елена")
+
+    with pytest.raises(sa.exc.IntegrityError, match="ck_users_measure_glass_ml_range"):
+        with session.begin_nested():
+            session.execute(
+                sa.text("UPDATE users SET measure_glass_ml = 1001 WHERE id = :id"),
+                {"id": elena.id.hex},
+            )
 
 
 def test_the_profile_is_the_users_own_name_size_and_sign_in_methods(session):

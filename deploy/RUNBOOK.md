@@ -624,6 +624,41 @@ It changes no existing table, row, index or constraint and revokes nothing. Ther
 
 **Not shown yet.** The migration up, down and up again on SQLite, the schema fingerprint against the models, the offline PostgreSQL rendering and a populated `0010 -> 0011 -> 0010 -> 0011` cycle on a disposable PostgreSQL 16.15 are in the tests (the real-PostgreSQL tests are opt-in and CI does not run them). The image, `deploy/upgrade.sh` against a real `0010` database, the real Telegram menu and list rendering, and Codex/CI are not.
 
+### 9.3 The next upgrade: `0013_user_text_size` -> `0014_user_measure_overrides` (personal kitchen measures) **[OWNER]**
+
+**State (2026-11-11).** This revision is implemented and tested **in the working tree only** (KH-F01-B1); it is not
+committed, pushed, released or deployed. The procedure below is written so it is ready when the owner authorises the
+release; nothing in it has been run against a production database. The migration has run up, down and up again on
+disposable SQLite files, and its PostgreSQL form has been rendered offline only.
+
+**What the migration does.** It adds three nullable integer columns to `users`: `measure_glass_ml` (50..1000),
+`measure_teaspoon_ml` (1..20) and `measure_tablespoon_ml` (5..50), each with its own named CHECK. A NULL means "the
+system default applies" (250/5/15 mL). Nothing is seeded, backfilled or rewritten: every existing account keeps no
+personal value, and every other table is untouched. On SQLite each column is one `ALTER TABLE ... ADD COLUMN`; the
+`users` table is never rebuilt, so no ownership foreign key is cascaded.
+
+**The procedure is the one in section 9, unchanged.** Use `deploy/upgrade.sh` with the tag of the running container,
+a dry run first. The schema guard requires the exact repository head, so the image carrying `0014` and the migration
+move together: an older image refuses a `0014` database, and the new image refuses a `0013` one until it is migrated.
+Stop the cleanup timer before the upgrade and start it afterwards with the new tag (14.4). The migration is small, but
+a verified backup (section 9 step 2, section 10) is still the condition for running it; if the owner wants more
+assurance, rehearse on a restored copy of a backup in a disposable volume first (section 10).
+
+**After it** (by hand): `check-schema` names `0014_user_measure_overrides`; `GET /healthz` is 200; the profile page
+still shows both accounts' names, text sizes and sign-in methods, and its "My kitchen measures" rows show 250, 5 and
+15 mL marked as the defaults; saving one value (for example 240 mL for the glass) shows it after a reload and on a
+second sign-in; clearing the field restores the default. Do not change a real person's settings merely to test the
+screen; the refusal paths and the per-account isolation are covered by the tests.
+
+**Rollback.** As section 11 says for every migration: restore the pre-upgrade backup with the old image. The three
+columns hold only personal capacities entered after the upgrade, and `alembic downgrade 0013_user_text_size` drops
+them while every other column and row of every table stays. Neither is a casual step.
+
+**Not shown yet.** The image built with `0014`, `deploy/upgrade.sh` against a real `0013` database, real PostgreSQL,
+and the owner's smoke check are not done. The SQLite cycle, the schema fingerprint against the models, the named
+range CHECKs, the offline PostgreSQL rendering and the populated upgrade/downgrade tests are in the test suite; the
+real-PostgreSQL tests are opt-in and CI does not run them.
+
 ## 10. Backup and restore
 
 **What a backup is.** The database runs in WAL mode: committed data lives in the file *and* its

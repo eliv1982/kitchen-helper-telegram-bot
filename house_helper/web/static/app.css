@@ -999,6 +999,72 @@ textarea[aria-invalid="true"] {
   margin: 0.2rem 0;
 }
 
+/* KH-F01-B1: an ingredient keeps its original amount, with the person's own measure under
+   it. "Точно" is an exact rational; the approximation marker is separate wording. */
+.recipe-ingredient-measured {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.measure-caption {
+  margin: 0 0 0.25rem;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.measure-hint {
+  color: var(--green-dark);
+  font-size: 0.95rem;
+}
+
+/* The source-glass question: asked only when an amount contains an undeclared glass. */
+.measure-clarify {
+  min-width: 0;
+  margin: 0.9rem 0 0;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--pale);
+}
+
+.measure-clarify legend {
+  padding: 0 0.25rem;
+  font-weight: 600;
+}
+
+.measure-other {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.measure-other input[type="text"] {
+  width: 7rem;
+  max-width: 100%;
+  min-height: 2.75rem;
+  padding: 0.55rem 0.75rem;
+  border: 2px solid var(--field-edge);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+}
+
+.measure-other input[type="text"][aria-invalid="true"] {
+  border-color: var(--red);
+}
+
+/* The draft note belongs under its field, not beside the controls. */
+.measure-other .hint {
+  flex-basis: 100%;
+}
+
+.measure-clarify .hint {
+  margin: 0.5rem 0 0;
+}
+
 .recipe-notes .msg-text {
   padding: 0.6rem 0.8rem;
   border-left: 4px solid var(--green);
@@ -1457,6 +1523,51 @@ textarea[aria-invalid="true"] {
   width: 1.25rem;
   height: 1.25rem;
   accent-color: var(--green);
+}
+
+/* KH-F01-B1: the three personal household capacities. The field and its way back to the
+   default share a row while they fit and wrap onto two lines on a narrow screen, so
+   nothing is squeezed and no word is broken. */
+.profile-measure-field {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.5rem;
+  margin: 0 0 1.1rem;
+}
+
+.profile-measure-field .profile-field {
+  flex: 1 1 12rem;
+  margin: 0;
+}
+
+.profile-measure-reset {
+  flex: none;
+}
+
+.profile-measure-values .profile-value dd {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.15rem 0.6rem;
+}
+
+.profile-measure-state {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.85rem;
+  font-weight: 400;
+}
+
+.profile-measure-state-default {
+  background: var(--pale);
+  color: var(--muted);
+}
+
+.profile-measure-state-personal {
+  background: var(--green-pale);
+  color: var(--green-dark);
 }
 
 .profile-actions {

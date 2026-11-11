@@ -115,6 +115,18 @@
   var MAX_EDIT_NOTES = 2000; // the server's MAX_FAVORITE_NOTES_LENGTH
   var MAX_PROFILE_NAME = 200; // the server's users.display_name width, in code points
   var TEXT_SIZE_VALUES = { normal: true, large: true }; // the server's TextSize values
+  // The approved personal household-measure ranges and system defaults (D18/D19): the
+  // same numbers core.measures holds, repeated in persistence.profile. The profile read is
+  // checked against them and the form validates against them before any PATCH.
+  var MEASURE_LIMITS = {
+    glass_ml: { min: 50, max: 1000, def: 250 },
+    teaspoon_ml: { min: 1, max: 20, def: 5 },
+    tablespoon_ml: { min: 5, max: 50, def: 15 },
+  };
+  var MEASURE_KEYS = ["glass_ml", "teaspoon_ml", "tablespoon_ml"];
+  // Denominators whose exact decimal expansion ends within two places, with the factor
+  // that turns the fraction into hundredths (4/5 -> 80 -> "0,8").
+  var MEASURE_HUNDREDTHS_FACTOR = { 5: 20, 10: 10, 20: 5, 25: 4, 50: 2, 100: 1 };
   var MAX_SHOPPING_ITEMS = 200; // the server's shopping_lists.ITEMS_LIMIT
   var MAX_SHOPPING_NAME = 200; // the server's shopping_lists.MAX_NAME_LENGTH
   var MAX_SHOPPING_AMOUNT = 100; // the server's shopping_lists.MAX_AMOUNT_LENGTH
@@ -378,6 +390,44 @@
     ingredients: "Ингредиенты",
     steps: "Приготовление",
     notes: "Мои заметки",
+    // KH-F01-B1: the person's own household measures under the ingredient list.
+    measuresTitle: "В ваших мерах",
+    measureExact: "Точно: {value}",
+    measureApprox: "≈ {value}",
+    measureUnitGlass: {
+      one: "ваш стакан",
+      few: "ваших стакана",
+      many: "ваших стаканов",
+      fraction: "вашего стакана",
+    },
+    measureUnitTeaspoon: {
+      one: "ваша чайная ложка",
+      few: "ваших чайных ложки",
+      many: "ваших чайных ложек",
+      fraction: "вашей чайной ложки",
+    },
+    measureUnitTablespoon: {
+      one: "ваша столовая ложка",
+      few: "ваших столовых ложки",
+      many: "ваших столовых ложек",
+      fraction: "вашей столовой ложки",
+    },
+    sourceGlassQuestion: "Какой стакан имеется в виду в рецепте?",
+    sourceGlass200: "200 мл",
+    sourceGlass250: "250 мл",
+    sourceGlassOther: "Другой объем",
+    sourceGlassOtherLabel: "Объем, мл",
+    sourceGlassApply: "Применить",
+    sourceGlassInvalid: "Укажите целое число от 50 до 1000 мл.",
+    sourceGlassNote: "Выбор действует, пока открыт рецепт, и не сохраняется в профиле.",
+    // A typed capacity is only a draft until its own read succeeds: it is never drawn as
+    // the confirmed choice, and this says so beside the field.
+    sourceGlassDraftHint: "Черновик: объём применится после нажатия «Применить».",
+    sourceGlassConfirmed: "Выбрано: {value} мл",
+    sourceGlassPending: "Применяем {value} мл…",
+    sourceGlassFailed: "Не удалось применить объём. Попробуйте ещё раз.",
+    measuresRefreshPending: "Обновляем пересчёт в ваших мерах…",
+    measuresRefreshFailed: "Рецепт сохранён, но пересчёт в ваших мерах не удалось обновить. Попробуйте ещё раз.",
     editAction: "Редактировать",
     editTitleLabel: "Название",
     editServingsLabel: "Порции",
@@ -432,6 +482,16 @@
     profileTextSizeLabel: "Размер текста",
     profileSizeNormal: "Обычный",
     profileSizeLarge: "Крупный (120%)",
+    profileMeasuresTitle: "Мои кухонные меры",
+    profileMeasureGlass: "Мой стакан",
+    profileMeasureTeaspoon: "Моя чайная ложка",
+    profileMeasureTablespoon: "Моя столовая ложка",
+    profileMeasureDefault: "по умолчанию",
+    profileMeasurePersonal: "ваш размер",
+    profileMeasureHint: "От {min} до {max} мл. Пустое поле — по умолчанию ({def} мл).",
+    profileMeasureReset: "По умолчанию",
+    profileMeasureResetLabel: "Вернуть значение по умолчанию: {name}",
+    profileMeasureInvalid: "Укажите целое число от {min} до {max} мл или оставьте поле пустым.",
     profileEdit: "Изменить",
     profileSave: "Сохранить",
     profileSaving: "Сохраняем…",
@@ -488,6 +548,9 @@
     invalid_display_name:
       "Имя должно быть непустым, не длиннее 200 символов и без невидимых или управляющих символов.",
     invalid_text_size: "Не удалось сохранить размер текста. Выберите «Обычный» или «Крупный».",
+    invalid_measure:
+      "Укажите объем целым числом в миллилитрах: стакан — от 50 до 1000, " +
+      "чайная ложка — от 1 до 20, столовая ложка — от 5 до 50.",
     not_authenticated: "Войдите в аккаунт, чтобы продолжить.",
     conversation_not_found: "Разговор не найден.",
     message_not_found: "Этот ответ не найден: возможно, он уже удален.",
@@ -680,6 +743,150 @@
       return { ok: false, reason: "characters", message: TEXT.profileNameBadChars, count: count };
     }
     return { ok: true, text: text, count: count };
+  }
+
+  // --- household measures: the form's values and how a fraction is called -----------------------
+
+  function greatestCommonDivisor(left, right) {
+    var a = Math.abs(left);
+    var b = Math.abs(right);
+    while (b) {
+      var next = a % b;
+      a = b;
+      b = next;
+    }
+    return a;
+  }
+
+  function reducedFraction(numerator, denominator) {
+    if (!Number.isSafeInteger(numerator) || !Number.isSafeInteger(denominator)) {
+      return null;
+    }
+    if (numerator < 0 || denominator < 1) {
+      return null;
+    }
+    var divisor = greatestCommonDivisor(numerator, denominator) || 1;
+    return { numerator: numerator / divisor, denominator: denominator / divisor };
+  }
+
+  // The common kitchen fractions, as the glyphs Russian recipe text uses. A denominator
+  // that is not here and terminates within two decimal places is written as a decimal
+  // with a comma (4/5 -> "0,8"); anything else stays a plain "num/den" fraction, so an
+  // exact value is never silently replaced by a rounded decimal.
+  var VULGAR_FRACTIONS = {
+    2: { 1: "½" },
+    3: { 1: "⅓", 2: "⅔" },
+    4: { 1: "¼", 2: "½", 3: "¾" },
+    6: { 1: "⅙", 5: "⅚" },
+    8: { 1: "⅛", 3: "⅜", 5: "⅝", 7: "⅞" },
+  };
+
+  function formatFraction(numerator, denominator) {
+    var value = reducedFraction(numerator, denominator);
+    if (value === null) {
+      return null;
+    }
+    var n = value.numerator;
+    var d = value.denominator;
+    if (d === 1) {
+      return String(n);
+    }
+    var whole = Math.floor(n / d);
+    var rest = n % d;
+    var vulgar = VULGAR_FRACTIONS[d] && VULGAR_FRACTIONS[d][rest];
+    if (vulgar) {
+      return (whole ? String(whole) : "") + vulgar;
+    }
+    var factor = MEASURE_HUNDREDTHS_FACTOR[d];
+    if (factor) {
+      var hundredths = n * factor;
+      var integer = Math.floor(hundredths / 100);
+      var tail = hundredths % 100;
+      if (tail === 0) {
+        return String(integer);
+      }
+      var digits = (tail < 10 ? "0" : "") + String(tail);
+      return integer + "," + digits.replace(/0+$/, "");
+    }
+    return n + "/" + d;
+  }
+
+  // Which Russian form of the unit a count takes: 1 -> "ваш стакан", 2..4 -> "ваших
+  // стакана", 0 and 5+ -> "ваших стаканов" (11..14 included), and a fraction always takes
+  // the genitive singular ("0,8 вашего стакана").
+  function measureGrammar(numerator, denominator) {
+    var value = reducedFraction(numerator, denominator);
+    if (value === null) {
+      return null;
+    }
+    if (value.denominator !== 1) {
+      return "fraction";
+    }
+    var count = value.numerator;
+    var lastTwo = count % 100;
+    if (lastTwo >= 11 && lastTwo <= 14) {
+      return "many";
+    }
+    var last = count % 10;
+    if (last === 1) {
+      return "one";
+    }
+    if (last >= 2 && last <= 4) {
+      return "few";
+    }
+    return "many";
+  }
+
+  var MEASURE_UNIT_TEXT = {
+    glass: function () { return TEXT.measureUnitGlass; },
+    teaspoon: function () { return TEXT.measureUnitTeaspoon; },
+    tablespoon: function () { return TEXT.measureUnitTablespoon; },
+  };
+
+  function formatMeasure(numerator, denominator, unit) {
+    var amount = formatFraction(numerator, denominator);
+    var grammar = measureGrammar(numerator, denominator);
+    var forms = MEASURE_UNIT_TEXT[unit] ? MEASURE_UNIT_TEXT[unit]() : null;
+    if (amount === null || grammar === null || !forms) {
+      return null;
+    }
+    return amount + " " + forms[grammar];
+  }
+
+  // One measure as the form holds it: empty means "the system default" (null), anything
+  // else must be a whole number of millilitres within the approved range. Nothing is
+  // clamped or rounded; the server checks the same rule again and is the authority.
+  function prepareMeasure(name, raw) {
+    var limit = MEASURE_LIMITS[name];
+    if (!limit) {
+      return { ok: false, message: TEXT.profileMeasureInvalid };
+    }
+    var message = fill(TEXT.profileMeasureInvalid, { min: limit.min, max: limit.max });
+    var text = trimLikeServer(typeof raw === "string" ? raw : "");
+    if (text === "") {
+      return { ok: true, value: null };
+    }
+    if (!/^[0-9]+$/.test(text)) {
+      return { ok: false, message: message };
+    }
+    var number = Number(text);
+    if (!Number.isSafeInteger(number) || number < limit.min || number > limit.max) {
+      return { ok: false, message: message };
+    }
+    return { ok: true, value: number };
+  }
+
+  function prepareMeasures(values) {
+    var prepared = {};
+    for (var index = 0; index < MEASURE_KEYS.length; index++) {
+      var name = MEASURE_KEYS[index];
+      var result = prepareMeasure(name, values ? values[name] : "");
+      if (!result.ok) {
+        return { ok: false, field: name, message: result.message };
+      }
+      prepared[name] = result.value;
+    }
+    return { ok: true, values: prepared };
   }
 
   // --- idempotency keys -----------------------------------------------------------------------
@@ -1013,6 +1220,62 @@
     };
   }
 
+  // One of the three measure settings as the profile read carries it: the stored
+  // override (or null), its effective value, and the approved bounds. The bounds and the
+  // default must be the ones this page knows, and the effective value must follow from
+  // the override; anything else is an answer this page cannot use.
+  function normalizeMeasureSetting(item, name) {
+    var limit = MEASURE_LIMITS[name];
+    if (!isObject(item)) {
+      return null;
+    }
+    var override = item.override;
+    if (override !== null && !Number.isSafeInteger(override)) {
+      return null;
+    }
+    if (
+      !Number.isSafeInteger(item.effective) ||
+      !Number.isSafeInteger(item.default) ||
+      !Number.isSafeInteger(item.min) ||
+      !Number.isSafeInteger(item.max)
+    ) {
+      return null;
+    }
+    if (item.default !== limit.def || item.min !== limit.min || item.max !== limit.max) {
+      return null;
+    }
+    if (override !== null && (override < limit.min || override > limit.max)) {
+      return null;
+    }
+    var effective = override === null ? item.default : override;
+    if (item.effective !== effective) {
+      return null;
+    }
+    return {
+      override: override,
+      effective: item.effective,
+      defaultMl: item.default,
+      min: item.min,
+      max: item.max,
+    };
+  }
+
+  function normalizeProfileMeasures(value) {
+    if (!isObject(value)) {
+      return null;
+    }
+    var measures = {};
+    for (var index = 0; index < MEASURE_KEYS.length; index++) {
+      var name = MEASURE_KEYS[index];
+      var setting = normalizeMeasureSetting(value[name], name);
+      if (setting === null) {
+        return null;
+      }
+      measures[name] = setting;
+    }
+    return measures;
+  }
+
   function normalizeProfile(body) {
     if (!isObject(body)) {
       return null;
@@ -1022,6 +1285,10 @@
       return null;
     }
     if (!Object.prototype.hasOwnProperty.call(TEXT_SIZE_VALUES, body.text_size)) {
+      return null;
+    }
+    var measures = normalizeProfileMeasures(body.measures);
+    if (measures === null) {
       return null;
     }
     if (!Array.isArray(body.login_methods)) {
@@ -1035,7 +1302,12 @@
       }
       methods.push(method);
     }
-    return { displayName: name, textSize: body.text_size, loginMethods: methods };
+    return {
+      displayName: name,
+      textSize: body.text_size,
+      measures: measures,
+      loginMethods: methods,
+    };
   }
 
   // --- favorites: what the server says about the recipes a person kept ---------------------------------
@@ -1128,6 +1400,160 @@
     return items;
   }
 
+  // --- the favorite's household-measure block (KH-F01-B1) --------------------------------------
+
+  var CONVERSION_STATUSES = {
+    exact: true,
+    nominal_household: true,
+    clarification_required: true,
+    unsupported: true,
+    ambiguous: true,
+    unresolved: true,
+  };
+  var CONVERSION_TARGET_UNITS = { glass: true, teaspoon: true, tablespoon: true };
+  var CONVERSION_PRESENTATIONS = { rounded: true, exact: true, none: true };
+  // Only a genuinely converted amount may be drawn as a number: every other status says
+  // why the amount could not be converted, and a numeric presentation beside one of them
+  // contradicts the status. A block that does so is not used at all (nothing is repaired).
+  var CONVERSION_SUCCEEDED = { exact: true, nominal_household: true };
+
+  // An exact rational as the server writes it: two integers, never a float. Anything
+  // outside the safe-integer range is refused rather than rounded by the browser.
+  function normalizeRational(value) {
+    if (!isObject(value)) {
+      return null;
+    }
+    if (!Number.isSafeInteger(value.numerator) || !Number.isSafeInteger(value.denominator)) {
+      return null;
+    }
+    if (value.numerator < 0 || value.denominator < 1) {
+      return null;
+    }
+    return { numerator: value.numerator, denominator: value.denominator };
+  }
+
+  function normalizeIngredientConversion(item, ingredientCount) {
+    if (!isObject(item) || !isCount(item.position) || item.position >= ingredientCount) {
+      return null;
+    }
+    if (typeof item.source !== "string" || item.source === "") {
+      return null;
+    }
+    if (item.source_kind !== "household" && item.source_kind !== "metric_volume") {
+      return null;
+    }
+    if (CONVERSION_TARGET_UNITS[item.target_unit] !== true) {
+      return null;
+    }
+    if (typeof item.status !== "string" || CONVERSION_STATUSES[item.status] !== true) {
+      return null;
+    }
+    if (typeof item.reason !== "string" || item.reason === "") {
+      return null;
+    }
+    if (typeof item.identical !== "boolean") {
+      return null;
+    }
+    if (CONVERSION_PRESENTATIONS[item.presentation] !== true) {
+      return null;
+    }
+    var exact = null;
+    if (item.exact !== null && item.exact !== undefined) {
+      exact = normalizeRational(item.exact);
+      if (exact === null) {
+        return null;
+      }
+    }
+    var rounded = null;
+    if (item.rounded !== null && item.rounded !== undefined) {
+      var amount = normalizeRational(item.rounded);
+      var error = normalizeRational(item.rounded.relative_error);
+      if (amount === null || error === null) {
+        return null;
+      }
+      rounded = {
+        numerator: amount.numerator,
+        denominator: amount.denominator,
+        relativeError: error,
+      };
+    }
+    if (item.presentation === "rounded" && rounded === null) {
+      return null;
+    }
+    if (item.presentation === "exact" && exact === null) {
+      return null;
+    }
+    if (CONVERSION_SUCCEEDED[item.status] !== true) {
+      // A failed, unsupported, ambiguous or clarification-required amount carries no
+      // converted value: an exact or rounded presentation (or a value to fall back on)
+      // beside it is a contradiction, and no part of it may reach the page.
+      if (item.presentation !== "none" || item.identical !== false) {
+        return null;
+      }
+      if (exact !== null || rounded !== null) {
+        return null;
+      }
+    }
+    return {
+      position: item.position,
+      source: item.source,
+      sourceKind: item.source_kind,
+      targetUnit: item.target_unit,
+      status: item.status,
+      reason: item.reason,
+      exact: exact,
+      rounded: rounded,
+      identical: item.identical,
+      presentation: item.presentation,
+    };
+  }
+
+  // The additive measure block. A block this page cannot use is not an error of the
+  // recipe: normalizeFavoriteDetail ignores it and the card is drawn as it always was.
+  function normalizeMeasuresBlock(value, ingredientCount) {
+    if (!isObject(value) || !isObject(value.target)) {
+      return null;
+    }
+    var target = {};
+    for (var index = 0; index < MEASURE_KEYS.length; index++) {
+      var name = MEASURE_KEYS[index];
+      if (!isCount(value.target[name])) {
+        return null;
+      }
+      target[name] = value.target[name];
+    }
+    var sourceGlass = value.source_glass_ml;
+    if (
+      sourceGlass !== null &&
+      sourceGlass !== undefined &&
+      (!Number.isSafeInteger(sourceGlass) || sourceGlass < 50 || sourceGlass > 1000)
+    ) {
+      return null;
+    }
+    if (typeof value.source_glass_required !== "boolean") {
+      return null;
+    }
+    if (!Array.isArray(value.ingredients)) {
+      return null;
+    }
+    var seen = {};
+    var conversions = [];
+    for (var position = 0; position < value.ingredients.length; position++) {
+      var conversion = normalizeIngredientConversion(value.ingredients[position], ingredientCount);
+      if (conversion === null || seen[conversion.position] === true) {
+        return null;
+      }
+      seen[conversion.position] = true;
+      conversions.push(conversion);
+    }
+    return {
+      target: target,
+      sourceGlassMl: sourceGlass === undefined ? null : sourceGlass,
+      sourceGlassRequired: value.source_glass_required,
+      ingredients: conversions,
+    };
+  }
+
   // The recipe itself: the summary and the text, for the very favorite that was asked for.
   // A structured favorite also carries its fields: the card draws those, not the text.
   function normalizeFavoriteDetail(body, id) {
@@ -1152,10 +1578,13 @@
       item.servings = servings;
       item.ingredients = ingredients;
       item.steps = steps;
+      // Additive and optional: an older or unusual answer simply draws no hints.
+      item.measures = normalizeMeasuresBlock(body.measures, ingredients.length);
     } else {
       item.servings = "";
       item.ingredients = [];
       item.steps = [];
+      item.measures = null;
     }
     return item;
   }
@@ -1960,6 +2389,27 @@
         saving: {},
         removing: null,
         editor: null,
+        // The source-glass clarification for the recipe that is open, in whole millilitres,
+        // or null. It is page memory only: it is sent as the detail read's query parameter,
+        // is never written to the profile or the recipe, and starts again for another recipe.
+        // Only a choice the server has confirmed is kept here: its block and this value are
+        // updated together, so what is drawn always belongs to the same source capacity.
+        sourceGlass: null,
+        // The choice whose detail read is under way, or null. While it is here the card keeps
+        // the confirmed choice and its block, and the page says that the new one is pending.
+        sourceGlassPending: null,
+        // The last choice whose read failed: {value, text, correlationId} or null. The
+        // confirmed choice is untouched; the person may ask for the failed one again.
+        sourceGlassError: null,
+        // The custom part of the question as the person is working in it: the exact text
+        // of the field and whether that part is shown. Neither is a confirmation -- a
+        // typed capacity becomes `sourceGlass` only with the server's own answer for it --
+        // and neither is a setting: both are page memory for the open recipe only.
+        sourceGlassOtherOpen: false,
+        sourceGlassDraft: "",
+        // Counts the detail reads of the open card: only the newest answer may change what
+        // is drawn, so a slow answer can never overwrite a newer choice or a newer save.
+        detailReadSeq: 0,
       };
     }
 
@@ -2009,6 +2459,7 @@
         error: null,
         displayName: null,
         textSize: "normal",
+        measures: null,
         loginMethods: [],
         // False on the way in and after every fresh read: the pane opens on the saved values,
         // and only «Изменить» opens the form. A refused or failed save leaves it true.
@@ -2016,11 +2467,41 @@
         saving: false,
         notice: null,
         fieldError: null,
-        // What is in the form while it has not been saved: the exact text and the chosen
-        // size, kept here so a redraw (a failure, a retry) does not lose the person's work.
-        // A successful read or save replaces it with the server's values.
+        // A refusal of the household measures as a group: the form is drawn with it rather
+        // than with a name error, and the draft is kept.
+        measureError: null,
+        // What is in the form while it has not been saved: the exact text, the chosen size
+        // and the three measure fields, kept here so a redraw (a failure, a retry) does not
+        // lose the person's work. A successful read or save replaces it with the server's
+        // values.
         draft: null,
       };
+    }
+
+    // The form's strings for the saved measures: an empty field means the system default
+    // (no override). An explicit value equal to the default is still that person's choice
+    // and stays a non-empty field.
+    function measureDraftValues(measures) {
+      var values = {};
+      for (var index = 0; index < MEASURE_KEYS.length; index++) {
+        var name = MEASURE_KEYS[index];
+        var setting = measures ? measures[name] : null;
+        values[name] = setting && setting.override !== null ? String(setting.override) : "";
+      }
+      return values;
+    }
+
+    function draftMeasureValues(value) {
+      var values = measureDraftValues(state.profile.measures);
+      if (value && typeof value === "object") {
+        for (var index = 0; index < MEASURE_KEYS.length; index++) {
+          var name = MEASURE_KEYS[index];
+          if (typeof value[name] === "string") {
+            values[name] = value[name];
+          }
+        }
+      }
+      return values;
     }
 
     function freshState(screen) {
@@ -2508,6 +2989,7 @@
       state.profile.error = null;
       state.profile.notice = null;
       state.profile.fieldError = null;
+      state.profile.measureError = null;
       // A fresh read is the authority on the saved values, so the pane it draws shows them
       // rather than a form. A save under way is the exception: its own answer decides, and
       // the form (with what was typed) stays until it does.
@@ -2546,6 +3028,7 @@
       state.profile.loaded = true;
       state.profile.displayName = profile.displayName;
       state.profile.textSize = profile.textSize;
+      state.profile.measures = profile.measures;
       state.profile.loginMethods = profile.loginMethods;
     }
 
@@ -2564,14 +3047,20 @@
       state.profile.draft = null; // the form starts from the saved values
       state.profile.notice = null; // a previous save's message is about values already shown
       state.profile.fieldError = null;
+      state.profile.measureError = null;
       emit();
     }
 
-    // The name and the size as one save. The name is checked here (trimmed, non-empty, at
-    // most 200 code points, no category C character) so a refusal is immediate; the server
-    // checks it again and is the authority. The size is one of the two values the page drew.
+    // The name, the size and the three measures as one save. Every field the form holds is
+    // checked here first (the name as the server checks it; each measure as a whole number
+    // in its approved range, an empty field meaning the default), so a refusal is immediate;
+    // the server checks everything again and is the authority. Only the fields that changed
+    // are sent, and a form that changed nothing sends no PATCH at all.
     async function saveProfile(draft) {
-      if (state.screen !== "app" || state.gate || state.profile.saving) {
+      if (state.screen !== "app" || state.gate || !state.profile.loaded) {
+        return { ok: false, reason: "not_ready" };
+      }
+      if (state.profile.saving) {
         return { ok: false, reason: "busy" };
       }
       var size = draft && TEXT_SIZE_VALUES[draft.textSize] ? draft.textSize : state.profile.textSize;
@@ -2581,20 +3070,48 @@
       state.profile.draft = {
         displayName: draft && typeof draft.displayName === "string" ? draft.displayName : "",
         textSize: size,
+        measures: draftMeasureValues(draft ? draft.measures : null),
       };
       var prepared = prepareProfileName(draft ? draft.displayName : "");
       state.profile.notice = null;
       state.profile.fieldError = prepared.ok ? null : prepared.message;
       if (!prepared.ok) {
+        state.profile.measureError = null;
+        emit();
+        return { ok: false, reason: "invalid" };
+      }
+      var measures = prepareMeasures(draftMeasureValues(draft ? draft.measures : null));
+      state.profile.measureError = measures.ok ? null : measures.message;
+      if (!measures.ok) {
+        state.profile.fieldError = null;
         emit();
         return { ok: false, reason: "invalid" };
       }
       // A form that still holds the saved values has nothing to save: no PATCH is sent, no
       // message claims a save that did not happen, and the pane returns to those values.
       var savedName = state.profile.displayName === null ? "" : state.profile.displayName;
-      if (prepared.text === savedName && size === state.profile.textSize) {
+      var changed = {};
+      if (prepared.text !== savedName) {
+        changed.display_name = prepared.text;
+      }
+      if (size !== state.profile.textSize) {
+        changed.text_size = size;
+      }
+      var changedMeasures = {};
+      for (var index = 0; index < MEASURE_KEYS.length; index++) {
+        var name = MEASURE_KEYS[index];
+        var setting = state.profile.measures[name];
+        if (measures.values[name] !== setting.override) {
+          changedMeasures[name] = measures.values[name];
+        }
+      }
+      if (Object.keys(changedMeasures).length) {
+        changed.measures = changedMeasures;
+      }
+      if (!Object.keys(changed).length) {
         state.profile.draft = null;
         state.profile.editing = false;
+        state.profile.measureError = null;
         emit();
         return { ok: true, unchanged: true };
       }
@@ -2602,7 +3119,7 @@
       state.profile.saving = true;
       emit();
       var response = await http("PATCH", "/api/profile", {
-        json: { display_name: prepared.text, text_size: size },
+        json: changed,
         timeoutMs: READ_TIMEOUT_MS,
       });
       if (mine !== epoch) {
@@ -2624,6 +3141,7 @@
           state.profile.status = "ready";
           state.profile.error = null;
           state.profile.fieldError = null;
+          state.profile.measureError = null;
           state.profile.draft = null; // the server's values are what the pane shows now
           state.profile.editing = false; // the save is done: back to the values, read-only
           state.profile.notice = { kind: "ok", text: TEXT.profileSaved };
@@ -2635,9 +3153,15 @@
       if (response.kind === "http" && response.status >= 400 && response.status < 500 && error) {
         if (error.code === "invalid_display_name") {
           state.profile.fieldError = error.message || TEXT.profileNameBadChars;
+          state.profile.measureError = null;
+          state.profile.notice = null;
+        } else if (error.code === "invalid_measure") {
+          state.profile.fieldError = null;
+          state.profile.measureError = error.message || CODE_MESSAGES.invalid_measure;
           state.profile.notice = null;
         } else {
           state.profile.fieldError = null;
+          state.profile.measureError = null;
           state.profile.notice = {
             kind: "error",
             text: error.message || TEXT.profileSaveFailed,
@@ -2648,6 +3172,7 @@
         return { ok: false, reason: "rejected" };
       }
       state.profile.fieldError = null;
+      state.profile.measureError = null;
       state.profile.notice = {
         kind: "error",
         text: unavailableText(response, error),
@@ -2661,13 +3186,19 @@
       state.profile.draft = {
         displayName: draft && typeof draft.displayName === "string" ? draft.displayName : "",
         textSize: draft && TEXT_SIZE_VALUES[draft.textSize] ? draft.textSize : state.profile.textSize,
+        measures: draftMeasureValues(draft ? draft.measures : null),
       };
     }
 
     function clearProfileNotice() {
-      if (state.profile.notice !== null || state.profile.fieldError !== null) {
+      if (
+        state.profile.notice !== null ||
+        state.profile.fieldError !== null ||
+        state.profile.measureError !== null
+      ) {
         state.profile.notice = null;
         state.profile.fieldError = null;
+        state.profile.measureError = null;
         emit();
       }
     }
@@ -3495,6 +4026,9 @@
           ) {
             favorites.detail.status = "gone";
             favorites.detail.error = { text: TEXT.recipeGone, correlationId: null };
+            favorites.detail.measuresPending = false;
+            favorites.detail.measuresError = null;
+            favorites.sourceGlassPending = null;
           }
           emit();
           return true;
@@ -3511,6 +4045,18 @@
       return false;
     }
 
+    // A capacity that the two offered choices do not name: the one the custom field is for.
+    function isCustomGlass(value) {
+      return value !== null && value !== 200 && value !== 250;
+    }
+
+    // The source-glass clarification as a detail-read query parameter, or nothing. It is
+    // only a parameter: nothing is written anywhere.
+    function favoriteDetailQuery() {
+      var glass = state.favorites.sourceGlass;
+      return glass === null ? "" : "?source_glass_ml=" + glass;
+    }
+
     // The open card read again in the background, without putting it into "loading": a
     // recipe changed on another device shows its current fields when the person returns
     // to Favorites. A draft is never touched, and a failed refresh changes nothing (the
@@ -3522,29 +4068,45 @@
         id === null ||
         favorites.editor !== null ||
         favorites.detail === null ||
-        favorites.detail.status !== "ready"
+        favorites.detail.status !== "ready" ||
+        // A choice under way, or the settled read after a save, is the authority: a
+        // background read must not take its place (nor be taken for a newer answer).
+        favorites.sourceGlassPending !== null ||
+        favorites.detail.measuresPending === true
       ) {
         return false;
       }
       var mine = epoch;
-      var response = await http("GET", "/api/favorites/" + id, { timeoutMs: READ_TIMEOUT_MS });
+      var seq = ++favorites.detailReadSeq;
+      var query = favoriteDetailQuery();
+      var response = await http("GET", "/api/favorites/" + id + query, { timeoutMs: READ_TIMEOUT_MS });
       if (
         mine !== epoch ||
-        state.favorites.currentId !== id ||
-        state.favorites.editor !== null ||
-        state.favorites.detail === null ||
-        state.favorites.detail.id !== id
+        favorites !== state.favorites ||
+        favorites.detailReadSeq !== seq ||
+        favorites.currentId !== id ||
+        favorites.editor !== null ||
+        favorites.detail === null ||
+        favorites.detail.id !== id ||
+        favoriteDetailQuery() !== query // a newer source-glass choice is the authority
       ) {
         return false;
       }
-      var detail = state.favorites.detail;
+      var detail = favorites.detail;
       var found = classifyRead(response, "favorite_not_found");
       if (found.type === "ok") {
         var item = normalizeFavoriteDetail(found.body, id);
-        if (item !== null) {
+        if (
+          item !== null &&
+          (item.measures === null || item.measures.sourceGlassMl === favorites.sourceGlass)
+        ) {
           detail.status = "ready";
           detail.item = item;
           detail.error = null;
+          // This read used the confirmed choice: whatever a previous conversion read
+          // said about not having it is no longer true.
+          detail.measuresPending = false;
+          detail.measuresError = null;
           replaceFavoriteSummary(summaryOf(item));
           emit();
           return true;
@@ -3564,6 +4126,101 @@
         return false;
       }
       return false; // a failed background read is not an error shown over a readable card
+    }
+
+    // The open card's conversion read again with the choice it was drawn with -- after an
+    // edit, whose own answer carried no clarification, and when the person asks again
+    // after such a read failed. The saved fields stay on the card throughout; only the
+    // conversion section is pending, and a failure leaves a worded retry instead of a
+    // conversion that belongs to another context.
+    async function refreshFavoriteConversion(id, glass) {
+      var favorites = state.favorites;
+      var detail = favorites.detail;
+      if (
+        state.screen !== "app" ||
+        state.gate ||
+        favorites.currentId !== id ||
+        detail === null ||
+        detail.id !== id ||
+        detail.status !== "ready" ||
+        favorites.sourceGlass !== glass
+      ) {
+        return false;
+      }
+      var mine = epoch;
+      var seq = ++favorites.detailReadSeq;
+      detail.measuresPending = true;
+      detail.measuresError = null;
+      emit();
+      var response = await http(
+        "GET",
+        "/api/favorites/" + id + (glass === null ? "" : "?source_glass_ml=" + glass),
+        { timeoutMs: READ_TIMEOUT_MS }
+      );
+      if (
+        mine !== epoch ||
+        favorites !== state.favorites ||
+        favorites.detailReadSeq !== seq ||
+        favorites.currentId !== id ||
+        favorites.sourceGlass !== glass ||
+        // A draft opened meanwhile is based on the version on the card; a newer answer
+        // must not move that version under it (the editor is asked for again on cancel).
+        favorites.editor !== null
+      ) {
+        return false; // a newer choice, recipe, draft or save is the authority
+      }
+      detail = favorites.detail;
+      if (detail === null || detail.id !== id || detail.status !== "ready") {
+        return false;
+      }
+      var found = classifyRead(response, "favorite_not_found");
+      if (found.type === "ok") {
+        var item = normalizeFavoriteDetail(found.body, id);
+        if (
+          item !== null &&
+          (item.measures === null || item.measures.sourceGlassMl === glass)
+        ) {
+          detail.item = item;
+          detail.error = null;
+          detail.measuresPending = false;
+          detail.measuresError = null;
+          replaceFavoriteSummary(summaryOf(item));
+          emit();
+          return true;
+        }
+        found = { type: "unavailable", text: TEXT.unexpected, correlationId: null };
+      }
+      if (found.type === "auth") {
+        handleAuthLost();
+        return false;
+      }
+      if (found.type === "not_found") {
+        dropFavorite(id);
+        detail.status = "gone";
+        detail.item = null;
+        detail.error = { text: TEXT.recipeGone, correlationId: null };
+        detail.measuresPending = false;
+        emit();
+        return false;
+      }
+      detail.measuresPending = false;
+      detail.measuresError = {
+        text: TEXT.measuresRefreshFailed,
+        correlationId: found.correlationId || null,
+      };
+      emit();
+      return false;
+    }
+
+    // "Повторить" beside a failed conversion read: the saved card is kept and only its
+    // conversion is asked for again, with the choice that was confirmed for it.
+    function retryFavoriteConversion() {
+      var favorites = state.favorites;
+      var id = favorites.currentId;
+      if (id === null) {
+        return false;
+      }
+      return refreshFavoriteConversion(id, favorites.sourceGlass);
     }
 
     // Which part of the app is in front. The list of the favorites (and the open card, when
@@ -3600,21 +4257,50 @@
       }
       var mine = epoch;
       var favorites = state.favorites;
+      if (favorites.currentId !== id) {
+        // A clarification belongs to the recipe that is open; another recipe starts without
+        // one, and without a draft of one.
+        favorites.sourceGlass = null;
+        favorites.sourceGlassOtherOpen = false;
+        favorites.sourceGlassDraft = "";
+      }
+      // Opening a recipe (the same one again, too) abandons a choice whose read is out and
+      // the failure of one: only the newest read of this card may change it.
+      var seq = ++favorites.detailReadSeq;
+      favorites.sourceGlassPending = null;
+      favorites.sourceGlassError = null;
       state.section = "favorites";
       favorites.currentId = id;
       favorites.removing = null; // a question about another recipe is over
       favorites.editor = null; // (the page asked before discarding a draft; see app.js)
-      favorites.detail = { id: id, status: "loading", item: null, error: null };
+      favorites.detail = {
+        id: id,
+        status: "loading",
+        item: null,
+        error: null,
+        measuresPending: false,
+        measuresError: null,
+      };
       emit();
-      var response = await http("GET", "/api/favorites/" + id, { timeoutMs: READ_TIMEOUT_MS });
-      if (mine !== epoch || state.favorites.currentId !== id) {
-        return; // the session ended, or another recipe was asked for meanwhile
+      var response = await http("GET", "/api/favorites/" + id + favoriteDetailQuery(), { timeoutMs: READ_TIMEOUT_MS });
+      if (
+        mine !== epoch ||
+        favorites !== state.favorites ||
+        favorites.detailReadSeq !== seq ||
+        favorites.currentId !== id
+      ) {
+        return; // the session ended, or another recipe (or a newer read) was asked for meanwhile
       }
-      var detail = state.favorites.detail;
+      var detail = favorites.detail;
       var found = classifyRead(response, "favorite_not_found");
       if (found.type === "ok") {
         var item = normalizeFavoriteDetail(found.body, id);
         if (item !== null) {
+          // A block that names a clarification this read did not is not the card's: the
+          // recipe stays readable, without a conversion from another context.
+          if (item.measures !== null && item.measures.sourceGlassMl !== favorites.sourceGlass) {
+            item.measures = null;
+          }
           detail.status = "ready";
           detail.item = item;
           detail.error = null;
@@ -3642,6 +4328,192 @@
     function reloadRecipe() {
       var id = state.favorites.currentId;
       return id === null ? Promise.resolve() : openFavorite(id);
+    }
+
+    // The person's answer to "which glass does the recipe mean?": a whole number of
+    // millilitres in 50--1000, or null to drop the clarification. The open detail is read
+    // again with it. It is the current recipe's presentation only and is never stored.
+    //
+    // The choice is only confirmed with the block the server answers for it: until that
+    // answer arrives the card keeps the previous confirmed choice and its conversion, and
+    // a failure keeps them too, with a worded error and a way to ask again. Every read
+    // counts (detailReadSeq), so a slow answer for an older choice is discarded.
+    async function setSourceGlass(value) {
+      if (state.screen !== "app" || state.gate || state.favorites.currentId === null) {
+        return { ok: false, reason: "not_ready" };
+      }
+      // A draft fixes the version and the block it started from; a clarification read
+      // could bring a different version under it, so none is started while one is open
+      // (the chooser is not drawn then either).
+      if (state.favorites.editor !== null) {
+        return { ok: false, reason: "editing" };
+      }
+      var checked = null;
+      if (value !== null && value !== undefined) {
+        var text = trimLikeServer(typeof value === "string" ? value : String(value));
+        if (!/^[0-9]+$/.test(text)) {
+          return { ok: false, reason: "invalid" };
+        }
+        var number = Number(text);
+        if (!Number.isSafeInteger(number) || number < 50 || number > 1000) {
+          return { ok: false, reason: "invalid" };
+        }
+        checked = number;
+      }
+      var favorites = state.favorites;
+      var id = favorites.currentId;
+      var detail = favorites.detail;
+      if (detail === null || detail.id !== id) {
+        return { ok: false, reason: "not_ready" };
+      }
+      if (checked === favorites.sourceGlass && favorites.sourceGlassPending === null) {
+        // The confirmed choice was asked for again: nothing to read. A confirmed custom
+        // capacity is shown again in the field it belongs to.
+        var shown = false;
+        if (favorites.sourceGlassError !== null) {
+          favorites.sourceGlassError = null;
+          shown = true;
+        }
+        if (isCustomGlass(checked)) {
+          if (!favorites.sourceGlassOtherOpen) {
+            favorites.sourceGlassOtherOpen = true;
+            shown = true;
+          }
+          if (favorites.sourceGlassDraft !== String(checked)) {
+            favorites.sourceGlassDraft = String(checked);
+            shown = true;
+          }
+        }
+        if (shown) {
+          emit();
+        }
+        return { ok: true, reason: "unchanged" };
+      }
+      var mine = epoch;
+      var seq = ++favorites.detailReadSeq;
+      favorites.sourceGlassPending = checked;
+      favorites.sourceGlassError = null;
+      if (isCustomGlass(checked)) {
+        // The field names the capacity that is being applied (and holds it for a retry);
+        // the confirmed one, and the block drawn for it, stay as they were.
+        favorites.sourceGlassOtherOpen = true;
+        favorites.sourceGlassDraft = String(checked);
+      }
+      emit(); // (the confirmed choice and its conversion stay drawn while this is out)
+      var response = await http(
+        "GET",
+        "/api/favorites/" + id + (checked === null ? "" : "?source_glass_ml=" + checked),
+        { timeoutMs: READ_TIMEOUT_MS }
+      );
+      if (
+        mine !== epoch ||
+        favorites !== state.favorites ||
+        favorites.detailReadSeq !== seq ||
+        favorites.currentId !== id ||
+        // An editor opened while this was out: its draft owns the card's version now, and
+        // an answer read before that cannot replace it (the read is already invalidated
+        // by every read counter; this is the same rule said in the editor's terms).
+        favorites.editor !== null
+      ) {
+        return { ok: false, reason: "stale" }; // a newer choice, card or draft is the authority
+      }
+      detail = favorites.detail;
+      if (detail === null || detail.id !== id || detail.status !== "ready") {
+        return { ok: false, reason: "stale" };
+      }
+      var found = classifyRead(response, "favorite_not_found");
+      if (found.type === "auth") {
+        handleAuthLost();
+        return { ok: false, reason: "auth" };
+      }
+      if (found.type === "not_found") {
+        dropFavorite(id); // (removed in another window)
+        favorites.sourceGlassPending = null;
+        favorites.sourceGlass = null;
+        favorites.sourceGlassError = null;
+        detail.status = "gone";
+        detail.item = null;
+        detail.error = { text: TEXT.recipeGone, correlationId: null };
+        detail.measuresPending = false;
+        detail.measuresError = null;
+        emit();
+        return { ok: false, reason: "gone" };
+      }
+      if (found.type === "ok") {
+        var item = normalizeFavoriteDetail(found.body, id);
+        // The block must belong to the choice that was asked for: a value echoed for
+        // another capacity would put a new selection beside an old conversion.
+        if (
+          item !== null &&
+          (item.measures === null || item.measures.sourceGlassMl === checked)
+        ) {
+          // The confirmed choice and the block drawn for it change together. A custom
+          // capacity is the one its field holds when it is reopened; a standard one
+          // closes that field, whose text stays as the draft it was.
+          favorites.sourceGlassPending = null;
+          favorites.sourceGlass = checked;
+          favorites.sourceGlassError = null;
+          if (isCustomGlass(checked)) {
+            favorites.sourceGlassOtherOpen = true;
+            favorites.sourceGlassDraft = String(checked);
+          } else {
+            favorites.sourceGlassOtherOpen = false;
+          }
+          detail.status = "ready";
+          detail.item = item;
+          detail.error = null;
+          detail.measuresPending = false;
+          detail.measuresError = null;
+          emit();
+          return { ok: true };
+        }
+        found = { type: "unavailable", text: TEXT.unexpected, correlationId: null };
+      }
+      // The confirmed choice and its conversion are left exactly as they were; the
+      // person sees that this one failed and may ask for it again.
+      favorites.sourceGlassPending = null;
+      if (detail.measuresPending === true) {
+        detail.measuresPending = false;
+      }
+      favorites.sourceGlassError = {
+        value: checked,
+        text: TEXT.sourceGlassFailed,
+        correlationId: found.correlationId || null,
+      };
+      emit();
+      return { ok: false, reason: "failed" };
+    }
+
+    // Opening or closing the custom capacity of the question. It confirms nothing: the
+    // confirmed choice and its block stay exactly as they are, and the field inside is a
+    // draft until "Применить" has the server's answer for it. Returns the state the
+    // control is now in, so the page can put the keyboard where it belongs.
+    function toggleSourceGlassOther() {
+      var favorites = state.favorites;
+      if (
+        state.screen !== "app" ||
+        state.gate ||
+        favorites.currentId === null ||
+        favorites.editor !== null
+      ) {
+        return { open: favorites.sourceGlassOtherOpen === true, changed: false };
+      }
+      favorites.sourceGlassOtherOpen = !favorites.sourceGlassOtherOpen;
+      emit();
+      return { open: favorites.sourceGlassOtherOpen, changed: true };
+    }
+
+    // What is in the custom field while it has not been applied, exactly as it was typed.
+    // Like the editor's draft this redraws nothing (the person may be typing) and sends
+    // nothing: the field is the person's own work, not a choice.
+    function syncSourceGlassDraft(value) {
+      var favorites = state.favorites;
+      if (favorites.currentId === null || favorites.editor !== null) {
+        return false;
+      }
+      favorites.sourceGlassDraft =
+        typeof value === "string" ? value : value === null || value === undefined ? "" : String(value);
+      return true;
     }
 
     // Keep an answer of the assistant, or (with a position) one of its structured recipes.
@@ -3879,11 +4751,22 @@
       if (state.screen !== "app" || state.gate || item === null) {
         return false;
       }
-      if (state.favorites.editor !== null) {
+      var favorites = state.favorites;
+      if (favorites.editor !== null) {
         return false;
       }
-      state.favorites.editor = {
+      // The draft's baseline is the recipe on the card at this moment: its identity, its
+      // kind and the version it was read at. Every read of the card that is out -- a
+      // background refresh, a conversion refresh, a source-glass choice -- is invalidated
+      // here: its answer belongs to a view older than this draft, and letting it replace
+      // the card would make a save name a version the draft was never based on. A choice
+      // that was pending is dropped with its read (the confirmed one and its block stay).
+      favorites.detailReadSeq += 1;
+      favorites.sourceGlassPending = null;
+      favorites.editor = {
         id: item.id,
+        kind: item.kind,
+        baseVersion: item.version,
         phase: "editing",
         draft: draftOf(item),
         error: null,
@@ -3917,11 +4800,24 @@
     }
 
     function cancelEditFavorite() {
-      if (state.favorites.editor === null) {
+      var favorites = state.favorites;
+      if (favorites.editor === null) {
         return false;
       }
-      state.favorites.editor = null;
+      var id = favorites.editor.id;
+      favorites.editor = null;
       emit();
+      // The conversion read that a save started was answered while the draft was open (and
+      // therefore not applied): ask for it again now that the card is shown as it is.
+      var detail = favorites.detail;
+      if (
+        detail !== null &&
+        detail.id === id &&
+        detail.status === "ready" &&
+        detail.measuresPending === true
+      ) {
+        track(refreshFavoriteConversion(id, favorites.sourceGlass));
+      }
       return true;
     }
 
@@ -3949,13 +4845,34 @@
       if (outcome.type === "saved") {
         var updated = outcome.item;
         favorites.editor = null;
-        if (favorites.detail && favorites.detail.id === updated.id) {
-          favorites.detail.status = "ready";
-          favorites.detail.item = updated;
-          favorites.detail.error = null;
+        // The saved answer is the newest word about this card: a read that was out
+        // before it (a background refresh, an older choice) cannot replace it.
+        favorites.detailReadSeq += 1;
+        favorites.sourceGlassPending = null;
+        var detail = favorites.detail && favorites.detail.id === updated.id ? favorites.detail : null;
+        if (detail !== null) {
+          detail.status = "ready";
+          detail.item = updated;
+          detail.error = null;
+          detail.measuresPending = false;
+          detail.measuresError = null;
         }
         replaceFavoriteSummary(summaryOf(updated));
         announce(TEXT.editSaved);
+        if (detail !== null && favorites.sourceGlass !== null) {
+          // The edit's answer was calculated without the person's clarification, so its
+          // conversion is not the one that belongs to this card: it is not drawn. The
+          // saved recipe stays readable while the detail is read again with the confirmed
+          // choice; if that read fails, only a worded retry is shown, never an old hint.
+          detail.item.measures = null;
+          if (detail.item.kind === "structured") {
+            detail.measuresPending = true;
+          }
+          emit();
+          return refreshFavoriteConversion(updated.id, favorites.sourceGlass).then(function () {
+            return { ok: true }; // the edit itself is saved, whatever the refresh did
+          });
+        }
         emit();
         return { ok: true };
       }
@@ -4007,7 +4924,10 @@
       }
       var draft = draftFrom(rawDraft, editor.draft);
       editor.draft = draft;
-      var problem = draftProblem(draft, item.kind);
+      // The save names the version this draft started from -- never one a read may have
+      // brought to the card while it was open. If the recipe changed meanwhile, the server
+      // refuses it as a conflict and the draft stays; nothing is silently overwritten.
+      var problem = draftProblem(draft, editor.kind);
       if (problem !== null) {
         editor.phase = "editing";
         editor.error = { text: problem, correlationId: null };
@@ -4018,14 +4938,14 @@
       editor.phase = "saving";
       editor.error = null;
       emit();
-      var response = await http("PATCH", "/api/favorites/" + item.id, {
-        json: editBody(draft, item.kind, item.version),
+      var response = await http("PATCH", "/api/favorites/" + editor.id, {
+        json: editBody(draft, editor.kind, editor.baseVersion),
         timeoutMs: READ_TIMEOUT_MS,
       });
       if (mine !== epoch) {
         return { ok: false, reason: "stale" };
       }
-      return finishEdit(item, classifyFavoriteEdit(response, item.id), draft, editor);
+      return finishEdit({ id: editor.id }, classifyFavoriteEdit(response, editor.id), draft, editor);
     }
 
     // "Загрузить заново": the draft is given up and the last stored version is read.
@@ -4064,14 +4984,14 @@
       editor.draft = draft;
       // An over-limit field is refused here as it is on a plain save: the whole draft stays
       // on the page, in the conflict view, and nothing is sent.
-      var problem = draftProblem(draft, item.kind);
+      var problem = draftProblem(draft, editor.kind);
       if (problem !== null) {
         editor.phase = "conflict";
         editor.error = { text: problem, correlationId: null };
         emit();
         return { ok: false, reason: "invalid" };
       }
-      var response = await http("GET", "/api/favorites/" + item.id, { timeoutMs: READ_TIMEOUT_MS });
+      var response = await http("GET", "/api/favorites/" + editor.id, { timeoutMs: READ_TIMEOUT_MS });
       if (mine !== epoch || state.favorites.editor !== editor) {
         return { ok: false, reason: "stale" };
       }
@@ -4081,9 +5001,9 @@
         return { ok: false, reason: "auth" };
       }
       if (found.type === "not_found") {
-        return finishEdit(item, { type: "gone" }, draft, editor);
+        return finishEdit({ id: editor.id }, { type: "gone" }, draft, editor);
       }
-      var latest = found.type === "ok" ? normalizeFavoriteDetail(found.body, item.id) : null;
+      var latest = found.type === "ok" ? normalizeFavoriteDetail(found.body, editor.id) : null;
       if (latest === null) {
         editor.phase = "conflict";
         editor.error = {
@@ -4097,14 +5017,14 @@
       editor.phase = "saving";
       editor.error = null;
       emit();
-      var response2 = await http("PATCH", "/api/favorites/" + item.id, {
+      var response2 = await http("PATCH", "/api/favorites/" + editor.id, {
         json: editBody(draft, latest.kind, latest.version),
         timeoutMs: READ_TIMEOUT_MS,
       });
       if (mine !== epoch) {
         return { ok: false, reason: "stale" };
       }
-      return finishEdit(latest, classifyFavoriteEdit(response2, item.id), draft, editor);
+      return finishEdit(latest, classifyFavoriteEdit(response2, editor.id), draft, editor);
     }
 
     function hasUnsavedChanges() {
@@ -5876,10 +6796,23 @@
           servings: detail.item ? detail.item.servings : "",
           ingredients: detail.item ? detail.item.ingredients : [],
           steps: detail.item ? detail.item.steps : [],
+          measures: detail.item ? detail.item.measures : null,
+          measuresPending: detail.measuresPending === true,
+          measuresError: detail.measuresError || null,
+          sourceGlass: favorites.sourceGlass,
+          sourceGlassPending: favorites.sourceGlassPending,
+          sourceGlassError: favorites.sourceGlassError,
+          // The custom capacity is drawn as what it is: an open field with the person's
+          // own draft text, never as a confirmed choice of its own.
+          sourceGlassOtherOpen: favorites.sourceGlassOtherOpen === true,
+          sourceGlassDraft: favorites.sourceGlassDraft,
           updatedAt: detail.item ? detail.item.updatedAt : null,
           editor: editor
             ? {
                 phase: editor.phase,
+                // The version the draft was opened on: a save names this one, whatever the
+                // card may have shown later.
+                baseVersion: editor.baseVersion,
                 error: editor.error,
                 draft: {
                   title: editor.draft.title,
@@ -6078,6 +7011,7 @@
         error: profile.error,
         displayName: profile.displayName,
         textSize: profile.textSize,
+        measures: profile.measures,
         loginMethods: profile.loginMethods.map(function (method) {
           return { provider: method.provider, address: method.address, status: method.status };
         }),
@@ -6085,8 +7019,13 @@
         saving: profile.saving,
         notice: profile.notice,
         fieldError: profile.fieldError,
+        measureError: profile.measureError,
         draft: profile.draft
-          ? { displayName: profile.draft.displayName, textSize: profile.draft.textSize }
+          ? {
+              displayName: profile.draft.displayName,
+              textSize: profile.draft.textSize,
+              measures: profile.draft.measures,
+            }
           : null,
       };
     }
@@ -6345,6 +7284,14 @@
       },
       reloadRecipe: function () {
         return track(reloadRecipe());
+      },
+      setSourceGlass: function (value) {
+        return track(setSourceGlass(value));
+      },
+      toggleSourceGlassOther: toggleSourceGlassOther,
+      syncSourceGlassDraft: syncSourceGlassDraft,
+      retryFavoriteConversion: function () {
+        return track(retryFavoriteConversion());
       },
       keepFavorite: function (conversationId, messageId, recipeIndex) {
         return track(keepFavorite(conversationId, messageId, recipeIndex));
@@ -6854,6 +7801,13 @@
   return {
     MAX_MESSAGE_LENGTH: MAX_MESSAGE_LENGTH,
     MAX_PROFILE_NAME: MAX_PROFILE_NAME,
+    MEASURE_LIMITS: MEASURE_LIMITS,
+    MEASURE_KEYS: MEASURE_KEYS,
+    formatFraction: formatFraction,
+    formatMeasure: formatMeasure,
+    measureGrammar: measureGrammar,
+    prepareMeasure: prepareMeasure,
+    prepareMeasures: prepareMeasures,
     PAGE_SIZE: PAGE_SIZE,
     STORAGE_KEY: STORAGE_KEY,
     TEXT: TEXT,
@@ -6862,6 +7816,7 @@
     trimLikeServer: trimLikeServer,
     hasUnstorableCharacters: hasUnstorableCharacters,
     prepareMessage: prepareMessage,
+    prepareProfileName: prepareProfileName,
     isValidIdempotencyKey: isValidIdempotencyKey,
     newIdempotencyKey: newIdempotencyKey,
     parseTimestamp: parseTimestamp,

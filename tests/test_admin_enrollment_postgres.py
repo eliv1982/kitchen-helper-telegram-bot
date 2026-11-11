@@ -138,7 +138,7 @@ def entries(monitor):
 def test_the_migrations_end_at_the_head_and_the_table_and_its_partial_index_are_what_the_models_say(
     scratch_rc, monitor_rc
 ):
-    assert scalar(monitor_rc, "SELECT version_num FROM alembic_version") == "0013_user_text_size"
+    assert scalar(monitor_rc, "SELECT version_num FROM alembic_version") == "0014_user_measure_overrides"
     definition = scalar(
         monitor_rc,
         "SELECT indexdef FROM pg_indexes WHERE indexname = 'uq_identity_invitations_one_outstanding'",
@@ -158,7 +158,7 @@ def test_the_invitation_revision_downgrades_and_upgrades_again(scratch_rc, monit
     finally:
         engine.dispose()
 
-    assert scalar(monitor_rc, "SELECT version_num FROM alembic_version") == "0013_user_text_size"
+    assert scalar(monitor_rc, "SELECT version_num FROM alembic_version") == "0014_user_measure_overrides"
     assert scalar(monitor_rc, "SELECT count(*) FROM identity_invitations") == 0  # an empty table again
 
 

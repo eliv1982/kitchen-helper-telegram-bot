@@ -19,6 +19,22 @@ from tests.persistence_support import new_identity_link
 
 PATCH_HEADERS = {"Origin": ORIGIN}
 
+DEFAULT_MEASURES = {
+    "glass_ml": {"override": None, "effective": 250, "default": 250, "min": 50, "max": 1000},
+    "teaspoon_ml": {"override": None, "effective": 5, "default": 5, "min": 1, "max": 20},
+    "tablespoon_ml": {"override": None, "effective": 15, "default": 15, "min": 5, "max": 50},
+}
+
+
+def measure(name, default, minimum, maximum, override=None):
+    return {
+        "override": override,
+        "effective": default if override is None else override,
+        "default": default,
+        "min": minimum,
+        "max": maximum,
+    }
+
 
 async def profile(client) -> dict:
     response = await client.get("/api/profile")
@@ -82,6 +98,7 @@ async def test_the_profile_is_the_users_own_name_size_and_sign_in_methods(tmp_pa
     assert body == {
         "display_name": "Елена",
         "text_size": "normal",
+        "measures": DEFAULT_MEASURES,
         "login_methods": [{"provider": "telegram", "address": None, "status": "active"}],
     }
     # The Telegram subject is not part of the answer: it is an internal identifier, and
@@ -163,6 +180,155 @@ async def test_the_change_is_persisted_in_the_database_not_only_in_the_answer(tm
             assert (user.display_name, user.text_size) == ("Иван", "large")
 
 
+# --- household measures (KH-F01-B1) --------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_measures_start_at_the_system_defaults_and_no_account_is_seeded(tmp_path):
+    async with chat_app(tmp_path) as chat:
+        mine = await profile(chat.client)
+        other = await chat.second_user()
+        theirs = await profile(other)
+        with chat.base.factory() as db:
+            user = db.get(User, chat.user_id)
+            row = (user.measure_glass_ml, user.measure_teaspoon_ml, user.measure_tablespoon_ml)
+
+    assert mine["measures"] == DEFAULT_MEASURES == theirs["measures"]
+    assert row == (None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_each_measure_changes_on_its_own_and_null_restores_the_default(tmp_path):
+    async with chat_app(tmp_path) as chat:
+        glass = await change(chat.client, measures={"glass_ml": 240})
+        teaspoon = await change(chat.client, measures={"teaspoon_ml": 4})
+        tablespoon = await change(chat.client, measures={"tablespoon_ml": 20})
+        restored = await change(chat.client, measures={"tablespoon_ml": None})
+
+    assert glass.json()["measures"] == {
+        **DEFAULT_MEASURES,
+        "glass_ml": measure("glass_ml", 250, 50, 1000, 240),
+    }
+    assert teaspoon.json()["measures"]["teaspoon_ml"] == measure("teaspoon_ml", 5, 1, 20, 4)
+    assert teaspoon.json()["measures"]["glass_ml"]["override"] == 240  # untouched
+    assert tablespoon.json()["measures"]["tablespoon_ml"]["effective"] == 20
+    assert restored.json()["measures"]["tablespoon_ml"] == DEFAULT_MEASURES["tablespoon_ml"]
+    assert restored.json()["measures"]["glass_ml"]["override"] == 240
+    assert restored.json()["measures"]["teaspoon_ml"]["override"] == 4
+
+
+@pytest.mark.asyncio
+async def test_a_value_equal_to_the_default_may_remain_an_explicit_override(tmp_path):
+    async with chat_app(tmp_path) as chat:
+        explicit = await change(chat.client, measures={"glass_ml": 250})
+        after_reload = await profile(chat.client)
+
+    assert explicit.json()["measures"]["glass_ml"] == {
+        "override": 250,
+        "effective": 250,
+        "default": 250,
+        "min": 50,
+        "max": 1000,
+    }
+    assert after_reload["measures"]["glass_ml"]["override"] == 250
+
+
+@pytest.mark.asyncio
+async def test_the_range_boundaries_are_accepted_and_the_measures_survive_another_session(tmp_path):
+    async with chat_app(tmp_path) as chat:
+        low = await change(
+            chat.client,
+            measures={"glass_ml": 50, "teaspoon_ml": 1, "tablespoon_ml": 5},
+        )
+        high = await change(
+            chat.client,
+            measures={"glass_ml": 1000, "teaspoon_ml": 20, "tablespoon_ml": 50},
+        )
+        # Another browser signs in as the same person: the measures are the account's.
+        other = chat.base.new_client()
+        assert (await sign_in(other, chat.base.telegram)).status_code == 303
+        elsewhere = await profile(other)
+
+    assert low.status_code == 200 and high.status_code == 200
+    assert low.json()["measures"]["glass_ml"]["effective"] == 50
+    assert low.json()["measures"]["teaspoon_ml"]["effective"] == 1
+    assert low.json()["measures"]["tablespoon_ml"]["effective"] == 5
+    assert elsewhere["measures"] == {
+        **DEFAULT_MEASURES,
+        "glass_ml": measure("glass_ml", 250, 50, 1000, 1000),
+        "teaspoon_ml": measure("teaspoon_ml", 5, 1, 20, 20),
+        "tablespoon_ml": measure("tablespoon_ml", 15, 5, 50, 50),
+    }
+
+
+@pytest.mark.asyncio
+async def test_no_cross_field_rule_requires_the_tablespoon_to_exceed_the_teaspoon(tmp_path):
+    async with chat_app(tmp_path) as chat:
+        response = await change(
+            chat.client, measures={"teaspoon_ml": 20, "tablespoon_ml": 5}
+        )
+        after = await profile(chat.client)
+
+    assert response.status_code == 200
+    assert after["measures"]["teaspoon_ml"]["effective"] == 20
+    assert after["measures"]["tablespoon_ml"]["effective"] == 5
+
+
+@pytest.mark.asyncio
+async def test_the_measures_are_persisted_in_the_database_not_only_in_the_answer(tmp_path):
+    async with chat_app(tmp_path) as chat:
+        assert (await change(chat.client, measures={"glass_ml": 240})).status_code == 200
+        with chat.base.factory() as db:
+            user = db.get(User, chat.user_id)
+            row = (user.measure_glass_ml, user.measure_teaspoon_ml, user.measure_tablespoon_ml)
+
+    assert row == (240, None, None)
+
+
+@pytest.mark.asyncio
+async def test_two_people_have_their_own_measures_and_nothing_crosses_between_them(tmp_path):
+    async with chat_app(tmp_path) as chat:
+        other = await chat.second_user()
+        assert (await change(chat.client, measures={"glass_ml": 240})).status_code == 200
+        assert (await change(other, measures={"glass_ml": 300})).status_code == 200
+
+        mine = await profile(chat.client)
+        theirs = await profile(other)
+
+    assert mine["measures"]["glass_ml"]["override"] == 240
+    assert theirs["measures"]["glass_ml"]["override"] == 300
+
+
+@pytest.mark.asyncio
+async def test_an_unusable_measure_writes_nothing_and_names_its_own_error(tmp_path):
+    async with chat_app(tmp_path) as chat:
+        before = await profile(chat.client)
+        # The valid field in the same body is not written either: the whole change is refused.
+        response = await change(
+            chat.client,
+            display_name="Иван",
+            measures={"glass_ml": 240, "teaspoon_ml": 0},
+        )
+        after = await profile(chat.client)
+
+    assert response.status_code == 400
+    assert error_of(response)["detail"] == "invalid_measure"
+    assert "50" in error_of(response)["message"] and "1000" in error_of(response)["message"]
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_the_measure_refusal_asks_no_provider(tmp_path):
+    from tests.chat_support import ScriptedBackend
+
+    backend = ScriptedBackend()
+    async with chat_app(tmp_path, backend) as chat:
+        assert (await change(chat.client, measures={"glass_ml": 49})).status_code == 400
+        assert (await change(chat.client, measures={"glass_ml": 240})).status_code == 200
+
+    assert backend.calls == 0
+
+
 # --- two people ----------------------------------------------------------------------
 
 
@@ -232,6 +398,29 @@ INVALID_BODIES = [
     ({"text_size": ["normal"]}, "invalid_text_size"),
     ({"text_size": {"size": "normal"}}, "invalid_text_size"),
     ({"display_name": "Иван", "text_size": "normal", "extra": 1}, "invalid_request"),
+    # The household measures: a value must be a whole millilitre inside its own range, or
+    # null to restore the default. Nothing is clamped or rounded into range.
+    ({"measures": {"glass_ml": 49}}, "invalid_measure"),
+    ({"measures": {"glass_ml": 1001}}, "invalid_measure"),
+    ({"measures": {"glass_ml": 0}}, "invalid_measure"),
+    ({"measures": {"glass_ml": -1}}, "invalid_measure"),
+    ({"measures": {"glass_ml": 240.5}}, "invalid_measure"),
+    ({"measures": {"glass_ml": 240.0}}, "invalid_measure"),
+    ({"measures": {"glass_ml": "240"}}, "invalid_measure"),
+    ({"measures": {"glass_ml": True}}, "invalid_measure"),
+    ({"measures": {"glass_ml": False}}, "invalid_measure"),
+    ({"measures": {"glass_ml": [240]}}, "invalid_measure"),
+    ({"measures": {"glass_ml": {"ml": 240}}}, "invalid_measure"),
+    ({"measures": {"teaspoon_ml": 0}}, "invalid_measure"),
+    ({"measures": {"teaspoon_ml": 21}}, "invalid_measure"),
+    ({"measures": {"tablespoon_ml": 4}}, "invalid_measure"),
+    ({"measures": {"tablespoon_ml": 51}}, "invalid_measure"),
+    ({"measures": {"glass_ml": 200, "cup_ml": 200}}, "invalid_request"),
+    ({"measures": []}, "invalid_request"),
+    ({"measures": "240"}, "invalid_request"),
+    ({"measures": None}, "invalid_request"),
+    ({"measures": {}}, "invalid_request"),  # an empty object alone is no change at all
+    ({"display_name": "Иван", "measures": {"glass_ml": 240, "unknown": 1}}, "invalid_request"),
 ]
 
 
