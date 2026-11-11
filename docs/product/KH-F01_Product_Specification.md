@@ -1,28 +1,28 @@
 # House Helper / Kitchen — KH-F01 Smart Measures & Portion Scaling
 
-**Product Specification — Consolidated Product Baseline v0.2 (owner review)**  
-**Date:** 10 November 2026  
-**Scope:** KH-F01 only  
-**Status:** PRODUCT DISCOVERY / D01–D17 approved as product decisions; consolidated document awaits final owner acceptance; **implementation NOT authorized**.
+**Product Specification — Consolidated Product Baseline v0.3 (owner review)**\
+**Date:** 11 November 2026\
+**Scope:** KH-F01 only\
+**Status:** D01–D19 approved as product decisions; KH-F01-A deterministic measurement core accepted internally (`c4f852c`, not deployed); KH-F01-B0 technical design approved; **implementation of KH-F01-B0/B1/B2 NOT authorized**.
 
 ## 0. Project baseline and authority
 
 - Product: **House Helper**; Kitchen is the first module, served from the site root. The mom-facing interface, buttons, explanations and errors are **Russian**; brand remains in English.
-- Production as reported by owner: `https://house.elivcloud.org`, `eliv1982/kitchen-helper-telegram-bot`, `HEAD 59d1b806099d86a0a2037e7f6a5ecd1ca9756010`, image `house-helper:59d1b806099d`, schema `0013_user_text_size`; two accounts, data preserved.
+- Production as reported by owner: `https://house.elivcloud.org`, `eliv1982/kitchen-helper-telegram-bot`, production `HEAD 59d1b806099d86a0a2037e7f6a5ecd1ca9756010`, image `house-helper:59d1b806099d`, schema `0013_user_text_size`; two accounts, data preserved. Repository `main` has since advanced to `c4f852c` (KH-F01-A measurement core, internal accept); that commit is **not** deployed.
 - Previously released: KH-SHOP-01, KH-PROFILE-01, KH-PROFILE-01A-FIX-01; no reopening without new reproducible defect.
 - Ops: first normal purge/backup timer runs on 11 November 2026 still need separate evidence; not part of this KH-F01 product work.
 - Workflow: Lena + Teya decide product logic; Claude Code implements **only after approval**; Codex independently audits; Lena personally commits/pushes; Cursor Agent handles VPS/deploy; Lena performs owner smoke and final acceptance.
-- This document reflects the owner's product decisions D01–D17 and prior desk review of public reference sources. Codex separately inspected local repository at reported HEAD; no code/database/production changes, tests, live datasets or APIs were executed during preflight. Production claims remain owner-reported.
+- This document reflects the owner's product decisions D01–D19 and prior desk review of public reference sources. Codex separately inspected local repository at the reported HEAD; no code/database/production changes, tests, live datasets or APIs were executed during that preflight. Production claims remain owner-reported.
 
 ## 1. Goal and scope
 
 **User need.** In a recipe, show familiar ways to measure a specified ingredient without kitchen scales (e.g. `40 г пшеничной муки (≈ … ст. л. без горки)`), while preserving the author's original quantity. Let the user scale recipe portions and request sensible alternatives when a mathematically correct quantity is awkward.
 
-**In scope:** mass/volume/unit parsing; ingredient-specific household equivalents; verified and extensible ingredient-coefficient registry; serving-scale arithmetic; context-sensitive alternative suggestions; honest precision; graceful partial results; Russian Web UX and corresponding Telegram presentation where that recipe interaction is supported.
+**In scope:** mass/volume/unit parsing; personal household-measure capacities and independent source/target measurement contexts (D18/D19); ingredient-specific household equivalents; verified and extensible ingredient-coefficient registry; serving-scale arithmetic; context-sensitive alternative suggestions; honest precision; graceful partial results; Russian Web UX and corresponding Telegram presentation where that recipe interaction is supported.
 
 **Not in scope:** KH-F02 concentrations/dilution (especially vinegar); KH-PROFILE-02 configuration; HH-ALPHA-01 inferred preferences; KH-F03 food preservation/storage; purchasing/shopping-list redesign; appliance training. Do not rewrite the recipe storage model or authentication absent a demonstrated need.
 
-## 2. Approved product decisions (D01–D17)
+## 2. Approved product decisions (D01–D19)
 
 | ID | Binding product decision |
 |---|---|
@@ -43,20 +43,68 @@
 | D15 | For serving ranges (e.g. `2–3 порции`) or unknown base servings, ask for a concrete base before calculating; reuse the choice in current context; no silent midpoint. |
 | D16 | Support leveled/heaped spoon distinctions (only separately evidenced heaped coefficients); ¼, ½, 1½ measures; glasses 200/250 mL; discrete counts, package sizes only when declared, and quantity ranges without silently replacing them by a midpoint. Respect the user's chosen measurement form when practical. |
 | D17 | After **all pre-approved and testable** source, conditions, consistency, rights, unit and contradiction checks pass, candidate coefficients may be auto-promoted without an owner click. If any gate is inconclusive, keep candidate inactive. Preserve evidence, version, suspension and revalidation; LLM is not the authority. No enrichment implementation is authorized yet. |
+| D18 | System default glass capacity is **250 mL**. A user may independently configure a personal glass capacity in **50–1000 mL** inclusive. No personal glass capacity is preconfigured for any account; a missing personal setting uses the system default; removing the override restores it. A user's glass capacity never determines an unknown source-recipe glass capacity. |
+| D19 | Personal household measures are **glass** (system 250 mL; 50–1000 mL), **teaspoon** (system 5 mL; 1–20 mL) and **tablespoon** (system 15 mL; 5–50 mL). Each is independently configurable and isolated by account; no personal values are seeded, hardcoded or migrated for existing users. Profile UI collects whole millilitres; no cross-field rule requires tablespoon capacity to exceed teaspoon capacity. Source-recipe and target-user measurement contexts are independent: personal capacities affect target measures only. Ordinary level source teaspoons/tablespoons use conventional 5/15 mL unless reliable source metadata establishes otherwise; heaped and ambiguous spoon measures remain unsupported as exact measures. Original recipes are never automatically modified. |
+
+### 2.1 Decision relationships and limited supersession
+
+D18 and D19 extend the approved baseline; they do not reopen D01–D17.
+
+- **Limited supersession.** D18 supersedes the fixed `200/250 mL` glass rule of D01 and the `200/250 mL` glass enumeration of D16 **only for personal target (user-facing) household volumes**. D19 supersedes the fixed target values `tsp = 5 mL` / `tbsp = 15 mL` of D01 **only for personal target measures**. All other D01–D17 requirements remain in force unchanged.
+- **Case 1 — legacy KH-F01-A behavior.** Existing KH-F01-A callers retain their original 200/250 mL glass restrictions and validation semantics. No legacy call gains a default glass size, accepts a nonstandard declared size, or otherwise changes meaning.
+- **Case 2 — personal target measures.** Configurable target glass, teaspoon and tablespoon capacities follow the approved D18/D19 ranges (§3.3). These values affect target measures only; they never resolve or reinterpret a source recipe.
+- **Case 3 — explicit source-recipe declarations.** With `allow_nonstandard_glass_sizes=True`, an explicitly declared source glass capacity may be any validated value, including nonstandard and fractional millilitre volumes (e.g. 237.5 mL), and is used exactly. With the legacy default (`False`), previous parsing behavior remains unchanged, including the 200/250 mL restriction.
+- **Undeclared source glass.** An undeclared source glass is never resolved using a personal target setting or the system default; it requires clarification (§3.4).
+- **No retroactive invalidation.** KH-F01-A's accepted behavior, public contract and acceptance criteria AC01–AC50 remain valid. The extension is additive and opt-in.
 
 ## 3. Household units and context
 
 ### 3.1 Dimensional rules
 
 - **Exact within declared units:** 1 kg = 1000 g; 1 L = 1000 mL. These conversions do not depend on an ingredient.
-- **Defined household volumes:** 1 teaspoon = 5 mL; 1 tablespoon = 15 mL. These define volume, **not gram weights**.
-- **Glass:** 200 mL or 250 mL, as explicitly stated/confirmed for this context. If a recipe says `1 стакан` and the size matters, ask once: `Какой стакан: 200 или 250 мл?`.
+- **Defined household volumes:** the system defaults are 1 teaspoon = 5 mL and 1 tablespoon = 15 mL. These define volume, **not gram weights**. A user's personal spoon capacities (D19) replace these values for that user's **target** measures only; ordinary level spoons in a source recipe stay 5/15 mL unless reliable source metadata establishes otherwise (§3.3–§3.4).
+- **Glass:** in the legacy default (`allow_nonstandard_glass_sizes=False`), a source recipe's glass is 200 mL or 250 mL, as explicitly stated/confirmed, and an unspecified source glass is never defaulted. With `allow_nonstandard_glass_sizes=True`, an explicitly declared source capacity may be any validated value, including nonstandard and fractional millilitre volumes (e.g. 237.5 mL), and is used exactly (§3.4). The system default for a **target** glass is 250 mL; a user's personal capacity (50–1000 mL) replaces it for that account only and never resolves a source glass. If a recipe says `1 стакан` and the size matters, ask once: `Какой стакан: 200 или 250 мл?`; in extended mode also offer another valid volume.
 - **Countable:** шт., зубчик, головка, ломтик. Mass equivalents require specific size/state evidence, not a universal `1 шт = X г`.
 - **Fuzzy instructions:** preserve `щепотка`, `на глаз`, `немного`, `по вкусу`, no fabricated numeric conversion.
 
 ### 3.2 Critical incompatibility with US sources
 
 US references usually define **1 US cup as approximately 240 mL** (NIST/FDA). It is **not** automatically a Russian 250-mL or 200-mL glass. The system must carry the original source measure with its volume. For particulate ingredients (flour, oats, salt), extrapolating a published US cup's mass to a tablespoon or a 250-mL glass is *not automatically allowed*: packing, leveling, granularity and preparation may change apparent bulk density. A direct measured tablespoon, or a validated bulk-density relationship with matching technique, is needed for automatic conversion.
+
+### 3.3 Personal household measures (D18/D19)
+
+| Measure | System default | Allowed personal range |
+|---|---|---|
+| Glass | 250 mL | 50–1000 mL |
+| Teaspoon | 5 mL | 1–20 mL |
+| Tablespoon | 15 mL | 5–50 mL |
+
+- Each measure is independently configurable; the profile UI collects whole millilitres within the stated range.
+- No personal value is preconfigured, seeded, hardcoded or migrated for any account. An account without an override resolves to the system default, and removing an override restores it.
+- Settings are isolated by account.
+- There is no cross-field restriction requiring the tablespoon capacity to exceed the teaspoon capacity.
+- The system defaults (250/5/15 mL) are fixed product constants; a personal capacity changes that account's target measures only.
+
+### 3.4 Source and target measurement contexts
+
+D18/D19 make the source-recipe and target-user measurement contexts independent.
+
+- **Source context.** A source recipe's own declaration governs its household measures. With `allow_nonstandard_glass_sizes=True`, an explicitly declared glass capacity may be any validated value, including values outside legacy 200/250 mL and fractional values such as 237.5 mL, and is used exactly with rational arithmetic. With the legacy default (`False`), previous parsing behavior is unchanged. A missing source glass capacity is never inferred from the system default or from personal settings; it requires clarification. Conflicting source declarations or reliable context metadata require clarification.
+- **Clarification.** In extended mode, when a source glass capacity must be clarified, offer 200 mL, 250 mL and an option to specify another valid volume. With the legacy default, the 200/250-only prompt and parsing behavior remain unchanged.
+- **Target context.** The target glass is the user's personal capacity, or 250 mL when none is set; target spoons are the user's personal capacities, or 5/15 mL.
+- **Independence.** Personal capacities affect target measures only. They never interpret a source recipe, never resolve an unknown source glass and never override a declared source value. A user's glass capacity never determines an unknown source-recipe glass capacity.
+- **Spoons.** Ordinary level source teaspoons/tablespoons use conventional 5/15 mL unless reliable source metadata establishes otherwise. Heaped, `с верхом` and ambiguous spoon measures remain unsupported as exact measures.
+- **Originals.** Original recipe quantities and text are never automatically modified; target capacities are a calculation/presentation context, not a data rewrite.
+- **US cups.** US cups remain distinct from Russian glasses of any capacity and are never silently read as a glass.
+
+### 3.5 Backward compatibility with KH-F01-A
+
+D18/D19 extend the requirements without retroactively invalidating accepted KH-F01-A behavior or its acceptance criteria (AC01–AC50).
+
+- Legacy calls keep their current interpretation and restrictions: an unspecified glass is never defaulted, legacy callers accept only the 200/250 mL glass sizes, and mass↔volume conversion still requires an approved ingredient coefficient.
+- The explicit nonstandard source-capacity parser policy is opt-in through `allow_nonstandard_glass_sizes`: `False` (the default) keeps legacy parsing and the 200/250 mL restriction; `True` enables explicitly declared nonstandard and fractional capacities. The default remains legacy-compatible.
+- The extended public contract describes source and target measurement contexts (`MeasureVolumes`) and a target default resolver; the legacy `glass_ml` argument is not combined with these contexts, and the legacy interpretation remains available unchanged.
+- No accepted KH-F01-A acceptance criterion is changed, removed or retroactively narrowed.
 
 ## 4. Core user experience
 
@@ -209,6 +257,16 @@ A candidate must pass all gates before publication:
 - **AC49** The strict current recipe protocol remains backwards compatible. Changing its keys or ingredient schema requires a separately reviewed versioning/compatibility plan; don't add keys that make v1 validation reject recipes.
 - **AC50** Public release smoke checks original/derived recipe consistency, shopping creation from a saved variant, Russian UX on desktop/iPhone, and source-suspension behavior for enabled enrichment.
 
+**Additional acceptance criteria derived from D18/D19 (configurable household measures)**
+
+- **AC51** System defaults are glass 250 mL, teaspoon 5 mL and tablespoon 15 mL. A personal value is accepted only within its approved range — glass 50–1000 mL, teaspoon 1–20 mL, tablespoon 5–50 mL — and is collected as whole millilitres in the profile UI; an out-of-range or non-integer value is rejected with a validation message and is never clamped, rounded into range or silently replaced by the default.
+- **AC52** No account receives preconfigured, seeded, hardcoded or migrated personal household-measure values. A measure without a personal override resolves to its system default; removing an override restores the default; settings are isolated by account; no cross-field rule requires the tablespoon capacity to exceed the teaspoon capacity.
+- **AC53** Personal glass/teaspoon/tablespoon capacities affect target measures only. They never determine an unknown source-recipe glass capacity, reinterpret a source spoon or override a declared source value; ordinary level source spoons remain 5/15 mL unless reliable source metadata establishes otherwise; heaped and ambiguous spoon measures remain unsupported.
+- **AC54** With `allow_nonstandard_glass_sizes=True`, a source recipe that explicitly declares a validated glass capacity is converted using that exact capacity, including nonstandard capacities outside 200/250 mL and fractional values such as 237.5 mL, with exact rational arithmetic. With the default `False`, previous parsing behavior is unchanged; conflicting declarations or reliable metadata require clarification, and an unspecified capacity is never defaulted.
+- **AC55** With `allow_nonstandard_glass_sizes=True`, when a source glass capacity requires clarification, the user is offered 200 mL, 250 mL and an option to specify another valid volume; no capacity is assumed before the user chooses. With the default `False`, the legacy 200/250 prompt is unchanged.
+- **AC56** All conversions preserve exact `Fraction` arithmetic, the ≤5% practical-rounding gate and the ingredient-coefficient qualification rules. Volume-to-volume conversions never require an ingredient coefficient; mass-to-volume conversions require an approved ingredient-specific coefficient; original recipes are never automatically modified.
+- **AC57** KH-F01-A callers keep their current behavior and restrictions without new defaults; `allow_nonstandard_glass_sizes` defaults to `False`, so nonstandard source-capacity parsing is enabled only by an explicit `True`. D18/D19 and AC51–AC57 extend AC01–AC50 without changing or invalidating any of them.
+
 ## 11. Codex read-only technical preflight: verified architecture (10 Nov 2026)
 
 - Repo `main` HEAD `59d1b806099d86a0a2037e7f6a5ecd1ca9756010`, no tracked modifications. Existing untracked `.claude/` and `deploy/monitoring/` files left untouched. Latest repo migration definition is `0013_user_text_size`; production DB was not examined.
@@ -221,16 +279,34 @@ A candidate must pass all gates before publication:
 
 **Architecture consequence:** retain raw text, normalize conservatively in an additional layer, calculate against approved-only versioned values, and preserve server-side consistency of displayed/saved results. Do not infer exact schema, endpoint, migration or worker design solely from this preflight. A migration-free transient preview appears possible but is **not verified** as a final design.
 
+### 11.1 KH-F01-B0 technical design review — approved (11 November 2026)
+
+Read-only design work at repository `main @ c4f852c` (KH-F01-A accepted internally). Verified in the current core: `house_helper/core/measures.py` has no production callers; one glass context serves both source and target resolution; teaspoon/tablespoon are fixed at 5/15 mL; glass is 200/250 mL only; an unknown glass is never defaulted. The KH-F01-A suite (67 test functions / 195 cases on Python 3.12.10) passes.
+
+**Approved design, not implemented:**
+
+- one immutable measurement-context value `MeasureVolumes(glass_ml, teaspoon_ml, tablespoon_ml)` describing household capacities;
+- validation ranges glass 50–1000 mL, teaspoon 1–20 mL, tablespoon 5–50 mL; invalid contexts are rejected at construction;
+- fixed system constants 250/5/15 mL used by the target resolver;
+- `resolve_target_measures(overrides)` applies defaults on the target side only and never to source resolution;
+- source and target contexts are keyword-only additions to `convert_quantity` / `convert_text`; the legacy `glass_ml` argument cannot be combined with them;
+- the nonstandard source-glass parser policy is opt-in (`allow_nonstandard_glass_sizes=True`); the default `False` keeps legacy parsing and the 200/250 mL restriction;
+- no new status values are introduced.
+
+**Status:** technical design **APPROVED**; implementation **NOT AUTHORIZED** — not started, not committed, not released, not deployed.
+
 ## 12. Bounded delivery plan — proposed, not implementation authorization
 
 | Phase | Acceptance goal | Dependencies / release rule |
 |---|---|---|
-| **F01-A — deterministic arithmetic core** | Strict mass/volume math, nominal utensil volumes, targeted glass clarification, conservative quantity parsing and error statuses; pure calculation + unit tests | Internal foundation; **not** a standalone owner-facing feature release. Preserve v1 recipe protocol. |
-| **F01-B — curated usable kitchen equivalents** | Source-qualified initial coefficients, verified inline hints, detail-on-demand, Web and integrated Telegram support, D07/D11 guards | First meaningfully useful user-facing increment. Starter catalogue may include items without approved coefficients; disclose coverage honestly. |
-| **F01-C — scaling, actions, durable variants** | D08/D09/D13–D16; consistent ingredient list and step text, alternatives, serving-range clarification, server-validated separate saved variants, correct shopping-list snapshots | Before any release claiming scaling+save completion, test ownership, idempotency, catalogue versions, legacy recipes and both channels. |
-| **F01-D — controlled automatic enrichment** | Candidate fetch/evidence, deterministic verification, source independence, auto-promotion gates, suspension/revalidation and safe fallback | Separate authorization and security/ops review; D17 auto-promotion only after allowlist, test corpus and failure cases are independently audited. |
+| **KH-F01-A — deterministic arithmetic core** | Strict mass/volume math, nominal 5/15 mL spoon volumes, 200/250 mL glass clarification, conservative quantity parsing and error statuses; pure calculation + unit tests | **COMPLETE — internal accept** at `c4f852c`; committed and not deployed; not a standalone owner-facing feature release. Its behavior and AC01–AC50 are the compatibility baseline. |
+| **KH-F01-B0 — Calculation Core Extension** | `MeasureVolumes`; source/target measurement contexts; configurable household volumes; target default resolver; opt-in parser support for nonstandard declared glass capacities (`allow_nonstandard_glass_sizes=True`); validation and deterministic calculations; backward-compatible public contracts; focused tests and existing regression suite | Technical design **APPROVED**; implementation **NOT AUTHORIZED**. Must preserve legacy calls and AC01–AC50 exactly: default `False` keeps 200/250 parsing, personal capacities affect target measures only, and an undeclared source glass is never resolved from personal settings or the system default. |
+| **KH-F01-B1 — Profile Integration** | «Мои кухонные меры» settings for personal **target** capacities; persistence and account isolation; default restoration; Web integration; integration with the B0 calculation contract; user-facing validation and clarification UX | Depends on the approved B0 contract. Any persistence/migration design is reviewed separately; no personal values are seeded or migrated; these settings never influence source-recipe interpretation. |
+| **KH-F01-B2 — Qualified Ingredient Reference Data** | Verified ingredient-dependent coefficients; practical kitchen equivalents; reliability and uncertainty safeguards; initial curated reference baseline | Individual coefficients still pass the D05–D07/D11/D17 evidence gates before use; the current reference-data baseline remains research, not runtime data. |
+| **KH-F01-C — scaling, actions, durable variants** | D08/D09/D13–D16; consistent ingredient list and step text, alternatives, serving-range clarification, server-validated separate saved variants, correct shopping-list snapshots | Before any release claiming scaling+save completion, test ownership, idempotency, catalogue versions, legacy recipes and both channels. |
+| **KH-F01-D — controlled automatic enrichment** | Candidate fetch/evidence, deterministic verification, source independence, auto-promotion gates, suspension/revalidation and safe fallback | Separate authorization and security/ops review; D17 auto-promotion only after allowlist, test corpus and failure cases are independently audited. |
 
-Phases can be independently reviewed and staged. **KH-F01 fully complete** only after committed in-scope requirements are shipped and accepted; partial releases must be labeled partial and never claim full D01–D17 completion.
+The B0/B1/B2 split replaces the former single F01-B phase: B0 is the calculation contract, B1 the profile experience, B2 the qualified data. Phases can be independently reviewed and staged. **KH-F01 fully complete** only after committed in-scope requirements are shipped and accepted; partial releases must be labeled partial and never claim full D01–D19 completion.
 
 **Release workflow:** approved scoped implementation prompt → Claude Code changes + tests, no automatic commit/push → independent Codex audit → Lena review and commit/push → CI → Cursor Agent controlled deployment → Lena Web/iPhone and supported Telegram owner smoke → ACCEPT.
 
@@ -248,7 +324,7 @@ Phases can be independently reviewed and staged. **KH-F01 fully complete** only 
 
 ## 14. Current authorization gate
 
-D01–D17 **product decisions approved**; consolidated spec prepared for final owner acceptance. No implementation, migrations, database access, background workers, pushes or production changes are authorized. The **next single action** is owner confirmation of this consolidated specification and phased release boundaries, followed by a bounded F01-A task (no automatic start).
+D01–D19 **product decisions approved**. KH-F01-A is complete (internal accept, committed at `c4f852c`, not deployed). The KH-F01-B0 technical design is **approved**; implementation of KH-F01-B0, B1 and B2 is **NOT authorized**, not started, not committed, not released and not deployed. This v0.3 revision is documentation only; no implementation, migrations, database access, background workers, pushes or production changes are authorized by it. The **next single action** is owner review and acceptance of this specification update, followed by authorization of a bounded KH-F01-B0 task (no automatic start).
 
 ## Appendix. Public source references (desk-reviewed during Product Discovery)
 
