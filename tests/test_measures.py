@@ -9,6 +9,8 @@ coexists with the existing recipe protocol.
 import ast
 import copy
 import json
+from dataclasses import FrozenInstanceError
+from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
 
@@ -16,12 +18,22 @@ import pytest
 
 import house_helper.core.measures as measures
 from house_helper.core.measures import (
+    GLASS_ML_MAX,
+    GLASS_ML_MIN,
     GLASS_SIZES_ML,
     MAX_ROUNDING_RELATIVE_ERROR,
+    SYSTEM_GLASS_ML,
+    SYSTEM_TABLESPOON_ML,
+    SYSTEM_TEASPOON_ML,
+    TABLESPOON_ML_MAX,
+    TABLESPOON_ML_MIN,
+    TEASPOON_ML_MAX,
+    TEASPOON_ML_MIN,
     ConversionReason,
     ConversionStatus,
     Dimension,
     MeasurementBasis,
+    MeasureVolumes,
     QuantityPart,
     QuantityReason,
     QuantityStatus,
@@ -31,6 +43,7 @@ from house_helper.core.measures import (
     convert_text,
     parse_quantity,
     practical_round,
+    resolve_target_measures,
 )
 from house_helper.core.recipes import RECIPE_END, RECIPE_START, parse_reply
 
@@ -978,6 +991,618 @@ def test_amounts_from_the_recipe_protocol_convert_without_touching_the_recipe():
     assert recipe.ingredients[0].amount == "1½ ст. л."
     assert recipe.steps == snapshot.steps == ("Смешайте ингредиенты.",)
     assert recipe.recipe_id == snapshot.recipe_id
+
+
+# --- KH-F01-B0: household measurement contexts ---------------------------------------
+
+
+def test_system_defaults_are_glass_250_tsp_5_tbsp_15():
+    assert (SYSTEM_GLASS_ML, SYSTEM_TEASPOON_ML, SYSTEM_TABLESPOON_ML) == (250, 5, 15)
+    assert resolve_target_measures() == MeasureVolumes(250, 5, 15)
+    assert resolve_target_measures(None) == MeasureVolumes(
+        SYSTEM_GLASS_ML, SYSTEM_TEASPOON_ML, SYSTEM_TABLESPOON_ML
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        (MeasureVolumes(glass_ml=240), (240, 5, 15)),
+        (MeasureVolumes(teaspoon_ml=4), (250, 4, 15)),
+        (MeasureVolumes(tablespoon_ml=20), (250, 5, 20)),
+        (
+            MeasureVolumes(glass_ml=300, teaspoon_ml=4, tablespoon_ml=20),
+            (300, 4, 20),
+        ),
+    ],
+)
+def test_each_target_measure_is_overridden_independently(overrides, expected):
+    resolved = resolve_target_measures(overrides)
+
+    assert (
+        resolved.glass_ml,
+        resolved.teaspoon_ml,
+        resolved.tablespoon_ml,
+    ) == expected
+
+
+def test_a_target_override_may_be_fractional_and_stays_exact():
+    resolved = resolve_target_measures(MeasureVolumes(tablespoon_ml=Fraction(25, 2)))
+
+    assert resolved.tablespoon_ml == Fraction(25, 2)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("glass_ml", GLASS_ML_MIN),
+        ("glass_ml", GLASS_ML_MAX),
+        ("teaspoon_ml", TEASPOON_ML_MIN),
+        ("teaspoon_ml", TEASPOON_ML_MAX),
+        ("tablespoon_ml", TABLESPOON_ML_MIN),
+        ("tablespoon_ml", TABLESPOON_ML_MAX),
+    ],
+)
+def test_each_approved_range_boundary_is_inclusive(field, value):
+    context = MeasureVolumes(**{field: value})
+
+    assert getattr(context, field) == value
+
+
+@pytest.mark.parametrize("field", ["glass_ml", "teaspoon_ml", "tablespoon_ml"])
+@pytest.mark.parametrize("value", [True, False, 250.0, "250", Decimal("250")])
+def test_measure_volumes_refuse_values_that_are_not_exact_numbers(field, value):
+    with pytest.raises(TypeError):
+        MeasureVolumes(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("glass_ml", 0),
+        ("glass_ml", -1),
+        ("glass_ml", 49),
+        ("glass_ml", Fraction(99, 2)),
+        ("glass_ml", 1001),
+        ("teaspoon_ml", 0),
+        ("teaspoon_ml", -1),
+        ("teaspoon_ml", Fraction(1, 2)),
+        ("teaspoon_ml", Fraction(41, 2)),
+        ("teaspoon_ml", 21),
+        ("tablespoon_ml", 0),
+        ("tablespoon_ml", -1),
+        ("tablespoon_ml", Fraction(49, 10)),
+        ("tablespoon_ml", Fraction(101, 2)),
+        ("tablespoon_ml", 51),
+    ],
+)
+def test_measure_volumes_refuse_values_outside_the_approved_range(field, value):
+    with pytest.raises(ValueError):
+        MeasureVolumes(**{field: value})
+
+
+def test_measure_volumes_allow_every_field_to_be_unspecified():
+    context = MeasureVolumes()
+
+    assert context.glass_ml is None
+    assert context.teaspoon_ml is None
+    assert context.tablespoon_ml is None
+
+
+def test_measure_volumes_are_immutable_and_compare_by_value():
+    context = MeasureVolumes(glass_ml=240)
+
+    with pytest.raises(FrozenInstanceError):
+        context.glass_ml = 250  # type: ignore[misc]
+    assert context == MeasureVolumes(glass_ml=Fraction(240))
+    assert len({context, MeasureVolumes(glass_ml=240)}) == 1
+
+
+def test_no_cross_field_rule_requires_a_larger_tablespoon():
+    context = MeasureVolumes(teaspoon_ml=20, tablespoon_ml=5)
+
+    assert (context.teaspoon_ml, context.tablespoon_ml) == (20, 5)
+
+
+def test_resolve_target_measures_refuses_a_non_context():
+    with pytest.raises(TypeError):
+        resolve_target_measures(250)  # type: ignore[arg-type]
+
+
+# --- source and target contexts are independent --------------------------------------
+
+
+def test_a_source_glass_of_200_ml_is_five_sixths_of_a_target_glass_of_240_ml():
+    result = convert_text(
+        "1 стакан",
+        Unit.GLASS,
+        source_measures=MeasureVolumes(glass_ml=200),
+        target_measures=MeasureVolumes(glass_ml=240),
+    )
+
+    assert result.status is ConversionStatus.NOMINAL_HOUSEHOLD
+    assert result.reason is ConversionReason.CONVERTED
+    assert result.exact_amount == Fraction(5, 6)
+    assert result.glass_sizes_ml == (200, 240)
+
+
+def test_a_source_glass_of_240_ml_is_six_fifths_of_a_target_glass_of_200_ml():
+    result = convert_text(
+        "1 стакан",
+        Unit.GLASS,
+        source_measures=MeasureVolumes(glass_ml=240),
+        target_measures=MeasureVolumes(glass_ml=200),
+    )
+
+    assert result.exact_amount == Fraction(6, 5)
+    assert result.glass_sizes_ml == (200, 240)
+
+
+@pytest.mark.parametrize("target", [Unit.GLASS, Unit.MILLILITER])
+def test_a_target_capacity_never_resolves_an_unknown_source_glass(target):
+    result = convert_text(
+        "1 стакан", target, target_measures=MeasureVolumes(glass_ml=240)
+    )
+
+    assert result.status is ConversionStatus.CLARIFICATION_REQUIRED
+    assert result.reason is ConversionReason.GLASS_SIZE_REQUIRED
+    assert result.exact_amount is None
+
+
+def test_an_empty_target_context_still_does_not_resolve_a_source_glass():
+    result = convert_text(
+        "1 стакан", Unit.MILLILITER, target_measures=MeasureVolumes()
+    )
+
+    assert result.status is ConversionStatus.CLARIFICATION_REQUIRED
+    assert result.reason is ConversionReason.GLASS_SIZE_REQUIRED
+
+
+def test_source_glass_metadata_converts_when_the_target_is_metric():
+    result = convert_text(
+        "1 стакан", Unit.MILLILITER, source_measures=MeasureVolumes(glass_ml=200)
+    )
+
+    assert result.status is ConversionStatus.NOMINAL_HOUSEHOLD
+    assert result.exact_amount == 200
+    assert result.glass_sizes_ml == (200,)
+
+
+def test_a_target_capacity_never_overrides_a_declared_source_capacity():
+    result = convert_text(
+        "1 стакан 200 мл",
+        Unit.MILLILITER,
+        target_measures=MeasureVolumes(glass_ml=250),
+    )
+
+    assert result.exact_amount == 200
+    assert result.glass_sizes_ml == (200,)
+
+
+def test_a_declared_source_capacity_converts_into_the_target_glass():
+    result = convert_text(
+        "1 стакан 200 мл",
+        Unit.GLASS,
+        target_measures=MeasureVolumes(glass_ml=250),
+    )
+
+    assert result.status is ConversionStatus.NOMINAL_HOUSEHOLD
+    assert result.exact_amount == Fraction(4, 5)
+    assert result.glass_sizes_ml == (200, 250)
+
+
+def test_an_empty_target_context_uses_the_system_defaults():
+    glasses = convert_text("500 мл", Unit.GLASS, target_measures=MeasureVolumes())
+    teaspoons = convert_text(
+        "10 мл", Unit.TEASPOON, target_measures=MeasureVolumes()
+    )
+    tablespoons = convert_text(
+        "30 мл", Unit.TABLESPOON, target_measures=MeasureVolumes()
+    )
+
+    assert glasses.exact_amount == 2
+    assert glasses.glass_sizes_ml == (250,)
+    assert teaspoons.exact_amount == 2
+    assert tablespoons.exact_amount == 2
+
+
+def test_a_target_context_uses_its_override_for_the_target_unit():
+    result = convert_text(
+        "480 мл", Unit.GLASS, target_measures=MeasureVolumes(glass_ml=240)
+    )
+
+    assert result.exact_amount == 2
+    assert result.glass_sizes_ml == (240,)
+
+
+# --- opt-in nonstandard source glass declarations ------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "amount", "size"),
+    [
+        ("1 стакан 240 мл", 1, Fraction(240)),
+        ("1 стакан 237,5 мл", 1, Fraction(475, 2)),
+        ("1 стакан 237.5 мл", 1, Fraction(475, 2)),
+        ("1 стакан (50 мл)", 1, Fraction(50)),
+        ("1 стакан на 1000 мл", 1, Fraction(1000)),
+        ("2 стакана 300 мл", 2, Fraction(300)),
+    ],
+)
+def test_opt_in_parsing_accepts_an_explicit_valid_capacity_exactly(
+    text, amount, size
+):
+    quantity = parse_quantity(text, allow_nonstandard_glass_sizes=True)
+
+    assert quantity.status is QuantityStatus.QUANTIFIED
+    assert quantity.reason is QuantityReason.OK
+    assert quantity.parts == (
+        QuantityPart(Fraction(amount), Unit.GLASS, size),
+    )
+    assert quantity.text == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["1 стакан 49,9 мл", "1 стакан 0 мл", "1 стакан 1000,5 мл", "1 стакан 1001 мл"],
+)
+def test_opt_in_parsing_refuses_a_capacity_outside_the_glass_fence(text):
+    quantity = parse_quantity(text, allow_nonstandard_glass_sizes=True)
+
+    assert quantity.status is QuantityStatus.UNSUPPORTED
+    assert quantity.reason is QuantityReason.INVALID_GLASS_SIZE
+    assert quantity.parts == ()
+
+
+@pytest.mark.parametrize(
+    "text", ["1 стакан 240 мл", "1 стакан 237,5 мл", "1 стакан 300 мл"]
+)
+def test_legacy_parsing_still_refuses_nonstandard_capacities(text):
+    quantity = parse_quantity(text)
+
+    assert quantity.status is QuantityStatus.UNSUPPORTED
+    assert quantity.reason is QuantityReason.INVALID_GLASS_SIZE
+    assert quantity.parts == ()
+
+
+@pytest.mark.parametrize("size", [200, 250])
+def test_legacy_parsing_still_accepts_the_two_defined_sizes(size):
+    quantity = parse_quantity(f"1 стакан {size} мл")
+
+    assert quantity.status is QuantityStatus.QUANTIFIED
+    assert quantity.parts == (QuantityPart(Fraction(1), Unit.GLASS, size),)
+
+
+@pytest.mark.parametrize("allow", [False, True])
+def test_a_bare_glass_has_no_capacity_in_either_mode(allow):
+    quantity = parse_quantity("1 стакан", allow_nonstandard_glass_sizes=allow)
+
+    assert quantity.status is QuantityStatus.QUANTIFIED
+    assert quantity.parts == (QuantityPart(Fraction(1), Unit.GLASS),)
+
+
+def test_the_opt_in_flag_is_keyword_only():
+    with pytest.raises(TypeError):
+        parse_quantity("1 стакан 240 мл", True)  # type: ignore[misc]
+
+
+def test_opt_in_parsing_is_applied_by_convert_text():
+    legacy = convert_text("1 стакан 240 мл", Unit.MILLILITER)
+    extended = convert_text(
+        "1 стакан 240 мл",
+        Unit.MILLILITER,
+        allow_nonstandard_glass_sizes=True,
+    )
+
+    assert legacy.status is ConversionStatus.UNSUPPORTED
+    assert legacy.source.reason is QuantityReason.INVALID_GLASS_SIZE
+    assert extended.status is ConversionStatus.NOMINAL_HOUSEHOLD
+    assert extended.exact_amount == 240
+    assert extended.glass_sizes_ml == (240,)
+
+
+def test_a_fractional_declared_capacity_keeps_exact_rational_arithmetic():
+    doubled = convert_text(
+        "2 стакана 237,5 мл",
+        Unit.MILLILITER,
+        allow_nonstandard_glass_sizes=True,
+    )
+    as_liters = convert_text(
+        "1 стакан 237,5 мл",
+        Unit.LITER,
+        allow_nonstandard_glass_sizes=True,
+    )
+
+    assert doubled.exact_amount == 475
+    assert doubled.glass_sizes_ml == (Fraction(475, 2),)
+    assert as_liters.exact_amount == Fraction(19, 80)
+    assert as_liters.glass_sizes_ml == (Fraction(475, 2),)
+
+
+def test_a_fractional_source_capacity_targets_a_glass_exactly():
+    result = convert_text(
+        "1 стакан",
+        Unit.GLASS,
+        source_measures=MeasureVolumes(glass_ml=Fraction(475, 2)),
+        target_measures=MeasureVolumes(glass_ml=250),
+    )
+
+    assert result.exact_amount == Fraction(19, 20)
+    assert result.glass_sizes_ml == (Fraction(475, 2), 250)
+
+
+# --- conflicting source declarations and metadata ------------------------------------
+
+
+def test_source_metadata_conflicting_with_a_declaration_requires_clarification():
+    result = convert_text(
+        "1 стакан 250 мл",
+        Unit.MILLILITER,
+        source_measures=MeasureVolumes(glass_ml=200),
+    )
+
+    assert result.status is ConversionStatus.CLARIFICATION_REQUIRED
+    assert result.reason is ConversionReason.GLASS_SIZE_CONFLICT
+    assert result.exact_amount is None
+
+
+def test_source_metadata_agreeing_with_a_declaration_converts():
+    result = convert_text(
+        "1 стакан 200 мл",
+        Unit.MILLILITER,
+        source_measures=MeasureVolumes(glass_ml=200),
+    )
+
+    assert result.status is ConversionStatus.NOMINAL_HOUSEHOLD
+    assert result.exact_amount == 200
+
+
+def test_fractional_source_metadata_conflicting_with_a_declaration_is_a_conflict():
+    result = convert_text(
+        "1 стакан 237,5 мл",
+        Unit.MILLILITER,
+        source_measures=MeasureVolumes(glass_ml=240),
+        allow_nonstandard_glass_sizes=True,
+    )
+
+    assert result.status is ConversionStatus.CLARIFICATION_REQUIRED
+    assert result.reason is ConversionReason.GLASS_SIZE_CONFLICT
+
+
+def test_mixed_declarations_stay_independent_without_source_metadata():
+    result = convert_text("1 стакан 200 мл + 1 стакан 250 мл", Unit.MILLILITER)
+
+    assert result.status is ConversionStatus.NOMINAL_HOUSEHOLD
+    assert result.exact_amount == 450
+    assert result.glass_sizes_ml == (200, 250)
+
+
+@pytest.mark.parametrize("size", [200, 250])
+def test_mixed_declarations_conflict_with_any_single_source_metadata(size):
+    result = convert_text(
+        "1 стакан 200 мл + 1 стакан 250 мл",
+        Unit.MILLILITER,
+        source_measures=MeasureVolumes(glass_ml=size),
+    )
+
+    assert result.status is ConversionStatus.CLARIFICATION_REQUIRED
+    assert result.reason is ConversionReason.GLASS_SIZE_CONFLICT
+
+
+def test_extended_mixed_declarations_stay_independent_without_source_metadata():
+    result = convert_text(
+        "1 стакан 240 мл + 1 стакан 250 мл",
+        Unit.MILLILITER,
+        allow_nonstandard_glass_sizes=True,
+    )
+
+    assert result.exact_amount == 490
+    assert result.glass_sizes_ml == (240, 250)
+
+
+def test_extended_mixed_declarations_conflict_with_matching_source_metadata():
+    result = convert_text(
+        "1 стакан 240 мл + 1 стакан 250 мл",
+        Unit.MILLILITER,
+        source_measures=MeasureVolumes(glass_ml=240),
+        allow_nonstandard_glass_sizes=True,
+    )
+
+    assert result.status is ConversionStatus.CLARIFICATION_REQUIRED
+    assert result.reason is ConversionReason.GLASS_SIZE_CONFLICT
+
+
+# --- spoon semantics -----------------------------------------------------------------
+
+
+def test_a_target_teaspoon_of_4_ml_makes_5_ml_five_quarters_of_a_spoon():
+    result = convert_text(
+        "1 ч. л.", Unit.TEASPOON, target_measures=MeasureVolumes(teaspoon_ml=4)
+    )
+
+    assert result.status is ConversionStatus.NOMINAL_HOUSEHOLD
+    assert result.exact_amount == Fraction(5, 4)
+    assert result.rounded == RoundedAmount(
+        Fraction(5, 4), Unit.TEASPOON, Fraction(0)
+    )
+
+
+def test_source_spoon_metadata_overrides_the_conventional_volume():
+    teaspoon = convert_text(
+        "1 ч. л.", Unit.MILLILITER, source_measures=MeasureVolumes(teaspoon_ml=6)
+    )
+    tablespoon = convert_text(
+        "1 ст. л.", Unit.MILLILITER, source_measures=MeasureVolumes(tablespoon_ml=20)
+    )
+
+    assert teaspoon.exact_amount == 6
+    assert tablespoon.exact_amount == 20
+
+
+def test_source_spoons_stay_conventional_without_reliable_metadata():
+    result = convert_text(
+        "1 ст. л. + 1 ч. л.",
+        Unit.MILLILITER,
+        source_measures=MeasureVolumes(glass_ml=200),
+    )
+
+    assert result.exact_amount == 20
+
+
+def test_source_and_target_spoon_volumes_are_independent():
+    result = convert_text(
+        "1 ст. л.",
+        Unit.TEASPOON,
+        source_measures=MeasureVolumes(tablespoon_ml=20),
+        target_measures=MeasureVolumes(teaspoon_ml=4),
+    )
+
+    assert result.exact_amount == 5
+
+
+@pytest.mark.parametrize(
+    "text", ["1 ч. л. с горкой", "1 ст. л. с верхом", "1 ст. л. с горкой2"]
+)
+def test_heaped_spoons_are_not_made_exact_by_measurement_contexts(text):
+    result = convert_text(
+        text,
+        Unit.TEASPOON,
+        source_measures=MeasureVolumes(teaspoon_ml=4),
+        target_measures=MeasureVolumes(teaspoon_ml=4),
+    )
+
+    assert result.status is ConversionStatus.UNSUPPORTED
+    assert result.reason is ConversionReason.SOURCE_NOT_QUANTIFIED
+    assert result.source.reason is QuantityReason.HEAPED
+    assert result.exact_amount is None
+
+
+def test_an_ambiguous_spoon_expression_stays_ambiguous_with_contexts():
+    result = convert_text(
+        "2 ст. л. 1 ч. л.",
+        Unit.TEASPOON,
+        source_measures=MeasureVolumes(),
+        target_measures=MeasureVolumes(),
+    )
+
+    assert result.status is ConversionStatus.AMBIGUOUS
+    assert result.reason is ConversionReason.SOURCE_NOT_QUANTIFIED
+    assert result.source.reason is QuantityReason.AMBIGUOUS_JUXTAPOSITION
+
+
+def test_a_level_spoon_qualifier_is_still_accepted_with_contexts():
+    result = convert_text(
+        "1 ч. л. без горки",
+        Unit.TEASPOON,
+        target_measures=MeasureVolumes(teaspoon_ml=4),
+    )
+
+    assert result.exact_amount == Fraction(5, 4)
+
+
+# --- rounding and the coefficient gate under contexts --------------------------------
+
+
+def test_target_rounding_still_uses_the_target_unit_grid():
+    result = convert_text(
+        "2,6 ст. л.",
+        Unit.TABLESPOON,
+        target_measures=MeasureVolumes(tablespoon_ml=15),
+    )
+
+    assert result.exact_amount == Fraction(13, 5)
+    assert result.rounded == RoundedAmount(
+        Fraction(5, 2), Unit.TABLESPOON, Fraction(1, 26)
+    )
+
+
+def test_no_practical_rounding_is_offered_when_the_target_grid_misses_the_gate():
+    result = convert_text(
+        "1 ст. л.", Unit.TABLESPOON, target_measures=MeasureVolumes(tablespoon_ml=8)
+    )
+
+    assert result.exact_amount == Fraction(15, 8)
+    assert result.rounded is None
+
+
+@pytest.mark.parametrize(
+    ("text", "target"),
+    [("500 г", Unit.MILLILITER), ("500 мл", Unit.GRAM)],
+)
+def test_measurement_contexts_never_bypass_the_ingredient_coefficient_gate(
+    text, target
+):
+    result = convert_text(
+        text,
+        target,
+        source_measures=MeasureVolumes(),
+        target_measures=MeasureVolumes(),
+    )
+
+    assert result.status is ConversionStatus.UNSUPPORTED
+    assert result.reason is ConversionReason.MASS_VOLUME_COEFFICIENT_REQUIRED
+    assert result.exact_amount is None
+
+
+# --- determinism, non-mutation and legacy compatibility ------------------------------
+
+
+def test_context_conversions_are_deterministic_and_mutate_nothing():
+    source = parse_quantity("1 стакан 237,5 мл", allow_nonstandard_glass_sizes=True)
+    snapshot = copy.deepcopy(source)
+    overrides = MeasureVolumes(glass_ml=240)
+
+    first = convert_quantity(source, Unit.GLASS, target_measures=overrides)
+    second = convert_quantity(source, Unit.GLASS, target_measures=overrides)
+
+    assert first == second
+    assert first.exact_amount == Fraction(95, 96)
+    assert source == snapshot
+    assert overrides == MeasureVolumes(glass_ml=240)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"source_measures": MeasureVolumes(glass_ml=200)},
+        {"target_measures": MeasureVolumes()},
+        {
+            "source_measures": MeasureVolumes(glass_ml=200),
+            "target_measures": MeasureVolumes(glass_ml=250),
+        },
+    ],
+)
+def test_legacy_glass_ml_cannot_be_combined_with_measurement_contexts(kwargs):
+    with pytest.raises(ValueError):
+        convert_text("1 стакан", Unit.MILLILITER, glass_ml=200, **kwargs)
+    with pytest.raises(ValueError):
+        convert_quantity(
+            parse_quantity("1 стакан"), Unit.MILLILITER, glass_ml=200, **kwargs
+        )
+
+
+def test_measurement_contexts_refuse_wrong_argument_types():
+    with pytest.raises(TypeError):
+        convert_text(
+            "1 стакан", Unit.MILLILITER, source_measures={"glass_ml": 200}
+        )
+    with pytest.raises(TypeError):
+        convert_text("1 стакан", Unit.MILLILITER, target_measures=250)
+
+
+def test_legacy_calls_keep_their_behavior_when_no_context_is_given():
+    unresolved_glass = convert_text("1 стакан", Unit.MILLILITER)
+    nonstandard = convert_text("1 стакан 240 мл", Unit.MILLILITER)
+    spoons = convert_text("1 ст. л.", Unit.MILLILITER)
+    explicit = convert_text("500 мл", Unit.GLASS, glass_ml=200)
+
+    assert unresolved_glass.status is ConversionStatus.CLARIFICATION_REQUIRED
+    assert unresolved_glass.reason is ConversionReason.GLASS_SIZE_REQUIRED
+    assert nonstandard.status is ConversionStatus.UNSUPPORTED
+    assert nonstandard.source.reason is QuantityReason.INVALID_GLASS_SIZE
+    assert spoons.exact_amount == 15
+    assert explicit.exact_amount == Fraction(5, 2)
+    assert explicit.glass_sizes_ml == (200,)
 
 
 # --- boundaries ----------------------------------------------------------------------
