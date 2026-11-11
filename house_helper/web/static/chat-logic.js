@@ -422,12 +422,12 @@
     sourceGlassNote: "Выбор действует, пока открыт рецепт, и не сохраняется в профиле.",
     // A typed capacity is only a draft until its own read succeeds: it is never drawn as
     // the confirmed choice, and this says so beside the field.
-    sourceGlassDraftHint: "Черновик: объём применится после нажатия «Применить».",
+    sourceGlassDraftHint: "Черновик: объем применится после нажатия «Применить».",
     sourceGlassConfirmed: "Выбрано: {value} мл",
     sourceGlassPending: "Применяем {value} мл…",
-    sourceGlassFailed: "Не удалось применить объём. Попробуйте ещё раз.",
-    measuresRefreshPending: "Обновляем пересчёт в ваших мерах…",
-    measuresRefreshFailed: "Рецепт сохранён, но пересчёт в ваших мерах не удалось обновить. Попробуйте ещё раз.",
+    sourceGlassFailed: "Не удалось применить объем. Попробуйте еще раз.",
+    measuresRefreshPending: "Обновляем пересчет в ваших мерах…",
+    measuresRefreshFailed: "Рецепт сохранен, но пересчет в ваших мерах не удалось обновить. Попробуйте еще раз.",
     editAction: "Редактировать",
     editTitleLabel: "Название",
     editServingsLabel: "Порции",
