@@ -40,6 +40,7 @@ from tests.persistence_support import (  # noqa: F401  (fixtures)
     session,
     utc,
 )
+from tests.chat_support import ScriptedBackend, chat_app, post_headers
 
 NOW = utc(2026, 11, 1, 12)
 LATER = NOW + timedelta(hours=1)
@@ -200,6 +201,113 @@ def test_the_saved_copy_holds_the_fields_and_its_rendered_text(factory, user_id)
         [("свекла", "2 шт."), ("капуста", "300 г")],
         ["Сварите бульон.", "Добавьте овощи."],
     )
+
+
+def test_a_source_capacity_declaration_survives_storage_copy_and_edit(factory, user_id):
+    # KH-F01-B1.1-A / AC59: the declaration is part of the amount text, so it travels
+    # through message_recipes storage, the favorite copy, GET and an unrelated PATCH edit
+    # unchanged, with no migration and no extra protocol key.
+    recipe = {
+        "title": "Вода с мерой",
+        "servings": "1 порция",
+        "ingredients": [
+            {"name": "Вода", "amount": "1 стакан (200 мл)"},
+            {"name": "Соль", "amount": "по вкусу"},
+        ],
+        "steps": ["Вскипятите воду."],
+    }
+    conversation_id, answer = answer_with(factory, user_id, text=block(recipe))
+
+    saved = save(factory, user_id, conversation_id, answer, 0)
+
+    [(_, _, _, stored_ingredients, stored_steps)] = message_recipe_values(factory, answer)
+    assert stored_ingredients[0] == {
+        "name": "Вода",
+        "amount": "1 стакан (200 мл)",
+    }
+    assert stored_ingredients[1] == {"name": "Соль", "amount": "по вкусу"}
+    assert stored_steps == ["Вскипятите воду."]
+
+    found = detail(factory, user_id, saved.favorite.id)
+    assert found.ingredients[0].amount == "1 стакан (200 мл)"
+
+    updated = edit(factory, user_id, saved.favorite.id, 1, {"title": "Новая вода"})
+
+    assert updated.title == "Новая вода"
+    assert updated.ingredients[0].amount == "1 стакан (200 мл)"
+
+
+@pytest.mark.asyncio
+async def test_a_source_capacity_declaration_survives_the_http_get_and_patch(tmp_path):
+    # KH-F01-B1.1-A / AC59 over the real routes: the declaration is part of the amount
+    # text, so it travels from the stored answer through the favorite copy, the actual
+    # GET and an unrelated PATCH unchanged, with no migration and no extra protocol key.
+    recipe = {
+        "title": "Вода с мерой",
+        "servings": "1 порция",
+        "ingredients": [
+            {"name": "Вода", "amount": "1 стакан (200 мл)"},
+            {"name": "Соль", "amount": "по вкусу"},
+        ],
+        "steps": ["Вскипятите воду."],
+    }
+    text = block(recipe)
+
+    async with chat_app(tmp_path, ScriptedBackend(default=text)) as chat:
+        conversation = await chat.create()
+        sent = await chat.send(conversation, "Сварите воду.", "k-1")
+        assert sent.status_code == 201, sent.text
+        answer = sent.json()["assistant_message"]["id"]
+
+        with chat.base.factory() as db:
+            stored = db.get(Message, answer).content
+        with chat.base.factory() as db, db.begin():
+            mr.record_recipes_for_message(db, answer, stored, now=chat.clock())
+
+        saved = await chat.client.post(
+            "/api/favorites",
+            json={
+                "conversation_id": conversation,
+                "message_id": answer,
+                "recipe_index": 0,
+            },
+            headers=post_headers(),
+        )
+        assert saved.status_code == 201, saved.text
+        favorite = saved.json()["id"]
+        assert saved.json()["kind"] == "structured"
+
+        detail = await chat.client.get(f"/api/favorites/{favorite}")
+        assert detail.status_code == 200, detail.text
+        shown = detail.json()
+        assert shown["kind"] == "structured" and shown["recipe_index"] == 0
+        assert shown["ingredients"] == recipe["ingredients"]
+        assert all(set(item) == {"name", "amount"} for item in shown["ingredients"])
+        assert shown["servings"] == "1 порция"
+        assert shown["steps"] == recipe["steps"]
+
+        edited = await chat.client.patch(
+            f"/api/favorites/{favorite}",
+            json={"expected_version": shown["version"], "title": "Моя вода"},
+            headers=post_headers(),
+        )
+        assert edited.status_code == 200, edited.text
+        patched = edited.json()
+        assert patched["title"] == "Моя вода"
+        assert patched["kind"] == "structured"
+        assert patched["ingredients"] == recipe["ingredients"]
+        assert patched["version"] == shown["version"] + 1
+
+        again = await chat.client.get(f"/api/favorites/{favorite}")
+        assert again.status_code == 200, again.text
+        assert again.json()["ingredients"] == recipe["ingredients"]
+
+        with chat.base.factory() as db:
+            [row] = db.scalars(
+                sa.select(MessageRecipe).where(MessageRecipe.message_id == answer)
+            )
+        assert row.ingredients == recipe["ingredients"]
+        assert all(set(item) == {"name", "amount"} for item in row.ingredients)
 
 
 def test_a_recipe_without_servings_saves_without_them(factory, user_id):
