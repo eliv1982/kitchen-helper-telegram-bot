@@ -291,6 +291,88 @@ function favoriteDetail(item, textValue, extra = {}) {
 const keptBody = (item, created = true) => json(created ? 201 : 200, { ...item, created });
 const removedBody = () => ({ kind: "empty", status: 204 });
 
+// --- KH-F01-B1.1: the typed step annotations of a schema_version 2 block -------------------------
+
+// The half-open offsets of `piece` in `text`, counted in Unicode code points -- the unit the
+// server's spans use, never JavaScript's UTF-16 indexes (15.8.4).
+function spanOffsets(text, piece) {
+  const haystack = Array.from(text);
+  const needle = Array.from(piece);
+  for (let i = 0; i + needle.length <= haystack.length; i++) {
+    let found = true;
+    for (let j = 0; j < needle.length; j++) {
+      if (haystack[i + j] !== needle[j]) {
+        found = false;
+        break;
+      }
+    }
+    if (found) return { start: i, end: i + needle.length };
+  }
+  throw new Error("the step does not contain " + JSON.stringify(piece));
+}
+
+// One SpanAnnotation: a linked metric amount that converts to two glasses, unless `extra`
+// says otherwise.
+function span(text, piece, extra = {}) {
+  const at = spanOffsets(text, piece);
+  return {
+    start: at.start,
+    end: at.end,
+    text: piece,
+    ingredient_position: 0,
+    link: "linked",
+    link_reason: "name_after",
+    conversion: {
+      target_unit: "glass",
+      status: "nominal_household",
+      reason: "converted",
+      exact: { numerator: 2, denominator: 1 },
+      rounded: { numerator: 2, denominator: 1, relative_error: { numerator: 0, denominator: 1 } },
+      identical: false,
+      presentation: "rounded",
+    },
+    conversion_omitted_reason: null,
+    capacity_origin: "not_applicable",
+    source_approximation: { approximate: false, word: null },
+    ...extra,
+  };
+}
+
+function stepAnnotation(index, text, spans = [], extra = {}) {
+  return {
+    step_index: index,
+    step_text: text,
+    text_sha256: "a".repeat(64),
+    status: "complete",
+    spans,
+    ...extra,
+  };
+}
+
+// The additive v2 block around a set of step annotations, bound to `version`.
+function stepBlock(version, annotations, extra = {}) {
+  const spans = annotations.reduce((count, entry) => count + entry.spans.length, 0);
+  return {
+    schema_version: 2,
+    favorite_version: version,
+    target: { glass_ml: 250, teaspoon_ml: 5, tablespoon_ml: 15 },
+    source_glass_ml: null,
+    source_glass_required: false,
+    steps_source_glass_required: false,
+    ingredients: [],
+    steps: annotations,
+    provenance: { status: "complete", declared: [], incomplete: [] },
+    analysis: {
+      status: "complete",
+      spans_emitted: spans,
+      spans_omitted: 0,
+      omitted_reasons: { limit_exceeded: 0, malformed: 0, unsafe_fraction: 0 },
+      limits: { max_spans_per_step: 32, max_spans_per_recipe: 128, max_step_chars: 1000, max_steps: 50 },
+    },
+    ...extra,
+  };
+}
+
 // The shopping lists, in the shapes of the real API (tests/test_web_shopping_lists.py checks those).
 const shoppingAt = (minutes = 0) =>
   new Date(START - 3600_000 + minutes * 60_000).toISOString().replace("Z", "+00:00");
@@ -564,6 +646,10 @@ module.exports = {
   shoppingDetail,
   shoppingSummary,
   shoppingListsBody,
+  spanOffsets,
+  span,
+  stepAnnotation,
+  stepBlock,
   recipeBody,
   message,
   historyBody,

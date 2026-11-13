@@ -5539,4 +5539,1392 @@ scenario("a_conversion_that_contradicts_its_own_status_draws_no_number_and_the_r
   assert.ok(!body.textContent.includes(Logic.TEXT.sourceGlassQuestion));
 });
 
+// KH-F01-B1.1-D: step hints, the safe «Не знаю» answer and the approved copy
+// ============================================================================================
+
+// The card of a structured favorite whose steps carry the block's annotations.
+function stepsCard(block, steps, extra = {}) {
+  return (env) => {
+    env.signedIn([conversation(CONV_A, 0)], { [CONV_A]: historyBody(CONV_A, structuredThread()) });
+    const item = structuredFavoriteItem({ steps, measures: block, ...extra });
+    env.net.route("GET", "/api/favorites", H.favoritesBody([item]));
+    env.net.route("GET", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(item, "Борщ"));
+  };
+}
+
+async function openCard(page) {
+  page.el("tab-favorites").click();
+  await page.settle();
+  page.el("favorite-list").byTag("button")[0].click();
+  await page.settle();
+}
+
+// The text of a node without any of its elements: what a reader may copy from the step.
+const textOnly = (node) =>
+  node.childNodes
+    .filter((child) => child.nodeType === 3)
+    .map((child) => child.data)
+    .join("");
+
+const stepItems = (body) => body.byClass("recipe-steps")[0].byTag("li");
+
+scenario("a_step_hint_is_a_separate_element_after_its_amount_and_the_text_is_unchanged", async () => {
+  const step = "Доведите до кипения, добавьте 500 мл воды.";
+  const page = await open(
+    stepsCard(H.stepBlock(3, [H.stepAnnotation(0, step, [H.span(step, "500 мл")])]), [step]),
+    { structured: true }
+  );
+  await openCard(page);
+
+  const body = page.el("recipe-body");
+  const [item] = stepItems(body);
+  assert.equal(textOnly(item), step, "the text nodes are the stored step, untouched");
+  assert.equal(item.textContent, step.slice(0, step.indexOf("500 мл")) + "500 мл (2 ваших стакана)" + step.slice(step.indexOf("500 мл") + "500 мл".length));
+  const hints = item.byClass("measure-hint");
+  assert.equal(hints.length, 1);
+  assert.equal(hints[0].textContent, " (2 ваших стакана)");
+  // Immediately after the amount it explains, not at the end of the step.
+  const children = item.childNodes;
+  const at = children.indexOf(hints[0]);
+  assert.equal(children[at - 1].data, "500 мл");
+  assert.equal(children[at + 1].data, " воды.");
+});
+
+scenario("two_step_amounts_are_hinted_independently_where_each_belongs", async () => {
+  const step = "Влейте 500 мл воды и добавьте 250 мл молока.";
+  const exactOne = {
+    target_unit: "glass",
+    status: "nominal_household",
+    reason: "converted",
+    exact: { numerator: 1, denominator: 1 },
+    rounded: { numerator: 1, denominator: 1, relative_error: { numerator: 0, denominator: 1 } },
+    identical: false,
+    presentation: "rounded",
+  };
+  const page = await open(
+    stepsCard(
+      H.stepBlock(3, [
+        H.stepAnnotation(0, step, [
+          H.span(step, "500 мл"),
+          H.span(step, "250 мл", { conversion: exactOne }),
+        ]),
+      ]),
+      [step]
+    ),
+    { structured: true }
+  );
+  await openCard(page);
+
+  const [item] = stepItems(page.el("recipe-body"));
+  assert.equal(textOnly(item), step);
+  assert.equal(item.byClass("measure-hint").length, 2);
+  assert.ok(item.textContent.includes("500 мл (2 ваших стакана)"));
+  assert.ok(item.textContent.includes("250 мл (1 ваш стакан)"));
+});
+
+scenario("an_emoji_before_an_amount_does_not_shift_its_hint", async () => {
+  const step = "Добавьте 🥛 500 мл воды 🥛.";
+  const page = await open(
+    stepsCard(H.stepBlock(3, [H.stepAnnotation(0, step, [H.span(step, "500 мл")])]), [step]),
+    { structured: true }
+  );
+  await openCard(page);
+
+  const [item] = stepItems(page.el("recipe-body"));
+  assert.equal(textOnly(item), step, "the astral characters are the stored ones");
+  const hints = item.byClass("measure-hint");
+  assert.equal(hints.length, 1);
+  const at = item.childNodes.indexOf(hints[0]);
+  assert.equal(item.childNodes[at - 1].data, "500 мл");
+  assert.ok(item.textContent.includes("🥛 500 мл (2 ваших стакана)"));
+});
+
+scenario("a_combining_mark_inside_the_amount_keeps_the_span_exact", async () => {
+  const step = "Добавьте 500 мл́ воды.";
+  const piece = "500 мл́";
+  const page = await open(
+    stepsCard(H.stepBlock(3, [H.stepAnnotation(0, step, [H.span(step, piece)])]), [step]),
+    { structured: true }
+  );
+  await openCard(page);
+
+  const [item] = stepItems(page.el("recipe-body"));
+  assert.equal(textOnly(item), step);
+  assert.equal(item.byClass("measure-hint").length, 1);
+  assert.ok(item.textContent.includes(piece + " (2 ваших стакана)"));
+});
+
+scenario("an_annotation_that_does_not_match_its_step_is_not_drawn_at_all", async () => {
+  const step = "Добавьте 500 мл воды.";
+  const good = H.span(step, "500 мл");
+  const broken = [
+    // Overlapping spans.
+    [good, { ...H.span(step, "500 мл воды"), start: good.start + 1, end: good.end + 4 }],
+    // The slice is not the text the span claims.
+    [{ ...good, text: "600 мл" }],
+    // The span runs past the stored step.
+    [{ ...good, start: 999, end: 1005 }],
+  ];
+  for (const spans of broken) {
+    const page = await open(
+      stepsCard(H.stepBlock(3, [H.stepAnnotation(0, step, spans)]), [step]),
+      { structured: true }
+    );
+    await openCard(page);
+    const [item] = stepItems(page.el("recipe-body"));
+    assert.equal(textOnly(item), step);
+    assert.equal(item.byClass("measure-hint").length, 0, JSON.stringify(spans));
+    assert.equal(item.textContent, step);
+  }
+});
+
+scenario("no_step_hint_is_drawn_for_an_amount_the_server_could_not_convert", async () => {
+  const step = "Добавьте 500 мл воды и 200 г муки.";
+  const noConversion = (extra) =>
+    H.span(step, extra.piece || "500 мл", { conversion: null, ...extra });
+  const cases = [
+    { link: "unresolved", link_reason: "no_local_binding", capacity_origin: "unresolved" },
+    { link: "ambiguous", link_reason: "multiple_candidates", capacity_origin: "declared_text" },
+    { link: "shared", link_reason: "shared_amount", capacity_origin: "not_applicable" },
+    { link: "unsupported", link_reason: "range", capacity_origin: "not_applicable" },
+    { link: "linked", link_reason: "name_after", capacity_origin: "not_applicable", conversion_omitted_reason: "mass", piece: "200 г" },
+  ];
+  for (const extra of cases) {
+    const piece = extra.piece || "500 мл";
+    const page = await open(
+      stepsCard(H.stepBlock(3, [H.stepAnnotation(0, step, [noConversion({ ...extra, piece })])]), [step]),
+      { structured: true }
+    );
+    await openCard(page);
+    const [item] = stepItems(page.el("recipe-body"));
+    assert.equal(item.byClass("measure-hint").length, 0, JSON.stringify(extra));
+    assert.equal(item.textContent, step);
+  }
+});
+
+scenario("exact_rounded_and_the_three_source_words_read_as_the_spec_says", async () => {
+  const step = "Возьмите 500 мл воды.";
+  const exactPresentation = {
+    target_unit: "glass",
+    status: "nominal_household",
+    reason: "converted",
+    exact: { numerator: 4, denominator: 5 },
+    rounded: null,
+    identical: false,
+    presentation: "exact",
+  };
+  const roundedTwoAndAHalf = {
+    target_unit: "glass",
+    status: "nominal_household",
+    reason: "converted",
+    exact: { numerator: 23, denominator: 9 },
+    rounded: { numerator: 5, denominator: 2, relative_error: { numerator: 1, denominator: 50 } },
+    identical: false,
+    presentation: "rounded",
+  };
+  for (const word of ["около", "примерно", "приблизительно"]) {
+    const page = await open(
+      stepsCard(
+        H.stepBlock(3, [
+          H.stepAnnotation(0, step, [
+            H.span(step, "500 мл", {
+              conversion: roundedTwoAndAHalf,
+              source_approximation: { approximate: true, word },
+            }),
+          ]),
+        ]),
+        [step]
+      ),
+      { structured: true }
+    );
+    await openCard(page);
+    const [item] = stepItems(page.el("recipe-body"));
+    // The word makes the hint approximate even though two and a half is exact arithmetic.
+    assert.ok(item.textContent.includes("≈ 2½ вашего стакана"), word);
+    assert.ok(!item.textContent.includes("Точно"), word);
+  }
+
+  const exactPage = await open(
+    stepsCard(
+      H.stepBlock(3, [
+        H.stepAnnotation(0, step, [H.span(step, "500 мл", { conversion: exactPresentation })]),
+      ]),
+      [step]
+    ),
+    { structured: true }
+  );
+  await openCard(exactPage);
+  assert.ok(
+    stepItems(exactPage.el("recipe-body"))[0].textContent.includes("Точно: 0,8 вашего стакана")
+  );
+
+  // A rounded value whose error is zero needs no marker at all.
+  const zeroError = {
+    ...roundedTwoAndAHalf,
+    rounded: { numerator: 2, denominator: 1, relative_error: { numerator: 0, denominator: 1 } },
+  };
+  const plainPage = await open(
+    stepsCard(
+      H.stepBlock(3, [H.stepAnnotation(0, step, [H.span(step, "500 мл", { conversion: zeroError })])]),
+      [step]
+    ),
+    { structured: true }
+  );
+  await openCard(plainPage);
+  const plain = stepItems(plainPage.el("recipe-body"))[0];
+  assert.ok(plain.textContent.includes("500 мл (2 ваших стакана)"));
+  assert.ok(!plain.textContent.includes("≈"));
+});
+
+scenario("a_step_only_undeclared_glass_asks_the_question_once_with_the_safe_answer_offered", async () => {
+  const step = "Добавьте 1 стакан воды.";
+  const block = H.stepBlock(
+    3,
+    [
+      H.stepAnnotation(0, step, [
+        H.span(step, "1 стакан", {
+          capacity_origin: "unresolved",
+          conversion: null,
+          conversion_omitted_reason: null,
+        }),
+      ]),
+    ],
+    { steps_source_glass_required: true, source_glass_required: false }
+  );
+  const item = structuredFavoriteItem({ steps: [step], measures: block });
+  const clarified = structuredFavoriteItem({
+    steps: [step],
+    measures: H.stepBlock(
+      3,
+      [H.stepAnnotation(0, step, [H.span(step, "1 стакан", { capacity_origin: "temporary_clarification" })])],
+      { steps_source_glass_required: true, source_glass_ml: 250 }
+    ),
+  });
+  const page = await open(
+    (env) => {
+      env.signedIn([conversation(CONV_A, 0)], { [CONV_A]: historyBody(CONV_A, structuredThread()) });
+      env.net.route("GET", "/api/favorites", H.favoritesBody([item]));
+      env.net.route(
+        "GET",
+        `/api/favorites/${H.FAV_1}`,
+        H.favoriteDetail(item, "Борщ"),
+        H.favoriteDetail(clarified, "Борщ")
+      );
+    },
+    { structured: true }
+  );
+  await openCard(page);
+
+  const body = page.el("recipe-body");
+  assert.ok(body.textContent.includes(Logic.TEXT.sourceGlassQuestion));
+  assert.ok(body.textContent.includes(Logic.TEXT.sourceGlassExplanation));
+  assert.equal(body.byClass("measure-clarify").length, 1, "one question per recipe");
+  assert.equal(body.buttons(Logic.TEXT.sourceGlassUnknown).length, 1);
+  // No hint rests on a capacity nobody supplied.
+  assert.equal(stepItems(body)[0].byClass("measure-hint").length, 0);
+
+  page.el("source-glass-250").checked = true;
+  page.el("source-glass-250").fire("change");
+  await page.settle();
+
+  assert.equal(
+    page.env.net.requests("GET", `/api/favorites/${H.FAV_1}`).slice(-1)[0].url,
+    `/api/favorites/${H.FAV_1}?source_glass_ml=250`
+  );
+  assert.ok(stepItems(page.el("recipe-body"))[0].textContent.includes("1 стакан (2 ваших стакана)"));
+  assert.equal(page.env.net.requests("PATCH", "/api/favorites").length, 0);
+});
+
+scenario("the_safe_unknown_answer_closes_the_question_and_keeps_only_declared_hints", async () => {
+  const step = "Добавьте 500 мл воды.";
+  const ingredients = [
+    { name: "вода", amount: "1 стакан" },
+    { name: "мука", amount: "1 стакан 200 мл" },
+  ];
+  const declaredLine = {
+    position: 1,
+    source: "1 стакан 200 мл",
+    source_kind: "household",
+    target_unit: "glass",
+    status: "nominal_household",
+    reason: "converted",
+    exact: { numerator: 1, denominator: 2 },
+    rounded: null,
+    identical: false,
+    presentation: "exact",
+    source_terms: [
+      {
+        unit: "glass",
+        amount: { numerator: 1, denominator: 1 },
+        capacity_ml: { numerator: 200, denominator: 1 },
+        capacity_origin: "declared_text",
+      },
+    ],
+  };
+  const glassLine = (origin, extra = {}) => ({
+    position: 0,
+    source: "1 стакан",
+    source_kind: "household",
+    target_unit: "glass",
+    status: "clarification_required",
+    reason: "glass_size_required",
+    exact: null,
+    rounded: null,
+    identical: false,
+    presentation: "none",
+    source_terms: [
+      {
+        unit: "glass",
+        amount: { numerator: 1, denominator: 1 },
+        capacity_ml: null,
+        capacity_origin: origin,
+      },
+    ],
+    ...extra,
+  });
+  const convertedLine = glassLine("temporary_clarification", {
+    status: "nominal_household",
+    reason: "converted",
+    exact: { numerator: 4, denominator: 5 },
+    presentation: "exact",
+  });
+  const unclarified = H.stepBlock(
+    3,
+    [
+      H.stepAnnotation(0, step, [
+        H.span(step, "500 мл", {
+          capacity_origin: "unresolved",
+          conversion: null,
+          conversion_omitted_reason: null,
+        }),
+      ]),
+    ],
+    {
+      source_glass_required: true,
+      steps_source_glass_required: true,
+      ingredients: [glassLine("unresolved"), declaredLine],
+    }
+  );
+  const clarified = H.stepBlock(
+    3,
+    [H.stepAnnotation(0, step, [H.span(step, "500 мл", { capacity_origin: "temporary_clarification" })])],
+    {
+      source_glass_ml: 200,
+      source_glass_required: true,
+      steps_source_glass_required: true,
+      ingredients: [convertedLine, declaredLine],
+    }
+  );
+  const card = (block) => structuredFavoriteItem({ steps: [step], ingredients, measures: block });
+  const page = await open(
+    (env) => {
+      env.signedIn([conversation(CONV_A, 0)], { [CONV_A]: historyBody(CONV_A, structuredThread()) });
+      env.net.route("GET", "/api/favorites", H.favoritesBody([card(unclarified)]));
+      env.net.route(
+        "GET",
+        `/api/favorites/${H.FAV_1}`,
+        H.favoriteDetail(card(unclarified), "Борщ"),
+        H.favoriteDetail(card(clarified), "Борщ"),
+        H.favoriteDetail(card(unclarified), "Борщ")
+      );
+    },
+    { structured: true }
+  );
+  await openCard(page);
+
+  page.el("source-glass-200").checked = true;
+  page.el("source-glass-200").fire("change");
+  await page.settle();
+  let body = page.el("recipe-body");
+  assert.ok(body.textContent.includes("вода — 1 стакан"));
+  assert.ok(body.textContent.includes("Точно: 0,8 вашего стакана"), "the clarified line");
+  assert.ok(body.textContent.includes("Точно: ½ вашего стакана"), "the declared line");
+  assert.ok(stepItems(body)[0].textContent.includes("500 мл (2 ваших стакана)"));
+
+  page.el("source-glass-unknown").click();
+  await page.settle();
+
+  body = page.el("recipe-body");
+  // The question is closed, with nothing drawn from the withdrawn capacity.
+  assert.ok(!body.textContent.includes(Logic.TEXT.sourceGlassQuestion));
+  assert.ok(!body.textContent.includes(Logic.TEXT.sourceGlassExplanation));
+  assert.ok(!body.textContent.includes("Точно: 0,8 вашего стакана"));
+  assert.equal(stepItems(body)[0].byClass("measure-hint").length, 0);
+  // The declared conversion and every original amount are still there.
+  assert.ok(body.textContent.includes("Точно: ½ вашего стакана"));
+  assert.ok(body.textContent.includes("вода — 1 стакан"));
+  assert.ok(body.textContent.includes("мука — 1 стакан 200 мл"));
+  assert.equal(textOnly(stepItems(body)[0]), step);
+  // Nothing was written, and the re-read carried no capacity.
+  assert.equal(page.env.net.requests("PATCH", "/api/favorites").length, 0);
+  assert.equal(page.env.net.requests("POST", "/api/favorites").length, 0);
+  assert.equal(
+    page.env.net.requests("GET", `/api/favorites/${H.FAV_1}`).slice(-1)[0].url,
+    `/api/favorites/${H.FAV_1}`
+  );
+
+  // Reopening the recipe is a new view: the question comes back.
+  await openCard(page);
+  assert.ok(page.el("recipe-body").textContent.includes(Logic.TEXT.sourceGlassQuestion));
+});
+
+scenario("a_failed_reread_after_the_safe_answer_leaves_only_the_declared_hints", async () => {
+  const step = "Добавьте 500 мл воды.";
+  const ingredients = [
+    { name: "вода", amount: "1 стакан" },
+    { name: "мука", amount: "1 стакан 200 мл" },
+  ];
+  const declaredLine = {
+    position: 1,
+    source: "1 стакан 200 мл",
+    source_kind: "household",
+    target_unit: "glass",
+    status: "nominal_household",
+    reason: "converted",
+    exact: { numerator: 1, denominator: 2 },
+    rounded: null,
+    identical: false,
+    presentation: "exact",
+    source_terms: [
+      {
+        unit: "glass",
+        amount: { numerator: 1, denominator: 1 },
+        capacity_ml: { numerator: 200, denominator: 1 },
+        capacity_origin: "declared_text",
+      },
+    ],
+  };
+  const glassLine = (origin, extra = {}) => ({
+    position: 0,
+    source: "1 стакан",
+    source_kind: "household",
+    target_unit: "glass",
+    status: "clarification_required",
+    reason: "glass_size_required",
+    exact: null,
+    rounded: null,
+    identical: false,
+    presentation: "none",
+    source_terms: [
+      {
+        unit: "glass",
+        amount: { numerator: 1, denominator: 1 },
+        capacity_ml: null,
+        capacity_origin: origin,
+      },
+    ],
+    ...extra,
+  });
+  const unclarified = H.stepBlock(
+    3,
+    [
+      H.stepAnnotation(0, step, [
+        H.span(step, "500 мл", {
+          capacity_origin: "unresolved",
+          conversion: null,
+          conversion_omitted_reason: null,
+        }),
+      ]),
+    ],
+    { steps_source_glass_required: true, ingredients: [glassLine("unresolved"), declaredLine] }
+  );
+  const clarified = H.stepBlock(
+    3,
+    [H.stepAnnotation(0, step, [H.span(step, "500 мл", { capacity_origin: "temporary_clarification" })])],
+    {
+      source_glass_ml: 200,
+      steps_source_glass_required: true,
+      ingredients: [
+        glassLine("temporary_clarification", {
+          status: "nominal_household",
+          reason: "converted",
+          exact: { numerator: 4, denominator: 5 },
+          presentation: "exact",
+        }),
+        declaredLine,
+      ],
+    }
+  );
+  const card = (block) => structuredFavoriteItem({ steps: [step], ingredients, measures: block });
+  const page = await open(
+    (env) => {
+      env.signedIn([conversation(CONV_A, 0)], { [CONV_A]: historyBody(CONV_A, structuredThread()) });
+      env.net.route("GET", "/api/favorites", H.favoritesBody([card(unclarified)]));
+      env.net.route(
+        "GET",
+        `/api/favorites/${H.FAV_1}`,
+        H.favoriteDetail(card(unclarified), "Борщ"),
+        H.favoriteDetail(card(clarified), "Борщ"),
+        fail()
+      );
+    },
+    { structured: true }
+  );
+  await openCard(page);
+  page.el("source-glass-200").checked = true;
+  page.el("source-glass-200").fire("change");
+  await page.settle();
+  assert.ok(page.el("recipe-body").textContent.includes("Точно: 0,8 вашего стакана"));
+
+  page.el("source-glass-unknown").click();
+  await page.settle();
+
+  const body = page.el("recipe-body");
+  // The cleared capacity is not drawn again just because the server could not be asked.
+  assert.ok(!body.textContent.includes("Точно: 0,8 вашего стакана"));
+  assert.equal(stepItems(body)[0].byClass("measure-hint").length, 0);
+  assert.ok(body.textContent.includes("Точно: ½ вашего стакана"));
+  assert.ok(body.textContent.includes("Добавьте 500 мл воды."));
+  assert.equal(body.buttons(Logic.TEXT.retry).length, 1, "the failed read can be asked again");
+});
+
+scenario("a_failed_analysis_is_said_in_words_and_no_speculative_hint_is_drawn", async () => {
+  const step = "Добавьте 500 мл воды.";
+  const block = H.stepBlock(3, [], {
+    analysis: {
+      status: "failed",
+      spans_emitted: 0,
+      spans_omitted: 0,
+      omitted_reasons: { limit_exceeded: 0, malformed: 0, unsafe_fraction: 0 },
+      limits: { max_spans_per_step: 32, max_spans_per_recipe: 128, max_step_chars: 1000, max_steps: 50 },
+    },
+    ingredients: [
+      {
+        position: 0,
+        source: "1 стакан 200 мл",
+        source_kind: "household",
+        target_unit: "glass",
+        status: "nominal_household",
+        reason: "converted",
+        exact: { numerator: 4, denominator: 5 },
+        rounded: null,
+        identical: false,
+        presentation: "exact",
+      },
+    ],
+  });
+  const page = await open(stepsCard(block, [step], { ingredients: [{ name: "вода", amount: "1 стакан 200 мл" }] }), {
+    structured: true,
+  });
+  await openCard(page);
+
+  const body = page.el("recipe-body");
+  assert.ok(body.textContent.includes(Logic.TEXT.stepsNotChecked));
+  assert.equal(stepItems(body)[0].textContent, step, "the stored step, with no derived number");
+  // The ingredient hint the server did compute is untouched.
+  assert.ok(body.textContent.includes("Точно: 0,8 вашего стакана"));
+  // Nothing claims the recipe was checked or is consistent.
+  assert.ok(!/проверен|подтвержд|согласован/i.test(body.textContent));
+});
+
+scenario("hostile_text_in_a_step_is_still_text_even_beside_a_hint", async () => {
+  const step = "<img src=x onerror=alert(1)> Добавьте 500 мл воды.";
+  const page = await open(
+    stepsCard(H.stepBlock(3, [H.stepAnnotation(0, step, [H.span(step, "500 мл")])]), [step]),
+    { structured: true }
+  );
+  await openCard(page);
+
+  const body = page.el("recipe-body");
+  const [item] = stepItems(body);
+  assert.equal(textOnly(item), step);
+  assert.ok(item.textContent.includes("500 мл (2 ваших стакана)"));
+  assert.equal(body.byTag("img").length, 0);
+  assert.equal(body.byTag("script").length, 0);
+});
+
+scenario("a_block_of_another_version_draws_no_step_hint_but_keeps_the_ingredient_ones", async () => {
+  const step = "Добавьте 500 мл воды.";
+  const block = H.stepBlock(2, [H.stepAnnotation(0, step, [H.span(step, "500 мл")])], {
+    ingredients: [
+      {
+        position: 0,
+        source: "1 стакан 200 мл",
+        source_kind: "household",
+        target_unit: "glass",
+        status: "nominal_household",
+        reason: "converted",
+        exact: { numerator: 4, denominator: 5 },
+        rounded: null,
+        identical: false,
+        presentation: "exact",
+      },
+    ],
+  });
+  const page = await open(stepsCard(block, [step], { ingredients: [{ name: "вода", amount: "1 стакан 200 мл" }] }), {
+    structured: true,
+  });
+  await openCard(page);
+
+  const body = page.el("recipe-body");
+  assert.equal(stepItems(body)[0].textContent, step);
+  assert.ok(body.textContent.includes("Точно: 0,8 вашего стакана"));
+});
+
+scenario("the_profile_carries_the_approved_badge_and_measure_labels", async () => {
+  const page = await open((env) => {
+    env.signedIn([]);
+    env.net.route("GET", "/api/profile", H.profileBody("Елена", "normal", [], { glass_ml: 240 }));
+  });
+  page.el("profile-open").click();
+  await page.settle();
+  await page.settle();
+
+  const body = page.el("profile-body");
+  assert.ok(body.textContent.includes("Указано вами"));
+  assert.ok(body.textContent.includes("Объем моего стакана, мл"));
+  assert.ok(body.textContent.includes("Объем моей чайной ложки, мл"));
+  assert.ok(body.textContent.includes("Объем моей столовой ложки, мл"));
+  assert.ok(!body.textContent.includes("ваш размер"));
+  assert.ok(!body.textContent.includes("Объём"), "the UI spelling is Объем, as everywhere else");
+  assert.ok(body.textContent.includes("240 мл"));
+});
+
+// ============================================================================================
+// KH-F01-B1.1-D-REMEDIATION-01: rendering regressions for the audit findings
+// ============================================================================================
+
+// A conversion object the page reads as a number: an exact rational or a rounded one.
+function exactConversion(numerator, denominator, extra = {}) {
+  return {
+    target_unit: "glass",
+    status: "nominal_household",
+    reason: "converted",
+    exact: { numerator, denominator },
+    rounded: null,
+    identical: false,
+    presentation: "exact",
+    ...extra,
+  };
+}
+
+const declaredTerm = {
+  unit: "glass",
+  amount: { numerator: 1, denominator: 1 },
+  capacity_ml: { numerator: 200, denominator: 1 },
+  capacity_origin: "declared_text",
+};
+const metricTerm = {
+  unit: "milliliter",
+  amount: { numerator: 500, denominator: 1 },
+  capacity_ml: null,
+  capacity_origin: "not_applicable",
+};
+const temporaryTerm = (capacity) => ({
+  unit: "glass",
+  amount: { numerator: 1, denominator: 1 },
+  capacity_ml: { numerator: capacity, denominator: 1 },
+  capacity_origin: "temporary_clarification",
+});
+const unresolvedTerm = {
+  unit: "glass",
+  amount: { numerator: 1, denominator: 1 },
+  capacity_ml: null,
+  capacity_origin: "unresolved",
+};
+
+function ingredientConversion(position, source, terms, extra = {}) {
+  return {
+    position,
+    source,
+    source_kind: "household",
+    target_unit: "glass",
+    status: "nominal_household",
+    reason: "converted",
+    exact: { numerator: 1, denominator: 2 },
+    rounded: null,
+    identical: false,
+    presentation: "exact",
+    source_terms: terms,
+    ...extra,
+  };
+}
+
+// The five-hint payload of the audit's D-R05 reproduction: three ingredient hints (one
+// temporary-dependent, one declared, one metric) and two step hints (one temporary, one
+// metric), all for recipe version 3.
+const HINTED_STEP = "Добавьте 1 стакан воды и 500 мл молока.";
+const HINTED_INGREDIENTS = [
+  { name: "вода", amount: "1 стакан" },
+  { name: "мука", amount: "1 стакан 200 мл" },
+  { name: "молоко", amount: "500 мл" },
+];
+
+function hintedBlock({ clarified, terms = temporaryTerm(200) }) {
+  const tempLine = ingredientConversion(0, "1 стакан", [terms], {
+    status: clarified ? "nominal_household" : "clarification_required",
+    reason: clarified ? "converted" : "glass_size_required",
+    exact: clarified ? { numerator: 4, denominator: 5 } : null,
+    presentation: clarified ? "exact" : "none",
+  });
+  const declaredLine = ingredientConversion(1, "1 стакан 200 мл", [declaredTerm], {
+    exact: { numerator: 1, denominator: 2 },
+    presentation: "exact",
+  });
+  const metricLine = ingredientConversion(2, "500 мл", [metricTerm], {
+    source_kind: "metric_volume",
+    exact: { numerator: 2, denominator: 1 },
+    presentation: "exact",
+  });
+  const tempSpan = H.span(HINTED_STEP, "1 стакан", {
+    ingredient_position: 0,
+    capacity_origin: clarified ? "temporary_clarification" : "unresolved",
+    conversion: clarified
+      ? exactConversion(3, 5)
+      : exactConversion(0, 1, {
+          status: "clarification_required",
+          reason: "glass_size_required",
+          exact: null,
+          presentation: "none",
+        }),
+  });
+  const metricSpan = H.span(HINTED_STEP, "500 мл", {
+    ingredient_position: 2,
+    capacity_origin: "not_applicable",
+    conversion: exactConversion(2, 1),
+  });
+  return H.stepBlock(
+    3,
+    [H.stepAnnotation(0, HINTED_STEP, [tempSpan, metricSpan])],
+    {
+      source_glass_ml: clarified ? 200 : null,
+      source_glass_required: true,
+      steps_source_glass_required: true,
+      ingredients: [tempLine, declaredLine, metricLine],
+    }
+  );
+}
+
+function hintedCard(block) {
+  return structuredFavoriteItem({ steps: [HINTED_STEP], ingredients: HINTED_INGREDIENTS, measures: block });
+}
+
+function hintedPage(env, { third }) {
+  env.signedIn([conversation(CONV_A, 0)], { [CONV_A]: historyBody(CONV_A, structuredThread()) });
+  env.net.route("GET", "/api/favorites", H.favoritesBody([hintedCard(hintedBlock({ clarified: false }))]));
+  env.net.route(
+    "GET",
+    `/api/favorites/${H.FAV_1}`,
+    H.favoriteDetail(hintedCard(hintedBlock({ clarified: false })), "Борщ"),
+    H.favoriteDetail(hintedCard(hintedBlock({ clarified: true })), "Борщ"),
+    third
+  );
+}
+
+scenario("the_safe_refresh_never_blanks_the_independent_hints_on_the_card", async () => {
+  const pending = deferred();
+  const page = await open((env) => hintedPage(env, { third: () => pending.promise }), { structured: true });
+  await openCard(page);
+
+  page.el("source-glass-200").checked = true;
+  page.el("source-glass-200").fire("change");
+  await page.settle();
+  let body = page.el("recipe-body");
+  assert.equal(body.byClass("measure-hint").length, 5, "the clarified block has five hints");
+  assert.ok(body.textContent.includes("0,8 вашего стакана"));
+  assert.ok(body.textContent.includes("0,6 вашего стакана"));
+
+  // «Не знаю» while the no-parameter read is out: only the temporary-dependent hints go.
+  page.el("source-glass-unknown").click();
+  await page.settle();
+  body = page.el("recipe-body");
+  assert.equal(body.byClass("measure-hint").length, 3, "5 -> 3, never 5 -> 0");
+  assert.ok(!body.textContent.includes("0,8 вашего стакана"), "the temporary ingredient hint");
+  assert.ok(!body.textContent.includes("0,6 вашего стакана"), "the temporary step hint");
+  assert.ok(body.textContent.includes("½ вашего стакана"), "the declared ingredient hint");
+  assert.ok(body.textContent.includes("2 ваших стакана"), "the metric hints, ingredient and step");
+  assert.ok(body.textContent.includes(Logic.TEXT.measuresRefreshPending), "the read is named");
+  assert.equal(textOnly(stepItems(body)[0]), HINTED_STEP, "the recipe stays readable throughout");
+
+  // The authoritative answer replaces the block; the temporary hints stay gone.
+  pending.resolve(H.favoriteDetail(hintedCard(hintedBlock({ clarified: false })), "Борщ"));
+  await page.settle();
+  body = page.el("recipe-body");
+  assert.equal(body.byClass("measure-hint").length, 3);
+  assert.ok(!body.textContent.includes("0,8 вашего стакана"));
+  assert.ok(body.textContent.includes("½ вашего стакана"));
+  assert.ok(!body.textContent.includes(Logic.TEXT.measuresRefreshPending));
+});
+
+scenario("a_failed_safe_refresh_keeps_exactly_the_independent_hints", async () => {
+  const page = await open((env) => hintedPage(env, { third: fail() }), { structured: true });
+  await openCard(page);
+  page.el("source-glass-200").checked = true;
+  page.el("source-glass-200").fire("change");
+  await page.settle();
+  assert.equal(page.el("recipe-body").byClass("measure-hint").length, 5);
+
+  page.el("source-glass-unknown").click();
+  await page.settle();
+
+  const body = page.el("recipe-body");
+  assert.equal(body.byClass("measure-hint").length, 3);
+  assert.ok(!body.textContent.includes("0,8 вашего стакана"));
+  assert.ok(!body.textContent.includes("0,6 вашего стакана"));
+  assert.ok(body.textContent.includes("½ вашего стакана"));
+  assert.ok(body.textContent.includes("2 ваших стакана"));
+  assert.equal(body.buttons(Logic.TEXT.retry).length, 1, "the failed read can be asked again");
+});
+
+scenario("an_unverifiable_source_term_does_not_keep_its_hint_after_the_safe_answer", async () => {
+  // The audit's D-R02 reproduction: the compound quantity's derived hint rests partly on
+  // the temporary capacity, and the metadata says nothing usable about it.
+  const compound = ingredientConversion(0, "1 стакан (200 мл) + 1 стакан", null, {
+    exact: null,
+    rounded: { numerator: 7, denominator: 4, relative_error: { numerator: 1, denominator: 100 } },
+    presentation: "rounded",
+  });
+  const declared = ingredientConversion(1, "1 стакан 200 мл", [declaredTerm], {
+    exact: { numerator: 4, denominator: 5 },
+    presentation: "exact",
+  });
+  const ingredients = [
+    { name: "вода", amount: "1 стакан (200 мл) + 1 стакан" },
+    { name: "мука", amount: "1 стакан 200 мл" },
+  ];
+  const block = (capacity) =>
+    H.stepBlock(3, [], {
+      source_glass_ml: capacity,
+      source_glass_required: true,
+      ingredients: [compound, declared],
+    });
+  const card = (capacity) => structuredFavoriteItem({ steps: ["Смешайте."], ingredients, measures: block(capacity) });
+  const page = await open(
+    (env) => {
+      env.signedIn([conversation(CONV_A, 0)], { [CONV_A]: historyBody(CONV_A, structuredThread()) });
+      env.net.route("GET", "/api/favorites", H.favoritesBody([card(null)]));
+      env.net.route(
+        "GET",
+        `/api/favorites/${H.FAV_1}`,
+        H.favoriteDetail(card(null), "Борщ"),
+        H.favoriteDetail(card(250), "Борщ"),
+        fail()
+      );
+    },
+    { structured: true }
+  );
+  await openCard(page);
+
+  page.el("source-glass-250").checked = true;
+  page.el("source-glass-250").fire("change");
+  await page.settle();
+  let body = page.el("recipe-body");
+  assert.ok(body.textContent.includes("≈ 1¾ вашего стакана"), "the clarified conversion, before the refusal");
+  assert.ok(body.textContent.includes("Точно: 0,8 вашего стакана"));
+
+  page.el("source-glass-unknown").click();
+  await page.settle();
+
+  body = page.el("recipe-body");
+  assert.ok(
+    !body.textContent.includes("≈ 1¾ вашего стакана"),
+    "a hint that may rest on the withdrawn capacity is not trusted without source terms"
+  );
+  assert.ok(body.textContent.includes("Точно: 0,8 вашего стакана"), "the independent declared hint stays");
+  assert.ok(body.textContent.includes("вода — 1 стакан (200 мл) + 1 стакан"));
+  assert.ok(body.textContent.includes("мука — 1 стакан 200 мл"));
+});
+
+// The exact D-R02 mutation, on the five-hint page: with the 250 mL temporary capacity in
+// effect the real Stage C payload reports the second term of `1 стакан (200 мл) + 1 стакан`
+// as `temporary_clarification`; this payload says `unresolved` (no capacity at all) and keeps
+// the successful conversion the 250 mL produced. Stage C never emits that combination (an
+// undeclared glass without a clarification is `clarification_required`), so the number is
+// refused outright -- it is never drawn, even while the capacity is confirmed on the card.
+const MUTATED_STEP = "Добавьте 1 стакан воды и 500 мл молока.";
+const MUTATED_INGREDIENTS = [
+  { name: "вода", amount: "1 стакан (200 мл) + 1 стакан" },
+  { name: "мука", amount: "1 стакан 200 мл" },
+  { name: "молоко", amount: "500 мл" },
+];
+
+// `secondTerm(capacity)` is the resolved second source term: `temporaryTerm(250)` for the
+// valid Stage C answer, `unresolvedTerm` for the mutation.
+function compoundCard(capacity, secondTerm = () => unresolvedTerm) {
+  const conversion = capacity === null
+    ? { status: "clarification_required", reason: "glass_size_required", exact: null, presentation: "none" }
+    : {
+        exact: null,
+        rounded: { numerator: 7, denominator: 4, relative_error: { numerator: 1, denominator: 100 } },
+        presentation: "rounded",
+      };
+  const compound = ingredientConversion(
+    0,
+    "1 стакан (200 мл) + 1 стакан",
+    [declaredTerm, secondTerm(capacity)],
+    conversion
+  );
+  const declaredLine = ingredientConversion(1, "1 стакан 200 мл", [declaredTerm], {
+    exact: { numerator: 1, denominator: 2 },
+    presentation: "exact",
+  });
+  const metricLine = ingredientConversion(2, "500 мл", [metricTerm], {
+    source_kind: "metric_volume",
+    exact: { numerator: 2, denominator: 1 },
+    presentation: "exact",
+  });
+  const block = H.stepBlock(
+    3,
+    [
+      H.stepAnnotation(0, MUTATED_STEP, [
+        H.span(MUTATED_STEP, "1 стакан", {
+          ingredient_position: 0,
+          capacity_origin: capacity === null ? "unresolved" : "temporary_clarification",
+          conversion:
+            capacity === null
+              ? exactConversion(0, 1, {
+                  status: "clarification_required",
+                  reason: "glass_size_required",
+                  exact: null,
+                  presentation: "none",
+                })
+              : exactConversion(3, 5),
+        }),
+        H.span(MUTATED_STEP, "500 мл", {
+          ingredient_position: 2,
+          capacity_origin: "not_applicable",
+          conversion: exactConversion(2, 1),
+        }),
+      ]),
+    ],
+    {
+      source_glass_ml: capacity,
+      source_glass_required: true,
+      steps_source_glass_required: true,
+      ingredients: [compound, declaredLine, metricLine],
+    }
+  );
+  return structuredFavoriteItem({ steps: [MUTATED_STEP], ingredients: MUTATED_INGREDIENTS, measures: block });
+}
+
+scenario("the_codex_unresolved_term_payload_never_draws_its_number", async () => {
+  const page = await open(
+    (env) => {
+      env.signedIn([conversation(CONV_A, 0)], { [CONV_A]: historyBody(CONV_A, structuredThread()) });
+      env.net.route("GET", "/api/favorites", H.favoritesBody([compoundCard(null)]));
+      env.net.route(
+        "GET",
+        `/api/favorites/${H.FAV_1}`,
+        H.favoriteDetail(compoundCard(null), "Борщ"),
+        H.favoriteDetail(compoundCard(250), "Борщ"),
+        fail()
+      );
+    },
+    { structured: true }
+  );
+  await openCard(page);
+
+  let body = page.el("recipe-body");
+  assert.equal(body.byClass("measure-hint").length, 3, "the unclarified payload has three hints");
+  assert.ok(!body.textContent.includes("≈ 1¾ вашего стакана"));
+  assert.ok(body.textContent.includes("вода — 1 стакан (200 мл) + 1 стакан"), "the stored text");
+
+  // Even with 250 mL confirmed, the contradictory conversion is refused: four hints, and the
+  // refused number is not among them.
+  page.el("source-glass-250").checked = true;
+  page.el("source-glass-250").fire("change");
+  await page.settle();
+  body = page.el("recipe-body");
+  assert.equal(body.byClass("measure-hint").length, 4, "the clarified block draws four hints");
+  assert.ok(
+    !body.textContent.includes("≈ 1¾ вашего стакана"),
+    "a successful conversion beside an unresolved term is never drawn"
+  );
+  // The valid ones are untouched, including the step hint supplied by this clarification.
+  assert.ok(body.textContent.includes("0,6 вашего стакана"), "the temporary step hint");
+  assert.ok(body.textContent.includes("½ вашего стакана"), "the independent declared hint");
+  assert.ok(body.textContent.includes("2 ваших стакана"), "the independent metric hints");
+
+  // «Не знаю» while the no-parameter read is out and fails: the temporary step hint goes,
+  // and exactly the three independently valid hints remain.
+  page.el("source-glass-unknown").click();
+  await page.settle();
+  body = page.el("recipe-body");
+  assert.equal(body.byClass("measure-hint").length, 3, "three independent hints, before and after");
+  assert.ok(!body.textContent.includes("≈ 1¾ вашего стакана"), "the refused number stays gone");
+  assert.ok(!body.textContent.includes("0,6 вашего стакана"), "the temporary step hint");
+  assert.ok(body.textContent.includes("½ вашего стакана"), "the independent declared hint stays");
+  assert.ok(body.textContent.includes("2 ваших стакана"), "the independent metric hints stay");
+  assert.equal(body.buttons(Logic.TEXT.retry).length, 1, "the failed read can be asked again");
+  assert.equal(textOnly(stepItems(body)[0]), MUTATED_STEP, "the recipe stays readable");
+});
+
+// The same mutation with the capacity the clarification supplied still written beside the
+// unresolved origin. The origin alone decides -- `unresolved` says no capacity was ever
+// established -- so the number it produced may not be drawn whatever `capacity_ml` says.
+const unresolvedWithCapacity = (capacity) => ({
+  ...unresolvedTerm,
+  capacity_ml: { numerator: capacity, denominator: 1 },
+});
+
+scenario("an_unresolved_term_that_keeps_a_capacity_still_refuses_its_number", async () => {
+  const pending = deferred();
+  const kept = () => unresolvedWithCapacity(250);
+  const page = await open(
+    (env) => {
+      env.signedIn([conversation(CONV_A, 0)], { [CONV_A]: historyBody(CONV_A, structuredThread()) });
+      env.net.route("GET", "/api/favorites", H.favoritesBody([compoundCard(null, kept)]));
+      env.net.route(
+        "GET",
+        `/api/favorites/${H.FAV_1}`,
+        H.favoriteDetail(compoundCard(null, kept), "Борщ"),
+        H.favoriteDetail(compoundCard(250, kept), "Борщ"),
+        () => pending.promise
+      );
+    },
+    { structured: true }
+  );
+  await openCard(page);
+
+  // The unclarified answer: three hints, and none of them the compound line's number.
+  let body = page.el("recipe-body");
+  assert.equal(body.byClass("measure-hint").length, 3, "the unclarified payload has three hints");
+  assert.ok(!body.textContent.includes("≈ 1¾ вашего стакана"));
+
+  // Even with 250 mL confirmed -- and still written beside the unresolved origin -- the
+  // contradictory conversion is refused: the four independently valid hints remain, and the
+  // refused number is never drawn.
+  page.el("source-glass-250").checked = true;
+  page.el("source-glass-250").fire("change");
+  await page.settle();
+  body = page.el("recipe-body");
+  assert.equal(body.byClass("measure-hint").length, 4, "the clarified block draws four hints");
+  assert.ok(
+    !body.textContent.includes("≈ 1¾ вашего стакана"),
+    "an unresolved origin keeps no number beside any capacity"
+  );
+  assert.ok(body.textContent.includes("0,6 вашего стакана"), "the temporary step hint");
+  assert.ok(body.textContent.includes("½ вашего стакана"), "the independent declared hint");
+  assert.ok(body.textContent.includes("2 ваших стакана"), "the independent metric hints");
+
+  // «Не знаю» while the no-parameter read is still out: the temporary step hint goes, and
+  // exactly the three independent hints remain.
+  page.el("source-glass-unknown").click();
+  await page.settle();
+  body = page.el("recipe-body");
+  assert.equal(body.byClass("measure-hint").length, 3, "three independent hints during the safe read");
+  assert.ok(!body.textContent.includes("≈ 1¾ вашего стакана"), "the refused number stays gone");
+  assert.ok(!body.textContent.includes("0,6 вашего стакана"), "the temporary step hint");
+  assert.ok(body.textContent.includes("½ вашего стакана"));
+  assert.ok(body.textContent.includes("2 ваших стакана"));
+  assert.ok(body.textContent.includes(Logic.TEXT.measuresRefreshPending), "the read is named");
+
+  // The read fails: the old block stays, and still exactly three hints are drawn.
+  pending.resolve(fail());
+  await page.settle();
+  body = page.el("recipe-body");
+  assert.equal(body.byClass("measure-hint").length, 3, "three independent hints after the failed read");
+  assert.ok(!body.textContent.includes("≈ 1¾ вашего стакана"), "the refused number stays gone");
+  assert.ok(!body.textContent.includes("0,6 вашего стакана"));
+  assert.ok(body.textContent.includes("½ вашего стакана"));
+  assert.ok(body.textContent.includes("2 ваших стакана"));
+  assert.equal(body.buttons(Logic.TEXT.retry).length, 1, "the failed read can be asked again");
+  assert.equal(textOnly(stepItems(body)[0]), MUTATED_STEP, "the recipe stays readable");
+});
+
+scenario("a_valid_clarified_compound_still_draws_all_five_hints", async () => {
+  // The unmodified Stage C payload: the second term of the compound is
+  // `temporary_clarification`, so the number it produced is the one the person confirmed.
+  const terms = (capacity) => (capacity === null ? unresolvedTerm : temporaryTerm(capacity));
+  const page = await open(
+    (env) => {
+      env.signedIn([conversation(CONV_A, 0)], { [CONV_A]: historyBody(CONV_A, structuredThread()) });
+      env.net.route("GET", "/api/favorites", H.favoritesBody([compoundCard(null, terms)]));
+      env.net.route(
+        "GET",
+        `/api/favorites/${H.FAV_1}`,
+        H.favoriteDetail(compoundCard(null, terms), "Борщ"),
+        H.favoriteDetail(compoundCard(250, terms), "Борщ"),
+        fail()
+      );
+    },
+    { structured: true }
+  );
+  await openCard(page);
+
+  page.el("source-glass-250").checked = true;
+  page.el("source-glass-250").fire("change");
+  await page.settle();
+  let body = page.el("recipe-body");
+  assert.equal(body.byClass("measure-hint").length, 5, "the valid clarified payload draws five");
+  assert.ok(body.textContent.includes("≈ 1¾ вашего стакана"));
+
+  // The safe answer withdraws the temporary capacity, and with it only the hints that rest
+  // on it: five become three, never zero.
+  page.el("source-glass-unknown").click();
+  await page.settle();
+  body = page.el("recipe-body");
+  assert.equal(body.byClass("measure-hint").length, 3, "5 -> 3");
+  assert.ok(!body.textContent.includes("≈ 1¾ вашего стакана"));
+  assert.ok(!body.textContent.includes("0,6 вашего стакана"));
+  assert.ok(body.textContent.includes("½ вашего стакана"));
+  assert.ok(body.textContent.includes("2 ваших стакана"));
+});
+
+scenario("an_authoritative_no_parameter_refresh_for_the_mutated_payload_restores_only_valid_hints", async () => {
+  const page = await open(
+    (env) => {
+      env.signedIn([conversation(CONV_A, 0)], { [CONV_A]: historyBody(CONV_A, structuredThread()) });
+      env.net.route("GET", "/api/favorites", H.favoritesBody([compoundCard(null)]));
+      env.net.route(
+        "GET",
+        `/api/favorites/${H.FAV_1}`,
+        H.favoriteDetail(compoundCard(null), "Борщ"),
+        H.favoriteDetail(compoundCard(250), "Борщ"),
+        H.favoriteDetail(compoundCard(null), "Борщ")
+      );
+    },
+    { structured: true }
+  );
+  await openCard(page);
+
+  page.el("source-glass-250").checked = true;
+  page.el("source-glass-250").fire("change");
+  await page.settle();
+  assert.equal(page.el("recipe-body").byClass("measure-hint").length, 4);
+
+  page.el("source-glass-unknown").click();
+  await page.settle();
+  const body = page.el("recipe-body");
+  assert.equal(body.byClass("measure-hint").length, 3, "the server's own unclarified block");
+  assert.ok(!body.textContent.includes("≈ 1¾ вашего стакана"), "no number without a capacity");
+  assert.ok(!body.textContent.includes("0,6 вашего стакана"));
+  assert.ok(body.textContent.includes("½ вашего стакана"));
+  assert.ok(body.textContent.includes("2 ваших стакана"));
+  assert.ok(!body.textContent.includes(Logic.TEXT.measuresRefreshPending), "the read answered");
+});
+
+scenario("a_compound_conversion_with_one_temporary_term_is_suppressed_as_a_whole", async () => {
+  // A declared term beside a temporary one does not rescue the line: any term may rest on
+  // the withdrawn capacity, so the whole conversion is not drawn after the refusal.
+  const block = (capacity) => {
+    const compound = ingredientConversion(
+      0,
+      "1 стакан (200 мл) + 1 стакан",
+      [declaredTerm, capacity === null ? unresolvedTerm : temporaryTerm(250)],
+      capacity === null
+        ? { status: "clarification_required", reason: "glass_size_required", exact: null, presentation: "none" }
+        : {
+            exact: null,
+            rounded: { numerator: 7, denominator: 4, relative_error: { numerator: 1, denominator: 100 } },
+            presentation: "rounded",
+          }
+    );
+    const declaredLine = ingredientConversion(1, "1 стакан 200 мл", [declaredTerm], {
+      exact: { numerator: 1, denominator: 2 },
+      presentation: "exact",
+    });
+    return H.stepBlock(3, [], {
+      source_glass_ml: capacity,
+      source_glass_required: true,
+      ingredients: [compound, declaredLine],
+    });
+  };
+  const ingredients = [
+    { name: "вода", amount: "1 стакан (200 мл) + 1 стакан" },
+    { name: "мука", amount: "1 стакан 200 мл" },
+  ];
+  const card = (capacity) => structuredFavoriteItem({ ingredients, measures: block(capacity) });
+  const page = await open(
+    (env) => {
+      env.signedIn([conversation(CONV_A, 0)], { [CONV_A]: historyBody(CONV_A, structuredThread()) });
+      env.net.route("GET", "/api/favorites", H.favoritesBody([card(null)]));
+      env.net.route(
+        "GET",
+        `/api/favorites/${H.FAV_1}`,
+        H.favoriteDetail(card(null), "Борщ"),
+        H.favoriteDetail(card(250), "Борщ"),
+        fail()
+      );
+    },
+    { structured: true }
+  );
+  await openCard(page);
+  page.el("source-glass-250").checked = true;
+  page.el("source-glass-250").fire("change");
+  await page.settle();
+  assert.ok(page.el("recipe-body").textContent.includes("≈ 1¾ вашего стакана"));
+
+  page.el("source-glass-unknown").click();
+  await page.settle();
+  const body = page.el("recipe-body");
+  assert.ok(!body.textContent.includes("≈ 1¾ вашего стакана"), "the whole line goes");
+  assert.ok(body.textContent.includes("½ вашего стакана"), "the declared line stays");
+  assert.equal(body.byClass("measure-hint").length, 1);
+});
+
+scenario("a_fully_declared_compound_and_independent_spoons_survive_the_safe_answer", async () => {
+  const spoonTerm = {
+    unit: "tablespoon",
+    amount: { numerator: 1, denominator: 1 },
+    capacity_ml: null,
+    capacity_origin: "not_applicable",
+  };
+  const spoons = ingredientConversion(1, "1 ст. л.", [spoonTerm], {
+    target_unit: "tablespoon",
+    exact: { numerator: 1, denominator: 1 },
+    presentation: "exact",
+  });
+  const declaredCompound = ingredientConversion(0, "1 стакан 200 мл + 1 стакан 200 мл", [declaredTerm, declaredTerm], {
+    exact: { numerator: 8, denominator: 5 },
+    presentation: "exact",
+  });
+  const block = H.stepBlock(3, [], {
+    source_glass_required: true,
+    ingredients: [declaredCompound, spoons],
+  });
+  const ingredients = [
+    { name: "вода", amount: "1 стакан 200 мл + 1 стакан 200 мл" },
+    { name: "масло", amount: "1 ст. л." },
+  ];
+  const card = structuredFavoriteItem({ ingredients, measures: block });
+  const page = await open(
+    (env) => {
+      env.signedIn([conversation(CONV_A, 0)], { [CONV_A]: historyBody(CONV_A, structuredThread()) });
+      env.net.route("GET", "/api/favorites", H.favoritesBody([card]));
+      env.net.route("GET", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(card, "Борщ"));
+    },
+    { structured: true }
+  );
+  await openCard(page);
+  const before = page.el("recipe-body").byClass("measure-hint").length;
+  assert.equal(before, 2);
+
+  page.el("source-glass-unknown").click();
+  await page.settle();
+  const body = page.el("recipe-body");
+  assert.equal(body.byClass("measure-hint").length, 2, "nothing was withdrawn");
+  assert.ok(body.textContent.includes("Точно: 1,6 вашего стакана"));
+  assert.ok(body.textContent.includes("Точно: 1 ваша столовая ложка"));
+});
+
+scenario("each_failed_component_is_said_in_its_own_words", async () => {
+  const step = "Добавьте 500 мл воды.";
+  const goodSpan = H.span(step, "500 мл");
+  const steps = [step];
+  const ingredients = [{ name: "вода", amount: "500 мл" }];
+  const ingredient = ingredientConversion(0, "500 мл", [metricTerm], {
+    source_kind: "metric_volume",
+    exact: { numerator: 2, denominator: 1 },
+    presentation: "exact",
+  });
+  const failedAnalysis = {
+    status: "failed",
+    spans_emitted: 0,
+    spans_omitted: 0,
+    omitted_reasons: { limit_exceeded: 0, malformed: 0, unsafe_fraction: 0 },
+    limits: { max_spans_per_step: 32, max_spans_per_recipe: 128, max_step_chars: 1000, max_steps: 50 },
+  };
+  const failedProvenance = { status: "failed", declared: [], incomplete: [] };
+
+  async function card(block) {
+    const page = await open(stepsCard(block, steps, { ingredients }), { structured: true });
+    await openCard(page);
+    return page.el("recipe-body");
+  }
+
+  // Provenance only: the step conversions are still there and are not denied.
+  let body = await card(
+    H.stepBlock(3, [H.stepAnnotation(0, step, [goodSpan])], {
+      analysis: failedAnalysis,
+      provenance: failedProvenance,
+      ingredients: [ingredient],
+    })
+  );
+  assert.ok(body.textContent.includes(Logic.TEXT.provenanceNotChecked));
+  assert.ok(!body.textContent.includes(Logic.TEXT.stepsNotChecked), "no claim about step amounts");
+  assert.ok(stepItems(body)[0].textContent.includes("2 ваших стакана"), "the step hint stays");
+  assert.ok(body.textContent.includes("Точно: 2 ваших стакана"), "the ingredient hint stays");
+  assert.ok(!/проверен|подтвержд|согласован/i.test(body.textContent), "no claim the recipe was checked");
+
+  // Steps only: nothing is claimed about the ingredients, whose hint stays.
+  body = await card(
+    H.stepBlock(3, [], {
+      analysis: failedAnalysis,
+      ingredients: [ingredient],
+    })
+  );
+  assert.ok(body.textContent.includes(Logic.TEXT.stepsNotChecked));
+  assert.ok(!body.textContent.includes(Logic.TEXT.provenanceNotChecked));
+  assert.ok(body.textContent.includes("Точно: 2 ваших стакана"));
+  assert.ok(!/проверен|подтвержд|согласован/i.test(body.textContent));
+
+  // Both: the provenance failure is named and the whole-block summary is said neutrally;
+  // the client cannot tell a step-pass failure from a pass with no amounts.
+  body = await card(
+    H.stepBlock(3, [], {
+      analysis: failedAnalysis,
+      provenance: failedProvenance,
+      ingredients: [ingredient],
+    })
+  );
+  assert.ok(body.textContent.includes(Logic.TEXT.provenanceNotChecked));
+  assert.ok(body.textContent.includes(Logic.TEXT.analysisPartlyFailed));
+  assert.ok(!body.textContent.includes(Logic.TEXT.stepsNotChecked));
+  assert.ok(!/проверен|подтвержд|согласован/i.test(body.textContent));
+});
+
+scenario("reopening_the_same_favorite_from_the_list_asks_without_the_old_capacity", async () => {
+  const block = (capacity) =>
+    H.stepBlock(3, [H.stepAnnotation(0, HINTED_STEP, [
+      H.span(HINTED_STEP, "1 стакан", {
+        ingredient_position: 0,
+        capacity_origin: capacity === null ? "unresolved" : "temporary_clarification",
+        conversion: capacity === null
+          ? exactConversion(0, 1, {
+              status: "clarification_required",
+              reason: "glass_size_required",
+              exact: null,
+              presentation: "none",
+            })
+          : exactConversion(4, 5),
+      }),
+    ])], {
+      source_glass_ml: capacity,
+      source_glass_required: true,
+      steps_source_glass_required: true,
+      ingredients: [ingredientConversion(0, "1 стакан", capacity === null ? [unresolvedTerm] : [temporaryTerm(capacity)], {
+        status: capacity === null ? "clarification_required" : "nominal_household",
+        reason: capacity === null ? "glass_size_required" : "converted",
+        exact: capacity === null ? null : { numerator: 4, denominator: 5 },
+        presentation: capacity === null ? "none" : "exact",
+      })],
+    });
+  const ingredients = [{ name: "вода", amount: "1 стакан" }];
+  const card = (capacity) => structuredFavoriteItem({ steps: [HINTED_STEP], ingredients, measures: block(capacity) });
+  const page = await open(
+    (env) => {
+      env.signedIn([conversation(CONV_A, 0)], { [CONV_A]: historyBody(CONV_A, structuredThread()) });
+      env.net.route("GET", "/api/favorites", H.favoritesBody([card(null)]));
+      env.net.route(
+        "GET",
+        `/api/favorites/${H.FAV_1}`,
+        H.favoriteDetail(card(null), "Борщ"),
+        H.favoriteDetail(card(200), "Борщ"),
+        H.favoriteDetail(card(null), "Борщ")
+      );
+    },
+    { structured: true }
+  );
+  await openCard(page);
+  page.el("source-glass-200").checked = true;
+  page.el("source-glass-200").fire("change");
+  await page.settle();
+  assert.ok(page.el("recipe-body").textContent.includes("0,8 вашего стакана"));
+  assert.equal(
+    page.env.net.requests("GET", `/api/favorites/${H.FAV_1}`).slice(-1)[0].url,
+    `/api/favorites/${H.FAV_1}?source_glass_ml=200`
+  );
+
+  // The same favorite, clicked again in the list, is a new view: no capacity is carried.
+  await openCard(page);
+  assert.equal(
+    page.env.net.requests("GET", `/api/favorites/${H.FAV_1}`).slice(-1)[0].url,
+    `/api/favorites/${H.FAV_1}`,
+    "the reopened view asks for the recipe as its own text declares it"
+  );
+  assert.ok(!page.el("recipe-body").textContent.includes("0,8 вашего стакана"));
+  assert.ok(page.el("recipe-body").textContent.includes(Logic.TEXT.sourceGlassQuestion));
+});
+
 module.exports = { scenarios, useShell, useNoLoginShell };

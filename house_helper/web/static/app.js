@@ -2336,6 +2336,83 @@
     return null;
   }
 
+  // One step amount's hint, or null when the server's data does not carry a number this
+  // page may show. A hint is drawn only for an amount that was really linked and really
+  // converted; an unresolved, ambiguous, shared, unsupported, mass or failed amount keeps
+  // its original text and gets no number. A recognized source word ("около") makes the
+  // hint approximate even when the rounded value is numerically exact (15.7.3).
+  function stepMeasureHint(span) {
+    var conversion = span.conversion;
+    if (span.link !== "linked" || !conversion) {
+      return null;
+    }
+    // A number exists only for a capacity the server established (declared in the text,
+    // supplied for this request, or not needed at all). An unresolved capacity is always
+    // drawn as the original text, never as a number.
+    if (span.capacityOrigin === "unresolved") {
+      return null;
+    }
+    // `identical` and `presentation: "none"` mean there is nothing new to say.
+    if (conversion.identical || conversion.presentation === "none") {
+      return null;
+    }
+    if (conversion.status !== "exact" && conversion.status !== "nominal_household") {
+      return null;
+    }
+    var fraction = conversion.presentation === "exact" ? conversion.exact : conversion.rounded;
+    if (!fraction) {
+      return null;
+    }
+    // The released B1 formatting: the fraction and the Russian grammatical form of the unit.
+    var value = Logic.formatMeasure(fraction.numerator, fraction.denominator, conversion.targetUnit);
+    if (value === null) {
+      return null;
+    }
+    if (span.sourceApproximate) {
+      return Logic.TEXT.measureApprox.replace("{value}", value);
+    }
+    if (conversion.presentation === "exact") {
+      return Logic.TEXT.measureExact.replace("{value}", value);
+    }
+    return conversion.rounded.relativeError.numerator !== 0
+      ? Logic.TEXT.measureApprox.replace("{value}", value)
+      : value;
+  }
+
+  // One step with its hints: the stored text is a run of text nodes exactly as it was
+  // stored, and each hint is a separate element placed after the amount span it belongs to.
+  // Nothing is rewritten, normalized or inserted into the string, and no recipe text is
+  // ever parsed as markup (15.8.4). A span whose slice does not match the text the page
+  // holds (which the logic already refuses) is skipped rather than trusted.
+  function stepLine(step, annotation, dropClarified) {
+    var children = [];
+    var at = 0;
+    annotation.spans.forEach(function (span) {
+      // After the safe «Не знаю» answer, a hint that rests on the withdrawn temporary
+      // capacity is not drawn; one from the recipe's own declaration still is.
+      if (dropClarified && span.capacityOrigin === "temporary_clarification") {
+        return;
+      }
+      var start16 = Logic.codePointToUtf16(step, span.start);
+      var end16 = Logic.codePointToUtf16(step, span.end);
+      if (start16 < 0 || end16 <= start16 || end16 < at) {
+        return;
+      }
+      if (step.slice(start16, end16) !== span.text) {
+        return;
+      }
+      children.push(document.createTextNode(step.slice(at, start16)));
+      children.push(document.createTextNode(step.slice(start16, end16)));
+      at = end16;
+      var hint = stepMeasureHint(span);
+      if (hint !== null) {
+        children.push(h("span", { class: "measure-hint recipe-step-hint", text: " (" + hint + ")" }));
+      }
+    });
+    children.push(document.createTextNode(step.slice(at)));
+    return h("li", null, children);
+  }
+
   // "Which glass does the recipe mean?" -- asked only when an amount contains an
   // undeclared source glass. Nothing is preselected: the person's own glass is never
   // assumed to be the recipe's. The answer applies to this recipe's presentation only;
@@ -2355,6 +2432,8 @@
     var custom = chosen !== null && chosen !== 200 && chosen !== 250;
     var fieldset = h("fieldset", { class: "measure-clarify" }, [
       h("legend", { text: Logic.TEXT.sourceGlassQuestion }),
+      // What is missing and why a hint is absent -- said once per recipe, not per amount.
+      h("p", { class: "hint", text: Logic.TEXT.sourceGlassExplanation }),
     ]);
     function option(value, label, id) {
       var input = h("input", {
@@ -2482,6 +2561,16 @@
       ])
     );
     fieldset.appendChild(panel);
+    // The safe answer (15.7.4): no capacity is guessed, the question closes, and every hint
+    // that rested on a temporary capacity of this view is dropped -- the declared ones stay.
+    var unknown = action(Logic.TEXT.sourceGlassUnknown, "btn-quiet", function () {
+      // The control disappears with the question: the keyboard goes to the card's title.
+      wantFocus = "recipe";
+      controller.chooseUnknownSourceGlass();
+    });
+    unknown.setAttribute("id", "source-glass-unknown");
+    unknown.setAttribute("data-focus", "source-glass-unknown");
+    fieldset.appendChild(h("div", { class: "measure-unknown" }, [unknown]));
     fieldset.appendChild(h("p", { id: "source-glass-hint", class: "hint", text: Logic.TEXT.sourceGlassNote }));
     fieldset.appendChild(error);
     return fieldset;
@@ -2502,8 +2591,28 @@
         );
       }
       var conversions = {};
-      if (current.measures && !current.measuresPending) {
+      // Component-level failure states, each true only for its own domain (15.8.2): a
+      // provenance failure is not a step failure, and the whole-block summary failing does
+      // not by itself say which component did. A step-only claim is made only when the
+      // provenance component is present and did not fail; otherwise the summary is said
+      // neutrally rather than guessed.
+      var provenanceStatus = Boolean(current.measures) ? current.measures.provenanceStatus : null;
+      var provenanceFailed = provenanceStatus === "failed";
+      var analysisFailed = Boolean(current.measures) && current.measures.analysisStatus === "failed";
+      var stepAnalysisFailed =
+        analysisFailed && (provenanceStatus === "complete" || provenanceStatus === "incomplete");
+      // A safe refresh after «Не знаю» is a pending read like any other, but it must not
+      // take independently valid information off the card: while it is out, the block on
+      // the card stays drawn and only the lines that may rest on the withdrawn capacity
+      // are filtered. Any other pending read (a newer capacity, a save) draws no hint
+      // until its own answer arrives.
+      if (current.measures && (!current.measuresPending || current.sourceGlassUnknown)) {
         current.measures.ingredients.forEach(function (conversion) {
+          // After «Не знаю», a line converted only with the withdrawn temporary capacity is
+          // not shown as converted; a declared capacity's conversion still is.
+          if (current.sourceGlassUnknown && current.measures.clarifiedPositions[conversion.position] === true) {
+            return;
+          }
           conversions[conversion.position] = conversion;
         });
       }
@@ -2527,8 +2636,24 @@
       var ingredientsBody = anyHint
         ? h("div", null, [h("p", { class: "measure-caption", text: Logic.TEXT.measuresTitle }), ingredientList])
         : ingredientList;
+      if (provenanceFailed) {
+        // The audit of where the ingredient amounts came from failed. The conversions the
+        // server did compute are a different component and stay as they are; nothing here
+        // says the step amounts were not calculated.
+        ingredientsBody = h("div", null, [
+          ingredientsBody,
+          h("p", { class: "hint", role: "status", text: Logic.TEXT.provenanceNotChecked }),
+        ]);
+      }
       wrapper.appendChild(recipeSection(Logic.TEXT.ingredients, ingredientsBody));
-      if (current.measures && current.measures.sourceGlassRequired) {
+      // The question is asked once per recipe, when any amount -- an ingredient's or a
+      // step's -- contains an undeclared glass. It is not asked again once the safe
+      // «Не знаю» answer closed it for this view.
+      if (
+        current.measures &&
+        !current.sourceGlassUnknown &&
+        (current.measures.sourceGlassRequired || current.measures.stepsGlassRequired)
+      ) {
         wrapper.appendChild(sourceGlassChooser(current));
       }
       // A choice under way is named; the confirmed one and its conversion stay on the card
@@ -2549,6 +2674,13 @@
         );
         var retryGlass = action(Logic.TEXT.retry, "btn-secondary", function () {
           var failed = current.sourceGlassError.value;
+          if (failed === null) {
+            // The re-read after «Не знаю» failed: ask again for the recipe as its own text
+            // declares it, with no capacity assumed.
+            wantFocus = "recipe";
+            controller.retryFavoriteConversion();
+            return;
+          }
           // The redraw that starts the retry keeps the keyboard on the choice it repeats.
           wantFocus =
             failed === 200
@@ -2575,18 +2707,45 @@
         });
         wrapper.appendChild(retryMeasure);
       }
-      wrapper.appendChild(
-        recipeSection(
-          Logic.TEXT.steps,
-          h(
-            "ol",
-            { class: "recipe-list recipe-steps" },
-            current.steps.map(function (step) {
-              return h("li", { text: step });
-            })
-          )
-        )
+      // The step hints belong to the block on the card: a read under way, or one whose
+      // answer belongs to another version, draws no derived hint at all.
+      var stepAnnotations = {};
+      if (current.measures && (!current.measuresPending || current.sourceGlassUnknown)) {
+        current.measures.steps.forEach(function (annotation) {
+          stepAnnotations[annotation.stepIndex] = annotation;
+        });
+      }
+      var stepsBody = h(
+        "ol",
+        { class: "recipe-list recipe-steps" },
+        current.steps.map(function (step, index) {
+          var annotation = stepAnnotations[index];
+          // The echoed text must be the very step the page is drawing. The logic already
+          // checked it; a mismatch here simply means the stored text alone.
+          if (!annotation || annotation.text !== step) {
+            return h("li", { text: step });
+          }
+          return stepLine(step, annotation, current.sourceGlassUnknown === true);
+        })
       );
+      var stepsSectionBody = h("div", null, [stepsBody]);
+      if (analysisFailed && !stepAnalysisFailed) {
+        // The whole-block summary failed and the step component is not the one the client
+        // can name (the provenance audit failed, or its own status is absent). Whether the
+        // step pass also failed is not in the payload (empty `steps` is also a pass with no
+        // amounts), so the card says the neutral truth instead of claiming step amounts
+        // were unavailable.
+        stepsSectionBody.appendChild(
+          h("p", { class: "hint", role: "status", text: Logic.TEXT.analysisPartlyFailed })
+        );
+      } else if (stepAnalysisFailed) {
+        // The server could not finish its analysis. That is not a statement that every
+        // amount was understood: the text is drawn as stored, without speculative numbers.
+        stepsSectionBody.appendChild(
+          h("p", { class: "hint", role: "status", text: Logic.TEXT.stepsNotChecked })
+        );
+      }
+      wrapper.appendChild(recipeSection(Logic.TEXT.steps, stepsSectionBody));
     } else {
       var text = textBlocks(current.text);
       text.className += " recipe-text";

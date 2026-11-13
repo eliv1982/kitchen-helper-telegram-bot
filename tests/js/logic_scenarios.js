@@ -8025,4 +8025,1602 @@ scenario("a_failed_first_custom_volume_leaves_the_capacity_unconfirmed", async (
   assert.equal(current.sourceGlassPending, null);
 });
 
+// ============================================================================================
+// KH-F01-B1.1-D: step hints, code points and the safe «Не знаю» answer
+// ============================================================================================
+
+const STEPPED = {
+  steps: ["Доведите до кипения, добавьте 500 мл воды.", "Влейте 250 мл молока."],
+};
+
+// The same recipe with its step annotations: 500 mL and 250 mL are two glasses each for a
+// 250 mL target. The detail's version is BORSH_RECIPE's (3).
+function steppedFavorite(block, steps = STEPPED.steps, extra = {}) {
+  return structuredFavoriteItem({
+    steps,
+    measures: block,
+    ...extra,
+  });
+}
+
+async function withSteppedFavorite(block, options = {}) {
+  const item = steppedFavorite(block, options.steps || STEPPED.steps, options.extra || {});
+  const env = makeEnv({ structuredRecipes: true }).signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что?"), structuredAnswer()]),
+  });
+  env.net.route("GET", FAVORITES_URL, H.favoritesBody([item]));
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(item, STRUCTURED_TEXT));
+  await env.boot();
+  await env.ctl.openFavorite(H.FAV_1);
+  await env.settle();
+  return { env, item };
+}
+
+function steppedAnnotations() {
+  return [
+    H.stepAnnotation(0, STEPPED.steps[0], [H.span(STEPPED.steps[0], "500 мл")]),
+    H.stepAnnotation(1, STEPPED.steps[1], [H.span(STEPPED.steps[1], "250 мл")]),
+  ];
+}
+
+scenario("step_annotations_are_bound_to_the_drawn_text_and_read_in_code_points", async () => {
+  const { env } = await withSteppedFavorite(H.stepBlock(3, steppedAnnotations()));
+  const current = env.view().favorites.current;
+
+  assert.equal(current.measures.steps.length, 2);
+  const first = current.measures.steps[0];
+  assert.equal(first.stepIndex, 0);
+  assert.equal(first.text, STEPPED.steps[0]);
+  assert.equal(first.spans.length, 1);
+  assert.equal(first.spans[0].text, "500 мл");
+  assert.equal(first.spans[0].link, "linked");
+  assert.equal(first.spans[0].conversion.status, "nominal_household");
+  assert.equal(first.spans[0].sourceApproximate, false);
+  // The offsets are code points, and the mapping is the one the page slices with.
+  assert.equal([...STEPPED.steps[0]].slice(first.spans[0].start, first.spans[0].end).join(""), "500 мл");
+
+  // An emoji is one code point and two UTF-16 units: the mapping must say both. The space
+  // before the emoji is code point 8 and UTF-16 unit 8; the emoji is code point 9, so the
+  // next boundary is unit 11 (not 10).
+  const astral = "Добавьте 🥛 500 мл воды 🥛.";
+  assert.equal(Logic.countCodePoints("Добавьте "), 9);
+  assert.equal(Logic.codePointToUtf16(astral, 9), 9, "before the emoji");
+  assert.equal(Logic.codePointToUtf16(astral, 10), 11, "after the surrogate pair");
+  assert.equal(Logic.codePointToUtf16(astral, Logic.countCodePoints(astral)), astral.length);
+  assert.equal(Logic.codePointToUtf16(astral, Logic.countCodePoints(astral) + 1), -1);
+  assert.equal(Logic.codePointToUtf16(astral, -1), -1);
+  // A combining mark is a code point of its own, exactly as Python's slicing counts it.
+  const combining = "500 мл́ воды";
+  assert.equal(Logic.countCodePoints(combining), 12);
+  assert.equal(Logic.codePointToUtf16(combining, 6), 6, "the mark itself");
+  assert.equal(Logic.codePointToUtf16(combining, 7), 7, "after the mark");
+});
+
+scenario("a_step_annotation_that_does_not_match_its_step_is_dropped_and_nothing_else_is", async () => {
+  const text = STEPPED.steps[0];
+  const good = H.span(text, "500 мл");
+  const cases = {
+    "the echoed text is another step": [H.stepAnnotation(0, STEPPED.steps[1], [good])],
+    "the step index is beyond the recipe": [H.stepAnnotation(7, text, [good])],
+    "the span starts after it ends": [H.stepAnnotation(0, text, [{ ...good, start: 20, end: 10 }])],
+    "the span runs past the text": [H.stepAnnotation(0, text, [{ ...good, start: 5, end: 9999 }])],
+    "the span is reversed": [H.stepAnnotation(0, text, [{ ...good, start: 30, end: 30 }])],
+    "the slice is not the span's text": [H.stepAnnotation(0, text, [{ ...good, text: "600 мл" }])],
+    "two spans overlap": [
+      H.stepAnnotation(0, text, [
+        good,
+        { ...H.span(text, "500 мл воды"), start: good.start + 1, end: good.end + 4 },
+      ]),
+    ],
+    "two spans are out of order": [
+      H.stepAnnotation(0, text, [H.span(text, "воды"), { ...good, start: 0, end: 4, text: "Дове" }]),
+    ],
+    "the link is not a status the page knows": [H.stepAnnotation(0, text, [{ ...good, link: "certain" }])],
+    "the capacity origin is not one it knows": [
+      H.stepAnnotation(0, text, [{ ...good, capacity_origin: "inherited" }]),
+    ],
+    "the approximation says a word it does not carry": [
+      H.stepAnnotation(0, text, [
+        { ...good, source_approximation: { approximate: true, word: null } },
+      ]),
+    ],
+    "the hash is not a lowercase hex digest": [H.stepAnnotation(0, text, [good], { text_sha256: "XYZ" })],
+    "a fraction has a zero denominator": [
+      H.stepAnnotation(0, text, [
+        { ...good, conversion: { ...good.conversion, exact: { numerator: 1, denominator: 0 }, presentation: "exact" } },
+      ]),
+    ],
+    "the conversion contradicts its own status": [
+      H.stepAnnotation(0, text, [
+        { ...good, conversion: { ...good.conversion, status: "clarification_required" } },
+      ]),
+    ],
+    "a non-linked span carries a number": [
+      H.stepAnnotation(0, text, [{ ...good, link: "ambiguous" }]),
+    ],
+  };
+  for (const [label, annotations] of Object.entries(cases)) {
+    const { env } = await withSteppedFavorite(H.stepBlock(3, annotations));
+    const current = env.view().favorites.current;
+    assert.equal(current.status, "ready", label);
+    assert.deepEqual(current.measures.steps, [], label);
+    // The recipe and its texts are untouched; the block itself is still usable.
+    assert.deepEqual(current.steps, STEPPED.steps, label);
+  }
+});
+
+scenario("step_annotations_from_another_favorite_version_are_not_used", async () => {
+  const { env } = await withSteppedFavorite(
+    H.stepBlock(2, steppedAnnotations(), {
+      ingredients: [
+        {
+          position: 0,
+          source: "1 стакан 200 мл",
+          source_kind: "household",
+          target_unit: "glass",
+          status: "nominal_household",
+          reason: "converted",
+          exact: { numerator: 4, denominator: 5 },
+          rounded: null,
+          identical: false,
+          presentation: "exact",
+        },
+      ],
+    })
+  );
+  const current = env.view().favorites.current;
+
+  // The step hints belong to version 2, and the card is version 3.
+  assert.deepEqual(current.measures.steps, []);
+  // The released ingredient block is not stale data and is still read.
+  assert.equal(current.measures.ingredients[0].exact.numerator, 4);
+  assert.deepEqual(current.steps, STEPPED.steps);
+});
+
+scenario("a_block_without_step_data_draws_no_step_hints_and_keeps_the_ingredient_ones", async () => {
+  const { env } = await withSteppedFavorite(
+    measuresBlock({
+      // The released B1 block: no schema_version, no steps, no analysis.
+      ingredients: [
+        {
+          position: 0,
+          source: "1 стакан 200 мл",
+          source_kind: "household",
+          target_unit: "glass",
+          status: "nominal_household",
+          reason: "converted",
+          exact: { numerator: 4, denominator: 5 },
+          rounded: null,
+          identical: false,
+          presentation: "exact",
+        },
+      ],
+    })
+  );
+  const current = env.view().favorites.current;
+
+  assert.equal(current.status, "ready");
+  assert.deepEqual(current.measures.steps, []);
+  assert.equal(current.measures.analysisStatus, null);
+  assert.equal(current.measures.stepsGlassRequired, false);
+  assert.equal(current.measures.ingredients.length, 1);
+});
+
+scenario("a_step_pass_that_failed_is_reported_and_the_valid_ingredient_hints_stay", async () => {
+  const { env } = await withSteppedFavorite(
+    H.stepBlock(3, [], {
+      analysis: {
+        status: "failed",
+        spans_emitted: 0,
+        spans_omitted: 0,
+        omitted_reasons: { limit_exceeded: 0, malformed: 0, unsafe_fraction: 0 },
+        limits: { max_spans_per_step: 32, max_spans_per_recipe: 128, max_step_chars: 1000, max_steps: 50 },
+      },
+      ingredients: [
+        {
+          position: 0,
+          source: "1 стакан 200 мл",
+          source_kind: "household",
+          target_unit: "glass",
+          status: "nominal_household",
+          reason: "converted",
+          exact: { numerator: 4, denominator: 5 },
+          rounded: null,
+          identical: false,
+          presentation: "exact",
+        },
+      ],
+    })
+  );
+  const current = env.view().favorites.current;
+
+  assert.equal(current.status, "ready");
+  assert.equal(current.measures.analysisStatus, "failed");
+  assert.deepEqual(current.measures.steps, []);
+  assert.equal(current.measures.ingredients.length, 1);
+  // The failed flag is not read as "no step names an undeclared glass": it says nothing.
+  assert.equal(current.measures.stepsGlassRequired, false);
+});
+
+scenario("a_step_only_undeclared_glass_is_reported_as_the_question_s_own_reason", async () => {
+  const block = H.stepBlock(3, steppedAnnotations(), {
+    source_glass_required: false,
+    steps_source_glass_required: true,
+  });
+  const { env } = await withSteppedFavorite(block);
+  const current = env.view().favorites.current;
+
+  assert.equal(current.measures.sourceGlassRequired, false);
+  assert.equal(current.measures.stepsGlassRequired, true);
+  assert.equal(current.sourceGlassUnknown, false, "the question has not been answered");
+});
+
+scenario("the_safe_unknown_answer_clears_the_clarification_and_keeps_declared_conversions", async () => {
+  const unclarified = H.stepBlock(3, [
+    H.stepAnnotation(0, STEPPED.steps[0], [
+      H.span(STEPPED.steps[0], "500 мл", {
+        capacity_origin: "unresolved",
+        conversion: null,
+        conversion_omitted_reason: null,
+        link: "linked",
+      }),
+    ]),
+  ], {
+    steps_source_glass_required: true,
+    ingredients: [
+      {
+        position: 0,
+        source: "1 стакан",
+        source_kind: "household",
+        target_unit: "glass",
+        status: "clarification_required",
+        reason: "glass_size_required",
+        exact: null,
+        rounded: null,
+        identical: false,
+        presentation: "none",
+        source_terms: [
+          { unit: "glass", amount: { numerator: 1, denominator: 1 }, capacity_ml: null, capacity_origin: "unresolved" },
+        ],
+      },
+      {
+        position: 1,
+        source: "1 стакан 200 мл",
+        source_kind: "household",
+        target_unit: "glass",
+        status: "nominal_household",
+        reason: "converted",
+        exact: { numerator: 4, denominator: 5 },
+        rounded: null,
+        identical: false,
+        presentation: "exact",
+        source_terms: [
+          {
+            unit: "glass",
+            amount: { numerator: 1, denominator: 1 },
+            capacity_ml: { numerator: 200, denominator: 1 },
+            capacity_origin: "declared_text",
+          },
+        ],
+      },
+    ],
+  });
+  const item = steppedFavorite(unclarified, STEPPED.steps, {
+    ingredients: [
+      { name: "вода", amount: "1 стакан" },
+      { name: "мука", amount: "1 стакан 200 мл" },
+    ],
+  });
+  const env = makeEnv({ structuredRecipes: true }).signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что?"), structuredAnswer()]),
+  });
+  env.net.route("GET", FAVORITES_URL, H.favoritesBody([item]));
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(item, STRUCTURED_TEXT));
+  await env.boot();
+  await env.ctl.openFavorite(H.FAV_1);
+  await env.settle();
+
+  // A temporary capacity is confirmed for this view: the glass term converts with it.
+  const clarified = H.stepBlock(3, [
+    H.stepAnnotation(0, STEPPED.steps[0], [
+      H.span(STEPPED.steps[0], "500 мл", {
+        capacity_origin: "temporary_clarification",
+        source_approximation: { approximate: false, word: null },
+      }),
+    ]),
+  ], {
+    source_glass_ml: 200,
+    steps_source_glass_required: true,
+    ingredients: [
+      {
+        position: 0,
+        source: "1 стакан",
+        source_kind: "household",
+        target_unit: "glass",
+        status: "nominal_household",
+        reason: "converted",
+        exact: { numerator: 4, denominator: 5 },
+        rounded: null,
+        identical: false,
+        presentation: "exact",
+        source_terms: [
+          {
+            unit: "glass",
+            amount: { numerator: 1, denominator: 1 },
+            capacity_ml: { numerator: 200, denominator: 1 },
+            capacity_origin: "temporary_clarification",
+          },
+        ],
+      },
+      unclarified.ingredients[1],
+    ],
+  });
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(steppedFavorite(clarified, STEPPED.steps, {
+    ingredients: item.ingredients,
+  }), STRUCTURED_TEXT));
+  assert.deepEqual(await env.ctl.setSourceGlass(200), { ok: true });
+  await env.settle();
+
+  let current = env.view().favorites.current;
+  assert.equal(current.sourceGlass, 200);
+  assert.deepEqual(current.measures.clarifiedPositions, { 0: true });
+
+  // «Не знаю»: the capacity is dropped, the question closes, the recipe is read again as
+  // its own text declares it.
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(item, STRUCTURED_TEXT));
+  assert.deepEqual(await env.ctl.chooseUnknownSourceGlass(), { ok: true });
+  await env.settle();
+
+  current = env.view().favorites.current;
+  assert.equal(current.sourceGlass, null);
+  assert.equal(current.sourceGlassUnknown, true);
+  assert.equal(current.sourceGlassPending, null);
+  assert.equal(current.status, "ready");
+  assert.equal(
+    env.net.requests("GET", FAV_URL_1).slice(-1)[0].url,
+    FAV_URL_1,
+    "the temporary capacity is cleared from the request too"
+  );
+  // Nothing drawn rests on the withdrawn capacity, and nothing was stored.
+  assert.deepEqual(current.measures.clarifiedPositions, {});
+  assert.equal(current.measures.ingredients[0].status, "clarification_required");
+  // The independent declared conversion is still there.
+  assert.deepEqual(current.measures.ingredients[1].exact, { numerator: 4, denominator: 5 });
+});
+
+scenario("the_unknown_answer_reads_nothing_when_no_capacity_was_assumed", async () => {
+  const block = H.stepBlock(3, steppedAnnotations(), { steps_source_glass_required: true });
+  const { env } = await withSteppedFavorite(block);
+  const asked = env.net.log.length;
+
+  assert.deepEqual(await env.ctl.chooseUnknownSourceGlass(), { ok: true });
+  await env.settle();
+
+  assert.equal(env.net.log.length, asked, "there was no clarification to clear");
+  assert.equal(env.view().favorites.current.sourceGlassUnknown, true);
+});
+
+scenario("the_unknown_answer_belongs_to_one_view_and_is_not_kept_on_reopening", async () => {
+  const block = H.stepBlock(3, steppedAnnotations(), { steps_source_glass_required: true });
+  const { env } = await withSteppedFavorite(block);
+  assert.deepEqual(await env.ctl.chooseUnknownSourceGlass(), { ok: true });
+  await env.settle();
+  assert.equal(env.view().favorites.current.sourceGlassUnknown, true);
+
+  // Reopening the recipe is a new view of it: the recipe's own declarations are the start.
+  await env.ctl.openFavorite(H.FAV_1);
+  await env.settle();
+  assert.equal(env.view().favorites.current.sourceGlassUnknown, false);
+});
+
+scenario("the_unknown_answer_survives_a_failed_reread_without_putting_the_capacity_back", async () => {
+  const block = H.stepBlock(3, steppedAnnotations(), { steps_source_glass_required: true });
+  const { env } = await withSteppedFavorite(block);
+  env.net.route("GET", FAV_URL_1, fail());
+
+  // The first answer is applied, and the re-read that clears the capacity fails.
+  const clarified = H.stepBlock(3, steppedAnnotations(), {
+    source_glass_ml: 200,
+    steps_source_glass_required: true,
+  });
+  assert.equal(env.view().favorites.current.sourceGlass, null);
+
+  // Confirm 200 first, so there is a temporary capacity to clear.
+  env.net.route(
+    "GET",
+    FAV_URL_1,
+    H.favoriteDetail(steppedFavorite(clarified), STRUCTURED_TEXT),
+    fail()
+  );
+  assert.deepEqual(await env.ctl.setSourceGlass(200), { ok: true });
+  await env.settle();
+  assert.equal(env.view().favorites.current.sourceGlass, 200);
+
+  assert.deepEqual(await env.ctl.chooseUnknownSourceGlass(), { ok: true });
+  await env.settle();
+
+  const current = env.view().favorites.current;
+  assert.equal(current.status, "ready", "the recipe stays readable");
+  assert.equal(current.sourceGlass, null, "the capacity is cleared even though the read failed");
+  assert.equal(current.sourceGlassUnknown, true);
+  assert.ok(current.measuresError, "the failed re-read is worded");
+  assert.equal(current.measuresPending, false);
+});
+
+scenario("an_older_detail_answer_with_step_hints_cannot_replace_a_newer_one", async () => {
+  const item = steppedFavorite(H.stepBlock(3, steppedAnnotations()));
+  // The newer answer is the same recipe without a conversion block: no step hints at all.
+  const withoutHints = steppedFavorite(null);
+  const env = makeEnv({ structuredRecipes: true }).signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что?"), structuredAnswer()]),
+  });
+  env.net.route("GET", FAVORITES_URL, H.favoritesBody([item]));
+  const older = deferred();
+  const newer = deferred();
+  env.net.route("GET", FAV_URL_1, () => older.promise, () => newer.promise);
+  await env.boot();
+
+  const firstAsk = env.ctl.openFavorite(H.FAV_1);
+  await flush();
+  const secondAsk = env.ctl.openFavorite(H.FAV_1);
+  await flush();
+
+  newer.resolve(H.favoriteDetail(withoutHints, STRUCTURED_TEXT));
+  await flush();
+  older.resolve(H.favoriteDetail(item, STRUCTURED_TEXT));
+  await flush();
+
+  const current = env.view().favorites.current;
+  assert.equal(current.status, "ready");
+  assert.equal(current.measures, null, "the older answer's step hints were not applied");
+  assert.deepEqual(current.steps, STEPPED.steps);
+  await firstAsk;
+  await secondAsk;
+});
+
+scenario("a_late_step_answer_for_a_recipe_that_was_left_changes_nothing", async () => {
+  const item = steppedFavorite(H.stepBlock(3, steppedAnnotations()));
+  const second = H.structuredFavorite(H.FAV_2, 2, "Уха", 1, 0, {
+    servings: null,
+    ingredients: UKHA_RECIPE.ingredients,
+    steps: UKHA_RECIPE.steps,
+    version: 1,
+    measures: null,
+  });
+  const env = makeEnv({ structuredRecipes: true }).signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что?"), structuredAnswer()]),
+  });
+  env.net.route("GET", FAVORITES_URL, H.favoritesBody([item, second]));
+  const answer = deferred();
+  env.net.route("GET", FAV_URL_1, () => answer.promise);
+  env.net.route("GET", FAV_URL_2, H.favoriteDetail(second, "Уха"));
+  await env.boot();
+
+  const asked = env.ctl.openFavorite(H.FAV_1);
+  await flush();
+  await env.ctl.openFavorite(H.FAV_2);
+  answer.resolve(H.favoriteDetail(item, STRUCTURED_TEXT));
+  await flush();
+
+  const current = env.view().favorites.current;
+  assert.equal(current.id, H.FAV_2);
+  assert.equal(current.measures, null);
+  await asked;
+  await env.settle();
+});
+
+// ============================================================================================
+// KH-F01-B1.1-D-REMEDIATION-01: regression tests for the seven audit findings
+// ============================================================================================
+
+// One v2 ingredient object with per-term source data; `terms` is whatever the case wants
+// (an array, null, undefined, a string, ...).
+function v2Ingredient(position, source, terms, extra = {}) {
+  return {
+    position,
+    source,
+    source_kind: "household",
+    target_unit: "glass",
+    status: "nominal_household",
+    reason: "converted",
+    exact: { numerator: 1, denominator: 2 },
+    rounded: null,
+    identical: false,
+    presentation: "exact",
+    source_terms: terms,
+    ...extra,
+  };
+}
+
+function sourceTerm(unit, origin, capacity = null) {
+  return {
+    unit,
+    amount: { numerator: 1, denominator: 1 },
+    capacity_ml: capacity === null ? null : { numerator: capacity, denominator: 1 },
+    capacity_origin: origin,
+  };
+}
+
+// --- D-R01: a late capacity answer may not revive a withdrawn clarification ---------------
+
+scenario("a_late_capacity_answer_cannot_revive_the_unknown_answer", async () => {
+  const unclarified = measuresBlock();
+  const { env } = await withMeasuredFavorite(unclarified);
+
+  // The 200 mL answer is still out when the safe answer is given.
+  const late = deferred();
+  env.net.route("GET", FAV_URL_1, () => late.promise);
+  const choice = env.ctl.setSourceGlass(200);
+  await flush();
+  assert.equal(env.view().favorites.current.sourceGlassPending, 200);
+
+  assert.deepEqual(await env.ctl.chooseUnknownSourceGlass(), { ok: true });
+  await flush(); // (the 200 mL answer is still out: settle would wait for it)
+  let current = env.view().favorites.current;
+  assert.equal(current.sourceGlass, null);
+  assert.equal(current.sourceGlassUnknown, true);
+  assert.equal(current.sourceGlassPending, null);
+
+  // The old answer carries a block read with 200 mL. It may not put the capacity back or
+  // replace the recipe the safe answer was given for.
+  const clarified = measuresBlock({
+    source_glass_ml: 200,
+    ingredients: [
+      {
+        position: 0,
+        source: "1 стакан",
+        source_kind: "household",
+        target_unit: "glass",
+        status: "nominal_household",
+        reason: "converted",
+        exact: { numerator: 4, denominator: 5 },
+        rounded: null,
+        identical: false,
+        presentation: "exact",
+      },
+    ],
+  });
+  late.resolve(H.favoriteDetail(structuredFavoriteItem({ measures: clarified }), STRUCTURED_TEXT));
+  await env.settle();
+
+  assert.deepEqual(await choice, { ok: false, reason: "stale" });
+  current = env.view().favorites.current;
+  assert.equal(current.sourceGlass, null, "the withdrawn clarification is not revived");
+  assert.equal(current.sourceGlassUnknown, true);
+  assert.equal(current.measures.sourceGlassMl, null, "no block of the withdrawn capacity is drawn");
+});
+
+scenario("a_capacity_chosen_after_the_safe_answer_wins_over_delayed_answers_in_either_order", async () => {
+  const unclarified = measuresBlock();
+  const clarified200 = measuresBlock({ source_glass_ml: 200 });
+  const clarified250 = measuresBlock({ source_glass_ml: 250 });
+
+  async function run(order) {
+    const item = structuredFavoriteItem({ measures: unclarified });
+    const env = makeEnv({ structuredRecipes: true }).signedIn([conversation(CONV_A, 0)], {
+      [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что?"), structuredAnswer()]),
+    });
+    env.net.route("GET", FAVORITES_URL, H.favoritesBody([item]));
+    env.net.route("GET", FAV_URL_1, H.favoriteDetail(item, STRUCTURED_TEXT));
+    await env.boot();
+    await env.ctl.openFavorite(H.FAV_1);
+    await env.settle();
+
+    // 200 is confirmed.
+    const answer200 = deferred();
+    env.net.route("GET", FAV_URL_1, () => answer200.promise);
+    const choose200 = env.ctl.setSourceGlass(200);
+    await flush();
+    answer200.resolve(H.favoriteDetail(structuredFavoriteItem({ measures: clarified200 }), STRUCTURED_TEXT));
+    await env.settle();
+    await choose200;
+    assert.equal(env.view().favorites.current.sourceGlass, 200, order);
+
+    // The safe answer starts a no-parameter read, and 250 is chosen while it is out.
+    const safeRefresh = deferred();
+    env.net.route("GET", FAV_URL_1, () => safeRefresh.promise);
+    const unknown = env.ctl.chooseUnknownSourceGlass();
+    await flush();
+    const answer250 = deferred();
+    env.net.route("GET", FAV_URL_1, () => answer250.promise);
+    const choose250 = env.ctl.setSourceGlass(250);
+    await flush();
+
+    const release = order === "safe first"
+      ? [() => safeRefresh.resolve(H.favoriteDetail(item, STRUCTURED_TEXT)),
+         () => answer250.resolve(H.favoriteDetail(structuredFavoriteItem({ measures: clarified250 }), STRUCTURED_TEXT))]
+      : [() => answer250.resolve(H.favoriteDetail(structuredFavoriteItem({ measures: clarified250 }), STRUCTURED_TEXT)),
+         () => safeRefresh.resolve(H.favoriteDetail(item, STRUCTURED_TEXT))];
+    release[0]();
+    await flush();
+    release[1]();
+    await env.settle();
+    await unknown;
+    await choose250;
+
+    const current = env.view().favorites.current;
+    assert.equal(current.sourceGlass, 250, order);
+    assert.equal(current.sourceGlassUnknown, false, order);
+    assert.equal(current.measures.sourceGlassMl, 250, order);
+  }
+
+  await run("safe first");
+  await run("capacity first");
+});
+
+// --- D-R02: unverifiable source terms are treated conservatively (fail closed) -------------
+
+scenario("an_ingredient_without_verifiable_source_terms_is_treated_as_clarification_dependent", async () => {
+  const variants = {
+    "fully declared": [sourceTerm("glass", "declared_text", 200), sourceTerm("glass", "declared_text", 200)],
+    "fully temporary": [
+      sourceTerm("glass", "temporary_clarification", 250),
+      sourceTerm("glass", "temporary_clarification", 250),
+    ],
+    mixed: [sourceTerm("glass", "declared_text", 200), sourceTerm("glass", "temporary_clarification", 250)],
+    null: null,
+    missing: undefined,
+    empty: [],
+    "a string": "declared_text",
+    "an object": { capacity_origin: "declared_text" },
+    "an element of the wrong type": [42],
+    "an unknown origin": [sourceTerm("glass", "inherited_from_ingredient", 200)],
+    "a glass marked not_applicable": [sourceTerm("glass", "not_applicable")],
+    "a spoon claiming a capacity": [sourceTerm("teaspoon", "not_applicable", 5)],
+  };
+  for (const [label, terms] of Object.entries(variants)) {
+    const block = H.stepBlock(3, [], {
+      source_glass_required: true,
+      ingredients: [
+        v2Ingredient(0, "1 стакан 200 мл + 1 стакан", terms),
+        v2Ingredient(1, "500 мл", [sourceTerm("milliliter", "not_applicable")], {
+          source_kind: "metric_volume",
+        }),
+      ],
+    });
+    const { env } = await withSteppedFavorite(block, {
+      steps: STEPPED.steps,
+      extra: {
+        ingredients: [
+          { name: "вода", amount: "1 стакан 200 мл + 1 стакан" },
+          { name: "молоко", amount: "500 мл" },
+        ],
+      },
+    });
+    const current = env.view().favorites.current;
+    assert.equal(current.status, "ready", label);
+    const expected = label === "fully declared";
+    assert.equal(current.measures.clarifiedPositions[0] === true, !expected, label);
+    assert.equal(current.measures.clarifiedPositions[1] === true, false, label + ": independent metric");
+  }
+
+  // An `unresolved` glass term that carries a capacity is not one of those unreadable lists: a
+  // successful conversion beside it is a contradiction of the typed contract itself (D-R02),
+  // so its number is refused rather than drawn and withdrawn. The conservative path above is
+  // for terms no successful conversion rests on.
+  const contradictory = H.stepBlock(3, [], {
+    source_glass_required: true,
+    ingredients: [v2Ingredient(0, "1 стакан 200 мл + 1 стакан", [sourceTerm("glass", "unresolved", 200)])],
+  });
+  const { env } = await withSteppedFavorite(contradictory, {
+    steps: STEPPED.steps,
+    extra: { ingredients: [{ name: "вода", amount: "1 стакан 200 мл + 1 стакан" }] },
+  });
+  const current = env.view().favorites.current;
+  assert.equal(current.status, "ready");
+  assert.deepEqual(current.measures.ingredients, [], "the contradictory conversion is refused outright");
+  assert.deepEqual(current.measures.clarifiedPositions, {}, "there is nothing to withdraw");
+});
+
+scenario("a_failed_reread_after_the_safe_answer_does_not_restore_an_unverified_hint", async () => {
+  // The 250 mL answer declares no usable source terms: independence cannot be proven.
+  const clarified = H.stepBlock(3, [], {
+    source_glass_ml: 250,
+    source_glass_required: true,
+    ingredients: [v2Ingredient(0, "1 стакан 200 мл + 1 стакан", null)],
+  });
+  const unclarified = H.stepBlock(3, [], {
+    source_glass_required: true,
+    ingredients: [v2Ingredient(0, "1 стакан 200 мл + 1 стакан", null)],
+  });
+  const item = structuredFavoriteItem({
+    measures: unclarified,
+    ingredients: [{ name: "вода", amount: "1 стакан 200 мл + 1 стакан" }],
+  });
+  const clarifiedItem = structuredFavoriteItem({
+    measures: clarified,
+    ingredients: item.ingredients,
+  });
+  const env = makeEnv({ structuredRecipes: true }).signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что?"), structuredAnswer()]),
+  });
+  env.net.route("GET", FAVORITES_URL, H.favoritesBody([item]));
+  env.net.route(
+    "GET",
+    FAV_URL_1,
+    H.favoriteDetail(item, STRUCTURED_TEXT),
+    H.favoriteDetail(clarifiedItem, STRUCTURED_TEXT),
+    fail()
+  );
+  await env.boot();
+  await env.ctl.openFavorite(H.FAV_1);
+  await env.settle();
+
+  assert.deepEqual(await env.ctl.setSourceGlass(250), { ok: true });
+  await env.settle();
+  assert.equal(env.view().favorites.current.measures.clarifiedPositions[0], true);
+
+  // The no-parameter re-read fails; the old block stays, but its line is not safe to draw.
+  assert.deepEqual(await env.ctl.chooseUnknownSourceGlass(), { ok: true });
+  await env.settle();
+  const current = env.view().favorites.current;
+  assert.equal(current.sourceGlass, null);
+  assert.equal(current.sourceGlassUnknown, true);
+  assert.ok(current.measuresError, "the failed read is worded");
+  assert.equal(current.measures.clarifiedPositions[0], true);
+});
+
+// The exact D-R02 mutation: the real Stage C payload of `1 стакан (200 мл) + 1 стакан` with a
+// temporary capacity reports the second term as `temporary_clarification`; this payload says
+// `unresolved` (no capacity) and keeps the successful conversion. Stage C never produces that
+// combination -- an undeclared glass without a clarification is `clarification_required` -- so
+// the contradictory number is refused at normalization, whatever the view currently holds.
+const compoundTerms = (second) => [sourceTerm("glass", "declared_text", 200), second];
+
+scenario("a_successful_conversion_beside_an_unresolved_term_is_refused_during_normalization", async () => {
+  // The real Stage C payload (clarified with 250 mL) is mutated so that the second term says
+  // `unresolved` while the conversion that used the 250 mL stays successful.
+  const unclarified = H.stepBlock(3, [], {
+    source_glass_required: true,
+    ingredients: [
+      v2Ingredient(0, "1 стакан (200 мл) + 1 стакан", compoundTerms(sourceTerm("glass", "unresolved")), {
+        status: "clarification_required",
+        reason: "glass_size_required",
+        exact: null,
+        presentation: "none",
+      }),
+    ],
+  });
+  const clarified = H.stepBlock(3, [], {
+    source_glass_ml: 250,
+    source_glass_required: true,
+    ingredients: [
+      v2Ingredient(0, "1 стакан (200 мл) + 1 стакан", compoundTerms(sourceTerm("glass", "unresolved")), {
+        exact: null,
+        rounded: { numerator: 7, denominator: 4, relative_error: { numerator: 1, denominator: 100 } },
+        presentation: "rounded",
+      }),
+      v2Ingredient(1, "1 стакан 200 мл", [sourceTerm("glass", "declared_text", 200)]),
+      v2Ingredient(2, "500 мл", [sourceTerm("milliliter", "not_applicable")], {
+        source_kind: "metric_volume",
+      }),
+    ],
+  });
+  const ingredients = [
+    { name: "вода", amount: "1 стакан (200 мл) + 1 стакан" },
+    { name: "мука", amount: "1 стакан 200 мл" },
+    { name: "молоко", amount: "500 мл" },
+  ];
+  const item = structuredFavoriteItem({ measures: unclarified, ingredients });
+  const clarifiedItem = structuredFavoriteItem({ measures: clarified, ingredients });
+  const env = makeEnv({ structuredRecipes: true }).signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что?"), structuredAnswer()]),
+  });
+  env.net.route("GET", FAVORITES_URL, H.favoritesBody([item]));
+  env.net.route(
+    "GET",
+    FAV_URL_1,
+    H.favoriteDetail(item, STRUCTURED_TEXT),
+    H.favoriteDetail(clarifiedItem, STRUCTURED_TEXT)
+  );
+  await env.boot();
+  await env.ctl.openFavorite(H.FAV_1);
+  await env.settle();
+  assert.deepEqual(await env.ctl.setSourceGlass(250), { ok: true });
+  await env.settle();
+  const current = env.view().favorites.current;
+
+  assert.equal(current.status, "ready");
+  // The contradictory number is gone from the very block that was read with the 250 mL in
+  // effect; the conversion is not in the block at all, so no view state can draw it later.
+  assert.deepEqual(
+    current.measures.ingredients.map((conversion) => conversion.position),
+    [1, 2],
+    "only the independent conversions survive"
+  );
+  assert.deepEqual(current.measures.clarifiedPositions, {}, "there is nothing to withdraw");
+  // The recipe's own text is untouched: the line is drawn exactly as it was stored.
+  assert.deepEqual(
+    current.ingredients.map((ingredient) => ingredient.amount),
+    ingredients.map((ingredient) => ingredient.amount)
+  );
+  assert.equal(current.measures.sourceGlassMl, 250, "the block still answers for its request");
+});
+
+scenario("a_successful_conversion_with_every_unresolved_shape_is_refused_alone", async () => {
+  const variants = {
+    "the Codex mutation": compoundTerms(sourceTerm("glass", "unresolved")),
+    "an unresolved term alone": [sourceTerm("glass", "unresolved")],
+    "temporary and unresolved": [
+      sourceTerm("glass", "temporary_clarification", 250),
+      sourceTerm("glass", "unresolved"),
+    ],
+  };
+  for (const [label, terms] of Object.entries(variants)) {
+    const block = H.stepBlock(3, [], {
+      source_glass_required: true,
+      ingredients: [
+        v2Ingredient(0, "1 стакан 200 мл + 1 стакан", terms, {
+          exact: null,
+          rounded: { numerator: 7, denominator: 4, relative_error: { numerator: 1, denominator: 100 } },
+          presentation: "rounded",
+        }),
+        v2Ingredient(1, "500 мл", [sourceTerm("milliliter", "not_applicable")], {
+          source_kind: "metric_volume",
+        }),
+      ],
+    });
+    const { env } = await withSteppedFavorite(block, {
+      extra: {
+        ingredients: [
+          { name: "вода", amount: "1 стакан 200 мл + 1 стакан" },
+          { name: "молоко", amount: "500 мл" },
+        ],
+      },
+    });
+    const current = env.view().favorites.current;
+    assert.equal(current.status, "ready", label);
+    assert.deepEqual(
+      current.measures.ingredients.map((conversion) => conversion.position),
+      [1],
+      label + ": only the contradiction is lost"
+    );
+    assert.deepEqual(current.measures.clarifiedPositions, {}, label);
+  }
+});
+
+// The rest of the audit's D-R02 matrix: the `capacity_ml` written beside an `unresolved` glass
+// origin never decides the question. Null or absent is no proof of a capacity, and neither is a
+// valid rational, a zero, or a malformed shape: the origin says the capacity was never
+// established, whatever number is written beside it. Both successful statuses are tried, and
+// the legitimate `clarification_required` answer for the same term stays nonnumeric.
+const unresolvedCapacityShapes = {
+  "a valid rational": { numerator: 250, denominator: 1 },
+  "a zero": { numerator: 0, denominator: 1 },
+  "a negative rational": { numerator: -250, denominator: 1 },
+  "a zero denominator": { numerator: 250, denominator: 0 },
+  "a number": 250,
+  "a string": "250",
+  "an empty object": {},
+  null: null,
+  missing: undefined,
+};
+
+const successfulValues = {
+  exact: { status: "exact", exact: { numerator: 7, denominator: 4 }, rounded: null, presentation: "exact" },
+  nominal_household: {
+    status: "nominal_household",
+    exact: null,
+    rounded: { numerator: 7, denominator: 4, relative_error: { numerator: 1, denominator: 100 } },
+    presentation: "rounded",
+  },
+};
+
+function withCapacity(term, capacity) {
+  const copy = { ...term };
+  if (capacity === undefined) {
+    delete copy.capacity_ml;
+  } else {
+    copy.capacity_ml = capacity;
+  }
+  return copy;
+}
+
+scenario("a_successful_conversion_beside_an_unresolved_glass_term_is_refused_whatever_the_capacity", async () => {
+  const ingredients = [
+    { name: "вода", amount: "1 стакан (200 мл) + 1 стакан" },
+    { name: "молоко", amount: "500 мл" },
+  ];
+  let checked = 0;
+  for (const [status, values] of Object.entries(successfulValues)) {
+    for (const [shape, capacity] of Object.entries(unresolvedCapacityShapes)) {
+      const second = withCapacity(sourceTerm("glass", "unresolved"), capacity);
+      const block = (clarified) =>
+        H.stepBlock(3, [], {
+          source_glass_ml: clarified ? 250 : null,
+          source_glass_required: true,
+          ingredients: [
+            v2Ingredient(
+              0,
+              "1 стакан (200 мл) + 1 стакан",
+              [sourceTerm("glass", "declared_text", 200), second],
+              clarified
+                ? values
+                : {
+                    status: "clarification_required",
+                    reason: "glass_size_required",
+                    exact: null,
+                    rounded: null,
+                    presentation: "none",
+                  }
+            ),
+            v2Ingredient(1, "500 мл", [sourceTerm("milliliter", "not_applicable")], {
+              source_kind: "metric_volume",
+              exact: { numerator: 2, denominator: 1 },
+            }),
+          ],
+        });
+      const item = structuredFavoriteItem({ measures: block(false), ingredients });
+      const clarifiedItem = structuredFavoriteItem({ measures: block(true), ingredients });
+      const env = makeEnv({ structuredRecipes: true }).signedIn([conversation(CONV_A, 0)], {
+        [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что?"), structuredAnswer()]),
+      });
+      env.net.route("GET", FAVORITES_URL, H.favoritesBody([item]));
+      env.net.route(
+        "GET",
+        FAV_URL_1,
+        H.favoriteDetail(item, STRUCTURED_TEXT),
+        H.favoriteDetail(clarifiedItem, STRUCTURED_TEXT)
+      );
+      await env.boot();
+      await env.ctl.openFavorite(H.FAV_1);
+      await env.settle();
+
+      const where = status + " / " + shape;
+      // The real answer for a capacity nobody gave: no number, and nothing thrown.
+      const atRest = env.view().favorites.current;
+      assert.equal(atRest.status, "ready", where);
+      const waiting = atRest.measures.ingredients.find((conversion) => conversion.position === 0);
+      assert.equal(waiting.status, "clarification_required", where + ": the answer is the question");
+      assert.equal(waiting.exact, null, where + ": no number before the answer");
+      assert.equal(waiting.rounded, null, where + ": no rounded number before the answer");
+
+      assert.deepEqual(await env.ctl.setSourceGlass(250), { ok: true });
+      await env.settle();
+      const current = env.view().favorites.current;
+      assert.equal(current.status, "ready", where);
+      assert.deepEqual(
+        current.measures.ingredients.map((conversion) => conversion.position),
+        [1],
+        where + ": only the independent conversion survives"
+      );
+      assert.deepEqual(
+        current.measures.clarifiedPositions,
+        {},
+        where + ": the refused line is not marked clarification-dependent"
+      );
+      assert.deepEqual(
+        current.ingredients.map((ingredient) => ingredient.amount),
+        ingredients.map((ingredient) => ingredient.amount),
+        where + ": the stored text is untouched"
+      );
+      checked++;
+    }
+  }
+  assert.equal(checked, 18, "both successful statuses over all nine capacity shapes");
+});
+
+scenario("a_compound_conversion_with_temporary_and_declared_terms_is_suppressed_as_a_whole", async () => {
+  // One term may rest on the withdrawn clarification, so the whole line goes -- the declared
+  // term beside it does not make that line independent.
+  const clarified = H.stepBlock(3, [], {
+    source_glass_ml: 250,
+    source_glass_required: true,
+    ingredients: [
+      v2Ingredient(0, "1 стакан (200 мл) + 1 стакан", compoundTerms(sourceTerm("glass", "temporary_clarification", 250))),
+      v2Ingredient(1, "1 стакан 200 мл", [sourceTerm("glass", "declared_text", 200)]),
+    ],
+  });
+  const unclarified = H.stepBlock(3, [], {
+    source_glass_required: true,
+    ingredients: [
+      v2Ingredient(0, "1 стакан (200 мл) + 1 стакан", compoundTerms(sourceTerm("glass", "unresolved")), {
+        status: "clarification_required",
+        reason: "glass_size_required",
+        exact: null,
+        presentation: "none",
+      }),
+      v2Ingredient(1, "1 стакан 200 мл", [sourceTerm("glass", "declared_text", 200)]),
+    ],
+  });
+  const item = structuredFavoriteItem({
+    measures: unclarified,
+    ingredients: [
+      { name: "вода", amount: "1 стакан (200 мл) + 1 стакан" },
+      { name: "мука", amount: "1 стакан 200 мл" },
+    ],
+  });
+  const clarifiedItem = structuredFavoriteItem({ measures: clarified, ingredients: item.ingredients });
+  const env = makeEnv({ structuredRecipes: true }).signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что?"), structuredAnswer()]),
+  });
+  env.net.route("GET", FAVORITES_URL, H.favoritesBody([item]));
+  env.net.route(
+    "GET",
+    FAV_URL_1,
+    H.favoriteDetail(item, STRUCTURED_TEXT),
+    H.favoriteDetail(clarifiedItem, STRUCTURED_TEXT),
+    fail()
+  );
+  await env.boot();
+  await env.ctl.openFavorite(H.FAV_1);
+  await env.settle();
+
+  assert.deepEqual(await env.ctl.setSourceGlass(250), { ok: true });
+  await env.settle();
+  assert.deepEqual(env.view().favorites.current.measures.clarifiedPositions, { 0: true });
+
+  // The safe answer withdraws the capacity; a failed re-read keeps the old block, whose
+  // compound line must not be drawn as converted.
+  assert.deepEqual(await env.ctl.chooseUnknownSourceGlass(), { ok: true });
+  await env.settle();
+  const current = env.view().favorites.current;
+  assert.equal(current.measuresError !== null, true);
+  assert.equal(current.measures.clarifiedPositions[0], true);
+  assert.equal(current.measures.clarifiedPositions[1] === true, false);
+});
+
+scenario("a_fully_declared_compound_conversion_is_independent_of_the_clarification", async () => {
+  const block = H.stepBlock(3, [], {
+    source_glass_required: true,
+    ingredients: [
+      v2Ingredient(0, "1 стакан 200 мл + 1 стакан 200 мл", [
+        sourceTerm("glass", "declared_text", 200),
+        sourceTerm("glass", "declared_text", 200),
+      ]),
+      v2Ingredient(1, "500 мл", [sourceTerm("milliliter", "not_applicable")], {
+        source_kind: "metric_volume",
+      }),
+    ],
+  });
+  const { env } = await withSteppedFavorite(block, {
+    extra: {
+      ingredients: [
+        { name: "вода", amount: "1 стакан 200 мл + 1 стакан 200 мл" },
+        { name: "молоко", amount: "500 мл" },
+      ],
+    },
+  });
+  const current = env.view().favorites.current;
+  assert.equal(current.status, "ready");
+  assert.deepEqual(current.measures.clarifiedPositions, {}, "nothing rests on a clarification");
+});
+
+scenario("independent_spoon_and_metric_conversions_are_never_marked_dependent", async () => {
+  const block = H.stepBlock(3, [], {
+    source_glass_required: true,
+    ingredients: [
+      v2Ingredient(0, "1 ст. л.", [sourceTerm("tablespoon", "not_applicable")], {
+        target_unit: "tablespoon",
+        exact: { numerator: 1, denominator: 1 },
+      }),
+      v2Ingredient(1, "500 мл", [sourceTerm("milliliter", "not_applicable")], {
+        source_kind: "metric_volume",
+      }),
+      v2Ingredient(2, "1 ч. л.", [sourceTerm("teaspoon", "not_applicable")], {
+        target_unit: "teaspoon",
+        exact: { numerator: 1, denominator: 1 },
+      }),
+    ],
+  });
+  const { env } = await withSteppedFavorite(block, {
+    extra: {
+      ingredients: [
+        { name: "масло", amount: "1 ст. л." },
+        { name: "молоко", amount: "500 мл" },
+        { name: "соль", amount: "1 ч. л." },
+      ],
+    },
+  });
+  const current = env.view().favorites.current;
+  assert.equal(current.status, "ready");
+  assert.deepEqual(current.measures.clarifiedPositions, {});
+});
+
+scenario("legitimate_unresolved_terms_without_a_conversion_do_not_crash_or_invent_a_hint", async () => {
+  // The unclarified Stage C payload: the same compound, but the conversion itself says the
+  // capacity is required and carries no number. Nothing is invented, and there is no number
+  // to withdraw either: the line is simply drawn as its own text.
+  const block = H.stepBlock(3, [], {
+    source_glass_required: true,
+    ingredients: [
+      v2Ingredient(0, "1 стакан (200 мл) + 1 стакан", compoundTerms(sourceTerm("glass", "unresolved")), {
+        status: "clarification_required",
+        reason: "glass_size_required",
+        exact: null,
+        presentation: "none",
+        identical: false,
+      }),
+    ],
+  });
+  const { env } = await withSteppedFavorite(block, {
+    extra: { ingredients: [{ name: "вода", amount: "1 стакан (200 мл) + 1 стакан" }] },
+  });
+  const current = env.view().favorites.current;
+  assert.equal(current.status, "ready");
+  assert.equal(current.measures.ingredients[0].status, "clarification_required");
+  assert.equal(current.measures.ingredients[0].exact, null);
+  assert.equal(current.measures.ingredients[0].rounded, null);
+  assert.equal(current.measures.ingredients[0].presentation, "none");
+  assert.deepEqual(current.measures.clarifiedPositions, {}, "no drawn number to withdraw");
+});
+
+scenario("hostile_source_terms_never_change_the_request_order_or_the_version_binding", async () => {
+  const hostile = { toString: null };
+  const compound = (terms) =>
+    v2Ingredient(0, "1 стакан (200 мл) + 1 стакан", terms, {
+      exact: null,
+      rounded: { numerator: 7, denominator: 4, relative_error: { numerator: 1, denominator: 100 } },
+      presentation: "rounded",
+    });
+  const unclarified = (terms) =>
+    H.stepBlock(3, [], {
+      source_glass_required: true,
+      ingredients: [compound(terms)],
+    });
+  const clarified = (terms) =>
+    H.stepBlock(3, [], {
+      source_glass_ml: 250,
+      source_glass_required: true,
+      ingredients: [compound(terms)],
+    });
+  const cases = {
+    "the Codex mutation": { terms: compoundTerms(sourceTerm("glass", "unresolved")), refused: true },
+    "a hostile origin object": { terms: compoundTerms(sourceTerm("glass", hostile, 200)), refused: false },
+    "a wrong-type list": { terms: "declared_text", refused: false },
+  };
+  for (const [label, { terms, refused }] of Object.entries(cases)) {
+    const item = structuredFavoriteItem({ measures: unclarified(terms) });
+    const withCapacity = structuredFavoriteItem({
+      measures: clarified(terms),
+      ingredients: item.ingredients,
+    });
+    const env = makeEnv({ structuredRecipes: true }).signedIn([conversation(CONV_A, 0)], {
+      [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что?"), structuredAnswer()]),
+    });
+    env.net.route("GET", FAVORITES_URL, H.favoritesBody([item]));
+    env.net.route(
+      "GET",
+      FAV_URL_1,
+      H.favoriteDetail(item, STRUCTURED_TEXT),
+      H.favoriteDetail(withCapacity, STRUCTURED_TEXT),
+      H.favoriteDetail(item, STRUCTURED_TEXT)
+    );
+    await env.boot();
+    await env.ctl.openFavorite(H.FAV_1);
+    await env.settle();
+
+    const current = env.view().favorites.current;
+    assert.equal(current.status, "ready", label);
+    assert.equal(current.id, H.FAV_1, label);
+    assert.equal(current.version, 3, label);
+    // The metadata costs only its own conversion: the contradiction is refused outright,
+    // an unreadable list only loses its independence. Neither touches the view.
+    if (refused) {
+      assert.deepEqual(current.measures.ingredients, [], label + ": the contradiction is gone");
+      assert.deepEqual(current.measures.clarifiedPositions, {}, label);
+    } else {
+      assert.equal(current.measures.ingredients.length, 1, label);
+      assert.equal(current.measures.clarifiedPositions[0], true, label);
+    }
+
+    // The clarification reads exactly once, in order; the metadata changes no request.
+    assert.deepEqual(await env.ctl.setSourceGlass(250), { ok: true }, label);
+    await env.settle();
+    assert.equal(env.view().favorites.current.version, 3, label);
+    if (refused) {
+      assert.deepEqual(env.view().favorites.current.measures.ingredients, [], label);
+    } else {
+      assert.equal(env.view().favorites.current.measures.clarifiedPositions[0], true, label);
+    }
+
+    // The view lifecycle is untouched: the safe answer still reads the plain favorite once.
+    assert.deepEqual(await env.ctl.chooseUnknownSourceGlass(), { ok: true }, label);
+    await env.settle();
+    assert.deepEqual(
+      env.net.requests("GET", FAV_URL_1).map((request) => request.url),
+      [FAV_URL_1, FAV_URL_1 + "?source_glass_ml=250", FAV_URL_1],
+      label + ": one read per step, in order"
+    );
+    assert.equal(env.view().favorites.current.version, 3, label);
+    assert.equal(env.view().favorites.current.sourceGlassUnknown, true, label);
+  }
+});
+
+// --- D-R03: hostile enum values and non-throwing normalization -----------------------------
+
+scenario("hostile_values_in_every_closed_enum_never_throw_and_only_cost_their_own_hint", async () => {
+  const step = STEPPED.steps[0];
+  const hostile = { toString: null };
+  const spanCases = {
+    "link object": (s) => ({ ...s, link: hostile }),
+    "link array": (s) => ({ ...s, link: ["linked"] }),
+    "link_reason object": (s) => ({ ...s, link_reason: hostile }),
+    "link_reason array": (s) => ({ ...s, link_reason: ["name_after"] }),
+    "capacity_origin object": (s) => ({ ...s, capacity_origin: hostile }),
+    "capacity_origin array": (s) => ({ ...s, capacity_origin: ["declared_text"] }),
+    "conversion status object": (s) => ({ ...s, conversion: { ...s.conversion, status: hostile } }),
+    "conversion target unit object": (s) =>
+      ({ ...s, conversion: { ...s.conversion, target_unit: hostile } }),
+    "conversion presentation array": (s) =>
+      ({ ...s, conversion: { ...s.conversion, presentation: ["rounded"] } }),
+    "conversion reason object": (s) => ({ ...s, conversion: { ...s.conversion, reason: hostile } }),
+    "conversion reason array": (s) =>
+      ({ ...s, conversion: { ...s.conversion, reason: ["converted"] } }),
+    "omitted reason object": (s) => ({ ...s, conversion_omitted_reason: hostile }),
+    "omitted reason array": (s) => ({ ...s, conversion_omitted_reason: ["mass"] }),
+    "approximation word object": (s) =>
+      ({ ...s, source_approximation: { approximate: false, word: hostile } }),
+    "approximation flag object": (s) =>
+      ({ ...s, source_approximation: { approximate: hostile, word: null } }),
+  };
+  for (const [label, mutate] of Object.entries(spanCases)) {
+    const block = H.stepBlock(3, [
+      H.stepAnnotation(0, step, [mutate(H.span(step, "500 мл"))]),
+    ]);
+    const { env } = await withSteppedFavorite(block);
+    const current = env.view().favorites.current;
+    assert.equal(current.status, "ready", label);
+    assert.deepEqual(current.measures.steps, [], label);
+    assert.deepEqual(current.steps, STEPPED.steps, label);
+  }
+
+  // Step- and block-level enums are as hostile, and still nothing throws.
+  const blockCases = {
+    "step status object": {
+      block: H.stepBlock(3, [H.stepAnnotation(0, step, [H.span(step, "500 мл")], { status: hostile })]),
+      check: (current) => assert.deepEqual(current.measures.steps, []),
+    },
+    "analysis status object": {
+      block: H.stepBlock(3, [H.stepAnnotation(0, step, [H.span(step, "500 мл")])], {
+        analysis: { status: hostile },
+      }),
+      check: (current) => {
+        assert.equal(current.measures.analysisStatus, null);
+        assert.equal(current.measures.steps.length, 1);
+      },
+    },
+    "provenance status array": {
+      block: H.stepBlock(3, [], { provenance: { status: ["failed"], declared: [], incomplete: [] } }),
+      check: (current) => assert.equal(current.measures.provenanceStatus, null),
+    },
+    "steps glass flag object": {
+      block: H.stepBlock(3, [], { steps_source_glass_required: hostile }),
+      check: (current) => assert.equal(current.measures.stepsGlassRequired, false),
+    },
+    "source term origin object": {
+      block: H.stepBlock(3, [], {
+        ingredients: [v2Ingredient(0, "1 стакан", [sourceTerm("glass", hostile, 200)])],
+      }),
+      check: (current) => assert.equal(current.measures.clarifiedPositions[0], true),
+    },
+    "ingredient conversion status object": {
+      block: H.stepBlock(3, [], {
+        ingredients: [
+          v2Ingredient(0, "1 стакан", [sourceTerm("glass", "declared_text", 200)], {
+            status: hostile,
+          }),
+        ],
+      }),
+      check: (current) => assert.equal(current.measures, null, "the unusable block is not drawn"),
+    },
+    "ingredient source term unit array": {
+      block: H.stepBlock(3, [], {
+        ingredients: [
+          v2Ingredient(0, "1 стакан", [
+            { unit: ["glass"], amount: { numerator: 1, denominator: 1 }, capacity_ml: null, capacity_origin: "declared_text" },
+          ]),
+        ],
+      }),
+      check: (current) => assert.equal(current.measures.clarifiedPositions[0], true),
+    },
+  };
+  for (const [label, { block, check }] of Object.entries(blockCases)) {
+    const { env } = await withSteppedFavorite(block);
+    const current = env.view().favorites.current;
+    assert.equal(current.status, "ready", label);
+    check(current);
+  }
+
+  // The released legacy block, with none of the additive optional fields, still loads.
+  const legacy = await withSteppedFavorite(
+    measuresBlock({
+      ingredients: [
+        {
+          position: 0,
+          source: "1 стакан 200 мл",
+          source_kind: "household",
+          target_unit: "glass",
+          status: "nominal_household",
+          reason: "converted",
+          exact: { numerator: 4, denominator: 5 },
+          rounded: null,
+          identical: false,
+          presentation: "exact",
+        },
+      ],
+    })
+  );
+  const legacyCurrent = legacy.env.view().favorites.current;
+  assert.equal(legacyCurrent.status, "ready");
+  assert.deepEqual(legacyCurrent.measures.steps, []);
+  assert.equal(legacyCurrent.measures.analysisStatus, null);
+  assert.equal(legacyCurrent.measures.provenanceStatus, null);
+  assert.equal(legacyCurrent.measures.ingredients.length, 1);
+});
+
+// --- D-R04: contradictory annotations and duplicate steps ----------------------------------
+
+scenario("contradictory_step_annotations_are_rejected_and_nothing_is_invented", async () => {
+  const step = "Добавьте 500 мл воды.";
+  const good = H.span(step, "500 мл");
+  const successful = good.conversion;
+  const cases = {
+    "a successful conversion with an omitted reason": {
+      ...good,
+      conversion_omitted_reason: "mass",
+    },
+    "a successful conversion from an unresolved capacity": {
+      ...good,
+      capacity_origin: "unresolved",
+    },
+    "a linked span naming an ingredient the recipe does not have": {
+      ...good,
+      ingredient_position: 5,
+    },
+    "a linked span naming no ingredient": { ...good, ingredient_position: null },
+    "a linked span with an ambiguity reason": { ...good, link_reason: "multiple_candidates" },
+    "a linked span with neither conversion nor omission": {
+      ...good,
+      conversion: null,
+      conversion_omitted_reason: null,
+    },
+  };
+  for (const [label, span] of Object.entries(cases)) {
+    const { env } = await withSteppedFavorite(
+      H.stepBlock(3, [H.stepAnnotation(0, step, [span])]),
+      { steps: [step], extra: { ingredients: [{ name: "вода", amount: "500 мл" }] } }
+    );
+    const current = env.view().favorites.current;
+    assert.equal(current.status, "ready", label);
+    assert.deepEqual(current.measures.steps, [], label);
+    assert.deepEqual(current.steps, [step], label);
+  }
+
+  // A non-linked span carries no number, no omission and no ingredient.
+  for (const extra of [
+    { link: "ambiguous", link_reason: "multiple_candidates" },
+    { link: "unsupported", link_reason: "range" },
+  ]) {
+    const span = { ...good, ...extra, conversion: null };
+    const { env } = await withSteppedFavorite(
+      H.stepBlock(3, [H.stepAnnotation(0, step, [span])]),
+      { steps: [step], extra: { ingredients: [{ name: "вода", amount: "500 мл" }] } }
+    );
+    assert.deepEqual(env.view().favorites.current.measures.steps, [], JSON.stringify(extra));
+  }
+
+  // A mass amount the server reported correctly still gets no number, and keeps its step.
+  const massStep = "Добавьте 200 г муки.";
+  const massSpan = H.span(massStep, "200 г", {
+    conversion: null,
+    conversion_omitted_reason: "mass",
+  });
+  const { env: massEnv } = await withSteppedFavorite(
+    H.stepBlock(3, [H.stepAnnotation(0, massStep, [massSpan])]),
+    { steps: [massStep], extra: { ingredients: [{ name: "мука", amount: "200 г" }] } }
+  );
+  const kept = massEnv.view().favorites.current.measures.steps;
+  assert.equal(kept.length, 1);
+  assert.equal(kept[0].spans[0].conversion, null);
+
+  // A positive control: a declared conversion is still drawn as a number.
+  const declared = H.span(step, "500 мл", { capacity_origin: "declared_text" });
+  const { env: positive } = await withSteppedFavorite(
+    H.stepBlock(3, [H.stepAnnotation(0, step, [declared])]),
+    { steps: [step], extra: { ingredients: [{ name: "вода", amount: "500 мл" }] } }
+  );
+  const positiveSpans = positive.view().favorites.current.measures.steps[0].spans;
+  assert.equal(positiveSpans.length, 1);
+  assert.equal(positiveSpans[0].conversion.status, "nominal_household");
+  assert.equal(positiveSpans[0].capacityOrigin, "declared_text");
+});
+
+scenario("a_duplicated_step_index_discards_all_its_annotations_in_either_order", async () => {
+  const first = STEPPED.steps[0];
+  const second = STEPPED.steps[1];
+  const valid = H.stepAnnotation(0, first, [H.span(first, "500 мл")]);
+  // The same step index, but claiming another step's text: unusable by itself.
+  const malformed = H.stepAnnotation(0, first, [H.span(first, "500 мл")], { text_sha256: "XYZ" });
+  const other = H.stepAnnotation(1, second, [H.span(second, "250 мл")]);
+
+  for (const annotations of [
+    [valid, malformed, other],
+    [malformed, valid, other],
+    [other, valid, malformed],
+  ]) {
+    const { env } = await withSteppedFavorite(H.stepBlock(3, annotations));
+    const current = env.view().favorites.current;
+    assert.equal(current.status, "ready");
+    assert.deepEqual(
+      current.measures.steps.map((entry) => entry.stepIndex),
+      [1],
+      "only the step whose index is unique keeps its hints"
+    );
+    assert.deepEqual(current.steps, STEPPED.steps);
+  }
+});
+
+// --- D-R06: every explicit opening is a new view -------------------------------------------
+
+scenario("reopening_the_same_favorite_starts_from_its_own_declarations", async () => {
+  const unclarified = measuresBlock();
+  const clarified = measuresBlock({ source_glass_ml: 200 });
+  const item = structuredFavoriteItem({ measures: unclarified });
+  const env = makeEnv({ structuredRecipes: true }).signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что?"), structuredAnswer()]),
+  });
+  env.net.route("GET", FAVORITES_URL, H.favoritesBody([item]));
+  env.net.route(
+    "GET",
+    FAV_URL_1,
+    H.favoriteDetail(item, STRUCTURED_TEXT),
+    H.favoriteDetail(structuredFavoriteItem({ measures: clarified }), STRUCTURED_TEXT),
+    H.favoriteDetail(item, STRUCTURED_TEXT)
+  );
+  await env.boot();
+  await env.ctl.openFavorite(H.FAV_1);
+  await env.settle();
+
+  assert.deepEqual(await env.ctl.setSourceGlass(200), { ok: true });
+  await env.settle();
+  assert.equal(env.view().favorites.current.sourceGlass, 200);
+  assert.ok(
+    env.net.requests("GET", FAV_URL_1).slice(-1)[0].url.endsWith("?source_glass_ml=200")
+  );
+
+  // Clicking the same favorite again is a new view: no capacity, no query.
+  await env.ctl.openFavorite(H.FAV_1);
+  await env.settle();
+  const current = env.view().favorites.current;
+  assert.equal(current.sourceGlass, null);
+  assert.equal(current.sourceGlassUnknown, false);
+  assert.equal(current.measures.sourceGlassMl, null);
+  assert.equal(
+    env.net.requests("GET", FAV_URL_1).slice(-1)[0].url,
+    FAV_URL_1,
+    "the reopened view asks without a capacity"
+  );
+});
+
+scenario("moving_between_favorites_and_back_never_carries_a_clarification", async () => {
+  const unclarified = measuresBlock();
+  const clarified = measuresBlock({ source_glass_ml: 200 });
+  const item = structuredFavoriteItem({ measures: unclarified });
+  const second = H.structuredFavorite(H.FAV_2, 2, "Уха", 1, 0, {
+    servings: null,
+    ingredients: UKHA_RECIPE.ingredients,
+    steps: UKHA_RECIPE.steps,
+    version: 1,
+    measures: null,
+  });
+  const env = makeEnv({ structuredRecipes: true }).signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что?"), structuredAnswer()]),
+  });
+  env.net.route("GET", FAVORITES_URL, H.favoritesBody([item, second]));
+  env.net.route(
+    "GET",
+    FAV_URL_1,
+    H.favoriteDetail(item, STRUCTURED_TEXT),
+    H.favoriteDetail(structuredFavoriteItem({ measures: clarified }), STRUCTURED_TEXT),
+    H.favoriteDetail(item, STRUCTURED_TEXT)
+  );
+  env.net.route("GET", FAV_URL_2, H.favoriteDetail(second, "Уха"));
+  await env.boot();
+
+  await env.ctl.openFavorite(H.FAV_1);
+  await env.settle();
+  assert.deepEqual(await env.ctl.setSourceGlass(200), { ok: true });
+  await env.settle();
+
+  await env.ctl.openFavorite(H.FAV_2);
+  await env.settle();
+  assert.equal(env.view().favorites.current.sourceGlass, null);
+
+  await env.ctl.openFavorite(H.FAV_1);
+  await env.settle();
+  const current = env.view().favorites.current;
+  assert.equal(current.sourceGlass, null, "A -> B -> A starts A from its own text");
+  assert.equal(current.measures.sourceGlassMl, null);
+  assert.equal(env.net.requests("GET", FAV_URL_1).slice(-1)[0].url, FAV_URL_1);
+});
+
+scenario("reopening_while_an_older_read_is_out_takes_the_new_view_s_answer", async () => {
+  const unclarified = measuresBlock();
+  const clarified = measuresBlock({ source_glass_ml: 200 });
+  const item = structuredFavoriteItem({ measures: unclarified });
+  const env = makeEnv({ structuredRecipes: true }).signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что?"), structuredAnswer()]),
+  });
+  env.net.route("GET", FAVORITES_URL, H.favoritesBody([item]));
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(item, STRUCTURED_TEXT));
+  await env.boot();
+  await env.ctl.openFavorite(H.FAV_1);
+  await env.settle();
+
+  const stale = deferred();
+  env.net.route("GET", FAV_URL_1, () => stale.promise);
+  const first = env.ctl.openFavorite(H.FAV_1);
+  await flush();
+  // The second opening asks again; its answer is the one that counts.
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(item, STRUCTURED_TEXT));
+  await env.ctl.openFavorite(H.FAV_1);
+  await flush();
+
+  stale.resolve(H.favoriteDetail(structuredFavoriteItem({ measures: clarified }), STRUCTURED_TEXT));
+  await env.settle();
+  const current = env.view().favorites.current;
+  assert.equal(current.sourceGlass, null);
+  assert.equal(current.measures.sourceGlassMl, null);
+  assert.equal(current.status, "ready");
+  await first;
+});
+
+scenario("a_concurrent_edit_during_the_safe_refresh_leaves_no_hint_of_the_old_version", async () => {
+  const step = "Добавьте 500 мл воды.";
+  const block = (capacity) =>
+    H.stepBlock(3, [H.stepAnnotation(0, step, [H.span(step, "500 мл")])], {
+      source_glass_ml: capacity,
+      steps_source_glass_required: true,
+      ingredients: [v2Ingredient(0, "500 мл", [sourceTerm("milliliter", "not_applicable")])],
+    });
+  const recipe = {
+    steps: [step],
+    ingredients: [{ name: "вода", amount: "500 мл" }],
+  };
+  const item = structuredFavoriteItem({ ...recipe, measures: block(null) });
+  const clarifiedItem = structuredFavoriteItem({ ...recipe, measures: block(200) });
+  const env = makeEnv({ structuredRecipes: true }).signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что?"), structuredAnswer()]),
+  });
+  env.net.route("GET", FAVORITES_URL, H.favoritesBody([item]));
+  const pending = deferred();
+  env.net.route(
+    "GET",
+    FAV_URL_1,
+    H.favoriteDetail(item, STRUCTURED_TEXT),
+    H.favoriteDetail(clarifiedItem, STRUCTURED_TEXT),
+    () => pending.promise
+  );
+  await env.boot();
+  await env.ctl.openFavorite(H.FAV_1);
+  await env.settle();
+  assert.deepEqual(await env.ctl.setSourceGlass(200), { ok: true });
+  await env.settle();
+  assert.equal(env.view().favorites.current.measures.steps.length, 1);
+
+  // The safe answer's no-parameter read is out when a draft is opened and saved.
+  const unknown = env.ctl.chooseUnknownSourceGlass();
+  await flush();
+  assert.equal(env.ctl.beginEditFavorite(), true);
+  const draft = Object.assign({}, env.view().favorites.current.editor.draft, { notes: "Поправка" });
+  const updated = structuredFavoriteItem({
+    ...recipe,
+    notes: "Поправка",
+    version: 4,
+    measures: null,
+  });
+  env.net.route("PATCH", FAV_URL_1, H.favoriteDetail(updated, STRUCTURED_TEXT));
+  assert.deepEqual(await env.ctl.saveFavoriteEdit(draft), { ok: true });
+
+  // The old answer for the old version arrives late: the new version stays as it is.
+  pending.resolve(H.favoriteDetail(clarifiedItem, STRUCTURED_TEXT));
+  await env.settle();
+  const current = env.view().favorites.current;
+  assert.equal(current.version, 4);
+  assert.equal(current.measures, null, "the old version's block is not drawn");
+  assert.deepEqual(current.steps, [step]);
+  await unknown;
+});
+
 module.exports = scenarios;

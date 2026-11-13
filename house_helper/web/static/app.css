@@ -1033,6 +1033,11 @@ textarea[aria-invalid="true"] {
   font-weight: 600;
 }
 
+/* The safe «Не знаю» answer: an option of the question, never a capacity of its own. */
+.measure-unknown {
+  margin: 0.35rem 0 0;
+}
+
 .measure-other {
   display: flex;
   flex-wrap: wrap;

@@ -413,9 +413,25 @@
       fraction: "вашей столовой ложки",
     },
     sourceGlassQuestion: "Какой стакан имеется в виду в рецепте?",
+    // KH-F01-B1.1 (15.7.4): what is missing, said once per recipe -- never a demand that
+    // the person supply a fact the recipe omitted.
+    sourceGlassExplanation:
+      "В рецепте не указан объем стакана, поэтому мы не можем точно пересчитать эти количества.",
     sourceGlass200: "200 мл",
     sourceGlass250: "250 мл",
     sourceGlassOther: "Другой объем",
+    // The safe option: no capacity is guessed, nothing is converted from an assumption.
+    sourceGlassUnknown: "Не знаю — оставить исходное количество без пересчета",
+    // A derived-domain failure is said by the component it belongs to (15.8.2/15.8.4): a
+    // provenance failure never claims that step amounts were not calculated, and a step
+    // failure never claims anything about the ingredients. Neither says the recipe was
+    // checked, validated or consistent.
+    provenanceNotChecked: "Не удалось определить, откуда взяты количества в ингредиентах.",
+    stepsNotChecked: "Не удалось рассчитать количества в шагах. Текст шагов показан как есть.",
+    // The whole-block summary failed and the client cannot say which component did it: a
+    // neutral statement, without a claim about either component.
+    analysisPartlyFailed:
+      "Не удалось выполнить полный расчет количеств. Подсказки могут быть неполными.",
     sourceGlassOtherLabel: "Объем, мл",
     sourceGlassApply: "Применить",
     sourceGlassInvalid: "Укажите целое число от 50 до 1000 мл.",
@@ -483,11 +499,11 @@
     profileSizeNormal: "Обычный",
     profileSizeLarge: "Крупный (120%)",
     profileMeasuresTitle: "Мои кухонные меры",
-    profileMeasureGlass: "Мой стакан",
-    profileMeasureTeaspoon: "Моя чайная ложка",
-    profileMeasureTablespoon: "Моя столовая ложка",
+    profileMeasureGlass: "Объем моего стакана, мл",
+    profileMeasureTeaspoon: "Объем моей чайной ложки, мл",
+    profileMeasureTablespoon: "Объем моей столовой ложки, мл",
     profileMeasureDefault: "по умолчанию",
-    profileMeasurePersonal: "ваш размер",
+    profileMeasurePersonal: "Указано вами",
     profileMeasureHint: "От {min} до {max} мл. Пустое поле — по умолчанию ({def} мл).",
     profileMeasureReset: "По умолчанию",
     profileMeasureResetLabel: "Вернуть значение по умолчанию: {name}",
@@ -653,6 +669,30 @@
       count++;
     }
     return count;
+  }
+
+  // A code-point index as an index into the string's UTF-16 code units, or -1 when it is
+  // outside [0, countCodePoints(text)]. The server counts its step spans in code points
+  // (15.8.4); JavaScript's slicing counts code units, and an emoji is two of them. This is
+  // the only conversion, so no raw server offset ever reaches .slice().
+  function codePointToUtf16(text, index) {
+    var codePoints = 0;
+    var units = 0;
+    for (var i = 0; i < text.length; i++) {
+      if (codePoints === index) {
+        return units;
+      }
+      var unit = text.charCodeAt(i);
+      if (unit >= 0xd800 && unit <= 0xdbff && i + 1 < text.length) {
+        var next = text.charCodeAt(i + 1);
+        if (next >= 0xdc00 && next <= 0xdfff) {
+          i++;
+        }
+      }
+      codePoints++;
+      units = i + 1;
+    }
+    return codePoints === index ? units : -1;
   }
 
   function hasLoneSurrogate(text) {
@@ -1003,6 +1043,13 @@
 
   function isCount(value) {
     return typeof value === "number" && isFinite(value) && Math.floor(value) === value && value >= 0;
+  }
+
+  // Membership in a closed set of string members. The type check comes first: an object or
+  // an array must never be coerced into a key (a plain object with no usable toString
+  // throws, and `["temporary_clarification"]` would otherwise read as its joined text).
+  function isEnum(value, members) {
+    return typeof value === "string" && members.has(value);
   }
 
   function parseJson(text) {
@@ -1402,20 +1449,30 @@
 
   // --- the favorite's household-measure block (KH-F01-B1) --------------------------------------
 
-  var CONVERSION_STATUSES = {
-    exact: true,
-    nominal_household: true,
-    clarification_required: true,
-    unsupported: true,
-    ambiguous: true,
-    unresolved: true,
-  };
-  var CONVERSION_TARGET_UNITS = { glass: true, teaspoon: true, tablespoon: true };
-  var CONVERSION_PRESENTATIONS = { rounded: true, exact: true, none: true };
+  var CONVERSION_STATUSES = new Set([
+    "exact",
+    "nominal_household",
+    "clarification_required",
+    "unsupported",
+    "ambiguous",
+    "unresolved",
+  ]);
+  var CONVERSION_TARGET_UNITS = new Set(["glass", "teaspoon", "tablespoon"]);
+  var CONVERSION_PRESENTATIONS = new Set(["rounded", "exact", "none"]);
+  // The closed reason set of 15.8.2. It drives no drawing of its own, but a value outside
+  // it is not one the page understands.
+  var CONVERSION_REASONS = new Set([
+    "converted",
+    "source_not_quantified",
+    "glass_size_required",
+    "glass_size_invalid",
+    "glass_size_conflict",
+    "mass_volume_coefficient_required",
+  ]);
   // Only a genuinely converted amount may be drawn as a number: every other status says
   // why the amount could not be converted, and a numeric presentation beside one of them
   // contradicts the status. A block that does so is not used at all (nothing is repaired).
-  var CONVERSION_SUCCEEDED = { exact: true, nominal_household: true };
+  var CONVERSION_SUCCEEDED = new Set(["exact", "nominal_household"]);
 
   // An exact rational as the server writes it: two integers, never a float. Anything
   // outside the safe-integer range is refused rather than rounded by the browser.
@@ -1432,29 +1489,26 @@
     return { numerator: value.numerator, denominator: value.denominator };
   }
 
-  function normalizeIngredientConversion(item, ingredientCount) {
-    if (!isObject(item) || !isCount(item.position) || item.position >= ingredientCount) {
+  // The typed conversion of an ingredient amount or of a step span (15.8.2), as the page
+  // reads it. The released B1 encoding is unchanged; a value that contradicts its own status
+  // is refused rather than repaired.
+  function normalizeConversionValues(item) {
+    if (!isObject(item)) {
       return null;
     }
-    if (typeof item.source !== "string" || item.source === "") {
+    if (!isEnum(item.target_unit, CONVERSION_TARGET_UNITS)) {
       return null;
     }
-    if (item.source_kind !== "household" && item.source_kind !== "metric_volume") {
+    if (!isEnum(item.status, CONVERSION_STATUSES)) {
       return null;
     }
-    if (CONVERSION_TARGET_UNITS[item.target_unit] !== true) {
-      return null;
-    }
-    if (typeof item.status !== "string" || CONVERSION_STATUSES[item.status] !== true) {
-      return null;
-    }
-    if (typeof item.reason !== "string" || item.reason === "") {
+    if (!isEnum(item.reason, CONVERSION_REASONS)) {
       return null;
     }
     if (typeof item.identical !== "boolean") {
       return null;
     }
-    if (CONVERSION_PRESENTATIONS[item.presentation] !== true) {
+    if (!isEnum(item.presentation, CONVERSION_PRESENTATIONS)) {
       return null;
     }
     var exact = null;
@@ -1483,7 +1537,7 @@
     if (item.presentation === "exact" && exact === null) {
       return null;
     }
-    if (CONVERSION_SUCCEEDED[item.status] !== true) {
+    if (!CONVERSION_SUCCEEDED.has(item.status)) {
       // A failed, unsupported, ambiguous or clarification-required amount carries no
       // converted value: an exact or rounded presentation (or a value to fall back on)
       // beside it is a contradiction, and no part of it may reach the page.
@@ -1495,9 +1549,6 @@
       }
     }
     return {
-      position: item.position,
-      source: item.source,
-      sourceKind: item.source_kind,
       targetUnit: item.target_unit,
       status: item.status,
       reason: item.reason,
@@ -1508,9 +1559,337 @@
     };
   }
 
+  function normalizeIngredientConversion(item, ingredientCount) {
+    if (!isObject(item) || !isCount(item.position) || item.position >= ingredientCount) {
+      return null;
+    }
+    if (typeof item.source !== "string" || item.source === "") {
+      return null;
+    }
+    if (item.source_kind !== "household" && item.source_kind !== "metric_volume") {
+      return null;
+    }
+    var values = normalizeConversionValues(item);
+    if (values === null) {
+      return null;
+    }
+    return {
+      position: item.position,
+      source: item.source,
+      sourceKind: item.source_kind,
+      targetUnit: values.targetUnit,
+      status: values.status,
+      reason: values.reason,
+      exact: values.exact,
+      rounded: values.rounded,
+      identical: values.identical,
+      presentation: values.presentation,
+    };
+  }
+
+  // Whether an ingredient conversion may rest on a capacity that only the temporary
+  // clarification supplied. Fail closed on purpose: absent, null, empty or structurally
+  // invalid source terms never prove independence, so the conversion is treated as
+  // possibly dependent (OD-03 has no inheritance, and nothing is drawn from a dependency
+  // nobody verified). A legacy B1 block carries no source terms at all, so its conversions
+  // take the same conservative path once the clarification has been dropped.
+  function conversionNeedsClarification(item) {
+    var terms = item.source_terms;
+    if (!Array.isArray(terms) || terms.length === 0) {
+      return true;
+    }
+    var dependent = false;
+    for (var index = 0; index < terms.length; index++) {
+      var term = terms[index];
+      if (!isObject(term)) {
+        return true;
+      }
+      if (!isEnum(term.unit, SOURCE_TERM_UNITS)) {
+        return true;
+      }
+      if (normalizeRational(term.amount) === null) {
+        return true;
+      }
+      if (!isEnum(term.capacity_origin, CAPACITY_ORIGINS)) {
+        return true;
+      }
+      // The per-term shapes of 15.8.2: a glass term names the capacity it was resolved
+      // with (or has none because it is unresolved); a spoon or metric term has
+      // `not_applicable` and no capacity. Anything else establishes nothing.
+      if (term.unit === "glass") {
+        if (term.capacity_origin === "not_applicable") {
+          return true;
+        }
+        if (term.capacity_origin === "unresolved") {
+          if (term.capacity_ml !== null && term.capacity_ml !== undefined) {
+            return true;
+          }
+        } else if (normalizeRational(term.capacity_ml) === null) {
+          return true;
+        }
+      } else {
+        if (term.capacity_origin !== "not_applicable") {
+          return true;
+        }
+        if (term.capacity_ml !== null && term.capacity_ml !== undefined) {
+          return true;
+        }
+      }
+      if (term.capacity_origin === "temporary_clarification") {
+        dependent = true;
+      }
+    }
+    return dependent;
+  }
+
+  // Whether a successful conversion claims a number beside a glass term whose capacity was
+  // never established. The typed contract of 15.8.2 allows `unresolved` only where the
+  // capacity is still required, and Stage C's own conversion then reports
+  // `clarification_required` (MeasureVolumes never fills a source capacity); a success
+  // beside such a term is therefore contradictory, and the number is refused during
+  // normalization instead of being shown and withdrawn later. The origin alone decides:
+  // `unresolved` never establishes a capacity, so no `capacity_ml` beside it -- null,
+  // absent, a valid rational, zero, or any other shape -- makes the success compatible.
+  // A failed conversion needs no such rejection: it draws no number at all. Unreadable
+  // source terms are not decided here: they take the conservative clarification-dependent
+  // path above.
+  function conversionContradictsSourceTerms(item) {
+    if (!CONVERSION_SUCCEEDED.has(item.status)) {
+      return false;
+    }
+    var terms = item.source_terms;
+    if (!Array.isArray(terms)) {
+      return false;
+    }
+    for (var index = 0; index < terms.length; index++) {
+      var term = terms[index];
+      if (isObject(term) && term.unit === "glass" && term.capacity_origin === "unresolved") {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // --- KH-F01-B1.1: the step annotations of a `schema_version: 2` block ------------------------
+
+  var LINK_STATUSES = new Set(["linked", "ambiguous", "shared", "unresolved", "unsupported"]);
+  var LINK_REASONS = new Set([
+    "name_after",
+    "name_before_separator",
+    "name_before_copula",
+    "shared_amount",
+    "multiple_candidates",
+    "anaphora",
+    "no_local_binding",
+    "no_mention",
+    "range",
+    "us_cup",
+    "package",
+    "countable",
+    "heaped",
+    "unsupported_construct",
+    "malformed_expression",
+  ]);
+  // The reasons the scanner's explicit binding rules give a `linked` span. Any other
+  // reason beside `linked` is a combination the server never produces.
+  var LINKED_REASONS = new Set([
+    "name_after",
+    "name_before_separator",
+    "name_before_copula",
+  ]);
+  var CAPACITY_ORIGINS = new Set([
+    "declared_text",
+    "temporary_clarification",
+    "not_applicable",
+    "unresolved",
+  ]);
+  var OMITTED_CONVERSION_REASONS = new Set(["mass", "unsafe_fraction", "conversion_failed"]);
+  var APPROXIMATION_WORDS = new Set(["около", "примерно", "приблизительно"]);
+  var STEP_STATUSES = new Set(["complete", "incomplete", "failed"]);
+  var ANALYSIS_STATUSES = new Set(["complete", "incomplete", "failed"]);
+  var PROVENANCE_STATUSES = new Set(["complete", "incomplete", "failed"]);
+  // The source-term units of the typed contract: the units a per-term capacity can say
+  // anything about.
+  var SOURCE_TERM_UNITS = new Set(["glass", "teaspoon", "tablespoon", "milliliter", "liter"]);
+  var STEP_TEXT_HASH = /^[0-9a-f]{64}$/;
+
+  // One span, validated against the step it claims to annotate. Every check of 15.8.4 that
+  // can be made synchronously is made here: the offsets are code points into the exact text
+  // the page is about to draw, the mapped slice equals the span's own text, and every enum,
+  // rational and optional field is a value the page understands. The cross-field rules of
+  // 15.8.2 are checked too: a number belongs only to a span that was really linked to an
+  // ingredient of this recipe and really converted, and no contradictory combination is
+  // repaired. Anything less drops the span, and its step is drawn as the stored text only.
+  function normalizeSpanAnnotation(item, stepText, ingredientCount) {
+    if (!isObject(item)) {
+      return null;
+    }
+    if (!Number.isSafeInteger(item.start) || !Number.isSafeInteger(item.end)) {
+      return null;
+    }
+    if (item.start < 0 || item.end <= item.start) {
+      return null;
+    }
+    if (typeof item.text !== "string" || item.text === "") {
+      return null;
+    }
+    if (!isEnum(item.link, LINK_STATUSES) || !isEnum(item.link_reason, LINK_REASONS)) {
+      return null;
+    }
+    if (!isEnum(item.capacity_origin, CAPACITY_ORIGINS)) {
+      return null;
+    }
+    var position = item.ingredient_position === undefined ? null : item.ingredient_position;
+    if (position !== null && !isCount(position)) {
+      return null;
+    }
+    var conversion = null;
+    if (item.conversion !== null && item.conversion !== undefined) {
+      conversion = normalizeConversionValues(item.conversion);
+      if (conversion === null) {
+        return null;
+      }
+    }
+    var omitted =
+      item.conversion_omitted_reason === undefined ? null : item.conversion_omitted_reason;
+    if (omitted !== null && !isEnum(omitted, OMITTED_CONVERSION_REASONS)) {
+      return null;
+    }
+    if (item.link === "linked") {
+      // A linked amount names an ingredient this recipe actually has, by a reason the
+      // binding rules produce, and has either a conversion or the reason it has none.
+      if (!LINKED_REASONS.has(item.link_reason)) {
+        return null;
+      }
+      if (position === null || position >= ingredientCount) {
+        return null;
+      }
+      if (conversion !== null && omitted !== null) {
+        return null; // a conversion and an omitted reason cannot both be true
+      }
+      if (conversion === null && omitted === null) {
+        return null;
+      }
+      if (
+        conversion !== null &&
+        item.capacity_origin === "unresolved" &&
+        CONVERSION_SUCCEEDED.has(conversion.status)
+      ) {
+        return null; // no number may come from a capacity nobody established
+      }
+    } else if (conversion !== null || omitted !== null || position !== null) {
+      // Every other outcome carries no conversion and names no ingredient (15.8.2).
+      return null;
+    }
+    var approximation = item.source_approximation;
+    if (!isObject(approximation) || typeof approximation.approximate !== "boolean") {
+      return null;
+    }
+    var word = approximation.word === undefined ? null : approximation.word;
+    if (approximation.approximate === true) {
+      if (!isEnum(word, APPROXIMATION_WORDS)) {
+        return null;
+      }
+    } else if (word !== null) {
+      return null;
+    }
+    // The coordinate gate. The server's offsets are code points; the page slices UTF-16
+    // code units, so both ends go through the one mapping and the slice must be the text
+    // the server says it is.
+    var start16 = codePointToUtf16(stepText, item.start);
+    var end16 = codePointToUtf16(stepText, item.end);
+    if (start16 < 0 || end16 < 0) {
+      return null;
+    }
+    if (stepText.slice(start16, end16) !== item.text) {
+      return null;
+    }
+    return {
+      start: item.start,
+      end: item.end,
+      text: item.text,
+      link: item.link,
+      linkReason: item.link_reason,
+      conversion: conversion,
+      capacityOrigin: item.capacity_origin,
+      sourceApproximate: approximation.approximate === true,
+      sourceWord: word,
+    };
+  }
+
+  // One `StepAnnotation`, or null when any of its data is not trustworthy for the step the
+  // page holds. One bad span discards the whole step's hints (never the recipe), because a
+  // partial set of annotations cannot be shown without guessing which one lied.
+  function normalizeStepAnnotation(item, steps, ingredientCount) {
+    if (!isObject(item)) {
+      return null;
+    }
+    if (!isCount(item.step_index) || item.step_index >= steps.length) {
+      return null;
+    }
+    if (typeof item.step_text !== "string" || item.step_text !== steps[item.step_index]) {
+      return null;
+    }
+    if (typeof item.text_sha256 !== "string" || !STEP_TEXT_HASH.test(item.text_sha256)) {
+      return null;
+    }
+    if (!isEnum(item.status, STEP_STATUSES)) {
+      return null;
+    }
+    if (!Array.isArray(item.spans)) {
+      return null;
+    }
+    if (item.status === "failed") {
+      // The step's own analysis failed: its stored text is drawn, with nothing derived.
+      return { stepIndex: item.step_index, text: item.step_text, spans: [] };
+    }
+    var spans = [];
+    var previousEnd = 0;
+    for (var index = 0; index < item.spans.length; index++) {
+      var span = normalizeSpanAnnotation(item.spans[index], item.step_text, ingredientCount);
+      if (span === null || span.start < previousEnd) {
+        return null; // unsorted, overlapping or unusable: no hints for this step
+      }
+      previousEnd = span.end;
+      spans.push(span);
+    }
+    return { stepIndex: item.step_index, text: item.step_text, spans: spans };
+  }
+
+  // The annotations of a block, keyed by step. A `step_index` that appears more than once is
+  // a step-level integrity failure: every entry for that index is discarded, in whichever
+  // order they arrived and whichever one looks valid, so a corrupt duplicate can never leave
+  // a hint on a step whose annotations disagree about what they describe. The stored text of
+  // that step is drawn as it is; other steps and the ingredient hints are untouched.
+  function normalizeStepAnnotations(items, steps, ingredientCount) {
+    var counts = Object.create(null);
+    for (var raw = 0; raw < items.length; raw++) {
+      var entry = items[raw];
+      if (isObject(entry) && isCount(entry.step_index) && entry.step_index < steps.length) {
+        counts[entry.step_index] = (counts[entry.step_index] || 0) + 1;
+      }
+    }
+    var found = [];
+    for (var index = 0; index < items.length; index++) {
+      var annotation = normalizeStepAnnotation(items[index], steps, ingredientCount);
+      if (annotation === null || counts[annotation.stepIndex] > 1) {
+        continue;
+      }
+      found.push(annotation);
+    }
+    found.sort(function (a, b) {
+      return a.stepIndex - b.stepIndex;
+    });
+    return found;
+  }
+
   // The additive measure block. A block this page cannot use is not an error of the
   // recipe: normalizeFavoriteDetail ignores it and the card is drawn as it always was.
-  function normalizeMeasuresBlock(value, ingredientCount) {
+  //
+  // A `schema_version: 2` block binds its step hints to `favorite_version` and the exact
+  // `steps` it echoes. A malformed additive field costs only the hints it describes; the
+  // released B1 ingredient block and the recipe itself are never discarded for it.
+  function normalizeMeasuresBlock(value, ingredientCount, steps, favoriteVersion) {
     if (!isObject(value) || !isObject(value.target)) {
       return null;
     }
@@ -1538,19 +1917,70 @@
     }
     var seen = {};
     var conversions = [];
+    var clarified = {};
     for (var position = 0; position < value.ingredients.length; position++) {
       var conversion = normalizeIngredientConversion(value.ingredients[position], ingredientCount);
       if (conversion === null || seen[conversion.position] === true) {
         return null;
       }
       seen[conversion.position] = true;
+      // A successful conversion beside a glass term whose capacity was never established is
+      // a contradiction Stage C does not produce: an undeclared glass without a clarification
+      // is `clarification_required`, never a converted number. The number is refused here,
+      // whatever clarification the view currently holds -- nothing is drawn from a capacity
+      // nobody established. Only this conversion is lost: its line keeps the stored text, and
+      // the block's other conversions stay usable (15.8.4; AC86, AC88).
+      if (conversionContradictsSourceTerms(value.ingredients[position])) {
+        continue;
+      }
+      if (conversionNeedsClarification(value.ingredients[position])) {
+        clarified[conversion.position] = true;
+      }
       conversions.push(conversion);
+    }
+    // The additive B1.1 fields. A block without `schema_version` is the released B1 block:
+    // no step data, and nothing asked of it that it never promised.
+    var versioned = value.schema_version === 2;
+    var annotations = [];
+    var stepsGlassRequired = false;
+    var analysisStatus = null;
+    var provenanceStatus = null;
+    if (versioned) {
+      if (typeof value.steps_source_glass_required === "boolean") {
+        stepsGlassRequired = value.steps_source_glass_required === true;
+      }
+      if (isObject(value.analysis) && isEnum(value.analysis.status, ANALYSIS_STATUSES)) {
+        analysisStatus = value.analysis.status;
+      }
+      // The provenance audit is the ingredient side's own component status; a step failure
+      // and a provenance failure are said apart (15.8.2).
+      if (isObject(value.provenance) && isEnum(value.provenance.status, PROVENANCE_STATUSES)) {
+        provenanceStatus = value.provenance.status;
+      }
+      // The steps are drawn only for the version on the card: an answer that names another
+      // one may have been written for text the page no longer shows.
+      var sameVersion =
+        Number.isSafeInteger(value.favorite_version) && value.favorite_version === favoriteVersion;
+      if (sameVersion && Array.isArray(value.steps)) {
+        annotations = normalizeStepAnnotations(value.steps, steps, ingredientCount);
+      }
     }
     return {
       target: target,
       sourceGlassMl: sourceGlass === undefined ? null : sourceGlass,
       sourceGlassRequired: value.source_glass_required,
       ingredients: conversions,
+      // The ingredient lines whose hint may rest on the temporary clarification. Nothing
+      // is drawn from them after the safe «Не знаю» answer withdrew that capacity. A
+      // legacy block names none because none of its terms can prove independence, so every
+      // line of one is treated conservatively.
+      clarifiedPositions: clarified,
+      // KH-F01-B1.1: the step hints, the independent "a step glass is undeclared" flag and
+      // the summary of what the server's analysis managed to do.
+      steps: annotations,
+      stepsGlassRequired: stepsGlassRequired,
+      analysisStatus: analysisStatus,
+      provenanceStatus: provenanceStatus,
     };
   }
 
@@ -1578,8 +2008,14 @@
       item.servings = servings;
       item.ingredients = ingredients;
       item.steps = steps;
-      // Additive and optional: an older or unusual answer simply draws no hints.
-      item.measures = normalizeMeasuresBlock(body.measures, ingredients.length);
+      // Additive and optional: an older or unusual answer simply draws no hints. The step
+      // hints are read against the very steps and version this card is about to draw.
+      item.measures = normalizeMeasuresBlock(
+        body.measures,
+        ingredients.length,
+        steps,
+        item.version
+      );
     } else {
       item.servings = "";
       item.ingredients = [];
@@ -2407,6 +2843,11 @@
         // and neither is a setting: both are page memory for the open recipe only.
         sourceGlassOtherOpen: false,
         sourceGlassDraft: "",
+        // The safe answer to the source-glass question: the person does not know the
+        // recipe's glass, so no capacity is assumed for it. Page memory for the open
+        // recipe only -- it closes the question, clears any temporary clarification and
+        // is never stored; opening the recipe again starts from its own text.
+        sourceGlassUnknown: false,
         // Counts the detail reads of the open card: only the newest answer may change what
         // is drawn, so a slow answer can never overwrite a newer choice or a newer save.
         detailReadSeq: 0,
@@ -4250,19 +4691,27 @@
       }
     }
 
-    async function openFavorite(rawId) {
+    // Opening a card from anywhere the person opens one is a new view of it. `keepView` is
+    // for the two internal re-reads of the card already open (the retry of a failed first
+    // read, and "Загрузить заново" after an edit conflict): those show the same view again,
+    // so its clarification stays. No user-facing action reaches this function with it.
+    async function openFavorite(rawId, keepView) {
       var id = typeof rawId === "string" ? rawId.toLowerCase() : "";
       if (state.screen !== "app" || state.gate || !UUID_PATTERN.test(id)) {
         return;
       }
       var mine = epoch;
       var favorites = state.favorites;
-      if (favorites.currentId !== id) {
-        // A clarification belongs to the recipe that is open; another recipe starts without
-        // one, and without a draft of one.
+      if (keepView !== true) {
+        // Every explicit opening is a new view of the recipe, even when it is the same
+        // recipe again: a clarification belongs to one view of one card, so the confirmed
+        // capacity, the custom field's draft, a pending choice, its failure and the safe
+        // «Не знаю» answer all start over. The recipe's own declarations are the new
+        // view's start. A redraw of the same view never comes through here.
         favorites.sourceGlass = null;
         favorites.sourceGlassOtherOpen = false;
         favorites.sourceGlassDraft = "";
+        favorites.sourceGlassUnknown = false;
       }
       // Opening a recipe (the same one again, too) abandons a choice whose read is out and
       // the failure of one: only the newest read of this card may change it.
@@ -4327,7 +4776,7 @@
 
     function reloadRecipe() {
       var id = state.favorites.currentId;
-      return id === null ? Promise.resolve() : openFavorite(id);
+      return id === null ? Promise.resolve() : openFavorite(id, true);
     }
 
     // The person's answer to "which glass does the recipe mean?": a whole number of
@@ -4452,6 +4901,9 @@
           // closes that field, whose text stays as the draft it was.
           favorites.sourceGlassPending = null;
           favorites.sourceGlass = checked;
+          // A capacity the server has answered for is the view's answer again: the safe
+          // «Не знаю» state belongs to the view that had no capacity.
+          favorites.sourceGlassUnknown = false;
           favorites.sourceGlassError = null;
           if (isCustomGlass(checked)) {
             favorites.sourceGlassOtherOpen = true;
@@ -4482,6 +4934,51 @@
       };
       emit();
       return { ok: false, reason: "failed" };
+    }
+
+    // «Не знаю — оставить исходное количество без пересчета»: the safe answer (OD-10). It
+    // closes the question for this view, drops any temporary clarification the view held,
+    // and reads the recipe again as its own text declares it, so no hint is drawn from a
+    // capacity nobody confirmed. Nothing is guessed, nothing is stored, and the recipe is
+    // readable throughout -- a failed re-read is the same worded retry the other reads have.
+    async function chooseUnknownSourceGlass() {
+      if (state.screen !== "app" || state.gate || state.favorites.currentId === null) {
+        return { ok: false, reason: "not_ready" };
+      }
+      if (state.favorites.editor !== null) {
+        return { ok: false, reason: "editing" };
+      }
+      var favorites = state.favorites;
+      var id = favorites.currentId;
+      var detail = favorites.detail;
+      if (detail === null || detail.id !== id || detail.status !== "ready") {
+        return { ok: false, reason: "not_ready" };
+      }
+      if (favorites.sourceGlassUnknown === true) {
+        return { ok: true, reason: "unchanged" };
+      }
+      var confirmed = favorites.sourceGlass;
+      var block = detail.item ? detail.item.measures : null;
+      // «Не знаю» is an unconditional state change of this view: every detail read that is
+      // still out -- a pending capacity choice included, whether or not any capacity was
+      // ever confirmed -- is invalidated here, so no late answer can put a capacity back,
+      // replace the recipe or draw a hint from it. The counter is the only authority.
+      favorites.detailReadSeq += 1;
+      favorites.sourceGlassUnknown = true;
+      // The temporary clarification of this view is cleared, whether or not the server can
+      // be asked again: what the page draws never depends on a capacity that was dropped.
+      favorites.sourceGlass = null;
+      favorites.sourceGlassPending = null;
+      favorites.sourceGlassError = null;
+      favorites.sourceGlassOtherOpen = false;
+      emit();
+      // A block that was read with a clarification is stale as a whole: ask again for the
+      // recipe as its own text declares it. With nothing confirmed and nothing echoed there
+      // is nothing to clear on the server, and the local state is already the safe one.
+      if (confirmed !== null || (block !== null && block.sourceGlassMl !== null)) {
+        await refreshFavoriteConversion(id, null);
+      }
+      return { ok: true };
     }
 
     // Opening or closing the custom capacity of the question. It confirms nothing: the
@@ -4957,7 +5454,8 @@
       var id = editor.id;
       state.favorites.editor = null;
       emit();
-      return openFavorite(id);
+      // The same open card is read again: its clarification belongs to this view and stays.
+      return openFavorite(id, true);
     }
 
     // "Сохранить поверх": the person has explicitly chosen to overwrite. The last stored
@@ -6800,6 +7298,7 @@
           measuresPending: detail.measuresPending === true,
           measuresError: detail.measuresError || null,
           sourceGlass: favorites.sourceGlass,
+          sourceGlassUnknown: favorites.sourceGlassUnknown === true,
           sourceGlassPending: favorites.sourceGlassPending,
           sourceGlassError: favorites.sourceGlassError,
           // The custom capacity is drawn as what it is: an open field with the person's
@@ -7287,6 +7786,9 @@
       },
       setSourceGlass: function (value) {
         return track(setSourceGlass(value));
+      },
+      chooseUnknownSourceGlass: function () {
+        return track(chooseUnknownSourceGlass());
       },
       toggleSourceGlassOther: toggleSourceGlassOther,
       syncSourceGlassDraft: syncSourceGlassDraft,
@@ -7813,6 +8315,7 @@
     TEXT: TEXT,
     CODE_MESSAGES: CODE_MESSAGES,
     countCodePoints: countCodePoints,
+    codePointToUtf16: codePointToUtf16,
     trimLikeServer: trimLikeServer,
     hasUnstorableCharacters: hasUnstorableCharacters,
     prepareMessage: prepareMessage,
