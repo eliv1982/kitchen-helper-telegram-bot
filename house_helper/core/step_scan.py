@@ -2461,11 +2461,12 @@ def _previous_contiguous(
 
 
 # The closed positive allowlist of approved lexical hyphenated units (KH-F01-B1.1-B).
-# Russian prose writes the same ASCII hyphen both inside a word (`всё-таки`,
+# Russian prose writes the same ASCII hyphen both inside a word (`все-таки`,
 # `по-прежнему`, `добавьте-ка`) and as a clause dash (`500 мл воды - молоко
 # перемешайте`). Only a complete word listed here is word-internal. The entries are
-# stored in the matching form (`_norm`: lower case with one `е` spelling), so
-# `всё-таки` and `все-таки` are the same unit. Two closed groups are listed: adverbs
+# stored in the matching form (`_norm`: lower case with one `е` spelling), so a
+# spelling of `все-таки` with the marked letter matches the plain one. Two closed
+# groups are listed: adverbs
 # and the particle `-ка` attached to the approved imperative verbs. A compound outside
 # the allowlist (`воды-молоко`, `агар-агар`, `лук-порей`) is never classified as
 # word-internal, so its hyphen stays a conservative clause boundary. This is product
@@ -2499,8 +2500,9 @@ _CLAUSE_BOUNDARY_RE = re.compile(
 def _lexical_norm(text: str) -> str:
     """The matching form of one hyphenated unit: case first, then one ``е`` spelling.
 
-    `_norm` replaces ``ё`` before lower-casing, so an uppercase ``Ё`` survives into the
-    matching form (``ВСЁ-ТАКИ`` became ``всё-таки`` and was not recognised). The
+    `_norm` replaces the marked letter before lower-casing, so an uppercase marked
+    letter survives into the matching form (the uppercase spelling of `все-таки` became
+    its lower-case form with the mark and was not recognised). The
     lexical-hyphen path needs every case spelling of a unit to be the same stored form,
     so it lower-cases first and replaces afterwards. This is deliberately not a change
     to the global `_norm`, whose behaviour the rest of the scanner already depends on.
@@ -2547,7 +2549,7 @@ def _lexical_run(text: str, left: int, right: int) -> tuple[int, int] | None:
 def _is_lexical_hyphen(text: str, position: int) -> bool:
     """Whether the ASCII hyphen at ``position`` belongs to one approved word.
 
-    Russian prose writes the same ASCII hyphen both inside a word (``всё-таки``,
+    Russian prose writes the same ASCII hyphen both inside a word (``все-таки``,
     ``по-прежнему``, ``добавьте-ка``) and for a clause dash (``500 мл воды - молоко
     перемешайте``). Only the first is a lexical hyphen, and only for a complete unit in
     the closed allowlist: the maximal run of letters and hyphens around ``position`` is
@@ -2561,7 +2563,7 @@ def _is_lexical_hyphen(text: str, position: int) -> bool:
     listed unit, so the classification stays constant-time per hyphen and the clause
     pass stays bounded by the number of boundary characters, not by a rescan of the
     text. The matching form is `_lexical_norm`, so every case spelling of an approved
-    unit -- including ``ВСЁ-ТАКИ`` -- is recognised as the same unit.
+    unit -- including the fully uppercase ``ВСЕ-ТАКИ`` -- is recognised as the same unit.
     """
     if not (
         0 < position < len(text) - 1
@@ -2582,7 +2584,7 @@ def _is_predicate_word(text: str, word: _Word) -> bool:
     valid: a standalone word, or one complete approved hyphenated unit
     (``добавьте-ка``). A verb that is a fragment of a longer run -- inside an unknown
     compound (``добавьте-ка-молоко``, ``молоко-добавьте``) or inside an approved unit
-    extended by an unknown part (``всё-таки-добавьте``) -- is not evidence. Both sides of
+    extended by an unknown part (``все-таки-добавьте``) -- is not evidence. Both sides of
     the candidate are checked, because the extension may sit before or after it.
 
     The check is the same bounded lexical-unit recognition the clause-boundary search
@@ -2692,7 +2694,7 @@ def _clause_end_after(
     the sentence before this scan runs.
 
     An ASCII hyphen is classified by `_is_lexical_hyphen`: the hyphen of a complete
-    approved word (`воды всё-таки добавьте`) is word-internal and is skipped, while any
+    approved word (`воды все-таки добавьте`) is word-internal and is skipped, while any
     other hyphen -- a clause dash, a numeric hyphen or an unverified letter-joined
     compound (`воды-молоко`) -- ends the clause. The skip is a search over the
     punctuation positions only, so the pass stays bounded by the number of boundary
