@@ -13,6 +13,7 @@ with no practical rounded value is still carried exactly; and a clarification ap
 undeclared source glasses only, without inventing a conflict with a declared 240 mL.
 """
 
+import hashlib
 from uuid import UUID
 
 import pytest
@@ -292,12 +293,15 @@ async def test_the_edit_answer_carries_the_same_measures_block(tmp_path):
     assert response.status_code == 200
     body = response.json()
     assert body["title"] == "Тесто для пирога"
+    assert body["measures"]["schema_version"] == 2
+    assert body["measures"]["favorite_version"] == body["version"] == 2
     assert body["measures"]["target"] == {
         "glass_ml": 250,
         "teaspoon_ml": 5,
         "tablespoon_ml": 15,
     }
     assert len(body["measures"]["ingredients"]) == 5
+    assert all(item["source_terms"] for item in body["measures"]["ingredients"])
 
 
 async def test_a_conversion_failure_leaves_the_recipe_readable(tmp_path, monkeypatch):
@@ -308,7 +312,7 @@ async def test_a_conversion_failure_leaves_the_recipe_readable(tmp_path, monkeyp
 
     async with await kept_structured(tmp_path) as chat:
         favorite = await keep_recipe(chat)
-        monkeypatch.setattr(favorites_api.measure_targets, "measure_block", broken)
+        monkeypatch.setattr(favorites_api.measure_targets, "measure_block_v2", broken)
 
         response = await detail(chat, favorite)
 
@@ -317,6 +321,30 @@ async def test_a_conversion_failure_leaves_the_recipe_readable(tmp_path, monkeyp
     assert body["measures"] is None  # only the conversion section is missing
     assert body["title"] == "Тесто"
     assert [item["amount"] for item in body["ingredients"]] == [i.amount for i in INGREDIENTS]
+
+
+async def test_a_corrupt_profile_measure_leaves_the_recipe_readable(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from house_helper.web import favorites_api
+
+    corrupt = SimpleNamespace(
+        measures=SimpleNamespace(glass_ml=49, teaspoon_ml=None, tablespoon_ml=None)
+    )
+    monkeypatch.setattr(
+        favorites_api.profile_store, "get_profile", lambda session, user_id: corrupt
+    )
+    async with await kept_structured(tmp_path) as chat:
+        favorite = await keep_recipe(chat)
+        response = await detail(chat, favorite)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["measures"] is None  # no clamped or invented target
+    assert body["kind"] == "structured"
+    assert [item["amount"] for item in body["ingredients"]] == [
+        i.amount for i in INGREDIENTS
+    ]
 
 
 async def test_a_text_favorite_has_an_empty_but_valid_block(tmp_path):
@@ -333,9 +361,206 @@ async def test_a_text_favorite_has_an_empty_but_valid_block(tmp_path):
         body = (await detail(chat, kept.json()["id"])).json()
 
     assert body["kind"] == "text"
-    assert body["measures"] == {
-        "target": {"glass_ml": 250, "teaspoon_ml": 5, "tablespoon_ml": 15},
-        "source_glass_ml": None,
-        "source_glass_required": False,
-        "ingredients": [],
+    block = body["measures"]
+    assert block["schema_version"] == 2
+    assert block["favorite_version"] == body["version"]
+    assert block["target"] == {"glass_ml": 250, "teaspoon_ml": 5, "tablespoon_ml": 15}
+    assert block["source_glass_ml"] is None
+    assert block["source_glass_required"] is False
+    assert block["steps_source_glass_required"] is False
+    assert block["ingredients"] == []
+    assert block["steps"] == []
+    assert block["provenance"] == {
+        "status": "complete",
+        "declared": [],
+        "incomplete": [],
     }
+    assert block["analysis"]["status"] == "complete"
+    assert block["analysis"]["spans_emitted"] == 0
+
+
+# --- the schema_version 2 annotation block (KH-F01-B1.1-C) -----------------------------------
+
+
+STEP_INGREDIENTS = (
+    Ingredient("вода", "1 л"),
+    Ingredient("молоко", "1 стакан (200 мл)"),
+    Ingredient("соль", "300 г"),
+)
+STEP_RECIPE = Recipe(
+    index=0,
+    title="Суп",
+    servings="2 порции",
+    ingredients=STEP_INGREDIENTS,
+    steps=(
+        "Доведите 500 мл воды до кипения.",
+        "Добавьте 1 стакан молока.",
+        "Добавьте 250 мл воды.",
+    ),
+)
+
+
+async def kept_with_steps(tmp_path):
+    reply = BackendReply(text=render_recipe(STEP_RECIPE), recipes=(STEP_RECIPE,))
+    backend = ScriptedBackend(reply, reply)
+    return chat_app(tmp_path, backend)
+
+
+async def test_the_detail_carries_the_complete_typed_block_and_keeps_the_b1_fields(tmp_path):
+    async with await kept_with_steps(tmp_path) as chat:
+        favorite = await keep_recipe(chat)
+        body = (await detail(chat, favorite)).json()
+
+    block = body["measures"]
+    assert set(block) == {
+        "schema_version",
+        "favorite_version",
+        "target",
+        "source_glass_ml",
+        "source_glass_required",
+        "steps_source_glass_required",
+        "ingredients",
+        "steps",
+        "provenance",
+        "analysis",
+    }
+    assert block["schema_version"] == 2
+    assert block["favorite_version"] == body["version"] == 1
+
+    # Released B1 fields are unchanged; source_terms is the additive per-term data.
+    water = by_position(block)[0]
+    assert (water["position"], water["source"], water["source_kind"]) == (
+        0,
+        "1 л",
+        "metric_volume",
+    )
+    assert water["exact"] == {"numerator": 4, "denominator": 1}
+    assert water["source_terms"] == [
+        {
+            "unit": "liter",
+            "amount": {"numerator": 1, "denominator": 1},
+            "capacity_ml": None,
+            "capacity_origin": "not_applicable",
+        }
+    ]
+    milk = by_position(block)[1]
+    assert milk["source_terms"][0]["capacity_origin"] == "declared_text"
+
+    # Every step is annotated with its exact text, hash and code-point spans.
+    assert [step["step_index"] for step in block["steps"]] == [0, 1, 2]
+    for step in block["steps"]:
+        text = STEP_RECIPE.steps[step["step_index"]]
+        assert step["step_text"] == text
+        assert step["text_sha256"] == hashlib.sha256(text.encode("utf-8")).hexdigest()
+        assert step["status"] == "complete"
+        for span in step["spans"]:
+            assert text[span["start"] : span["end"]] == span["text"]
+    # OD-03 at the API boundary: the milk ingredient declares 200 mL, the step does not
+    # inherit it and asks for a clarification instead.
+    milk_span = block["steps"][1]["spans"][0]
+    assert milk_span["capacity_origin"] == "unresolved"
+    assert milk_span["conversion"]["status"] == "clarification_required"
+    assert block["steps_source_glass_required"] is True
+
+    assert block["provenance"]["status"] == "complete"
+    assert block["analysis"]["status"] == "complete"
+    assert block["analysis"]["spans_emitted"] == 3
+
+
+async def test_the_clarification_reaches_undeclared_step_terms_only(tmp_path):
+    async with await kept_with_steps(tmp_path) as chat:
+        favorite = await keep_recipe(chat)
+        body = (await detail(chat, favorite, "?source_glass_ml=200")).json()
+
+    block = body["measures"]
+    assert block["source_glass_ml"] == 200
+    milk_span = block["steps"][1]["spans"][0]
+    assert milk_span["capacity_origin"] == "temporary_clarification"
+    assert milk_span["conversion"]["exact"] == {"numerator": 4, "denominator": 5}
+    # The milk ingredient keeps its own declaration: no conflict, no override.
+    milk = by_position(block)[1]
+    assert milk["source_terms"][0]["capacity_origin"] == "declared_text"
+    assert milk["source_terms"][0]["capacity_ml"] == {"numerator": 200, "denominator": 1}
+
+
+async def test_a_patch_recomputes_the_block_at_the_new_version(tmp_path):
+    async with await kept_with_steps(tmp_path) as chat:
+        favorite = await keep_recipe(chat)
+        first = (await detail(chat, favorite)).json()
+        response = await chat.client.patch(
+            f"/api/favorites/{favorite}",
+            json={
+                "expected_version": 1,
+                "steps": [
+                    "Доведите 500 мл воды до кипения.",
+                    "Добавьте 250 мл молока.",
+                    "Добавьте 500 мл воды.",
+                ],
+            },
+            headers=post_headers(),
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["version"] == 2
+    assert body["measures"]["favorite_version"] == 2
+    assert body["steps"] == [
+        "Доведите 500 мл воды до кипения.",
+        "Добавьте 250 мл молока.",
+        "Добавьте 500 мл воды.",
+    ]
+    edited = body["measures"]["steps"][1]["spans"][0]
+    assert edited["text"] == "250 мл"
+    assert edited["link"] == "linked"
+    assert edited["conversion"]["exact"] == {"numerator": 1, "denominator": 1}
+    # The earlier answer stays bound to the earlier version; a client discards it as stale.
+    assert first["measures"]["favorite_version"] == 1
+    assert first["measures"]["steps"][1]["spans"][0]["text"] == "1 стакан"
+
+
+async def test_step_hints_use_only_the_signed_in_persons_target_capacity(tmp_path):
+    async with await kept_with_steps(tmp_path) as chat:
+        other = await chat.second_user()
+        mine = await keep_recipe(chat)
+        theirs = await keep_recipe(chat, other)
+        await set_measures(chat, glass_ml=200)
+
+        mine_block = (await detail(chat, mine)).json()["measures"]
+        theirs_block = (await detail(chat, theirs, client=other)).json()["measures"]
+
+    assert mine_block["steps"][0]["spans"][0]["conversion"]["exact"] == {
+        "numerator": 5,
+        "denominator": 2,
+    }
+    assert theirs_block["steps"][0]["spans"][0]["conversion"]["exact"] == {
+        "numerator": 2,
+        "denominator": 1,
+    }
+    assert (mine_block["target"]["glass_ml"], theirs_block["target"]["glass_ml"]) == (
+        200,
+        250,
+    )
+
+
+async def test_reading_step_annotations_writes_nothing_and_keeps_protocol_v1(tmp_path):
+    async with await kept_with_steps(tmp_path) as chat:
+        favorite = await keep_recipe(chat)
+        with chat.base.factory() as db:
+            row = db.get(FavoriteRecipe, UUID(favorite))
+            before = (row.content, row.version, row.updated_at, row.ingredients, row.steps)
+
+        for query in ("", "?source_glass_ml=200"):
+            assert (await detail(chat, favorite, query)).status_code == 200
+
+        with chat.base.factory() as db:
+            row = db.get(FavoriteRecipe, UUID(favorite))
+            after = (row.content, row.version, row.updated_at, row.ingredients, row.steps)
+        detail_body = (await detail(chat, favorite)).json()
+
+    assert after == before
+    # The stored protocol v1 fields are echoed exactly; the block is additive only.
+    assert detail_body["steps"] == list(STEP_RECIPE.steps)
+    assert detail_body["ingredients"] == [
+        {"name": item.name, "amount": item.amount} for item in STEP_INGREDIENTS
+    ]
+    assert chat.backend.calls == 1  # one answer; every detail read is derived locally

@@ -12,6 +12,7 @@ approved outcome; a confident wrong ingredient is not.
 
 import ast
 import time
+from contextlib import contextmanager
 from dataclasses import fields
 from pathlib import Path
 
@@ -68,6 +69,9 @@ def test_the_scanner_imports_only_the_standard_library_and_the_measures_core():
         "collections.abc",
         "dataclasses",
         "enum",
+        # KH-F01-B1.1-C: the exact declared capacity of a span is carried as a rational,
+        # so the adapter never re-parses a span the scanner already validated.
+        "fractions",
         "house_helper.core.measures",
     }
 
@@ -84,6 +88,10 @@ def test_the_result_has_no_conversion_or_hint_field():
         "reason",
         "ingredient_position",
         "approximate",
+        # KH-F01-B1.1-C metadata: the recognized approximation word and the exact
+        # validated quantity. Neither is a conversion or a hint.
+        "approximate_word",
+        "quantity",
     }
 
 
@@ -3380,3 +3388,151 @@ def test_b1b1_a_verb_is_evidence_only_as_a_complete_lexical_unit(text, expected)
     )
 
     assert step_scan_module._is_predicate_word(text, verb) is expected
+
+
+# --- the deterministic mention-work bound ---------------------------------------------
+
+
+@contextmanager
+def _counting_same_word():
+    """Count every real `_same_word` comparison made inside the block."""
+    calls = []
+    real = step_scan_module._same_word
+
+    def counting(left, right):
+        calls.append((left, right))
+        return real(left, right)
+
+    step_scan_module._same_word = counting
+    try:
+        yield calls
+    finally:
+        step_scan_module._same_word = real
+
+
+def _work_of(text, names):
+    infos = step_scan_module._ingredient_infos(list(names))
+    _, words = step_scan_module._tokenize(text)
+    return step_scan_module._mention_work(text, tuple(words), infos)
+
+
+def _ingredients(names):
+    return [Ingredient(name, "1 ч. л.") for name in names]
+
+
+# Adversarial structures, each a (names, steps) pair. They exercise the shapes the second
+# audit asked for: repeated modifiers, long compound names, a shared general/specific head,
+# many short steps, many ingredients with few words, and long steps with few ingredients.
+ADVERSARIAL = {
+    "repeated_modifiers": (
+        ["сухой " * 8 + "вода"] * 4,
+        ["горячей " * 24 + "сухой вода, 1 мл."] * 2,
+    ),
+    "long_compound_names": (
+        ["свежий охлажденный молотый " * 4 + "перец"] * 4,
+        ["возьмите " + "очень свежий охлажденный " * 6 + "молотый перец, 1 ч. л."],
+    ),
+    "shared_general_and_specific": (
+        ["вода", "морская вода"],
+        ["Добавьте 1 стакан 200 мл морской воды."],
+    ),
+    "many_short_steps": (
+        list(NAMES),
+        ["добавьте 1 мл воды."] * 8,
+    ),
+    "many_ingredients_few_words": (
+        [f"ингредиент{index}" for index in range(40)],
+        ["добавьте 1 мл воды."],
+    ),
+    "long_steps_few_ingredients": (
+        ["вода", "молоко"],
+        ["свежий " * 80 + "добавьте 1 стакан воды."],
+    ),
+}
+
+
+@pytest.mark.parametrize("structure", sorted(ADVERSARIAL))
+def test_the_mention_work_bound_covers_every_comparison_it_charges(structure):
+    names, steps = ADVERSARIAL[structure]
+    ingredients = _ingredients(names)
+
+    for text in steps:
+        with _counting_same_word() as calls:
+            unguarded = scan_recipe_steps([text], ingredients)
+        # The bound is an upper bound on the real expensive operations of this step.
+        assert len(calls) <= _work_of(text, names)
+        assert unguarded.omitted == 0
+
+    with _counting_same_word() as all_calls:
+        scan_recipe_steps(steps, ingredients)
+    assert len(all_calls) <= sum(_work_of(text, names) for text in steps)
+
+
+def test_the_bound_charges_the_nested_modifier_path_not_just_word_pairs():
+    names = ["сухой " * 8 + "вода"]
+    text = "горячей " * 24 + "сухой вода, 1 мл."
+
+    _, words = step_scan_module._tokenize(text)
+    old_estimate = len(words) * len(names)
+    with _counting_same_word() as calls:
+        scan_recipe_steps([text], _ingredients(names))
+
+    # The rejected guard would have admitted this step: the real comparisons run through
+    # the nested `all(any(...))` modifier matcher and far exceed words x ingredients.
+    assert len(calls) > old_estimate
+    assert _work_of(text, names) >= len(calls) > old_estimate
+
+
+def test_a_step_exactly_at_the_bound_is_scanned_and_one_beyond_degrades():
+    for structure in sorted(ADVERSARIAL):
+        names, steps = ADVERSARIAL[structure]
+        ingredients = _ingredients(names)
+        text = steps[0]
+        work = _work_of(text, names)
+        assert work > 0
+
+        with _counting_same_word() as at_bound_calls:
+            at_bound = scan_recipe_steps(
+                [text], ingredients, max_mention_work=work
+            )
+        assert at_bound.omitted == 0
+        assert at_bound.steps[0].amounts
+        assert len(at_bound_calls) <= work
+
+        with _counting_same_word() as beyond_calls:
+            beyond = scan_recipe_steps(
+                [text], ingredients, max_mention_work=work - 1
+            )
+        # Immediately beyond the bound: no matching at all, every expression counted.
+        assert beyond_calls == []
+        assert beyond.steps[0].amounts == ()
+        assert beyond.omitted == len(at_bound.steps[0].amounts)
+
+
+def test_a_bound_of_zero_performs_no_matching_and_counts_every_expression():
+    names = list(NAMES)
+    text = "Добавьте 1 стакан 200 мл воды."
+
+    with _counting_same_word() as calls:
+        result = scan_recipe_steps([text], _ingredients(names), max_mention_work=0)
+
+    assert calls == []
+    assert result.steps[0].amounts == ()
+    assert result.omitted == 1
+    assert result.glass_required is False  # the declared capacity is still read
+
+
+def test_the_unbudgeted_path_is_unchanged():
+    names = list(NAMES)
+    steps = ["Добавьте 1 стакан 200 мл воды.", "Добавьте 500 мл молока."]
+
+    assert scan_recipe_steps(steps, _ingredients(names)) == scan_recipe_steps(
+        steps, _ingredients(names), max_mention_work=None
+    )
+
+
+def test_the_mention_work_estimate_is_deterministic():
+    names = ["сухой " * 8 + "вода"] * 3
+    text = "горячей " * 12 + "сухой вода, 1 мл."
+
+    assert _work_of(text, names) == _work_of(text, names)

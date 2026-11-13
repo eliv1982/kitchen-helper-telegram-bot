@@ -17,18 +17,22 @@ in the request is never read. A favorite that does not exist, belongs to somebod
 not even a UUID is the same 404 "favorite_not_found" for every route; a conversation that is
 not the user's (or not a UUID) is the same 404 "conversation_not_found" as in the chat API.
 
-Household measures (KH-F01-B1). The detail body carries an additive `measures` object
-(measure_targets.measure_block): the signed-in person's resolved target capacities, the
-ingredient positions whose amount is a quantified volume, their conversion status and
-reason, exact rational numerators and denominators, the practical rounded value when one
-passed the 5% gate, whether the conversion is identical to the source, and what the page
-should present. A GET may carry `?source_glass_ml=<50..1000>` to clarify an undeclared
-source glass; an invalid value is the catalogue's invalid_measure, and the clarification
-affects only this answer (nothing is stored). Clarification metadata says whether an
-amount still contains an undeclared source glass. A conversion that cannot be built does
-not fail the recipe: `measures` is null and the detail is served normally. The block is
-read-only: no conversion read writes to a favorite, recipe, ingredient or shopping list.
-The same block is in the PATCH answer, with no clarification parameter.
+Household measures (KH-F01-B1, extended by KH-F01-B1.1-C). The detail body carries an
+additive `measures` object (measure_targets.measure_block_v2): the released B1 ingredient
+conversions (the signed-in person's resolved target capacities, statuses and reasons,
+exact rationals, practical rounded values, presentation) plus the additive
+`schema_version: 2` data -- per-term `source_terms` with `capacity_origin`, step span
+annotations with exact code-point offsets and text hashes, the per-term provenance audit,
+and an analysis summary. Step hints follow the same exact arithmetic and 5% gate and use
+no capacity inherited from a linked ingredient (OD-03). A GET may carry
+`?source_glass_ml=<50..1000>` to clarify an undeclared source glass; an invalid value is
+the catalogue's invalid_measure, and the clarification affects only this answer (nothing is
+stored) and applies to both ingredient and step terms that are still undeclared. A
+conversion that cannot be built does not fail the recipe: `measures` is null and the detail
+is served normally. Derived analysis failures are confined to their own section and never
+produce a new 4xx/5xx. The block is read-only: no conversion read writes to a favorite,
+recipe, ingredient or shopping list. The same block is in the PATCH answer, with no
+clarification parameter, recomputed at the new version.
 
 Keeping an answer (POST). The body is {"conversation_id", "message_id"} and, optionally,
 "recipe_index" (0 to MAX_RECIPES_PER_REPLY - 1). Without it, the old behaviour is exactly
@@ -217,22 +221,29 @@ def _measures_block(
     *,
     source_glass_ml: Optional[int] = None,
 ) -> Optional[dict[str, Any]]:
-    """The person's target measures applied to this favorite's ingredients.
+    """The person's target measures applied to this favorite's ingredients and steps.
 
     The target capacities are read from the signed-in person's own profile (never from
-    the request). A conversion failure is confined to this block: the caller still serves
-    the readable recipe, with `measures` null.
+    the request). The block is bound to the detail's version so a client can reject a
+    stale answer. A catastrophic conversion failure is confined to this block: the caller
+    still serves the readable recipe, with `measures` null. Inside the block, provenance
+    and step failures are confined further and leave the ingredient hints intact.
     """
     profile = profile_store.get_profile(session, user_id)
-    target = measure_targets.volumes(
-        profile.measures.glass_ml,
-        profile.measures.teaspoon_ml,
-        profile.measures.tablespoon_ml,
-    )
-    amounts = [item.amount for item in found.ingredients or ()]
     try:
-        return measure_targets.measure_block(
-            amounts, target, source_glass_ml=source_glass_ml
+        # A corrupt stored override is confined like any other conversion failure: the
+        # recipe stays readable and no target is clamped or invented (15.6.4).
+        target = measure_targets.volumes(
+            profile.measures.glass_ml,
+            profile.measures.teaspoon_ml,
+            profile.measures.tablespoon_ml,
+        )
+        return measure_targets.measure_block_v2(
+            found.ingredients,
+            found.steps,
+            target,
+            source_glass_ml=source_glass_ml,
+            favorite_version=found.version,
         )
     except Exception:
         # The recipe itself is still readable; only its conversion section is missing.

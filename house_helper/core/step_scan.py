@@ -51,10 +51,13 @@ from bisect import bisect_left, bisect_right
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
+from fractions import Fraction
 
 from house_helper.core.measures import (
     GLASS_ML_MAX,
     GLASS_ML_MIN,
+    Quantity,
+    QuantityPart,
     QuantityReason,
     Unit,
     parse_quantity,
@@ -116,6 +119,14 @@ class StepAmount:
     reason: AmountLinkReason
     ingredient_position: int | None = None
     approximate: bool = False
+    # The recognized approximation word itself (``около``/``примерно``/``приблизительно``),
+    # when one qualified the span; ``None`` otherwise. It is presentation metadata and
+    # changes no arithmetic.
+    approximate_word: str | None = None
+    # The exact quantity this span was validated as, with any declared glass capacity kept
+    # exactly (including a non-terminating one such as ``500/3``). ``None`` for a rejected
+    # construct. A later stage serializes and converts it instead of re-parsing the span.
+    quantity: Quantity | None = None
 
 
 @dataclass(frozen=True)
@@ -124,12 +135,17 @@ class StepAmountScan:
 
     ``text`` is the step exactly as stored. ``omitted`` counts spans left out by the
     per-step or per-recipe cap; the stored text is never truncated or rewritten.
+    ``glass_required`` reports whether the whole step (not only the kept prefix) contains
+    a glass term whose capacity is undeclared in the step text, before any temporary
+    clarification. It is derived from every scanned expression, so a span cap cannot hide
+    an undeclared glass from the caller.
     """
 
     step_index: int
     text: str
     amounts: tuple[StepAmount, ...]
     omitted: int = 0
+    glass_required: bool = False
 
 
 @dataclass(frozen=True)
@@ -138,6 +154,7 @@ class RecipeStepScan:
 
     steps: tuple[StepAmountScan, ...]
     omitted: int = 0
+    glass_required: bool = False
 
     @property
     def complete(self) -> bool:
@@ -1208,6 +1225,69 @@ class _WordIndex:
     adjacent_start: tuple[int, ...]
 
 
+def _adjective_run_starts(
+    text: str, words: Sequence[_Word], adjectives: Sequence[bool]
+) -> tuple[int, ...]:
+    """The first word of the whitespace-joined adjective run ending at this word.
+
+    A punctuation or sentence boundary ends the run, as a fixed look-back window must not
+    borrow a modifier from the previous phrase. The index is one linear pass, shared by the
+    binder and by the deterministic mention-work estimate, so both read the same run.
+    """
+    starts = [0] * len(words)
+    for index in range(len(words)):
+        if not adjectives[index]:
+            starts[index] = index
+            continue
+        if (
+            index > 0
+            and adjectives[index - 1]
+            and words[index - 1].sentence == words[index].sentence
+            and _whitespace_gap(
+                text, words[index - 1].end, words[index].start
+            )
+        ):
+            starts[index] = starts[index - 1]
+        else:
+            starts[index] = index
+    return tuple(starts)
+
+
+def _mention_work(
+    text: str, words: Sequence[_Word], infos: Sequence[_IngredientInfo]
+) -> int:
+    """A deterministic upper bound on one step's mention-matching comparisons.
+
+    Matching a step has two costs, both charged in ``_same_word``-class comparisons:
+
+    * ``_mention_at`` asks `_same_head` about every word and every ingredient, at most
+      ``len(words) * len(infos)`` times (a word that `modifies_following` short-circuits
+      merely costs less);
+    * for a word that matches a specific ingredient's head, `_modifiers_present` compares
+      every distinguishing word of that ingredient with every word of the adjective run
+      before the head -- ``len(info.modifiers) * run`` comparisons per matching ingredient.
+      This is the nested ``all(any(...))`` path, and it is the one the plain word x
+      ingredient estimate missed.
+
+    The bound assumes the worst case -- every ingredient's head matches every word, so the
+    run cost is charged for all specific ingredients at every word whose predecessor is
+    part of an adjective run. It is therefore a true upper bound, not an estimate of the
+    typical case, and it is computed in two linear passes with no matching.
+    """
+    modifier_total = sum(len(info.modifiers) for info in infos)
+    head_work = len(words) * len(infos)
+    if modifier_total == 0 or len(words) < 2:
+        return head_work
+    adjectives = tuple(_looks_like_adjective(word.norm) for word in words)
+    starts = _adjective_run_starts(text, words, adjectives)
+    run_work = 0
+    for index in range(1, len(words)):
+        if adjectives[index - 1]:
+            # A head at `index` would collect the adjective run that ends at index - 1.
+            run_work += index - starts[index - 1]
+    return head_work + modifier_total * run_work
+
+
 def _build_word_index(
     text: str, words: Sequence[_Word]
 ) -> _WordIndex:
@@ -1246,31 +1326,14 @@ def _build_word_index(
         adjectives[index] and following_ok[index]
         for index in range(nouns)
     )
-    # The first word of the whitespace-joined adjective run ending at this word. A
-    # punctuation or sentence boundary ends the run, as a fixed look-back window must not
-    # borrow a modifier from the previous phrase.
-    adjacent_start = [0] * nouns
-    for index in range(nouns):
-        if not adjectives[index]:
-            adjacent_start[index] = index
-            continue
-        if (
-            index > 0
-            and adjectives[index - 1]
-            and words[index - 1].sentence == words[index].sentence
-            and _whitespace_gap(
-                text, words[index - 1].end, words[index].start
-            )
-        ):
-            adjacent_start[index] = adjacent_start[index - 1]
-        else:
-            adjacent_start[index] = index
+    # The first word of the whitespace-joined adjective run ending at this word, from the
+    # same one-pass index the mention-work estimate reads.
     return _WordIndex(
         adjectives=adjectives,
         modifying=modifying,
         phrase_modifying=phrase_modifying,
         modifies_following=modifies_following,
-        adjacent_start=tuple(adjacent_start),
+        adjacent_start=_adjective_run_starts(text, words, adjectives),
     )
 
 
@@ -1380,6 +1443,10 @@ class _Expression:
     end: int
     supported: bool
     reason: AmountLinkReason | None
+    # The exact validated quantity of a supported expression. A declared capacity that
+    # cannot be written as a finite decimal is filled in here after validation, because
+    # the substituted validation text omits it; the span text is never changed.
+    quantity: Quantity | None = None
 
 
 @dataclass(frozen=True)
@@ -1389,13 +1456,15 @@ class _Part:
     ``substitutions`` are the parse-only replacements of exact capacity declarations, in
     source order. They never alter the reported span or the stored step text; they are
     accumulated while the part is consumed so the validation text is assembled in one
-    forward pass.
+    forward pass. ``capacity_ml`` is the exact declared glass capacity of this part, kept
+    as a rational even when the validation text had to omit a non-terminating declaration.
     """
 
     unit: Unit
     end: int
     reason: AmountLinkReason | None
     substitutions: tuple[tuple[int, int, str], ...] = ()
+    capacity_ml: Fraction | None = None
 
 
 @dataclass(frozen=True)
@@ -1627,28 +1696,31 @@ def _exact_decimal(numerator: int, denominator: int) -> str | None:
 
 def _capacity_override(
     text: str, match: re.Match[str]
-) -> tuple[tuple[int, int, str] | None, AmountLinkReason | None]:
+) -> tuple[tuple[int, int, str] | None, AmountLinkReason | None, Fraction | None]:
     """Evaluate an exact glass capacity, returning a parse substitution if needed.
 
     A terminating value is substituted as its exact decimal. A non-terminating value is
     checked exactly against the 50--1000 mL fence and the whole declaration is left out
-    of the core's parse text; the span always keeps the untouched original text.
+    of the core's parse text; the span always keeps the untouched original text. The
+    exact capacity is returned as a rational in every bounded case, so the caller can
+    restore a value the validation text could not spell.
     """
     size = text[match.start("size") : match.end("size")]
     if "/" not in size and not any(
         character in _VULGAR_VALUES for character in size
     ):
-        return None, None
+        return None, None, None
     fraction = _capacity_fraction(size)
     if fraction is None:
-        return None, _MALFORMED
+        return None, _MALFORMED, None
     numerator, denominator = fraction
     if not _within_glass_fence(numerator, denominator):
-        return None, _UNSUPPORTED
+        return None, _UNSUPPORTED, None
+    exact = Fraction(numerator, denominator)
     decimal = _exact_decimal(numerator, denominator)
     if decimal is None:
-        return (match.start(), match.end(), ""), None
-    return (match.start("size"), match.end("size"), decimal), None
+        return (match.start(), match.end(), ""), None, exact
+    return (match.start("size"), match.end("size"), decimal), None, exact
 
 
 def _read_suffix(
@@ -1658,14 +1730,16 @@ def _read_suffix(
     sentence_end: int,
     *,
     probe_dependent: bool = True,
-) -> tuple[int, AmountLinkReason | None, tuple[tuple[int, int, str], ...]]:
+) -> tuple[int, AmountLinkReason | None, tuple[tuple[int, int, str], ...], Fraction | None]:
     """Read every capacity declaration and qualifier after one part.
 
-    The result is the new end, the first rejection reason (if any) and the parse
-    substitutions accumulated in source order: the exact decimal of a terminating
+    The result is the new end, the first rejection reason (if any), the parse
+    substitutions accumulated in source order -- the exact decimal of a terminating
     fractional or vulgar capacity, or the removal of a non-terminating declaration that
-    was validated exactly here. A malformed capacity consumes the malformed text so no
-    smaller amount can be read out of it.
+    was validated exactly here -- and the exact declared capacity of this part as a
+    rational, so the caller can restore a non-terminating value the validation text could
+    not spell. A malformed capacity consumes the malformed text so no smaller amount can
+    be read out of it.
 
     The declaration loop is what makes a second declaration safe. The approved grammar
     has at most one capacity per part: a well-formed second declaration is an
@@ -1678,6 +1752,7 @@ def _read_suffix(
     number for the same spoon unit.
     """
     substitutions: list[tuple[int, int, str]] = []
+    capacity_ml: Fraction | None = None
     declarations = 0
     while True:
         paren_position = _skip_ws(text, end)
@@ -1690,17 +1765,20 @@ def _read_suffix(
                     _consume_to_paren(text, paren_position, sentence_end),
                     _MALFORMED,
                     (),
+                    None,
                 )
             declarations += 1
             if declarations > 1:
-                return capacity.end(), _UNSUPPORTED, ()
+                return capacity.end(), _UNSUPPORTED, (), None
             if unit is not Unit.GLASS:
-                return capacity.end(), _UNSUPPORTED, ()
-            override, reason = _capacity_override(text, capacity)
+                return capacity.end(), _UNSUPPORTED, (), None
+            override, reason, exact = _capacity_override(text, capacity)
             if reason is not None:
-                return capacity.end(), reason, ()
+                return capacity.end(), reason, (), None
             if override is not None:
                 substitutions.append(override)
+            if exact is not None:
+                capacity_ml = exact
             end = capacity.end()
             continue
         if unit is Unit.GLASS:
@@ -1710,12 +1788,14 @@ def _read_suffix(
             if capacity is not None:
                 declarations += 1
                 if declarations > 1:
-                    return capacity.end(), _UNSUPPORTED, ()
-                override, reason = _capacity_override(text, capacity)
+                    return capacity.end(), _UNSUPPORTED, (), None
+                override, reason, exact = _capacity_override(text, capacity)
                 if reason is not None:
-                    return capacity.end(), reason, ()
+                    return capacity.end(), reason, (), None
                 if override is not None:
                     substitutions.append(override)
+                if exact is not None:
+                    capacity_ml = exact
                 end = capacity.end()
                 continue
             na_prefix = _match_until(
@@ -1728,7 +1808,7 @@ def _read_suffix(
                 if declared is not None:
                     # "1 стакан на 200 л": a capacity with a non-millilitre unit is
                     # malformed and is consumed whole, never salvaged as "200 л".
-                    return declared.end(), _MALFORMED, ()
+                    return declared.end(), _MALFORMED, (), None
             number_position = _skip_ws(text, end)
             if number_position < sentence_end and _starts_number(
                 text, number_position
@@ -1741,6 +1821,7 @@ def _read_suffix(
                     ),
                     _MALFORMED,
                     (),
+                    None,
                 )
         elif unit in _SPOON_UNITS and probe_dependent:
             number_position = _skip_ws(text, end)
@@ -1761,12 +1842,13 @@ def _read_suffix(
                             _consume_number(text, number_position),
                             _MALFORMED,
                             (),
+                            None,
                         )
                     if following.reason is not None:
-                        return following.end, following.reason, ()
+                        return following.end, following.reason, (), None
                     next_position = _skip_ws(text, following.end)
                     if not _starts_number(text, next_position):
-                        return following.end, _UNSUPPORTED, ()
+                        return following.end, _UNSUPPORTED, (), None
                     number_position = next_position
         break
 
@@ -1778,14 +1860,14 @@ def _read_suffix(
         qualifiers.append(qualifier)
         end = qualifier.end()
     if len(qualifiers) > 1:
-        return end, _UNSUPPORTED, ()
+        return end, _UNSUPPORTED, (), None
     if qualifiers:
         word = _topic(qualifiers[0].group("qualifier"))
         if word in {"с горкой", "с верхом"}:
-            return end, _HEAPED, ()
+            return end, _HEAPED, (), None
         if unit not in _SPOON_UNITS:
-            return end, _UNSUPPORTED, ()
-    return end, None, tuple(substitutions)
+            return end, _UNSUPPORTED, (), None
+    return end, None, tuple(substitutions), capacity_ml
 
 
 def _validation_text(
@@ -1814,6 +1896,53 @@ def _validation_text(
     return "".join(pieces)
 
 
+def _apply_declared_capacities(
+    quantity: Quantity, parts: Sequence[_Part], span_text: str
+) -> Quantity:
+    """Restore a non-terminating declared capacity the validation text had to omit.
+
+    The core parser validates the substituted text, so a capacity such as ``500/3`` --
+    kept exactly by `_capacity_fraction` but not writable as a finite decimal -- is
+    missing from the parsed glass term. The scanned parts and the parsed terms are in the
+    same source order; when that alignment holds, an undeclared parsed glass term takes
+    the exact capacity its own source part declared. No grammar is re-implemented: the
+    value was already validated, and only its carrier changes. The returned quantity
+    carries the original span text, never the parser's substitution, so a consumer can
+    echo it without leaking a rewritten amount.
+    """
+    patched: list[QuantityPart] = []
+    changed = False
+    if len(quantity.parts) == len(parts):
+        for part, parsed in zip(parts, quantity.parts):
+            if (
+                part.capacity_ml is not None
+                and parsed.unit is Unit.GLASS
+                and parsed.glass_ml is None
+            ):
+                parsed = QuantityPart(
+                    amount=parsed.amount, unit=parsed.unit, glass_ml=part.capacity_ml
+                )
+                changed = True
+            patched.append(parsed)
+    if not changed and quantity.text == span_text:
+        return quantity
+    return Quantity(
+        text=span_text,
+        status=quantity.status,
+        reason=quantity.reason,
+        dimension=quantity.dimension,
+        parts=tuple(patched) if changed else quantity.parts,
+    )
+
+
+def _has_undeclared_glass(quantity: Quantity) -> bool:
+    """Whether any glass term of this quantity lacks a capacity in its own text."""
+    return any(
+        part.unit is Unit.GLASS and part.glass_ml is None
+        for part in quantity.parts
+    )
+
+
 def _read_part(
     text: str, position: int, sentence_end: int, probe_dependent: bool
 ) -> _Part | None:
@@ -1827,11 +1956,15 @@ def _read_part(
     unit = _UNIT_KEYS.get(_unit_key(head.group("unit")))
     if unit is None:
         return None
-    end, reason, substitutions = _read_suffix(
+    end, reason, substitutions, capacity_ml = _read_suffix(
         text, head.end(), unit, sentence_end, probe_dependent=probe_dependent
     )
     return _Part(
-        unit=unit, end=end, reason=reason, substitutions=substitutions
+        unit=unit,
+        end=end,
+        reason=reason,
+        substitutions=substitutions,
+        capacity_ml=capacity_ml,
     )
 
 
@@ -1944,6 +2077,7 @@ def _match_part(
     end = first.end
     unit = first.unit
     substitutions = list(first.substitutions)
+    parts = [first]
     while True:
         if end >= sentence_end:
             break
@@ -1979,6 +2113,7 @@ def _match_part(
                 end = following.end
                 unit = following.unit
                 substitutions.extend(following.substitutions)
+                parts.append(following)
                 continue
             # An explicit arithmetic sign joins a following rejected term into the same
             # maximal expression: the whole expression is rejected, never split so the
@@ -2033,6 +2168,7 @@ def _match_part(
             end = following.end
             unit = following.unit
             substitutions.extend(following.substitutions)
+            parts.append(following)
             continue
         # A household part followed by another part without an explicit separator is
         # ambiguous juxtaposition; it is rejected whole, never split.
@@ -2046,7 +2182,13 @@ def _match_part(
     parse_text = _validation_text(text, position, end, substitutions)
     quantity = parse_quantity(parse_text, allow_nonstandard_glass_sizes=True)
     if quantity.is_quantified:
-        return _Expression(position, end, True, None)
+        return _Expression(
+            position,
+            end,
+            True,
+            None,
+            _apply_declared_capacities(quantity, parts, text[position:end]),
+        )
     reason = _PARSE_REASONS.get(quantity.reason, _UNSUPPORTED)
     if not nested:
         end = _consume_trailing_chain(text, end, sentence_end)
@@ -2095,7 +2237,7 @@ def _match_range(
     unit = _UNIT_KEYS.get(_unit_key(unit_match.group("unit")))
     if unit is None:
         return end, None
-    suffix_end, reason, _ = _read_suffix(
+    suffix_end, reason, _, _ = _read_suffix(
         text, unit_match.end(), unit, sentence_end
     )
     if reason is _MALFORMED:
@@ -3237,24 +3379,49 @@ def _bind(ctx: _StepContext, expression: _Expression) -> _Binding:
 
 
 def _scan_step(
-    step_index: int, text: str, infos: Sequence[_IngredientInfo], limit: int
-) -> tuple[tuple[StepAmount, ...], int]:
+    step_index: int,
+    text: str,
+    infos: Sequence[_IngredientInfo],
+    limit: int,
+    mention_budget: int | None = None,
+) -> tuple[tuple[StepAmount, ...], int, bool, int, bool]:
     """Scan one step, binding at most ``limit`` spans and counting every expression.
 
     Expressions are found in a single left-to-right pass. Only the kept prefix is bound,
     so a step or recipe that exceeds the span cap does no binding work for the spans it
     omits, while the omission count and the cap behaviour stay exact.
+
+    ``mention_budget`` is an optional deterministic preflight bound on ingredient mention
+    matching, in `_same_word`-class comparisons (`_mention_work`). The estimate is computed
+    after the cheap expression pass and before any matching; when it exceeds the remaining
+    budget, no mention or binding work is done, every expression is counted as omitted and
+    the step reports ``degraded``. This reuses the same lightweight no-ingredient path as a
+    spent span budget; there is no second scanner.
+
+    The result is ``(amounts, expression_count, glass_required, work, degraded)``. The
+    glass flag is derived from every expression, including those a cap or the work guard
+    omits, so it never depends on the emitted prefix.
     """
     bounds, words = _tokenize(text)
-    if limit <= 0:
-        # The recipe budget is already spent: only the count is needed, so no word
-        # context or ingredient matching is built for a step whose spans are all omitted.
-        return (), len(_scan_expressions(text, bounds))
     expressions = _scan_expressions(text, bounds)
+    glass_required = any(
+        expression.quantity is not None
+        and _has_undeclared_glass(expression.quantity)
+        for expression in expressions
+    )
+    if limit <= 0:
+        # The span budget is already spent: only the count is needed, so no word context
+        # or ingredient matching is built for a step whose spans are all omitted.
+        return (), len(expressions), glass_required, 0, False
     if not expressions:
         # No candidate quantity exists, so no mention or binding context is built at all.
-        return (), 0
+        return (), 0, glass_required, 0, False
     words_tuple = tuple(words)
+    work = _mention_work(text, words_tuple, infos)
+    if mention_budget is not None and work > mention_budget:
+        # The deterministic work guard. The expression count stays exact, but no
+        # ingredient matching is performed: the step contributes no span.
+        return (), len(expressions), glass_required, 0, True
     word_index = _build_word_index(text, words_tuple)
     mentions = _mentions(text, words_tuple, infos, word_index)
     starts = tuple(word.start for word in words_tuple)
@@ -3296,9 +3463,16 @@ def _scan_step(
     for expression in expressions[: max(0, limit)]:
         sentence = _sentence_of(bounds, expression.start)
         nearby = _nearby_words(ctx, expression.start, sentence, 2)
-        approximate = any(
-            word.norm in _APPROXIMATE_WORDS for word in nearby
+        # The nearest recognized word, in deterministic left-to-right proximity order.
+        approximate_word = next(
+            (
+                word.norm
+                for word in nearby
+                if word.norm in _APPROXIMATE_WORDS
+            ),
+            None,
         )
+        approximate = approximate_word is not None
         if not expression.supported:
             reason = expression.reason or _UNSUPPORTED
             amounts.append(
@@ -3310,6 +3484,7 @@ def _scan_step(
                     status=AmountLinkStatus.UNSUPPORTED,
                     reason=reason,
                     approximate=approximate,
+                    approximate_word=approximate_word,
                 )
             )
             continue
@@ -3324,9 +3499,11 @@ def _scan_step(
                 reason=binding.reason,
                 ingredient_position=binding.position,
                 approximate=approximate,
+                approximate_word=approximate_word,
+                quantity=expression.quantity,
             )
         )
-    return tuple(amounts), len(expressions)
+    return tuple(amounts), len(expressions), glass_required, work, False
 
 
 def _require_names(ingredients: object) -> list[str]:
@@ -3365,7 +3542,7 @@ def scan_step(
         raise TypeError("text must be a string")
     names = _require_names(ingredients)
     infos = _ingredient_infos(names)
-    amounts, total = _scan_step(
+    amounts, total, glass_required, _, _ = _scan_step(
         step_index, text, infos, MAX_SPANS_PER_STEP
     )
     return StepAmountScan(
@@ -3373,28 +3550,55 @@ def scan_step(
         text=text,
         amounts=amounts,
         omitted=total - len(amounts),
+        glass_required=glass_required,
     )
 
 
 def scan_recipe_steps(
-    steps: Sequence[str], ingredients: Sequence[object]
+    steps: Sequence[str],
+    ingredients: Sequence[object],
+    *,
+    max_mention_work: int | None = None,
 ) -> RecipeStepScan:
     """Scan every step of one recipe, in stored order.
 
     The per-step limit (32 spans) and the per-recipe limit (128 spans) are applied as a
     deterministic prefix in step and start order. An omitted span is counted; the stored
     step text is returned unchanged and is never truncated, rewritten or reduced.
+
+    ``max_mention_work`` is an optional per-recipe bound on ingredient mention matching,
+    in `_same_word`-class comparisons. It is a deterministic preflight upper bound
+    (`_mention_work`) that charges both the per-word head lookups and the nested
+    modifier comparisons, never a wall-clock cutoff: a step whose bound would exceed the
+    remaining budget is counted as omitted without any mention matching, and the budget
+    stays spent for the rest of the recipe. ``None`` (the default) preserves the unbounded
+    Stage B behaviour exactly.
+    The ``glass_required`` flag is evaluated over every expression regardless of the span
+    cap or this guard.
     """
+    if max_mention_work is not None and (
+        isinstance(max_mention_work, bool)
+        or not isinstance(max_mention_work, int)
+        or max_mention_work < 0
+    ):
+        raise TypeError("max_mention_work must be a non-negative integer or None")
     texts = _require_steps(steps)
     names = _require_names(ingredients)
     infos = _ingredient_infos(names)
     scanned: list[StepAmountScan] = []
     total = 0
     omitted_total = 0
+    remaining_work = max_mention_work
+    glass_required = False
     for index, text in enumerate(texts):
         remaining = max(0, MAX_SPANS_PER_RECIPE - total)
         limit = min(MAX_SPANS_PER_STEP, remaining)
-        amounts, count = _scan_step(index, text, infos, limit)
+        amounts, count, step_glass, work, degraded = _scan_step(
+            index, text, infos, limit, remaining_work
+        )
+        glass_required = glass_required or step_glass
+        if remaining_work is not None:
+            remaining_work = 0 if degraded else max(0, remaining_work - work)
         omitted = count - len(amounts)
         omitted_total += omitted
         total += len(amounts)
@@ -3404,9 +3608,12 @@ def scan_recipe_steps(
                 text=text,
                 amounts=amounts,
                 omitted=omitted,
+                glass_required=step_glass,
             )
         )
-    return RecipeStepScan(tuple(scanned), omitted=omitted_total)
+    return RecipeStepScan(
+        tuple(scanned), omitted=omitted_total, glass_required=glass_required
+    )
 
 
 __all__ = [

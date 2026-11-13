@@ -481,12 +481,17 @@ async def test_the_list_is_newest_first_without_text_and_the_detail_has_the_text
         assert (detail["kind"], detail["recipe_index"], detail["version"]) == ("text", -1, 1)
         assert detail["notes"] is None and detail["ingredients"] is None and detail["steps"] is None
         # A text favorite has no structured ingredients; the additive block is still there.
-        assert detail["measures"] == {
-            "target": {"glass_ml": 250, "teaspoon_ml": 5, "tablespoon_ml": 15},
-            "source_glass_ml": None,
-            "source_glass_required": False,
-            "ingredients": [],
+        block = detail["measures"]
+        assert block["schema_version"] == 2
+        assert block["favorite_version"] == detail["version"]
+        assert block["target"] == {
+            "glass_ml": 250, "teaspoon_ml": 5, "tablespoon_ml": 15,
         }
+        assert block["source_glass_ml"] is None
+        assert block["source_glass_required"] is False
+        assert block["steps_source_glass_required"] is False
+        assert block["ingredients"] == [] and block["steps"] == []
+        assert block["provenance"]["status"] == "complete"
 
 
 async def test_an_empty_list_is_an_empty_list(tmp_path):
