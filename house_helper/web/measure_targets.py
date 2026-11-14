@@ -45,22 +45,60 @@ What is presented:
   * a metric volume (mL or L) is offered as the person's glass only when the practical
     rounding gate passes; otherwise no hint is presented at all, and the original metric
     amount is left as it is;
-  * mass is not converted: B1 authorizes no ingredient coefficient, so grams and
-    kilograms are not turned into spoons or glasses;
+  * mass is not converted inside the B1.1 arrays: B1 authorizes no ingredient
+    coefficient there, so grams and kilograms produce no `ingredients` or `steps`
+    annotation;
   * an amount identical to its source presentation is not repeated;
   * when rounding changed the exact value the presentation is "rounded" (the page marks
     it as approximate); when a household amount has no practical rounded value the exact
     rational is presented instead ("exact"); nothing else is presented.
+
+KH-F01-B2-2 (`_mass_annotations`) adds independent ingredient-specific mass conversion
+under its own key, `measures.mass_conversions` (its own `schema_version: 1`). It never
+touches the released arrays: a quantified mass still yields no `ingredients` item and a
+linked mass span still carries the frozen `conversion: null` / `"mass"` omission. The
+engine (`core.ingredient_reference.convert_ingredient_mass`) is called with the stored
+name, the parsed amount and the same resolved personal target measures as B1.1, so the
+target capacities are the person's own and are never a source capacity. Only `APPROVED`
+registry records produce numbers; the shipped registry approves none, so a real reference
+reports its closed non-conversion reason until the owner activates it. The section is a
+separate failure domain: registry acquisition, a malformed item and a section-level
+failure are each confined to `mass_conversions` and never affect the released block. Each
+item is checked for cross-field consistency and JSON safety, then the assembled section --
+its schema version, revision, status, items and counters -- is validated and serialized
+as a whole before it leaves that boundary. Every unexpected B2 failure writes one
+diagnostic event (fixed stage, exception class, position, correlation id) and nothing from
+the recipe or the person; a failing logging handler is confined too. Nothing here writes,
+caches or calls a provider.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
+import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass
 from fractions import Fraction
 from typing import Any, Optional, Sequence, Union
 
+from house_helper.core.ingredient_reference import (
+    DEFAULT_REGISTRY,
+    MAX_INTERVAL_RELATIVE_WIDTH,
+    CountConversion,
+    CountDisplay,
+    Derivation,
+    MassBasis,
+    MassConversionReason,
+    MassConversionStatus,
+    MatchStatus,
+    ReferenceKind,
+    ReferenceRegistry,
+    VolumeConversion,
+    convert_ingredient_mass,
+    mass_grams,
+)
 from house_helper.core.measures import (
     ConversionResult,
     Dimension,
@@ -977,6 +1015,867 @@ def _analysis_block(
     }
 
 
+# --- KH-F01-B2-2: the ingredient-specific mass conversion extension --------------------
+#
+# A separate, independently versioned key of the same block. It adds no arithmetic and no
+# second parser: the accepted B2-1 gateway (`convert_ingredient_mass`) is asked once per
+# quantified mass ingredient, with the stored name, the released parser's quantity and the
+# person's resolved target measures, and this section only serializes the closed result.
+#
+# It is deliberately disjoint from `ingredients`, `steps`, `provenance` and `analysis`: the
+# released client is a closed validator of `ingredients`, so a count unit or a B2 status
+# there would make it reject the whole block, and a linked mass span's frozen
+# `conversion: null` / `"mass"` cannot be contradicted by a parallel number. The outer
+# `schema_version` stays 2 for the same reason: `versioned === 2` is an exact client check.
+
+MASS_CONVERSIONS_SCHEMA_VERSION = 1
+
+# The section's own outcome, mirroring the released `analysis.status` vocabulary. `failed`
+# means the section could not be built at all; `incomplete` means one or more items were
+# dropped (an unsafe rational, or an unexpected engine/serialization failure); no dropped
+# item is ever replaced by a guessed number.
+MASS_COMPLETE = "complete"
+MASS_INCOMPLETE = "incomplete"
+MASS_FAILED = "failed"
+
+MASS_KIND_VOLUME = "volume"
+MASS_KIND_COUNT = "count"
+
+# The fixed diagnostic stages of an unexpected B2 failure. These words, the exception's
+# class name, the ingredient position and a correlation id are the only things that ever
+# reach the log; nothing from the recipe, the person or the exception's own message does.
+MASS_STAGE_ITEM_CONVERSION = "mass_item_conversion"
+MASS_STAGE_ITEM_SERIALIZATION = "mass_item_serialization"
+MASS_STAGE_REGISTRY = "mass_registry_resolution"
+MASS_STAGE_SECTION = "mass_section"
+
+logger = logging.getLogger(__name__)
+
+# The closed vocabularies the engine can emit. A value outside one is a malformed result,
+# not something to pass through to a JSON encoder.
+_MASS_STATUSES = frozenset(member.value for member in MassConversionStatus)
+_MASS_REASONS = frozenset(member.value for member in MassConversionReason)
+# Every closed reason has exactly one status family; any other pair is a malformed result.
+_MASS_STATUS_BY_REASON = {
+    MassConversionReason.CONVERTED.value: MassConversionStatus.REFERENCE_APPROXIMATE.value,
+    MassConversionReason.SIZE_CLASS_REQUIRED.value: (
+        MassConversionStatus.CLARIFICATION_REQUIRED.value
+    ),
+    MassConversionReason.GENERIC_NAME.value: MassConversionStatus.AMBIGUOUS.value,
+    MassConversionReason.INGREDIENT_AMBIGUOUS.value: MassConversionStatus.AMBIGUOUS.value,
+    MassConversionReason.QUALIFIER_CONFLICT.value: MassConversionStatus.AMBIGUOUS.value,
+    MassConversionReason.REFERENCE_VARIANT_CONFLICT.value: MassConversionStatus.AMBIGUOUS.value,
+    MassConversionReason.UNSUPPORTED_QUALIFIER.value: MassConversionStatus.UNSUPPORTED.value,
+    MassConversionReason.INGREDIENT_NOT_RECOGNIZED.value: MassConversionStatus.UNSUPPORTED.value,
+    MassConversionReason.STATE_MISMATCH.value: MassConversionStatus.UNSUPPORTED.value,
+    MassConversionReason.ZERO_MASS.value: MassConversionStatus.UNSUPPORTED.value,
+    MassConversionReason.REFERENCE_MISSING.value: MassConversionStatus.UNSUPPORTED.value,
+    MassConversionReason.REFERENCE_NOT_APPROVED.value: MassConversionStatus.UNSUPPORTED.value,
+    MassConversionReason.ROUNDING_GATE_FAILED.value: MassConversionStatus.UNSUPPORTED.value,
+    MassConversionReason.INTERVAL_TOO_WIDE.value: MassConversionStatus.UNSUPPORTED.value,
+    MassConversionReason.BELOW_USEFUL_COUNT.value: MassConversionStatus.UNSUPPORTED.value,
+}
+_MATCH_STATUSES = frozenset(member.value for member in MatchStatus)
+_MASS_BASES = frozenset(member.value for member in MassBasis)
+_DERIVATIONS = frozenset(member.value for member in Derivation)
+_REFERENCE_KINDS = frozenset(member.value for member in ReferenceKind)
+_DISPLAYS = frozenset(member.value for member in CountDisplay)
+_VOLUME_TARGET_UNITS = frozenset(
+    (Unit.GLASS.value, Unit.TEASPOON.value, Unit.TABLESPOON.value)
+)
+
+# The exact key sets of the serialized item; an unexpected extra or missing key is a
+# malformed result and is dropped, never merged into a client payload.
+_MASS_ITEM_KEYS = frozenset(
+    {
+        "position",
+        "name",
+        "source",
+        "mass_g",
+        "ingredient",
+        "status",
+        "reason",
+        "conditional",
+        "assumption",
+        "conversion",
+    }
+)
+_INGREDIENT_KEYS = frozenset({"id", "display_name", "match"})
+_ASSUMPTION_KEYS = frozenset({"kind", "size_class", "weight_g", "mass_basis", "label_ru"})
+_VOLUME_CONVERSION_KEYS = frozenset(
+    {"kind", "target_unit", "exact", "rounded", "reference"}
+)
+_VOLUME_REFERENCE_KEYS = frozenset(
+    {"evidence_id", "derivation", "normalization", "method"}
+)
+_COUNT_CONVERSION_KEYS = frozenset(
+    {
+        "kind",
+        "piece",
+        "display",
+        "count_low",
+        "count_high",
+        "rounded_low",
+        "rounded_high",
+        "relative_width",
+        "reference",
+    }
+)
+_PIECE_KEYS = frozenset({"id", "size_class", "reference_kind"})
+_COUNT_REFERENCE_KEYS = frozenset({"evidence_id"})
+
+# The exact keys of the assembled section, and its own closed vocabularies. They are
+# checked again as a whole (R2-01), not only item by item, so no malformed metadata can
+# reach the HTTP encoder after the section was reported as built.
+_MASS_SECTION_KEYS = frozenset(
+    {"schema_version", "registry_revision", "status", "items", "omitted"}
+)
+_MASS_OMITTED_KEYS = frozenset({"unsafe_fraction", "malformed"})
+_MASS_SECTION_STATUSES = frozenset({MASS_COMPLETE, MASS_INCOMPLETE, MASS_FAILED})
+
+# The match state that must accompany each match-failure reason. A successful conversion
+# must have `matched`; a refusal whose reason came from the matcher must carry the state
+# the matcher reported (R2-02 A). Every other closed reason is reached after a successful
+# match, so it is not constrained here.
+_MATCH_BY_REFUSAL_REASON = {
+    MassConversionReason.GENERIC_NAME.value: MatchStatus.GENERIC.value,
+    MassConversionReason.INGREDIENT_AMBIGUOUS.value: MatchStatus.AMBIGUOUS.value,
+    MassConversionReason.QUALIFIER_CONFLICT.value: MatchStatus.QUALIFIER_CONFLICT.value,
+    MassConversionReason.UNSUPPORTED_QUALIFIER.value: MatchStatus.UNSUPPORTED_QUALIFIER.value,
+    MassConversionReason.INGREDIENT_NOT_RECOGNIZED.value: MatchStatus.UNRECOGNIZED.value,
+}
+
+
+@dataclass
+class _MassOmissions:
+    """The items this section dropped, by reason. Nothing is clamped or re-derived."""
+
+    unsafe_fraction: int = 0
+    malformed: int = 0
+
+
+class _MalformedMassResult(ValueError):
+    """A B2 result that is not self-consistent or not JSON-safe, so it is dropped.
+
+    The message is an internal code and is never logged: the diagnostic event carries only
+    this class's name, a fixed stage, the position and the correlation id.
+    """
+
+
+def _operation_correlation_id(value: Optional[str]) -> str:
+    """The request's correlation id when it is safe to log, else one local to this build.
+
+    The id is made once per block build, so every diagnostic of the same operation can be
+    associated. A value that is not a short ASCII token is not trusted as a log field: a
+    client-controlled or newline-bearing string could otherwise forge a log line. When no
+    usable id arrives, this makes a minimal local one -- no tracing infrastructure.
+    """
+    if (
+        isinstance(value, str)
+        and 1 <= len(value) <= 64
+        and all(
+            char.isascii() and (char.isalnum() or char in "-_") for char in value
+        )
+    ):
+        return value
+    return "mass-" + secrets.token_hex(8)
+
+
+def _log_mass_failure(
+    stage: str,
+    exc: BaseException,
+    correlation_id: str,
+    position: Optional[int] = None,
+) -> None:
+    """One diagnostic event for an unexpected B2 failure, and nothing more.
+
+    Only the fixed stage, the exception's class name, the ingredient position and the
+    correlation id are written. The exception is never formatted and `exc_info` is never
+    set, so no message, traceback, name, amount, profile field or credential can reach the
+    log. Expected conversion refusals are values, not exceptions, and never come here.
+
+    Logging is best effort (R2-03): a handler whose `emit` raises must not turn a confined
+    B2 failure into a request failure. The diagnostic is simply lost -- it is never
+    retried and never routed to a second logger -- and the caller keeps the `incomplete`
+    or `failed` section it was building. Only `Exception` is caught; a process-level
+    `BaseException` still propagates.
+    """
+    try:
+        logger.warning(
+            "Mass conversion failed: stage=%s exception=%s position=%s correlation_id=%s",
+            stage,
+            type(exc).__name__,
+            "none" if position is None else position,
+            correlation_id,
+        )
+    except Exception:
+        # The logging subsystem itself failed. There is nowhere safe to report that
+        # without risking the same failure again, so the event is dropped.
+        pass
+
+
+def _reference_registry() -> ReferenceRegistry:
+    """The registry revision production converts against.
+
+    One shipped revision is the only production source. The indirection exists so the
+    API-level tests can substitute an approved synthetic fixture without a second code
+    path: nothing in the application passes a registry of its own. It is called inside
+    the B2 failure boundary, so a broken registry cannot blank the released block.
+    """
+    return DEFAULT_REGISTRY
+
+
+def _ingredient_name(item: object) -> str:
+    """The stored name of an ingredient object or mapping.
+
+    The name is what B2 matches; it is serialized verbatim and never rewritten.
+    """
+    name = getattr(item, "name", None)
+    if isinstance(name, str):
+        return name
+    if isinstance(item, Mapping) and isinstance(item.get("name"), str):
+        return item["name"]
+    raise TypeError("every ingredient must carry a string name")
+
+
+def _exact_number(value: object) -> bool:
+    """An integer or an exact rational, never a bool, a float or a numeric string."""
+    return isinstance(value, (int, Fraction)) and not isinstance(value, bool)
+
+
+def _safe_mass_fraction(value: object) -> dict[str, int]:
+    """A B2 rational as two safe integers; anything not exact is malformed, not coerced."""
+    if not _exact_number(value):
+        raise _MalformedMassResult("not an exact number")
+    return _safe_fraction_json(value)
+
+
+def _safe_mass_rounded(value: object) -> Optional[dict[str, Any]]:
+    """A rounded amount, keeping the same exact-number rule as its members."""
+    if value is None:
+        return None
+    return {
+        **_safe_mass_fraction(getattr(value, "amount", None)),
+        "relative_error": _safe_mass_fraction(getattr(value, "relative_error", None)),
+    }
+
+
+def _is_safe_integer(value: object, *, minimum: int) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and minimum <= value <= SAFE_INTEGER_MAX
+    )
+
+
+def _is_fraction_json(value: object) -> bool:
+    """Exactly `{"numerator", "denominator"}`, both within the safe-integer range."""
+    return (
+        isinstance(value, dict)
+        and set(value) == {"numerator", "denominator"}
+        and _is_safe_integer(value["numerator"], minimum=0)
+        and _is_safe_integer(value["denominator"], minimum=1)
+    )
+
+
+def _is_rounded_json(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"numerator", "denominator", "relative_error"}
+        and _is_fraction_json(
+            {key: value[key] for key in ("numerator", "denominator")}
+        )
+        and _is_fraction_json(value["relative_error"])
+    )
+
+
+def _fraction_value(value: Mapping[str, int]) -> Fraction:
+    """The exact rational of a fraction JSON object already checked by `_is_fraction_json`."""
+    return Fraction(value["numerator"], value["denominator"])
+
+
+def _is_text(value: object, *, optional: bool = False) -> bool:
+    if value is None:
+        return optional
+    return isinstance(value, str)
+
+
+def _is_identifier(value: object, *, optional: bool = False) -> bool:
+    """A non-blank string identifier (or None when the schema allows it)."""
+    if value is None:
+        return optional
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _mass_assumption_json(assumption: Any) -> dict[str, Any]:
+    """The explicitly labelled size assumption behind a conditional estimate."""
+    return {
+        "kind": assumption.kind,
+        "size_class": assumption.size_class,
+        "weight_g": _safe_mass_fraction(assumption.weight_g),
+        "mass_basis": assumption.mass_basis.value,
+        "label_ru": assumption.label_ru,
+    }
+
+
+def _mass_conversion_json(conversion: Any, entry: Any) -> dict[str, Any]:
+    """One successful conversion: a volume count or a count of pieces.
+
+    Only a successful engine result reaches this function, so every field it reads is the
+    one the engine filled for a number. A shape neither branch recognizes is a programming
+    error and raises; the caller then drops the item instead of inventing a payload.
+    """
+    if isinstance(conversion, VolumeConversion):
+        return {
+            "kind": MASS_KIND_VOLUME,
+            "target_unit": conversion.target_unit.value,
+            "exact": _safe_mass_fraction(conversion.exact_count),
+            "rounded": _safe_mass_rounded(conversion.rounded),
+            # The registry revision travels on the section; the evidence identifier and the
+            # derivation that produced this number travel with it.
+            "reference": {
+                "evidence_id": conversion.evidence_id,
+                "derivation": conversion.derivation.value,
+                "normalization": conversion.normalization,
+                "method": conversion.method,
+            },
+        }
+    if isinstance(conversion, CountConversion):
+        return {
+            "kind": MASS_KIND_COUNT,
+            "piece": {
+                "id": None if entry is None else entry.piece_id,
+                "size_class": conversion.size_class,
+                "reference_kind": conversion.reference_kind.value,
+            },
+            "display": conversion.display.value,
+            "count_low": _safe_mass_fraction(conversion.count_low),
+            "count_high": _safe_mass_fraction(conversion.count_high),
+            "rounded_low": _safe_mass_fraction(conversion.rounded_low),
+            "rounded_high": _safe_mass_fraction(conversion.rounded_high),
+            "relative_width": _safe_mass_fraction(conversion.relative_width),
+            "reference": {"evidence_id": conversion.evidence_id},
+        }
+    raise TypeError(f"unknown mass conversion result: {type(conversion).__name__}")
+
+
+def _validate_mass_ingredient(item: dict[str, Any]) -> None:
+    ingredient = item["ingredient"]
+    if not isinstance(ingredient, dict) or set(ingredient) != _INGREDIENT_KEYS:
+        raise _MalformedMassResult("ingredient shape")
+    if not _is_identifier(ingredient["id"], optional=True):
+        raise _MalformedMassResult("ingredient id")
+    if not _is_text(ingredient["display_name"], optional=True):
+        raise _MalformedMassResult("ingredient display name")
+    if ingredient["match"] not in _MATCH_STATUSES:
+        raise _MalformedMassResult("match status")
+
+
+def _validate_mass_assumption(assumption: object) -> None:
+    """The assumption behind a conditional estimate (R2-02 E).
+
+    It must name a real size class, carry a positive exact reference weight and a
+    non-empty Russian label, and use one of the closed mass-basis values. The class is
+    cross-checked against the conversion's own piece by `_validate_mass_item`.
+    """
+    if not isinstance(assumption, dict) or set(assumption) != _ASSUMPTION_KEYS:
+        raise _MalformedMassResult("assumption shape")
+    if assumption["kind"] != "size_class":
+        raise _MalformedMassResult("assumption kind")
+    if not _is_identifier(assumption["size_class"]):
+        raise _MalformedMassResult("assumption size class")
+    if not _is_fraction_json(assumption["weight_g"]):
+        raise _MalformedMassResult("assumption weight")
+    if _fraction_value(assumption["weight_g"]) <= 0:
+        raise _MalformedMassResult("assumption weight is not positive")
+    if assumption["mass_basis"] not in _MASS_BASES:
+        raise _MalformedMassResult("assumption mass basis")
+    label = assumption["label_ru"]
+    if not isinstance(label, str) or not label.strip():
+        raise _MalformedMassResult("assumption label")
+    if not any(chr(0x0400) <= char <= chr(0x04FF) for char in label):
+        raise _MalformedMassResult("assumption label is not Russian")
+
+
+def _validate_volume_conversion(conversion: dict[str, Any]) -> None:
+    if set(conversion) != _VOLUME_CONVERSION_KEYS:
+        raise _MalformedMassResult("volume conversion shape")
+    if conversion["target_unit"] not in _VOLUME_TARGET_UNITS:
+        raise _MalformedMassResult("volume target unit")
+    if not _is_fraction_json(conversion["exact"]):
+        raise _MalformedMassResult("volume exact count")
+    if _fraction_value(conversion["exact"]) <= 0:
+        raise _MalformedMassResult("volume exact count is not positive")
+    rounded = conversion["rounded"]
+    if rounded is not None and not _is_rounded_json(rounded):
+        raise _MalformedMassResult("volume rounded count")
+    if rounded is not None and _fraction_value(
+        {key: rounded[key] for key in ("numerator", "denominator")}
+    ) <= 0:
+        raise _MalformedMassResult("volume rounded count is not positive")
+    reference = conversion["reference"]
+    if not isinstance(reference, dict) or set(reference) != _VOLUME_REFERENCE_KEYS:
+        raise _MalformedMassResult("volume reference shape")
+    if not _is_identifier(reference["evidence_id"]):
+        raise _MalformedMassResult("volume evidence id")
+    if reference["derivation"] not in _DERIVATIONS:
+        raise _MalformedMassResult("volume derivation")
+    for field in ("normalization", "method"):
+        if not _is_text(reference[field], optional=True):
+            raise _MalformedMassResult("volume reference text")
+
+
+def _validate_count_conversion(conversion: dict[str, Any]) -> None:
+    if set(conversion) != _COUNT_CONVERSION_KEYS:
+        raise _MalformedMassResult("count conversion shape")
+    piece = conversion["piece"]
+    if not isinstance(piece, dict) or set(piece) != _PIECE_KEYS:
+        raise _MalformedMassResult("piece shape")
+    if not _is_identifier(piece["id"], optional=True):
+        raise _MalformedMassResult("piece id")
+    if not _is_identifier(piece["size_class"], optional=True):
+        raise _MalformedMassResult("piece size class")
+    if piece["reference_kind"] not in _REFERENCE_KINDS:
+        raise _MalformedMassResult("piece reference kind")
+    if conversion["display"] not in _DISPLAYS:
+        raise _MalformedMassResult("count display")
+    for field in (
+        "count_low",
+        "count_high",
+        "rounded_low",
+        "rounded_high",
+        "relative_width",
+    ):
+        if not _is_fraction_json(conversion[field]):
+            raise _MalformedMassResult("count fraction")
+    reference = conversion["reference"]
+    if not isinstance(reference, dict) or set(reference) != _COUNT_REFERENCE_KEYS:
+        raise _MalformedMassResult("count reference shape")
+    if not _is_identifier(reference["evidence_id"]):
+        raise _MalformedMassResult("count evidence id")
+    # The presentation follows the rounded bounds: a single number is exactly the case
+    # where both bounds rounded to the same value, and an interval is exactly the rest.
+    single = conversion["display"] == CountDisplay.SINGLE.value
+    if single != (conversion["rounded_low"] == conversion["rounded_high"]):
+        raise _MalformedMassResult("count display and bounds disagree")
+
+    # Cross-field consistency (R2-02 D). The values are not recalculated; only what the
+    # engine guarantees about them is checked, using exact rationals.
+    low = _fraction_value(conversion["count_low"])
+    high = _fraction_value(conversion["count_high"])
+    rounded_low = _fraction_value(conversion["rounded_low"])
+    rounded_high = _fraction_value(conversion["rounded_high"])
+    width = _fraction_value(conversion["relative_width"])
+    if min(low, high, rounded_low, rounded_high) <= 0:
+        raise _MalformedMassResult("count is not positive")
+    if low > high:
+        raise _MalformedMassResult("count interval is reversed")
+    if rounded_low > rounded_high:
+        raise _MalformedMassResult("rounded interval is reversed")
+    if width < 0:
+        raise _MalformedMassResult("relative width is negative")
+    if (low == high) != (width == 0):
+        raise _MalformedMassResult("relative width and bounds disagree")
+    if high != low and width != (high - low) / ((high + low) / 2):
+        raise _MalformedMassResult("relative width is inconsistent")
+    kind = piece["reference_kind"]
+    if kind == ReferenceKind.POINT.value:
+        # A point reference is one weight: it can never present as a measured interval.
+        if low != high or rounded_low != rounded_high or width != 0:
+            raise _MalformedMassResult("a point reference carries an interval")
+        if not single:
+            raise _MalformedMassResult("a point reference is not a single count")
+    elif width > MAX_INTERVAL_RELATIVE_WIDTH:
+        raise _MalformedMassResult("an interval is wider than the accepted bound")
+    if kind == ReferenceKind.CALIBRATION_CLASS.value and not piece["size_class"]:
+        raise _MalformedMassResult("a calibration class has no size class")
+
+
+def _validate_mass_item(item: dict[str, Any]) -> None:
+    """Strict shape, status and cross-field consistency of one B2 item (R2-02).
+
+    A refusal is exactly a non-`converted` reason with `conversion: null`; a success is
+    exactly a `reference_approximate`/`converted` pair with a payload. Any other
+    combination is dropped, so no non-null conversion can travel with a refusal and no
+    successful status can travel without one.
+
+    Beyond the closed shape, the item must be internally believable: a success must name a
+    recognized ingredient (a non-blank identity and the `matched` state, never an
+    unrecognized or ambiguous one); a matcher refusal must carry the match state that
+    reason belongs to; a conditional estimate must be the count conversion it describes,
+    with the same size class in both places; and the zero-mass invariants must hold (a
+    success needs strictly positive source mass, and `zero_mass` is exactly a zero source
+    mass). Any contradiction drops the item rather than choosing which field to trust.
+    """
+    if set(item) != _MASS_ITEM_KEYS:
+        raise _MalformedMassResult("item shape")
+    if not _is_safe_integer(item["position"], minimum=0):
+        raise _MalformedMassResult("position")
+    if not isinstance(item["name"], str) or not isinstance(item["source"], str):
+        raise _MalformedMassResult("stored text")
+    if not _is_fraction_json(item["mass_g"]):
+        raise _MalformedMassResult("source mass")
+    _validate_mass_ingredient(item)
+    if item["status"] not in _MASS_STATUSES:
+        raise _MalformedMassResult("conversion status")
+    if item["reason"] not in _MASS_REASONS:
+        raise _MalformedMassResult("conversion reason")
+    if _MASS_STATUS_BY_REASON.get(item["reason"]) != item["status"]:
+        raise _MalformedMassResult("status and reason disagree")
+    converted = item["reason"] == MassConversionReason.CONVERTED.value
+    # Zero-mass invariants (KH-F01-B2-2-R3). `mass_g` is the parsed source mass: the
+    # serializer already refused any result whose `mass_g` drifted from the amount the
+    # parser read (R2-02 B), so these are exact `Fraction` comparisons on the source mass,
+    # never a float approximation. A number is believable only for a strictly positive
+    # mass, and `zero_mass` is meaningful only for an exactly zero mass; conversely an
+    # exactly zero mass can only be that refusal.
+    #
+    # The reverse implication is safe only because of the accepted B2-1 precedence: the
+    # gateway checks `mass == 0` and returns `ZERO_MASS` before it consults the match or
+    # any reference, so no other refusal (such as `reference_not_approved`) can be
+    # returned first for a zero mass. Rejecting a zero mass with a different reason
+    # therefore cannot drop a legitimate engine result.
+    source_mass = _fraction_value(item["mass_g"])
+    if converted and source_mass <= 0:
+        raise _MalformedMassResult("a success with a non-positive source mass")
+    if item["reason"] == MassConversionReason.ZERO_MASS.value:
+        if source_mass != 0:
+            raise _MalformedMassResult("a zero-mass reason with a non-zero source mass")
+    elif source_mass == 0:
+        raise _MalformedMassResult("a zero source mass without the zero-mass reason")
+    match = item["ingredient"]["match"]
+    if converted:
+        # A number is only believable for an ingredient the matcher actually recognized.
+        if match != MatchStatus.MATCHED.value:
+            raise _MalformedMassResult("a success with an unsuccessful match")
+        if not _is_identifier(item["ingredient"]["id"]):
+            raise _MalformedMassResult("a success without an ingredient identity")
+        if not _is_text(item["ingredient"]["display_name"]):
+            raise _MalformedMassResult("a success without a display name")
+    else:
+        expected_match = _MATCH_BY_REFUSAL_REASON.get(item["reason"])
+        if expected_match is not None and match != expected_match:
+            raise _MalformedMassResult("refusal reason and match disagree")
+    conversion = item["conversion"]
+    if converted != (conversion is not None):
+        raise _MalformedMassResult("a refusal cannot carry a conversion")
+    if not isinstance(item["conditional"], bool):
+        raise _MalformedMassResult("conditional flag")
+    assumption = item["assumption"]
+    if (assumption is not None) != item["conditional"]:
+        raise _MalformedMassResult("conditional and assumption disagree")
+    if conversion is not None:
+        if not isinstance(conversion, dict):
+            raise _MalformedMassResult("conversion shape")
+        if conversion.get("kind") == MASS_KIND_VOLUME:
+            _validate_volume_conversion(conversion)
+        elif conversion.get("kind") == MASS_KIND_COUNT:
+            _validate_count_conversion(conversion)
+        else:
+            raise _MalformedMassResult("unknown conversion kind")
+    if assumption is not None:
+        _validate_mass_assumption(assumption)
+        # An unconditional result cannot reach here (`conditional` and the assumption
+        # agree), so this is exactly the conditional case: it must describe its count.
+        if conversion is None or conversion.get("kind") != MASS_KIND_COUNT:
+            raise _MalformedMassResult("a conditional estimate is not a count")
+        piece = conversion["piece"]
+        if not piece["size_class"]:
+            raise _MalformedMassResult("a conditional estimate has no size class")
+        if piece["size_class"] != assumption["size_class"]:
+            raise _MalformedMassResult("assumption and piece size classes disagree")
+
+
+def _json_ready(value: Any, label: str) -> Any:
+    """Strict JSON encoding inside the B2 boundary.
+
+    `allow_nan=False` refuses a non-finite float, and encoding the result as UTF-8 refuses
+    a lone surrogate a later response encoder would choke on. Used for each item and,
+    independently, for the whole assembled section (R2-01). A failure is a malformed
+    result, never a 500 after the response has begun.
+    """
+    try:
+        json.dumps(value, allow_nan=False, ensure_ascii=False).encode("utf-8")
+    except (TypeError, ValueError):
+        raise _MalformedMassResult(label) from None
+    return value
+
+
+def _json_ready_mass_item(item: dict[str, Any]) -> dict[str, Any]:
+    """The final item gate: strict JSON encoding, so nothing reaches the encoder later."""
+    return _json_ready(item, "not JSON-safe")
+
+
+def _mass_item_json(
+    position: int, name: str, amount: str, conversion: Any, source_mass: Fraction
+) -> dict[str, Any]:
+    """One ingredient's B2 result, successful or refused, validated before it is emitted.
+
+    The verbatim stored name and amount travel with the outcome so a client can bind the
+    item to its line without trusting an index alone. `mass_g` is the parsed source mass
+    (an input, never a converted result); it is checked against the exact mass the parser
+    read from `amount` (R2-02 B), so a result whose serialized mass drifted from the stored
+    amount is dropped rather than presented. A nested conversion's own status and reason
+    must agree with the outer result (R2-02 C): the serializer never chooses which of two
+    contradictory fields to trust. A refusal carries `conversion: null` and no count,
+    volume or rounded value at all; `conversion` is non-null exactly when the engine's
+    closed reason is `converted`. An inconsistent or non-JSON-safe result raises
+    `_MalformedMassResult`, and the caller drops only that item.
+    """
+    entry = conversion.match.entry
+    successful = conversion.conversion is not None
+    if not _exact_number(conversion.mass_g) or Fraction(conversion.mass_g) != source_mass:
+        raise _MalformedMassResult("source mass disagrees with the stored amount")
+    if successful:
+        nested = conversion.conversion
+        if (
+            nested.status is not conversion.status
+            or nested.reason is not MassConversionReason.CONVERTED
+        ):
+            raise _MalformedMassResult("nested status and reason disagree")
+    item = {
+        "position": position,
+        "name": name,
+        "source": amount,
+        "mass_g": _safe_mass_fraction(conversion.mass_g),
+        "ingredient": {
+            "id": None if entry is None else entry.ingredient_id,
+            "display_name": None if entry is None else entry.display_name,
+            # What the name resolved to (matched, generic, ambiguous, unrecognized, ...).
+            "match": conversion.match.status.value,
+        },
+        "status": conversion.status.value,
+        "reason": conversion.reason.value,
+        "conditional": conversion.conditional,
+        "assumption": (
+            None
+            if conversion.assumption is None
+            else _mass_assumption_json(conversion.assumption)
+        ),
+        "conversion": (
+            None if not successful else _mass_conversion_json(conversion.conversion, entry)
+        ),
+    }
+    _validate_mass_item(item)
+    return _json_ready_mass_item(item)
+
+
+def _mass_annotations(
+    ingredients: Sequence[object],
+    target: MeasureVolumes,
+    registry: ReferenceRegistry,
+    omissions: _MassOmissions,
+    correlation_id: str,
+) -> list[dict[str, Any]]:
+    """One item per quantified mass ingredient, in stored order.
+
+    The released parser decides what a mass is: a range, a qualitative phrase, a volume, a
+    count or a package yields no item at all (the B1.1 arrays own those amounts), and no
+    midpoint or partial reading is salvaged from them. A quantified mass always yields one
+    item, even when nothing converts.
+
+    Failure boundary. Expected outcomes are values, not exceptions: the engine's closed
+    `status`/`reason` pair covers every refusal, and an exception means the item could not
+    be built -- an unsafe rational (`UnsafeFraction`) or an unexpected engine or
+    serialization failure. Neither is turned into a number: the item is dropped and
+    counted. The section status becomes `incomplete` when anything was dropped, so a
+    defect is visible in the payload instead of being concealed behind a plausible value.
+    A converter returning `None` for an amount the parser itself called a mass is such a
+    defect, not a non-mass outcome. Every unexpected failure emits one safe diagnostic
+    event; an expected refusal emits none.
+    """
+    items: list[dict[str, Any]] = []
+    for position, item in enumerate(ingredients):
+        try:
+            name = _ingredient_name(item)
+            amount = _ingredient_amount(item)
+            # The same parser configuration the released B1 path uses for the same stored
+            # text; there is no second parser and no re-interpretation of the amount.
+            quantity = parse_quantity(amount, allow_nonstandard_glass_sizes=True)
+            source_mass = mass_grams(quantity)
+            conversion = convert_ingredient_mass(
+                name, quantity, target=target, registry=registry
+            )
+        except Exception as exc:
+            omissions.malformed += 1
+            _log_mass_failure(MASS_STAGE_ITEM_CONVERSION, exc, correlation_id, position)
+            continue
+        if conversion is None:
+            if source_mass is not None:
+                # A quantified mass always has an outcome; `None` is a defect, and it is
+                # never presented as a complete section with nothing omitted.
+                omissions.malformed += 1
+                _log_mass_failure(
+                    MASS_STAGE_ITEM_CONVERSION,
+                    _MalformedMassResult("a quantified mass produced no result"),
+                    correlation_id,
+                    position,
+                )
+            continue  # not a quantified mass: the released volume behavior owns it
+        if source_mass is None:
+            # A result for an amount the parser did not read as a mass is a defect too:
+            # its `mass_g` could not be checked against the stored amount (R2-02 B).
+            omissions.malformed += 1
+            _log_mass_failure(
+                MASS_STAGE_ITEM_CONVERSION,
+                _MalformedMassResult("a non-mass produced a result"),
+                correlation_id,
+                position,
+            )
+            continue
+        try:
+            items.append(_mass_item_json(position, name, amount, conversion, source_mass))
+        except UnsafeFraction:
+            omissions.unsafe_fraction += 1
+        except Exception as exc:
+            omissions.malformed += 1
+            _log_mass_failure(
+                MASS_STAGE_ITEM_SERIALIZATION, exc, correlation_id, position
+            )
+    return items
+
+
+def _failed_mass_section(revision: Optional[str]) -> dict[str, Any]:
+    """An empty `failed` section; `registry_revision` is null when it was never obtained.
+
+    This is a fixed structure that uses no value from the recipe, the person or the
+    failing result, so building it cannot fail the way the thing it replaces did. It is
+    the one fallback, used both for acquisition failures and for a section that does not
+    pass the complete-section gate.
+    """
+    return {
+        "schema_version": MASS_CONVERSIONS_SCHEMA_VERSION,
+        "registry_revision": revision,
+        "status": MASS_FAILED,
+        "items": [],
+        "omitted": {"unsafe_fraction": 0, "malformed": 0},
+    }
+
+
+def _validate_registry_revision(revision: object) -> None:
+    """A revision the HTTP encoder can emit as UTF-8, or the acquisition has failed.
+
+    A lone surrogate is a `str` but cannot be encoded to UTF-8, so checking only the type
+    would let it through to the response encoder and turn a confined B2 failure into an
+    HTTP 500 (R2-01).
+    """
+    if not isinstance(revision, str) or not revision:
+        raise _MalformedMassResult("the registry revision must be a non-empty string")
+    try:
+        revision.encode("utf-8")
+    except UnicodeEncodeError:
+        raise _MalformedMassResult(
+            "the registry revision is not valid UTF-8"
+        ) from None
+
+
+def _validated_mass_section(section: dict[str, Any]) -> dict[str, Any]:
+    """The complete-section gate (R2-01), run inside the B2 failure boundary.
+
+    Every metadata field is checked, not only each item: the schema version is this
+    section's own, the revision is a non-empty UTF-8 string, the status is one of the
+    closed values, `items` is a list and `omitted` is exactly the two non-negative
+    counters. The counters must agree with the status (`complete` has none, `incomplete`
+    has at least one, `failed` has no items). Finally the whole section is serialized with
+    `allow_nan=False` and encoded as UTF-8, so nothing that a later response encoder would
+    reject can ever leave this boundary as a built section.
+    """
+    if set(section) != _MASS_SECTION_KEYS:
+        raise _MalformedMassResult("section shape")
+    version = section["schema_version"]
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or version != MASS_CONVERSIONS_SCHEMA_VERSION
+    ):
+        raise _MalformedMassResult("section schema version")
+    _validate_registry_revision(section["registry_revision"])
+    status = section["status"]
+    if status not in _MASS_SECTION_STATUSES:
+        raise _MalformedMassResult("section status")
+    items = section["items"]
+    if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+        raise _MalformedMassResult("section items")
+    # The items were validated one by one as they were built; checking them again here
+    # means the section claim is about what is actually in it, not about what a builder
+    # promised. An item that is not believable fails the section, never leaks through it.
+    for item in items:
+        _validate_mass_item(item)
+    omitted = section["omitted"]
+    if not isinstance(omitted, dict) or set(omitted) != _MASS_OMITTED_KEYS:
+        raise _MalformedMassResult("section omissions")
+    for name in _MASS_OMITTED_KEYS:
+        value = omitted[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise _MalformedMassResult("section omission counter")
+    total = omitted["unsafe_fraction"] + omitted["malformed"]
+    if status == MASS_FAILED:
+        if items or total:
+            raise _MalformedMassResult("a failed section carries items or omissions")
+    elif status == MASS_COMPLETE:
+        if total:
+            raise _MalformedMassResult("a complete section has omissions")
+    elif not total:
+        raise _MalformedMassResult("an incomplete section has no omissions")
+    _json_ready(section, "the section is not JSON-safe")
+    return section
+
+
+def _mass_conversions_block(
+    ingredients: Sequence[object],
+    target: MeasureVolumes,
+    registry: Optional[ReferenceRegistry],
+    correlation_id: str,
+) -> dict[str, Any]:
+    """The `measures.mass_conversions` extension, with its own failure domain.
+
+    The block is built here and nowhere else. Registry acquisition happens inside this
+    boundary, so a registry that cannot be resolved -- including one whose revision is not
+    a UTF-8 string -- yields an empty `failed` section with a null revision instead of
+    failing the released block. A section-level failure yields the same, keeping the
+    revision that was actually obtained (it was validated before use). The assembled
+    section is then checked as a whole and serialized strictly before it is returned
+    (R2-01); a section that fails that gate becomes the same fixed `failed` fallback, with
+    no revision reused from the failed metadata. Nothing here ever nulls `measures`,
+    changes the HTTP status or affects the released ingredient, step, provenance or
+    analysis data.
+    """
+    omissions = _MassOmissions()
+    try:
+        active = _reference_registry() if registry is None else registry
+        revision = active.revision
+        _validate_registry_revision(revision)
+    except Exception as exc:
+        _log_mass_failure(MASS_STAGE_REGISTRY, exc, correlation_id)
+        return _failed_mass_section(None)
+    try:
+        items = _mass_annotations(ingredients, target, active, omissions, correlation_id)
+    except Exception as exc:
+        _log_mass_failure(MASS_STAGE_SECTION, exc, correlation_id)
+        return _failed_mass_section(revision)
+    section = {
+        "schema_version": MASS_CONVERSIONS_SCHEMA_VERSION,
+        "registry_revision": revision,
+        "status": (
+            MASS_INCOMPLETE
+            if omissions.unsafe_fraction or omissions.malformed
+            else MASS_COMPLETE
+        ),
+        "items": items,
+        "omitted": {
+            "unsafe_fraction": omissions.unsafe_fraction,
+            "malformed": omissions.malformed,
+        },
+    }
+    try:
+        return _validated_mass_section(section)
+    except Exception as exc:
+        # The section could not be validated or serialized as a whole. Do not reuse any
+        # of its metadata (the revision included): the fixed fallback is known to be safe.
+        _log_mass_failure(MASS_STAGE_SECTION, exc, correlation_id)
+        return _failed_mass_section(None)
+
+
 def measure_block_v2(
     ingredients: Optional[Sequence[object]],
     steps: Optional[Sequence[str]],
@@ -984,15 +1883,25 @@ def measure_block_v2(
     *,
     source_glass_ml: Optional[Union[int, Fraction]] = None,
     favorite_version: int,
+    reference_registry: Optional[ReferenceRegistry] = None,
+    correlation_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """The additive `schema_version: 2` measures block of a favorite detail answer.
 
     Every released B1 field keeps its name and meaning; the new data is the per-term
-    `source_terms`, the step annotations, the provenance audit and the analysis summary.
+    `source_terms`, the step annotations, the provenance audit and the analysis summary,
+    plus the independently versioned `mass_conversions` extension (KH-F01-B2-2).
     `favorite_version` is the detail's top-level `version`, so a client can reject a stale
     answer. The block is read-only: nothing here writes, caches or calls a provider, and
     the three domains fail independently (a provenance failure leaves steps and
     ingredients intact, and a step failure leaves the other two intact).
+
+    `reference_registry` is a test seam only: production passes nothing, which is the one
+    shipped registry revision. `correlation_id` is the request's diagnostic id when the
+    caller has one; a safe value is reused for every B2 event of this build, and anything
+    else is replaced by a local id so no client text can reach the log. The outer
+    `schema_version` stays 2 -- the released client compares it exactly, and the new key
+    carries its own version.
 
     Step analysis is bounded by `MENTION_WORK_BUDGET`, a deterministic upper bound on the
     mention-matching comparisons of each step (head lookups plus the nested modifier
@@ -1014,6 +1923,10 @@ def measure_block_v2(
             isinstance(value, (str, bytes)) or not isinstance(value, Sequence)
         ):
             raise TypeError(f"{name} must be a sequence or None")
+    if reference_registry is not None and not isinstance(
+        reference_registry, ReferenceRegistry
+    ):
+        raise TypeError("reference_registry must be a ReferenceRegistry or None")
     items = tuple(ingredients or ())
     texts = tuple(steps or ())
     clarification = (
@@ -1041,6 +1954,7 @@ def measure_block_v2(
     analysis = _analysis_block(
         provenance["status"], steps_failed, spans_emitted, omissions
     )
+    operation_id = _operation_correlation_id(correlation_id)
     return {
         "schema_version": SCHEMA_VERSION,
         "favorite_version": favorite_version,
@@ -1056,6 +1970,11 @@ def measure_block_v2(
         "steps": step_payload,
         "provenance": provenance,
         "analysis": analysis,
+        # The B2 extension is computed last and confined to its own section, so it cannot
+        # change any released field above it. Registry acquisition happens inside it.
+        "mass_conversions": _mass_conversions_block(
+            items, target, reference_registry, operation_id
+        ),
     }
 
 
@@ -1064,6 +1983,10 @@ __all__ = [
     "CAPACITY_NOT_APPLICABLE",
     "CAPACITY_TEMPORARY_CLARIFICATION",
     "CAPACITY_UNRESOLVED",
+    "MASS_COMPLETE",
+    "MASS_CONVERSIONS_SCHEMA_VERSION",
+    "MASS_FAILED",
+    "MASS_INCOMPLETE",
     "PRESENTATION_EXACT",
     "PRESENTATION_NONE",
     "PRESENTATION_ROUNDED",

@@ -34,6 +34,15 @@ produce a new 4xx/5xx. The block is read-only: no conversion read writes to a fa
 recipe, ingredient or shopping list. The same block is in the PATCH answer, with no
 clarification parameter, recomputed at the new version.
 
+Ingredient-specific mass conversion (KH-F01-B2-2). The same block carries an independent
+`mass_conversions` extension (its own `schema_version: 1`): one item per quantified mass
+ingredient, with the stored name and amount verbatim, a closed status/reason, and -- only
+for an approved reference -- an approximate volume count or piece count with its evidence
+identifier and registry revision. The shipped registry approves no reference, so a real
+recipe reports non-conversion reasons and no number. The extension is a separate failure
+domain: it never alters `ingredients`, `steps`, `provenance`, `analysis` or the outer
+`schema_version` (still 2), and a failure inside it cannot null `measures`.
+
 Keeping an answer (POST). The body is {"conversation_id", "message_id"} and, optionally,
 "recipe_index" (0 to MAX_RECIPES_PER_REPLY - 1). Without it, the old behaviour is exactly
 preserved: the whole assistant answer is copied as text. With it, only that structured
@@ -220,6 +229,7 @@ def _measures_block(
     found: favorites.FavoriteDetail,
     *,
     source_glass_ml: Optional[int] = None,
+    correlation_id: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
     """The person's target measures applied to this favorite's ingredients and steps.
 
@@ -227,7 +237,8 @@ def _measures_block(
     the request). The block is bound to the detail's version so a client can reject a
     stale answer. A catastrophic conversion failure is confined to this block: the caller
     still serves the readable recipe, with `measures` null. Inside the block, provenance
-    and step failures are confined further and leave the ingredient hints intact.
+    and step failures are confined further and leave the ingredient hints intact. The
+    request's correlation id reaches the B2 diagnostics, if the caller has one.
     """
     profile = profile_store.get_profile(session, user_id)
     try:
@@ -244,6 +255,7 @@ def _measures_block(
             target,
             source_glass_ml=source_glass_ml,
             favorite_version=found.version,
+            correlation_id=correlation_id,
         )
     except Exception:
         # The recipe itself is still readable; only its conversion section is missing.
@@ -360,7 +372,12 @@ async def edit_favorite(
             changes=changes,
             now=now,
         )
-        return updated, _measures_block(session, current.user_id, updated)
+        return updated, _measures_block(
+            session,
+            current.user_id,
+            updated,
+            correlation_id=getattr(request.state, "correlation_id", None),
+        )
 
     try:
         updated, measures = await database.run(edited)
@@ -388,7 +405,11 @@ async def read_favorite(
     def detail(session):
         found = favorites.get_favorite(session, current.user_id, wanted)
         return found, _measures_block(
-            session, current.user_id, found, source_glass_ml=source_glass_ml
+            session,
+            current.user_id,
+            found,
+            source_glass_ml=source_glass_ml,
+            correlation_id=getattr(request.state, "correlation_id", None),
         )
 
     try:

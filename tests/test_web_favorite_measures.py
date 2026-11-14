@@ -423,6 +423,7 @@ async def test_the_detail_carries_the_complete_typed_block_and_keeps_the_b1_fiel
         "steps",
         "provenance",
         "analysis",
+        "mass_conversions",
     }
     assert block["schema_version"] == 2
     assert block["favorite_version"] == body["version"] == 1

@@ -8206,6 +8206,93 @@ scenario("a_block_without_step_data_draws_no_step_hints_and_keeps_the_ingredient
   assert.equal(current.measures.ingredients.length, 1);
 });
 
+// KH-F01-B2-2: the additive `mass_conversions` extension of the same schema_version 2 block.
+// The released normalizer reads the fields it knows and never enumerates the block's keys, so
+// the extension is ignored here: no mass hint is drawn (that is B2-3), nothing inside it can
+// replace a released hint, and a malformed extension cannot make the block unusable.
+const MASS_CONVERSIONS = {
+  schema_version: 1,
+  registry_revision: "2026-11-13.4",
+  status: "complete",
+  items: [
+    {
+      position: 0,
+      name: "соль",
+      source: "300 г",
+      mass_g: { numerator: 300, denominator: 1 },
+      ingredient: { id: null, display_name: null, match: "generic" },
+      status: "ambiguous",
+      reason: "generic_name",
+      conditional: false,
+      assumption: null,
+      conversion: null,
+    },
+  ],
+  omitted: { unsafe_fraction: 0, malformed: 0 },
+};
+
+function convertedGlassIngredient() {
+  return {
+    position: 0,
+    source: "1 стакан 200 мл",
+    source_kind: "household",
+    target_unit: "glass",
+    status: "nominal_household",
+    reason: "converted",
+    exact: { numerator: 4, denominator: 5 },
+    rounded: null,
+    identical: false,
+    presentation: "exact",
+  };
+}
+
+scenario("the_mass_conversions_extension_is_ignored_and_never_unsettles_the_released_block", async () => {
+  const ingredients = [convertedGlassIngredient()];
+  const plain = await withSteppedFavorite(H.stepBlock(3, [], { ingredients }));
+  const extended = await withSteppedFavorite(
+    H.stepBlock(3, [], { ingredients, mass_conversions: MASS_CONVERSIONS })
+  );
+  const withoutExtension = plain.env.view().favorites.current;
+  const withExtension = extended.env.view().favorites.current;
+
+  // The released view is the same, field for field: the extension changes nothing in B1.1.
+  assert.equal(withoutExtension.status, "ready");
+  assert.deepEqual(withExtension.measures, withoutExtension.measures);
+  assert.deepEqual(withExtension.measures.ingredients[0].exact, {
+    numerator: 4,
+    denominator: 5,
+  });
+
+  // A malformed extension is equally harmless: the closed validator never reads it.
+  for (const malformed of [
+    "not an object",
+    [],
+    { schema_version: 1, items: "not a list" },
+    {
+      ...MASS_CONVERSIONS,
+      items: [
+        {
+          ...MASS_CONVERSIONS.items[0],
+          mass_g: { numerator: 1.5, denominator: 1 },
+          status: "an unknown status",
+        },
+      ],
+    },
+  ]) {
+    const { env } = await withSteppedFavorite(
+      H.stepBlock(3, [], { ingredients, mass_conversions: malformed })
+    );
+    const current = env.view().favorites.current;
+    assert.equal(current.status, "ready", JSON.stringify(malformed));
+    assert.notEqual(current.measures, null, JSON.stringify(malformed));
+    assert.deepEqual(
+      current.measures.ingredients,
+      withoutExtension.measures.ingredients,
+      JSON.stringify(malformed)
+    );
+  }
+});
+
 scenario("a_step_pass_that_failed_is_reported_and_the_valid_ingredient_hints_stay", async () => {
   const { env } = await withSteppedFavorite(
     H.stepBlock(3, [], {

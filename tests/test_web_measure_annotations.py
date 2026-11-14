@@ -80,6 +80,7 @@ def test_the_block_carries_every_frozen_v2_field_and_keeps_the_b1_fields():
         "steps",
         "provenance",
         "analysis",
+        "mass_conversions",
     }
     assert result["schema_version"] == 2
     assert result["favorite_version"] == 4
