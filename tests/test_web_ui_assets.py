@@ -355,6 +355,15 @@ def test_the_shopping_pane_scrolls_inside_the_window_and_long_names_wrap():
     assert tab_rules[0]["flex"] == "1"
 
 
+def test_a_mass_estimate_wraps_under_its_ingredient_at_every_width():
+    rules = _merged_rules()
+
+    # KH-F01-B2: the hint is drawn in the released B1.1 hint style, and a long conditional
+    # assumption label wraps inside the ingredient line instead of widening the column.
+    assert ".measure-hint" in rules
+    assert rules[".recipe-mass-hint"]["overflow-wrap"] == "anywhere"
+
+
 def test_the_side_column_keeps_its_top_and_its_foot_and_scrolls_the_list_between_them():
     rules = _merged_rules()
 

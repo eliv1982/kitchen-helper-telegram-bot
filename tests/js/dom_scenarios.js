@@ -6927,4 +6927,461 @@ scenario("reopening_the_same_favorite_from_the_list_asks_without_the_old_capacit
   assert.ok(page.el("recipe-body").textContent.includes(Logic.TEXT.sourceGlassQuestion));
 });
 
+// ============================================================================================
+// KH-F01-B2-3: ingredient-specific mass estimates on the saved card
+// ============================================================================================
+//
+// The payloads here are synthetic fixtures of the accepted B2-2 shape. The shipped registry
+// approves no record, so a real recipe may legitimately show no mass hint at all; nothing
+// below is a real coefficient.
+
+const MASS_INGREDIENTS = [
+  { name: "мука", amount: "125 г" },
+  { name: "сахар", amount: "200 г" },
+  { name: "соль", amount: "5 г" },
+  { name: "масло", amount: "30 г" },
+];
+
+function massVolumeItem(position, rounded, conversionExtra = {}, extra = {}) {
+  return {
+    position,
+    name: MASS_INGREDIENTS[position].name,
+    source: MASS_INGREDIENTS[position].amount,
+    mass_g: { numerator: 1, denominator: 1 },
+    ingredient: { id: "test_ingredient", display_name: "тестовый ингредиент", match: "matched" },
+    status: "reference_approximate",
+    reason: "converted",
+    conditional: false,
+    assumption: null,
+    conversion: {
+      kind: "volume",
+      target_unit: "glass",
+      exact: { numerator: 1, denominator: 1 },
+      rounded: {
+        numerator: rounded.numerator,
+        denominator: rounded.denominator,
+        relative_error: { numerator: 0, denominator: 1 },
+      },
+      reference: {
+        evidence_id: "fixture.test",
+        derivation: "direct_target",
+        normalization: null,
+        method: null,
+      },
+      ...conversionExtra,
+    },
+    ...extra,
+  };
+}
+
+function massCountItem(position, conversion = {}, extra = {}) {
+  return {
+    position,
+    name: MASS_INGREDIENTS[position].name,
+    source: MASS_INGREDIENTS[position].amount,
+    mass_g: { numerator: 1, denominator: 1 },
+    ingredient: { id: "test_ingredient", display_name: "тестовый ингредиент", match: "matched" },
+    status: "reference_approximate",
+    reason: "converted",
+    conditional: false,
+    assumption: null,
+    conversion: {
+      kind: "count",
+      piece: { id: "test_piece", size_class: null, reference_kind: "point" },
+      display: "single",
+      count_low: { numerator: 3, denominator: 1 },
+      count_high: { numerator: 3, denominator: 1 },
+      rounded_low: { numerator: 3, denominator: 1 },
+      rounded_high: { numerator: 3, denominator: 1 },
+      relative_width: { numerator: 0, denominator: 1 },
+      reference: { evidence_id: "fixture.test" },
+      ...conversion,
+    },
+    ...extra,
+  };
+}
+
+function massSection(items, extra = {}) {
+  return {
+    schema_version: 1,
+    registry_revision: "2026-11-14.test",
+    status: "complete",
+    items,
+    omitted: { unsafe_fraction: 0, malformed: 0 },
+    ...extra,
+  };
+}
+
+function massCard(blockOrNull, b1 = [], ingredients = MASS_INGREDIENTS) {
+  const block =
+    blockOrNull === null
+      ? H.stepBlock(3, [], { ingredients: b1 })
+      : H.stepBlock(3, [], { ingredients: b1, mass_conversions: blockOrNull });
+  return structuredFavoriteItem({ ingredients, measures: block });
+}
+
+async function openMassCard(blockOrNull, b1 = [], ingredients = MASS_INGREDIENTS) {
+  const page = await open(
+    (env) => {
+      env.signedIn([conversation(CONV_A, 0)], { [CONV_A]: historyBody(CONV_A, structuredThread()) });
+      const item = massCard(blockOrNull, b1, ingredients);
+      env.net.route("GET", "/api/favorites", H.favoritesBody([item]));
+      env.net.route("GET", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(item, "Борщ"));
+    },
+    { structured: true }
+  );
+  await openCard(page);
+  return page;
+}
+
+const massLines = (page) => page.el("recipe-body").byClass("recipe-list")[0].byTag("li");
+const massHints = (page) => page.el("recipe-body").byClass("recipe-mass-hint");
+
+scenario("a_mass_volume_estimate_is_drawn_under_its_own_ingredient_and_the_amount_is_unchanged", async () => {
+  const page = await openMassCard(massSection([massVolumeItem(1, { numerator: 1, denominator: 1 })]));
+  const lines = massLines(page);
+
+  // The estimate belongs to the second line; the first line is untouched.
+  assert.equal(lines[0].byClass("recipe-mass-hint").length, 0);
+  assert.equal(lines[1].byClass("recipe-mass-hint").length, 1);
+  assert.equal(lines[1].byClass("recipe-ingredient")[0].textContent, "сахар — 200 г");
+  const hint = massHints(page)[0];
+  assert.equal(hint.textContent, "≈ 1 стакан");
+  // The approximation is said in words, not by colour alone, and the caption groups it with
+  // the person's own measures.
+  assert.ok(hint.textContent.includes("≈"));
+  assert.equal(page.el("recipe-body").byClass("measure-caption")[0].textContent, Logic.TEXT.measuresTitle);
+});
+
+scenario("whole_fractional_and_mixed_measures_read_as_russian_kitchen_fractions", async () => {
+  const page = await openMassCard(
+    massSection([
+      massVolumeItem(0, { numerator: 1, denominator: 4 }),
+      massVolumeItem(1, { numerator: 3, denominator: 2 }),
+      massVolumeItem(2, { numerator: 5, denominator: 1 }),
+      massVolumeItem(3, { numerator: 1, denominator: 3 }, { target_unit: "teaspoon" }),
+    ])
+  );
+  const texts = massHints(page).map((hint) => hint.textContent);
+  assert.deepEqual(texts, [
+    "≈ ¼ стакана",
+    "≈ 1½ стакана",
+    "≈ 5 стаканов",
+    "≈ ⅓ чайной ложки",
+  ]);
+});
+
+scenario("a_point_count_and_a_genuine_interval_are_drawn_apart", async () => {
+  const page = await openMassCard(
+    massSection([
+      massCountItem(0),
+      massCountItem(1, {
+        piece: { id: "test_piece", size_class: "medium", reference_kind: "measured_interval" },
+        display: "interval",
+        count_low: { numerator: 50, denominator: 17 },
+        count_high: { numerator: 10, denominator: 3 },
+        rounded_low: { numerator: 3, denominator: 1 },
+        rounded_high: { numerator: 7, denominator: 2 },
+        relative_width: { numerator: 1, denominator: 8 },
+      }),
+    ])
+  );
+  const texts = massHints(page).map((hint) => hint.textContent);
+  assert.deepEqual(texts, ["≈ 3 шт.", "≈ 3–3½ шт."]);
+});
+
+scenario("a_conditional_estimate_states_its_assumption_beside_the_number", async () => {
+  const page = await openMassCard(
+    massSection([
+      massCountItem(
+        0,
+        {
+          piece: { id: "test_piece", size_class: "medium", reference_kind: "calibration_class" },
+          display: "single",
+          count_low: { numerator: 50, denominator: 17 },
+          count_high: { numerator: 25, denominator: 8 },
+          relative_width: { numerator: 2, denominator: 33 },
+        },
+        {
+          conditional: true,
+          assumption: {
+            kind: "size_class",
+            size_class: "medium",
+            weight_g: { numerator: 160, denominator: 1 },
+            mass_basis: "edible_portion",
+            label_ru: "если клубни средние",
+          },
+        }
+      ),
+    ])
+  );
+  const hint = massHints(page)[0];
+  assert.equal(hint.textContent, "≈ 3 шт., если клубни средние");
+  // The assumption is visible text, not a tooltip or an attribute only.
+  assert.equal(hint.getAttribute("title"), null);
+  assert.ok(hint.textContent.includes("если клубни средние"));
+});
+
+scenario("a_refused_conversion_draws_no_number_and_the_original_amount_stays", async () => {
+  const page = await openMassCard(
+    massSection([
+      massVolumeItem(
+        1,
+        { numerator: 1, denominator: 1 },
+        {},
+        {
+          status: "unsupported",
+          reason: "reference_not_approved",
+          ingredient: { id: null, display_name: null, match: "matched" },
+          conversion: null,
+        }
+      ),
+    ])
+  );
+  const lines = massLines(page);
+
+  assert.equal(massHints(page).length, 0);
+  assert.equal(lines[1].byClass("recipe-ingredient")[0].textContent, "сахар — 200 г");
+  assert.equal(lines[1].textContent, "сахар — 200 г", "no number and no technical reason");
+  assert.equal(page.el("recipe-body").textContent.includes("reference_not_approved"), false);
+  assert.equal(page.el("recipe-body").byClass("measure-caption").length, 0);
+});
+
+scenario("a_missing_or_malformed_mass_extension_draws_no_number_and_keeps_b1_1", async () => {
+  const b1 = [ingredientConversion(0, "125 г", [metricTerm], { source_kind: "metric_volume" })];
+  const malformed = [
+    null,
+    { schema_version: 2, status: "complete", items: [], omitted: { unsafe_fraction: 0, malformed: 0 } },
+    { schema_version: 1, status: "complete", items: "not a list" },
+    massSection([
+      massVolumeItem(0, { numerator: 1, denominator: 1 }, {
+        rounded: { numerator: 1.5, denominator: 1, relative_error: { numerator: 0, denominator: 1 } },
+      }),
+    ]),
+    massSection([massVolumeItem(0, { numerator: 1, denominator: 1 })], { status: "failed" }),
+  ];
+  for (const block of malformed) {
+    const page = await openMassCard(block, b1);
+    assert.equal(massHints(page).length, 0, JSON.stringify(block));
+    // B1.1 is exactly as it was: one hint, drawn from its own section.
+    assert.equal(page.el("recipe-body").byClass("measure-hint").length, 1, JSON.stringify(block));
+    assert.ok(page.el("recipe-body").textContent.includes("½ вашего стакана"), JSON.stringify(block));
+  }
+});
+
+scenario("a_mass_estimate_never_duplicates_a_b1_1_hint_for_the_same_line", async () => {
+  const b1 = [ingredientConversion(0, "125 г", [metricTerm], { source_kind: "metric_volume" })];
+  const page = await openMassCard(
+    massSection([massVolumeItem(0, { numerator: 1, denominator: 1 })]),
+    b1
+  );
+
+  assert.equal(page.el("recipe-body").byClass("measure-hint").length, 1);
+  assert.equal(massHints(page).length, 0);
+  assert.ok(page.el("recipe-body").textContent.includes("½ вашего стакана"));
+});
+
+scenario("a_long_ingredient_name_and_a_long_assumption_are_kept_whole_and_wrap", async () => {
+  const label = "если используются клубни указанного в рецепте размера";
+  const longName = "мука пшеничная цельнозерновая крупного помола высшего сорта";
+  const item = massCountItem(
+    0,
+    {
+      piece: { id: "test_piece", size_class: "large", reference_kind: "calibration_class" },
+      display: "single",
+      count_low: { numerator: 50, denominator: 17 },
+      count_high: { numerator: 25, denominator: 8 },
+      relative_width: { numerator: 2, denominator: 33 },
+    },
+    {
+      name: longName,
+      conditional: true,
+      assumption: {
+        kind: "size_class",
+        size_class: "large",
+        weight_g: { numerator: 160, denominator: 1 },
+        mass_basis: "edible_portion",
+        label_ru: label,
+      },
+    }
+  );
+  const page = await openMassCard(massSection([item]), [], [{ name: longName, amount: "125 г" }]);
+  const line = massLines(page)[0];
+  const hint = massHints(page)[0];
+
+  // Neither the ingredient nor the assumption is shortened in the drawn text; the wrap is
+  // the style's job (.recipe-mass-hint), and this mini DOM has no layout.
+  assert.equal(line.byClass("recipe-ingredient")[0].textContent, longName + " — 125 г");
+  assert.equal(hint.textContent, "≈ 3 шт., " + label);
+  assert.equal(hint.getAttribute("title"), null, "nothing is hidden in a tooltip");
+});
+
+// --- KH-F01-B2-3-R1: exact interval order, ingredient/version binding, zero mass ------------
+
+scenario("a_real_mass_count_interval_is_drawn_as_one_and_a_half_to_one_and_three_quarters", async () => {
+  // The accepted B2-2 shape: 250 g at 150-160 g per piece is 25/16..5/3 exact, rounded to
+  // 3/2..7/4. Before the comparison fix the page dropped this interval instead of drawing it.
+  const ingredients = [{ name: "тестовый корень", amount: "250 г" }];
+  const item = massCountItem(
+    0,
+    {
+      piece: { id: "test_root_piece", size_class: null, reference_kind: "measured_interval" },
+      display: "interval",
+      count_low: { numerator: 25, denominator: 16 },
+      count_high: { numerator: 5, denominator: 3 },
+      rounded_low: { numerator: 3, denominator: 2 },
+      rounded_high: { numerator: 7, denominator: 4 },
+      relative_width: { numerator: 1, denominator: 12 },
+    },
+    { name: "тестовый корень", source: "250 г", mass_g: { numerator: 250, denominator: 1 } }
+  );
+  const page = await openMassCard(massSection([item]), [], ingredients);
+
+  assert.equal(massHints(page).length, 1);
+  assert.equal(massHints(page)[0].textContent, "≈ 1½–1¾ шт.");
+  assert.equal(massLines(page)[0].byClass("recipe-ingredient")[0].textContent, "тестовый корень — 250 г");
+});
+
+scenario("a_mass_hint_written_for_another_ingredient_or_amount_is_not_drawn", async () => {
+  // The right position, but another ingredient's name: no hint on this line.
+  const wrongName = massVolumeItem(0, { numerator: 1, denominator: 1 }, {}, { name: "сахар", source: "200 г" });
+  let page = await openMassCard(massSection([wrongName]));
+  assert.equal(massHints(page).length, 0);
+  assert.equal(massLines(page)[0].textContent, "мука — 125 г", "the stored line is untouched");
+
+  // The right name, but another amount: no hint either.
+  const wrongAmount = massVolumeItem(0, { numerator: 1, denominator: 1 }, {}, { source: "200 г" });
+  page = await openMassCard(massSection([wrongAmount]));
+  assert.equal(massHints(page).length, 0);
+
+  // A wrong item costs only its own line: the genuine sibling is drawn, and B1.1 keeps its
+  // own hint on the line it already spoke for.
+  const b1 = [ingredientConversion(0, "125 г", [metricTerm], { source_kind: "metric_volume" })];
+  const mixed = await openMassCard(
+    massSection([
+      massVolumeItem(0, { numerator: 1, denominator: 1 }, {}, { name: "сахар" }),
+      massVolumeItem(1, { numerator: 1, denominator: 1 }),
+    ]),
+    b1
+  );
+  assert.equal(massHints(mixed).length, 1);
+  assert.equal(massLines(mixed)[0].byClass("recipe-mass-hint").length, 0);
+  assert.equal(massLines(mixed)[1].byClass("recipe-mass-hint")[0].textContent, "≈ 1 стакан");
+  assert.ok(mixed.el("recipe-body").textContent.includes("½ вашего стакана"), "B1.1 untouched");
+});
+
+scenario("a_mass_extension_bound_to_another_version_draws_no_hint_in_the_page", async () => {
+  const page = await open(
+    (env) => {
+      env.signedIn([conversation(CONV_A, 0)], { [CONV_A]: historyBody(CONV_A, structuredThread()) });
+      // The card is version 3; this block says it was built for version 2.
+      const block = H.stepBlock(2, [], {
+        ingredients: [],
+        mass_conversions: massSection([massVolumeItem(1, { numerator: 1, denominator: 1 })]),
+      });
+      const item = structuredFavoriteItem({ ingredients: MASS_INGREDIENTS, measures: block });
+      env.net.route("GET", "/api/favorites", H.favoritesBody([item]));
+      env.net.route("GET", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(item, "Борщ"));
+    },
+    { structured: true }
+  );
+  await openCard(page);
+
+  assert.equal(massHints(page).length, 0);
+  assert.equal(massLines(page)[1].textContent, "сахар — 200 г");
+});
+
+// KH-F01-B2-3-R2: the real detail normalization and rendering path, with an arbitrary
+// original top-level `version` on the favorite (`undefined` omits the key entirely).
+async function openMassCardWithOriginalVersion(version, block, ingredients = MASS_INGREDIENTS) {
+  const page = await open(
+    (env) => {
+      env.signedIn([conversation(CONV_A, 0)], { [CONV_A]: historyBody(CONV_A, structuredThread()) });
+      const item = structuredFavoriteItem({ ingredients, measures: block });
+      if (version === undefined) {
+        delete item.version;
+      } else {
+        item.version = version;
+      }
+      env.net.route("GET", "/api/favorites", H.favoritesBody([item]));
+      env.net.route("GET", `/api/favorites/${H.FAV_1}`, H.favoriteDetail(item, "Борщ"));
+    },
+    { structured: true }
+  );
+  await openCard(page);
+  return page;
+}
+
+scenario("a_mass_hint_without_a_valid_original_version_is_not_drawn_in_the_page", async () => {
+  // The block names version 1 -- the released fallback -- for a detail whose own version is
+  // missing or invalid. It also carries a released B1.1 hint that must stay drawn.
+  const block = H.stepBlock(1, [], {
+    ingredients: [ingredientConversion(0, "125 г", [metricTerm], { source_kind: "metric_volume" })],
+    mass_conversions: massSection([massVolumeItem(1, { numerator: 1, denominator: 1 })]),
+  });
+
+  for (const [label, version] of [
+    ["missing", undefined],
+    ["null", null],
+    ["string", "1"],
+    ["zero", 0],
+    ["negative", -1],
+    ["fractional", 1.5],
+    ["unsafe", Number.MAX_SAFE_INTEGER + 2],
+    ["boolean", true],
+  ]) {
+    const page = await openMassCardWithOriginalVersion(version, block);
+    assert.equal(massHints(page).length, 0, label);
+    assert.equal(massLines(page)[1].textContent, "сахар — 200 г", label + ": stored line");
+    // The first line's stored text, beside its own released B1.1 hint.
+    assert.equal(
+      massLines(page)[0].byClass("recipe-ingredient")[0].textContent,
+      "мука — 125 г",
+      label + ": first line"
+    );
+    // B1.1 is exactly as it was: its own hint is still there, from its own section.
+    assert.equal(page.el("recipe-body").byClass("measure-hint").length, 1, label);
+    assert.ok(page.el("recipe-body").textContent.includes("½ вашего стакана"), label);
+  }
+
+  // A valid original version still draws the mass hint beside the untouched B1.1 line.
+  const valid = await openMassCardWithOriginalVersion(1, block);
+  assert.equal(massHints(valid).length, 1);
+  assert.equal(massHints(valid)[0].textContent, "≈ 1 стакан");
+  assert.equal(massLines(valid)[1].byClass("recipe-ingredient")[0].textContent, "сахар — 200 г");
+  assert.equal(massLines(valid)[1].byClass("recipe-mass-hint")[0].textContent, "≈ 1 стакан");
+  assert.equal(massLines(valid)[0].byClass("recipe-mass-hint").length, 0);
+  // The line's released B1.1 hint is still there, beside the B2 number.
+  assert.equal(massLines(valid)[0].byClass("measure-hint").length, 1, "B1.1 untouched");
+  assert.ok(
+    massLines(valid)[0].byClass("measure-hint")[0].textContent.includes("½ вашего стакана"),
+    "B1.1 untouched"
+  );
+});
+
+scenario("a_zero_mass_estimate_draws_no_number_and_a_valid_sibling_stays", async () => {
+  const page = await openMassCard(
+    massSection([
+      massVolumeItem(1, { numerator: 1, denominator: 1 }, {}, { mass_g: { numerator: 0, denominator: 1 } }),
+      massVolumeItem(0, { numerator: 1, denominator: 1 }),
+    ])
+  );
+
+  assert.equal(massHints(page).length, 1);
+  assert.equal(massHints(page)[0].textContent, "≈ 1 стакан");
+  assert.equal(massLines(page)[1].byClass("recipe-mass-hint").length, 0);
+  assert.equal(massLines(page)[1].textContent, "сахар — 200 г");
+});
+
+scenario("reopening_the_card_draws_the_mass_hint_once", async () => {
+  const page = await openMassCard(massSection([massVolumeItem(1, { numerator: 1, denominator: 1 })]));
+  assert.equal(massHints(page).length, 1);
+
+  // The same favorite, opened again from the list: the card is replaced, not appended to.
+  page.el("favorite-list").byTag("button")[0].click();
+  await page.settle();
+  await page.settle();
+  assert.equal(massHints(page).length, 1);
+});
+
 module.exports = { scenarios, useShell, useNoLoginShell };

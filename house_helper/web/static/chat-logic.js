@@ -412,6 +412,27 @@
       many: "ваших столовых ложек",
       fraction: "вашей столовой ложки",
     },
+    // KH-F01-B2: an ingredient-specific mass estimate names the unit itself, not "your"
+    // measure: it is the unit the server selected from the person's capacities.
+    massUnitGlass: {
+      one: "стакан",
+      few: "стакана",
+      many: "стаканов",
+      fraction: "стакана",
+    },
+    massUnitTeaspoon: {
+      one: "чайная ложка",
+      few: "чайные ложки",
+      many: "чайных ложек",
+      fraction: "чайной ложки",
+    },
+    massUnitTablespoon: {
+      one: "столовая ложка",
+      few: "столовые ложки",
+      many: "столовых ложек",
+      fraction: "столовой ложки",
+    },
+    massCountUnit: "шт.",
     sourceGlassQuestion: "Какой стакан имеется в виду в рецепте?",
     // KH-F01-B1.1 (15.7.4): what is missing, said once per recipe -- never a demand that
     // the person supply a fact the recipe omitted.
@@ -887,6 +908,25 @@
     var amount = formatFraction(numerator, denominator);
     var grammar = measureGrammar(numerator, denominator);
     var forms = MEASURE_UNIT_TEXT[unit] ? MEASURE_UNIT_TEXT[unit]() : null;
+    if (amount === null || grammar === null || !forms) {
+      return null;
+    }
+    return amount + " " + forms[grammar];
+  }
+
+  // KH-F01-B2: a mass estimate's practical value ("≈ 1 стакан", "≈ 3½ столовой ложки").
+  // The unit is the one the engine selected; the grammar is the same Russian rule the
+  // released B1.1 hint uses, with the plain unit name instead of "your measure".
+  var MASS_MEASURE_UNIT_TEXT = {
+    glass: function () { return TEXT.massUnitGlass; },
+    teaspoon: function () { return TEXT.massUnitTeaspoon; },
+    tablespoon: function () { return TEXT.massUnitTablespoon; },
+  };
+
+  function formatMassMeasure(numerator, denominator, unit) {
+    var amount = formatFraction(numerator, denominator);
+    var grammar = measureGrammar(numerator, denominator);
+    var forms = MASS_MEASURE_UNIT_TEXT[unit] ? MASS_MEASURE_UNIT_TEXT[unit]() : null;
     if (amount === null || grammar === null || !forms) {
       return null;
     }
@@ -1713,6 +1753,399 @@
   var SOURCE_TERM_UNITS = new Set(["glass", "teaspoon", "tablespoon", "milliliter", "liter"]);
   var STEP_TEXT_HASH = /^[0-9a-f]{64}$/;
 
+  // --- KH-F01-B2: the independent `measures.mass_conversions` section --------------------------
+  //
+  // Its own `schema_version: 1`, its own closed vocabularies. The client draws a number only
+  // for a fully consistent successful item; a refusal, a contradiction or a value it cannot
+  // read exactly costs that item alone, never the released B1.1 block.
+
+  var MASS_SECTION_STATUSES = new Set(["complete", "incomplete", "failed"]);
+  var MASS_CONVERSION_STATUSES = new Set([
+    "reference_approximate",
+    "clarification_required",
+    "ambiguous",
+    "unsupported",
+  ]);
+  var MASS_CONVERSION_REASONS = new Set([
+    "converted",
+    "size_class_required",
+    "generic_name",
+    "ingredient_ambiguous",
+    "qualifier_conflict",
+    "reference_variant_conflict",
+    "ingredient_not_recognized",
+    "unsupported_qualifier",
+    "state_mismatch",
+    "zero_mass",
+    "reference_missing",
+    "reference_not_approved",
+    "rounding_gate_failed",
+    "interval_too_wide",
+    "below_useful_count",
+  ]);
+  // Every closed reason has exactly one status family; any other pair is contradictory.
+  var MASS_STATUS_BY_REASON = {
+    converted: "reference_approximate",
+    size_class_required: "clarification_required",
+    generic_name: "ambiguous",
+    ingredient_ambiguous: "ambiguous",
+    qualifier_conflict: "ambiguous",
+    reference_variant_conflict: "ambiguous",
+    unsupported_qualifier: "unsupported",
+    ingredient_not_recognized: "unsupported",
+    state_mismatch: "unsupported",
+    zero_mass: "unsupported",
+    reference_missing: "unsupported",
+    reference_not_approved: "unsupported",
+    rounding_gate_failed: "unsupported",
+    interval_too_wide: "unsupported",
+    below_useful_count: "unsupported",
+  };
+  var MASS_MATCH_STATUSES = new Set([
+    "matched",
+    "generic",
+    "ambiguous",
+    "qualifier_conflict",
+    "unsupported_qualifier",
+    "unrecognized",
+  ]);
+  // The match state a matcher refusal must carry, as the accepted B2-2 payload guarantees.
+  var MASS_MATCH_BY_REFUSAL_REASON = {
+    generic_name: "generic",
+    ingredient_ambiguous: "ambiguous",
+    qualifier_conflict: "qualifier_conflict",
+    unsupported_qualifier: "unsupported_qualifier",
+    ingredient_not_recognized: "unrecognized",
+  };
+  var MASS_BASES = new Set(["edible_portion", "as_purchased", "not_applicable"]);
+  var MASS_REFERENCE_KINDS = new Set(["point", "measured_interval", "calibration_class"]);
+  var MASS_DISPLAYS = new Set(["single", "interval"]);
+  var MASS_VOLUME_UNITS = new Set(["glass", "teaspoon", "tablespoon"]);
+
+  // An exact comparison of two normalized non-negative rationals, using only integer
+  // arithmetic. Cross multiplication could exceed the safe-integer range, and floating
+  // division could round a value just below a whole number up to it, so the comparison
+  // is the Euclidean one: integer parts first, then the reciprocal remainders -- which
+  // compare in the opposite order -- without ever multiplying two numerators together.
+  function compareWholeParts(numerator, denominator) {
+    return (numerator - (numerator % denominator)) / denominator;
+  }
+
+  function compareRationals(left, right) {
+    var wholeLeft = compareWholeParts(left.numerator, left.denominator);
+    var wholeRight = compareWholeParts(right.numerator, right.denominator);
+    if (wholeLeft !== wholeRight) {
+      return wholeLeft < wholeRight ? -1 : 1;
+    }
+    var remainderLeft = left.numerator % left.denominator;
+    var remainderRight = right.numerator % right.denominator;
+    if (remainderLeft === 0 || remainderRight === 0) {
+      if (remainderLeft === remainderRight) {
+        return 0;
+      }
+      return remainderLeft === 0 ? -1 : 1;
+    }
+    // With equal whole parts, left - right has the sign of (a mod b)*d - (c mod d)*b.
+    // Comparing d/(c mod d) against b/(a mod b) has that very sign, but its cross product
+    // is the same expression -- so no numerator is ever multiplied by another large one.
+    // The recursive result is therefore already the sign of left - right, and is returned
+    // as it is (a negation here would invert every genuine ordering such as 3/2 < 7/4).
+    return compareRationals(
+      { numerator: right.denominator, denominator: remainderRight },
+      { numerator: left.denominator, denominator: remainderLeft }
+    );
+  }
+
+  function normalizeMassAssumption(value) {
+    if (!isObject(value) || value.kind !== "size_class") {
+      return null;
+    }
+    if (typeof value.size_class !== "string" || value.size_class === "") {
+      return null;
+    }
+    var weight = normalizeRational(value.weight_g);
+    if (weight === null || weight.numerator <= 0) {
+      return null;
+    }
+    if (!isEnum(value.mass_basis, MASS_BASES)) {
+      return null;
+    }
+    var label = value.label_ru;
+    if (typeof label !== "string" || label.trim() === "") {
+      return null;
+    }
+    // The server's own rule: the label is Russian, so it names the assumption in words the
+    // person reads, never an internal class identifier.
+    var russian = false;
+    for (var index = 0; index < label.length; index++) {
+      var code = label.charCodeAt(index);
+      if (code >= 0x0400 && code <= 0x04ff) {
+        russian = true;
+        break;
+      }
+    }
+    if (!russian) {
+      return null;
+    }
+    return { sizeClass: value.size_class, label: label };
+  }
+
+  // A mass-to-volume result. Only the practical rounded value is drawn: the engine always
+  // fills it for a successful conversion, and the page never invents a rounded value of
+  // its own. The exact rational is still validated, so a contradictory payload is dropped.
+  function normalizeMassVolume(conversion) {
+    if (!isEnum(conversion.target_unit, MASS_VOLUME_UNITS)) {
+      return null;
+    }
+    var exact = normalizeRational(conversion.exact);
+    if (exact === null || exact.numerator <= 0) {
+      return null;
+    }
+    var rounded = normalizeRational(conversion.rounded);
+    if (rounded === null || rounded.numerator <= 0) {
+      return null;
+    }
+    var error = normalizeRational(conversion.rounded.relative_error);
+    if (error === null) {
+      return null;
+    }
+    return {
+      kind: "volume",
+      targetUnit: conversion.target_unit,
+      numerator: rounded.numerator,
+      denominator: rounded.denominator,
+    };
+  }
+
+  // A mass-to-count result. The rounded bounds are what a cook reads; `display` says
+  // whether they are one number or a genuine interval, and the two must agree exactly.
+  function normalizeMassCount(conversion, conditional) {
+    if (!isEnum(conversion.display, MASS_DISPLAYS)) {
+      return null;
+    }
+    var piece = conversion.piece;
+    if (!isObject(piece) || !isEnum(piece.reference_kind, MASS_REFERENCE_KINDS)) {
+      return null;
+    }
+    if (
+      piece.size_class !== null &&
+      piece.size_class !== undefined &&
+      (typeof piece.size_class !== "string" || piece.size_class === "")
+    ) {
+      return null;
+    }
+    var low = normalizeRational(conversion.count_low);
+    var high = normalizeRational(conversion.count_high);
+    var roundedLow = normalizeRational(conversion.rounded_low);
+    var roundedHigh = normalizeRational(conversion.rounded_high);
+    var width = normalizeRational(conversion.relative_width);
+    if (low === null || high === null || roundedLow === null || roundedHigh === null || width === null) {
+      return null;
+    }
+    if (
+      low.numerator <= 0 ||
+      high.numerator <= 0 ||
+      roundedLow.numerator <= 0 ||
+      roundedHigh.numerator <= 0
+    ) {
+      return null;
+    }
+    var exactOrder = compareRationals(low, high);
+    var roundedOrder = compareRationals(roundedLow, roundedHigh);
+    if (exactOrder > 0 || roundedOrder > 0) {
+      return null;
+    }
+    // A zero relative width is exactly a single exact count, and the display follows the
+    // rounded bounds: one number exactly when they rounded to the same value.
+    if ((exactOrder === 0) !== (width.numerator === 0)) {
+      return null;
+    }
+    var single = conversion.display === "single";
+    if (single !== (roundedOrder === 0)) {
+      return null;
+    }
+    if (piece.reference_kind === "point") {
+      // A point reference is one weight: it can never present as an interval.
+      if (exactOrder !== 0 || roundedOrder !== 0 || width.numerator !== 0 || !single) {
+        return null;
+      }
+    }
+    if (piece.reference_kind === "calibration_class" && !piece.size_class) {
+      // A supplier size grade without its class names nothing the assumption could match.
+      return null;
+    }
+    return {
+      kind: "count",
+      display: conversion.display,
+      low: roundedLow,
+      high: roundedHigh,
+      conditional: conditional,
+      assumptionLabel: null,
+    };
+  }
+
+  // One B2 item as the page may draw it, or null when it is a refusal or cannot be
+  // trusted. Only a successful, fully consistent item becomes a hint; a refusal is never
+  // turned into a number, and nothing is repaired.
+  //
+  // The item must also be about the ingredient the card actually draws at that position:
+  // its `name` and `source` are compared with the stored ingredient's original `name` and
+  // `amount` byte for byte. A position alone is not evidence -- an item may name another
+  // ingredient or another amount -- so a mismatch costs this item only, never its valid
+  // siblings and never the released B1.1 block. The originals are not trimmed, normalized
+  // or fuzzy-matched: the server writes the item from these very strings.
+  function normalizeMassItem(item, ingredients) {
+    if (!isObject(item) || !isCount(item.position) || item.position >= ingredients.length) {
+      return null;
+    }
+    var stored = ingredients[item.position];
+    if (!isObject(stored) || typeof stored.name !== "string" || typeof stored.amount !== "string") {
+      return null;
+    }
+    if (typeof item.name !== "string" || item.name === "") {
+      return null;
+    }
+    if (typeof item.source !== "string" || item.source === "") {
+      return null;
+    }
+    if (item.name !== stored.name || item.source !== stored.amount) {
+      return null;
+    }
+    // A successful conversion needs a real source mass. Zero is refused by the accepted
+    // B2-2 engine (`zero_mass`), so a "converted" item claiming it is contradictory: no
+    // number may be drawn from it, and the amount is never rewritten here.
+    var mass = normalizeRational(item.mass_g);
+    if (mass === null || mass.numerator <= 0) {
+      return null;
+    }
+    var ingredient = item.ingredient;
+    if (!isObject(ingredient) || !isEnum(ingredient.match, MASS_MATCH_STATUSES)) {
+      return null;
+    }
+    if (!isEnum(item.status, MASS_CONVERSION_STATUSES)) {
+      return null;
+    }
+    if (!isEnum(item.reason, MASS_CONVERSION_REASONS)) {
+      return null;
+    }
+    if (MASS_STATUS_BY_REASON[item.reason] !== item.status) {
+      return null;
+    }
+    if (typeof item.conditional !== "boolean") {
+      return null;
+    }
+    var assumption = item.assumption;
+    var hasAssumption = assumption !== null && assumption !== undefined;
+    if (item.conditional !== hasAssumption) {
+      return null;
+    }
+    var converted = item.reason === "converted";
+    var conversion = item.conversion;
+    var hasConversion = conversion !== null && conversion !== undefined;
+    if (converted !== hasConversion) {
+      return null;
+    }
+    if (!converted) {
+      // A refusal is never presented. It is still checked for the contradiction the
+      // accepted contract forbids, so a refusal that claims a match state it cannot have
+      // is dropped like any other malformed item.
+      var expectedMatch = MASS_MATCH_BY_REFUSAL_REASON[item.reason];
+      if (expectedMatch !== undefined && ingredient.match !== expectedMatch) {
+        return null;
+      }
+      return null;
+    }
+    // A number is only believable for an ingredient the matcher actually recognized.
+    if (
+      ingredient.match !== "matched" ||
+      typeof ingredient.id !== "string" ||
+      ingredient.id === "" ||
+      typeof ingredient.display_name !== "string" ||
+      ingredient.display_name === ""
+    ) {
+      return null;
+    }
+    if (!isObject(conversion)) {
+      return null;
+    }
+    var normalizedAssumption = null;
+    if (item.conditional) {
+      normalizedAssumption = normalizeMassAssumption(assumption);
+      if (normalizedAssumption === null) {
+        return null;
+      }
+    }
+    var normalized;
+    if (conversion.kind === "volume") {
+      // A conditional estimate is a count by definition, never a volume.
+      if (normalizedAssumption !== null) {
+        return null;
+      }
+      normalized = normalizeMassVolume(conversion);
+    } else if (conversion.kind === "count") {
+      normalized = normalizeMassCount(conversion, item.conditional);
+      if (normalized !== null && normalizedAssumption !== null) {
+        if (conversion.piece.size_class !== normalizedAssumption.sizeClass) {
+          return null;
+        }
+        normalized.assumptionLabel = normalizedAssumption.label;
+      }
+    } else {
+      return null;
+    }
+    if (normalized === null) {
+      return null;
+    }
+    normalized.position = item.position;
+    normalized.name = item.name;
+    return normalized;
+  }
+
+  // The `mass_conversions` extension as the hints the page may draw. Anything the page
+  // cannot use -- an older schema, a failed section, a malformed item -- costs only what
+  // it describes; the caller's B1.1 block is never touched by this function.
+  //
+  // The section inherits the outer block's `favorite_version`, because the server builds it
+  // for that very detail. An answer bound to another version, or one with no usable version
+  // at all, is conservatively refused here (B2 only): it may describe ingredients or amounts
+  // the card no longer shows, and a stale hint is worse than none. The released B1.1 fields
+  // stay drawn exactly as before either way.
+  function normalizeMassConversions(value, ingredients, sameVersion) {
+    if (!isObject(value) || value.schema_version !== 1) {
+      return [];
+    }
+    if (!isEnum(value.status, MASS_SECTION_STATUSES)) {
+      return [];
+    }
+    // A failed section promises nothing: even if items are present beside it, none is
+    // drawn. An incomplete one keeps exactly its valid successful items.
+    if (value.status === "failed") {
+      return [];
+    }
+    if (sameVersion !== true || !Array.isArray(value.items)) {
+      return [];
+    }
+    var counts = Object.create(null);
+    for (var raw = 0; raw < value.items.length; raw++) {
+      var candidate = value.items[raw];
+      if (isObject(candidate) && isCount(candidate.position) && candidate.position < ingredients.length) {
+        counts[candidate.position] = (counts[candidate.position] || 0) + 1;
+      }
+    }
+    var found = [];
+    for (var index = 0; index < value.items.length; index++) {
+      var normalized = normalizeMassItem(value.items[index], ingredients);
+      if (normalized === null || counts[normalized.position] > 1) {
+        continue;
+      }
+      found.push(normalized);
+    }
+    found.sort(function (left, right) {
+      return left.position - right.position;
+    });
+    return found;
+  }
+
   // One span, validated against the step it claims to annotate. Every check of 15.8.4 that
   // can be made synchronously is made here: the offsets are code points into the exact text
   // the page is about to draw, the mapped slice equals the span's own text, and every enum,
@@ -1889,10 +2322,20 @@
   // A `schema_version: 2` block binds its step hints to `favorite_version` and the exact
   // `steps` it echoes. A malformed additive field costs only the hints it describes; the
   // released B1 ingredient block and the recipe itself are never discarded for it.
-  function normalizeMeasuresBlock(value, ingredientCount, steps, favoriteVersion) {
+  //
+  // `ingredients` is the very array the card draws (each entry its stored `name` and
+  // `amount`): the B2 mass hints are checked against it, not against a count, so a hint can
+  // never land on a line it does not describe.
+  //
+  // `favoriteVersion` is the normalized card version, which keeps the released fallback of
+  // `1` for a missing or invalid top-level `version`. `originalVersion` is that same version
+  // only when the API really supplied a positive safe integer, and `null` otherwise: the B2
+  // gate (KH-F01-B2-3-R2) reads it instead, so the fallback can never authorize a hint.
+  function normalizeMeasuresBlock(value, ingredients, steps, favoriteVersion, originalVersion) {
     if (!isObject(value) || !isObject(value.target)) {
       return null;
     }
+    var ingredientCount = ingredients.length;
     var target = {};
     for (var index = 0; index < MEASURE_KEYS.length; index++) {
       var name = MEASURE_KEYS[index];
@@ -1941,6 +2384,20 @@
     // The additive B1.1 fields. A block without `schema_version` is the released B1 block:
     // no step data, and nothing asked of it that it never promised.
     var versioned = value.schema_version === 2;
+    // The steps and the B2 extension are drawn only for the version on the card: an answer
+    // that names another one may have been written for text the page no longer shows.
+    var sameVersion =
+      Number.isSafeInteger(value.favorite_version) && value.favorite_version === favoriteVersion;
+    // KH-F01-B2-3-R2: the mass section is gated on the version the API actually supplied.
+    // `sameVersion` above is enough for the released step hints, but its `favoriteVersion`
+    // has already been defaulted to 1 when the detail carried none. A section naming that
+    // fallback must not draw a B2 number: with no trustworthy original version there is
+    // nothing to prove the hint was built for this very card.
+    var b2SameVersion =
+      Number.isSafeInteger(originalVersion) &&
+      originalVersion >= 1 &&
+      Number.isSafeInteger(value.favorite_version) &&
+      value.favorite_version === originalVersion;
     var annotations = [];
     var stepsGlassRequired = false;
     var analysisStatus = null;
@@ -1957,10 +2414,6 @@
       if (isObject(value.provenance) && isEnum(value.provenance.status, PROVENANCE_STATUSES)) {
         provenanceStatus = value.provenance.status;
       }
-      // The steps are drawn only for the version on the card: an answer that names another
-      // one may have been written for text the page no longer shows.
-      var sameVersion =
-        Number.isSafeInteger(value.favorite_version) && value.favorite_version === favoriteVersion;
       if (sameVersion && Array.isArray(value.steps)) {
         annotations = normalizeStepAnnotations(value.steps, steps, ingredientCount);
       }
@@ -1981,6 +2434,16 @@
       stepsGlassRequired: stepsGlassRequired,
       analysisStatus: analysisStatus,
       provenanceStatus: provenanceStatus,
+      // KH-F01-B2: the ingredient-specific mass estimates, read in their own section with
+      // their own schema version, bound to these ingredients and this version. Only a
+      // versioned block (schema_version 2) whose favorite_version is this card's may say
+      // anything about its ingredients; a legacy, versionless or stale one yields no
+      // hints (a conservative B2-only failure) and cannot change any field above it.
+      massConversions: normalizeMassConversions(
+        value.mass_conversions,
+        ingredients,
+        versioned && b2SameVersion
+      ),
     };
   }
 
@@ -2009,12 +2472,21 @@
       item.ingredients = ingredients;
       item.steps = steps;
       // Additive and optional: an older or unusual answer simply draws no hints. The step
-      // hints are read against the very steps and version this card is about to draw.
+      // hints and the B2 mass estimates are read against the very ingredients, steps and
+      // version this card is about to draw.
+      //
+      // KH-F01-B2-3-R2: `item.version` keeps the released fallback of 1 for a missing or
+      // invalid `version`, which the step hints still use as before. The B2 gate receives
+      // the original value only when the API really supplied a positive safe integer, so a
+      // defaulted or coerced version can never authorize a mass hint.
+      var originalVersion =
+        Number.isSafeInteger(body.version) && body.version >= 1 ? body.version : null;
       item.measures = normalizeMeasuresBlock(
         body.measures,
-        ingredients.length,
+        ingredients,
         steps,
-        item.version
+        item.version,
+        originalVersion
       );
     } else {
       item.servings = "";
@@ -8307,6 +8779,7 @@
     MEASURE_KEYS: MEASURE_KEYS,
     formatFraction: formatFraction,
     formatMeasure: formatMeasure,
+    formatMassMeasure: formatMassMeasure,
     measureGrammar: measureGrammar,
     prepareMeasure: prepareMeasure,
     prepareMeasures: prepareMeasures,

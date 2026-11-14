@@ -8206,30 +8206,61 @@ scenario("a_block_without_step_data_draws_no_step_hints_and_keeps_the_ingredient
   assert.equal(current.measures.ingredients.length, 1);
 });
 
-// KH-F01-B2-2: the additive `mass_conversions` extension of the same schema_version 2 block.
-// The released normalizer reads the fields it knows and never enumerates the block's keys, so
-// the extension is ignored here: no mass hint is drawn (that is B2-3), nothing inside it can
-// replace a released hint, and a malformed extension cannot make the block unusable.
+// KH-F01-B2-2/B2-3: the additive `mass_conversions` extension of the same schema_version 2
+// block. It has its own schema version and failure domain: the released B1.1 fields are read
+// exactly as before, a malformed extension cannot make the block unusable, and only a fully
+// consistent successful item becomes a hint.
 const MASS_CONVERSIONS = {
   schema_version: 1,
-  registry_revision: "2026-11-13.4",
+  registry_revision: "2026-11-14.test",
   status: "complete",
   items: [
     {
-      position: 0,
-      name: "соль",
+      position: 1,
+      name: "капуста",
       source: "300 г",
       mass_g: { numerator: 300, denominator: 1 },
-      ingredient: { id: null, display_name: null, match: "generic" },
-      status: "ambiguous",
-      reason: "generic_name",
+      ingredient: { id: "test_cabbage", display_name: "тестовая капуста", match: "matched" },
+      status: "reference_approximate",
+      reason: "converted",
       conditional: false,
       assumption: null,
-      conversion: null,
+      conversion: {
+        kind: "volume",
+        target_unit: "glass",
+        exact: { numerator: 6, denominator: 5 },
+        rounded: {
+          numerator: 6,
+          denominator: 5,
+          relative_error: { numerator: 0, denominator: 1 },
+        },
+        reference: {
+          evidence_id: "fixture.test",
+          derivation: "direct_target",
+          normalization: null,
+          method: null,
+        },
+      },
     },
   ],
   omitted: { unsafe_fraction: 0, malformed: 0 },
 };
+
+// The released fields of the block, as B1.1 reads them. B2-3 adds `massConversions` beside
+// them and nothing else; the comparison below is field by field for that reason.
+function releasedMeasures(measures) {
+  return {
+    target: measures.target,
+    sourceGlassMl: measures.sourceGlassMl,
+    sourceGlassRequired: measures.sourceGlassRequired,
+    ingredients: measures.ingredients,
+    clarifiedPositions: measures.clarifiedPositions,
+    steps: measures.steps,
+    stepsGlassRequired: measures.stepsGlassRequired,
+    analysisStatus: measures.analysisStatus,
+    provenanceStatus: measures.provenanceStatus,
+  };
+}
 
 function convertedGlassIngredient() {
   return {
@@ -8246,7 +8277,7 @@ function convertedGlassIngredient() {
   };
 }
 
-scenario("the_mass_conversions_extension_is_ignored_and_never_unsettles_the_released_block", async () => {
+scenario("the_mass_conversions_extension_is_read_beside_the_released_block_it_never_changes", async () => {
   const ingredients = [convertedGlassIngredient()];
   const plain = await withSteppedFavorite(H.stepBlock(3, [], { ingredients }));
   const extended = await withSteppedFavorite(
@@ -8255,19 +8286,32 @@ scenario("the_mass_conversions_extension_is_ignored_and_never_unsettles_the_rele
   const withoutExtension = plain.env.view().favorites.current;
   const withExtension = extended.env.view().favorites.current;
 
-  // The released view is the same, field for field: the extension changes nothing in B1.1.
+  // The released view is the same, field for field: the extension adds its own list only.
   assert.equal(withoutExtension.status, "ready");
-  assert.deepEqual(withExtension.measures, withoutExtension.measures);
+  assert.deepEqual(releasedMeasures(withExtension.measures), releasedMeasures(withoutExtension.measures));
   assert.deepEqual(withExtension.measures.ingredients[0].exact, {
     numerator: 4,
     denominator: 5,
   });
+  assert.deepEqual(withoutExtension.measures.massConversions, []);
+  assert.deepEqual(withExtension.measures.massConversions, [
+    {
+      kind: "volume",
+      targetUnit: "glass",
+      numerator: 6,
+      denominator: 5,
+      position: 1,
+      name: "капуста",
+    },
+  ]);
 
-  // A malformed extension is equally harmless: the closed validator never reads it.
+  // A malformed extension is equally harmless: the released block stays exactly the same
+  // and no mass hint is invented from it.
   for (const malformed of [
     "not an object",
     [],
     { schema_version: 1, items: "not a list" },
+    { ...MASS_CONVERSIONS, schema_version: 2 },
     {
       ...MASS_CONVERSIONS,
       items: [
@@ -8286,11 +8330,763 @@ scenario("the_mass_conversions_extension_is_ignored_and_never_unsettles_the_rele
     assert.equal(current.status, "ready", JSON.stringify(malformed));
     assert.notEqual(current.measures, null, JSON.stringify(malformed));
     assert.deepEqual(
-      current.measures.ingredients,
-      withoutExtension.measures.ingredients,
+      releasedMeasures(current.measures),
+      releasedMeasures(withoutExtension.measures),
       JSON.stringify(malformed)
     );
+    assert.deepEqual(current.measures.massConversions, [], JSON.stringify(malformed));
   }
+});
+
+// --- KH-F01-B2-3: the mass conversion section as the client reads it -------------------------
+//
+// Every payload below is synthetic: fixture identifiers and fixture numbers only, never a
+// real ingredient coefficient. The client draws nothing for the shipped registry, which
+// approves no record.
+
+function massVolumeItem(extra = {}, conversion = {}) {
+  return {
+    position: 1,
+    name: "капуста",
+    source: "300 г",
+    mass_g: { numerator: 300, denominator: 1 },
+    ingredient: { id: "test_cabbage", display_name: "тестовая капуста", match: "matched" },
+    status: "reference_approximate",
+    reason: "converted",
+    conditional: false,
+    assumption: null,
+    conversion: {
+      kind: "volume",
+      target_unit: "glass",
+      exact: { numerator: 1, denominator: 1 },
+      rounded: {
+        numerator: 1,
+        denominator: 1,
+        relative_error: { numerator: 0, denominator: 1 },
+      },
+      reference: {
+        evidence_id: "fixture.test",
+        derivation: "direct_target",
+        normalization: null,
+        method: null,
+      },
+      ...conversion,
+    },
+    ...extra,
+  };
+}
+
+function massCountItem(conversion = {}, extra = {}) {
+  return {
+    position: 1,
+    name: "капуста",
+    source: "300 г",
+    mass_g: { numerator: 300, denominator: 1 },
+    ingredient: { id: "test_cabbage", display_name: "тестовая капуста", match: "matched" },
+    status: "reference_approximate",
+    reason: "converted",
+    conditional: false,
+    assumption: null,
+    conversion: {
+      kind: "count",
+      piece: { id: "test_piece", size_class: null, reference_kind: "point" },
+      display: "single",
+      count_low: { numerator: 3, denominator: 1 },
+      count_high: { numerator: 3, denominator: 1 },
+      rounded_low: { numerator: 3, denominator: 1 },
+      rounded_high: { numerator: 3, denominator: 1 },
+      relative_width: { numerator: 0, denominator: 1 },
+      reference: { evidence_id: "fixture.test" },
+      ...conversion,
+    },
+    ...extra,
+  };
+}
+
+function massSection(items, extra = {}) {
+  return {
+    schema_version: 1,
+    registry_revision: "2026-11-14.test",
+    status: "complete",
+    items,
+    omitted: { unsafe_fraction: 0, malformed: 0 },
+    ...extra,
+  };
+}
+
+// A sibling that genuinely belongs to BORSH's first line (свекла — 2 шт.). Used only as an
+// extra override on an item whose template defaults to the second line.
+const BEET_ITEM = { position: 0, name: "свекла", source: "2 шт." };
+
+async function withMassSection(items, extra = {}) {
+  const { env } = await withSteppedFavorite(
+    H.stepBlock(3, [], { ingredients: [convertedGlassIngredient()], mass_conversions: massSection(items, extra) })
+  );
+  return env.view().favorites.current;
+}
+
+scenario("a_mass_volume_estimate_keeps_the_engines_practical_value_and_never_touches_b1_1", async () => {
+  const current = await withMassSection([
+    massVolumeItem({}, { target_unit: "tablespoon", rounded: { numerator: 5, denominator: 2, relative_error: { numerator: 1, denominator: 200 } } }),
+  ]);
+
+  assert.equal(current.status, "ready");
+  assert.equal(current.measures.ingredients.length, 1, "the released B1.1 conversion is still there");
+  assert.deepEqual(current.measures.massConversions, [
+    {
+      kind: "volume",
+      targetUnit: "tablespoon",
+      numerator: 5,
+      denominator: 2,
+      position: 1,
+      name: "капуста",
+    },
+  ]);
+});
+
+scenario("a_point_count_and_a_genuine_interval_are_normalized_apart", async () => {
+  // The first item belongs to BORSH's first ingredient (свекла — 2 шт.), the second to its
+  // second (капуста — 300 г): the binding compares both the stored name and amount.
+  const point = massCountItem({}, { position: 0, name: "свекла", source: "2 шт." });
+  const interval = massCountItem(
+    {
+      piece: { id: "test_piece", size_class: "medium", reference_kind: "calibration_class" },
+      display: "interval",
+      count_low: { numerator: 50, denominator: 17 },
+      count_high: { numerator: 10, denominator: 3 },
+      rounded_low: { numerator: 3, denominator: 1 },
+      rounded_high: { numerator: 7, denominator: 2 },
+      relative_width: { numerator: 1, denominator: 8 },
+    },
+    { position: 1 }
+  );
+  const current = await withMassSection([point, interval]);
+
+  assert.deepEqual(current.measures.massConversions, [
+    {
+      kind: "count",
+      display: "single",
+      low: { numerator: 3, denominator: 1 },
+      high: { numerator: 3, denominator: 1 },
+      conditional: false,
+      assumptionLabel: null,
+      position: 0,
+      name: "свекла",
+    },
+    {
+      kind: "count",
+      display: "interval",
+      low: { numerator: 3, denominator: 1 },
+      high: { numerator: 7, denominator: 2 },
+      conditional: false,
+      assumptionLabel: null,
+      position: 1,
+      name: "капуста",
+    },
+  ]);
+});
+
+scenario("a_conditional_count_carries_its_validated_assumption_label", async () => {
+  const item = massCountItem(
+    {
+      piece: { id: "test_piece", size_class: "medium", reference_kind: "calibration_class" },
+      display: "single",
+      count_low: { numerator: 50, denominator: 17 },
+      count_high: { numerator: 25, denominator: 8 },
+      relative_width: { numerator: 2, denominator: 33 },
+    },
+    {
+      conditional: true,
+      assumption: {
+        kind: "size_class",
+        size_class: "medium",
+        weight_g: { numerator: 160, denominator: 1 },
+        mass_basis: "edible_portion",
+        label_ru: "если клубни средние",
+      },
+    }
+  );
+  const current = await withMassSection([item]);
+
+  assert.equal(current.measures.massConversions.length, 1);
+  assert.equal(current.measures.massConversions[0].conditional, true);
+  assert.equal(current.measures.massConversions[0].assumptionLabel, "если клубни средние");
+});
+
+scenario("a_refusal_never_becomes_a_mass_hint", async () => {
+  // Every closed refusal the shipped registry can produce, including the one a real,
+  // unapproved record yields today.
+  const refusals = [
+    ["unsupported", "reference_not_approved"],
+    ["unsupported", "reference_missing"],
+    ["unsupported", "state_mismatch"],
+    ["unsupported", "rounding_gate_failed"],
+    ["unsupported", "interval_too_wide"],
+    ["ambiguous", "generic_name"],
+    ["ambiguous", "ingredient_ambiguous"],
+    ["clarification_required", "size_class_required"],
+  ];
+  for (const [status, reason] of refusals) {
+    const current = await withMassSection([
+      massVolumeItem({
+        status,
+        reason,
+        ingredient: { id: null, display_name: null, match: reason === "generic_name" ? "generic" : "matched" },
+        conversion: null,
+      }),
+    ]);
+    assert.deepEqual(current.measures.massConversions, [], reason);
+    assert.equal(current.measures.ingredients.length, 1, reason + ": B1.1 untouched");
+  }
+});
+
+scenario("a_contradictory_mass_item_is_dropped_and_its_valid_sibling_stays", async () => {
+  const cases = {
+    "a refusal carrying a conversion": massVolumeItem({
+      status: "unsupported",
+      reason: "reference_missing",
+      conversion: massVolumeItem().conversion,
+    }),
+    "a success without a conversion": massVolumeItem({ conversion: null }),
+    "a status and reason from different families": massVolumeItem({
+      status: "unsupported",
+      reason: "converted",
+    }),
+    "a conditional flag without an assumption": massCountItem(
+      { piece: { id: "test_piece", size_class: null, reference_kind: "point" } },
+      { conditional: true, assumption: null }
+    ),
+    "an assumption without the conditional flag": massCountItem({}, {
+      conditional: false,
+      assumption: {
+        kind: "size_class",
+        size_class: "medium",
+        weight_g: { numerator: 160, denominator: 1 },
+        mass_basis: "edible_portion",
+        label_ru: "если клубни средние",
+      },
+    }),
+    "a success with an unrecognized ingredient": massVolumeItem({
+      ingredient: { id: "test_cabbage", display_name: "тестовая капуста", match: "unrecognized" },
+    }),
+    "a matcher refusal with the wrong match state": massVolumeItem({
+      status: "unsupported",
+      reason: "ingredient_not_recognized",
+      ingredient: { id: null, display_name: null, match: "matched" },
+      conversion: null,
+    }),
+  };
+  for (const [label, broken] of Object.entries(cases)) {
+    const current = await withMassSection([broken, massVolumeItem(BEET_ITEM)]);
+    assert.deepEqual(
+      current.measures.massConversions.map((entry) => entry.position),
+      [0],
+      label
+    );
+  }
+});
+
+scenario("a_malformed_or_unsafe_mass_item_costs_only_itself_in_an_incomplete_section", async () => {
+  const unsafe = [
+    { numerator: 1.5, denominator: 1 },
+    { numerator: 9007199254740992, denominator: 1 },
+    { numerator: 1, denominator: 0 },
+    { numerator: -1, denominator: 1 },
+    "not a rational",
+  ];
+  for (const value of unsafe) {
+    const current = await withMassSection(
+      [
+        massVolumeItem({}, {
+          rounded: { numerator: value.numerator, denominator: value.denominator },
+        }),
+        massVolumeItem(BEET_ITEM),
+      ],
+      { status: "incomplete", omitted: { unsafe_fraction: 1, malformed: 0 } }
+    );
+    assert.deepEqual(
+      current.measures.massConversions.map((entry) => entry.position),
+      [0],
+      JSON.stringify(value)
+    );
+  }
+  // A missing practical rounded value is not replaced by the exact rational.
+  const noRounded = await withMassSection(
+    [massVolumeItem({}, { rounded: null }), massVolumeItem(BEET_ITEM)],
+    { status: "incomplete", omitted: { unsafe_fraction: 0, malformed: 1 } }
+  );
+  assert.deepEqual(noRounded.measures.massConversions.map((entry) => entry.position), [0]);
+});
+
+scenario("a_failed_mass_section_draws_nothing_whatever_items_come_with_it", async () => {
+  const current = await withMassSection([massVolumeItem()], {
+    status: "failed",
+    omitted: { unsafe_fraction: 0, malformed: 0 },
+  });
+
+  assert.deepEqual(current.measures.massConversions, []);
+  assert.equal(current.measures.ingredients.length, 1, "B1.1 stays exactly as it was");
+});
+
+scenario("two_mass_items_for_one_position_are_dropped_whichever_looks_valid", async () => {
+  const current = await withMassSection([massVolumeItem(), massVolumeItem({ name: "капуста свежая" })]);
+
+  assert.deepEqual(current.measures.massConversions, []);
+});
+
+scenario("a_count_whose_fields_disagree_with_itself_is_dropped", async () => {
+  const cases = {
+    "a single display with two different rounded bounds": massCountItem({
+      display: "single",
+      rounded_low: { numerator: 3, denominator: 1 },
+      rounded_high: { numerator: 4, denominator: 1 },
+      count_low: { numerator: 3, denominator: 1 },
+      count_high: { numerator: 4, denominator: 1 },
+      relative_width: { numerator: 1, denominator: 4 },
+    }),
+    "an interval display with one rounded value": massCountItem({
+      display: "interval",
+      rounded_low: { numerator: 3, denominator: 1 },
+      rounded_high: { numerator: 3, denominator: 1 },
+    }),
+    "a point reference carrying an interval": massCountItem({
+      display: "interval",
+      piece: { id: "test_piece", size_class: null, reference_kind: "point" },
+      count_low: { numerator: 3, denominator: 1 },
+      count_high: { numerator: 4, denominator: 1 },
+      rounded_low: { numerator: 3, denominator: 1 },
+      rounded_high: { numerator: 4, denominator: 1 },
+      relative_width: { numerator: 1, denominator: 4 },
+    }),
+    "a zero count": massCountItem({
+      count_low: { numerator: 0, denominator: 1 },
+      count_high: { numerator: 0, denominator: 1 },
+      rounded_low: { numerator: 0, denominator: 1 },
+      rounded_high: { numerator: 0, denominator: 1 },
+    }),
+    "reversed bounds": massCountItem({
+      count_low: { numerator: 4, denominator: 1 },
+      count_high: { numerator: 3, denominator: 1 },
+      rounded_low: { numerator: 4, denominator: 1 },
+      rounded_high: { numerator: 3, denominator: 1 },
+      relative_width: { numerator: 1, denominator: 4 },
+      display: "interval",
+    }),
+  };
+  for (const [label, broken] of Object.entries(cases)) {
+    const current = await withMassSection([broken]);
+    assert.deepEqual(current.measures.massConversions, [], label);
+  }
+});
+
+// --- KH-F01-B2-3-R1: exact rational order, ingredient/version binding, zero mass -------------
+
+// A count item whose exact and rounded bounds are the same pair -- the shape of a
+// mass-to-count answer for a measured piece interval.
+function intervalCountItem(low, high) {
+  return massCountItem({
+    piece: { id: "test_piece", size_class: null, reference_kind: "measured_interval" },
+    display: "interval",
+    count_low: low,
+    count_high: high,
+    rounded_low: low,
+    rounded_high: high,
+    relative_width: { numerator: 1, denominator: 8 },
+  });
+}
+
+// UI-01: the comparator behind the interval gate. Every pair below is ordered by hand,
+// independently of the page's own comparison, including values near MAX_SAFE_INTEGER where
+// a cross product would overflow.
+scenario("a_mass_count_interval_is_ordered_exactly_in_both_directions", async () => {
+  const MAX = Number.MAX_SAFE_INTEGER;
+  const increasing = [
+    ["3/2 < 7/4 (the accepted 150-160 g piece range, rounded)", { numerator: 3, denominator: 2 }, { numerator: 7, denominator: 4 }],
+    ["25/16 < 5/3 (the same range, exact)", { numerator: 25, denominator: 16 }, { numerator: 5, denominator: 3 }],
+    ["1/3 < 2/5", { numerator: 1, denominator: 3 }, { numerator: 2, denominator: 5 }],
+    ["3/2 < 9/4", { numerator: 3, denominator: 2 }, { numerator: 9, denominator: 4 }],
+    // 1/(MAX-1) < 1/(MAX-2): the larger denominator is the smaller fraction.
+    ["1/(MAX_SAFE-1) < 1/(MAX_SAFE-2)", { numerator: 1, denominator: MAX - 1 }, { numerator: 1, denominator: MAX - 2 }],
+    // 1 + 1/(MAX-1) < 1 + 1/(MAX-2).
+    ["MAX/(MAX_SAFE-1) < (MAX-1)/(MAX_SAFE-2)", { numerator: MAX, denominator: MAX - 1 }, { numerator: MAX - 1, denominator: MAX - 2 }],
+  ];
+  for (const [label, low, high] of increasing) {
+    const current = await withMassSection([intervalCountItem(low, high)]);
+    assert.equal(current.measures.massConversions.length, 1, label);
+    assert.deepEqual(current.measures.massConversions[0].low, low, label);
+    assert.deepEqual(current.measures.massConversions[0].high, high, label);
+  }
+  // The very same pairs, reversed, are not an interval: each item is dropped on its own.
+  for (const [label, low, high] of increasing) {
+    const current = await withMassSection([intervalCountItem(high, low)]);
+    assert.deepEqual(current.measures.massConversions, [], "reversed: " + label);
+  }
+});
+
+scenario("mass_count_interval_ordering_matches_an_independent_bigint_oracle", async () => {
+  // An oracle written here, in exact integers: left < right iff left.n*right.d <
+  // right.n*left.d. It shares no code with the page's comparison.
+  const less = (left, right) =>
+    BigInt(left.numerator) * BigInt(right.denominator) <
+    BigInt(right.numerator) * BigInt(left.denominator);
+  const MAX = Number.MAX_SAFE_INTEGER;
+  const values = [
+    { numerator: 1, denominator: 3 },
+    { numerator: 1, denominator: 2 },
+    { numerator: 2, denominator: 4 },
+    { numerator: 2, denominator: 5 },
+    { numerator: 3, denominator: 2 },
+    { numerator: 25, denominator: 16 },
+    { numerator: 5, denominator: 3 },
+    { numerator: 7, denominator: 4 },
+    { numerator: 9, denominator: 4 },
+    { numerator: 1, denominator: MAX - 1 },
+    { numerator: 1, denominator: MAX - 2 },
+    { numerator: MAX, denominator: MAX - 1 },
+    { numerator: MAX - 1, denominator: MAX - 2 },
+    { numerator: MAX, denominator: 1 },
+  ];
+  const pairs = [];
+  for (let i = 0; i < values.length; i++) {
+    for (let j = 0; j < values.length; j++) pairs.push([values[i], values[j]]);
+  }
+  for (const [low, high] of pairs) {
+    const expected = less(low, high);
+    const current = await withMassSection([intervalCountItem(low, high)]);
+    const drawn = current.measures.massConversions.length === 1;
+    assert.equal(
+      drawn,
+      expected,
+      `${JSON.stringify(low)} < ${JSON.stringify(high)} should be ${expected}`
+    );
+  }
+});
+
+scenario("equal_representations_of_one_fraction_are_one_value_and_a_near_miss_is_not", async () => {
+  const equal = massCountItem({
+    piece: { id: "test_piece", size_class: null, reference_kind: "measured_interval" },
+    display: "single",
+    count_low: { numerator: 1, denominator: 2 },
+    count_high: { numerator: 2, denominator: 4 },
+    rounded_low: { numerator: 3, denominator: 6 },
+    rounded_high: { numerator: 4, denominator: 8 },
+    relative_width: { numerator: 0, denominator: 1 },
+  });
+  assert.equal((await withMassSection([equal])).measures.massConversions.length, 1);
+
+  // The exact bounds are the same fraction, but the rounded bounds differ by 1/1000000002:
+  // a "single" display must not be accepted for two different values.
+  const nearMiss = massCountItem({
+    piece: { id: "test_piece", size_class: null, reference_kind: "measured_interval" },
+    display: "single",
+    count_low: { numerator: 1, denominator: 2 },
+    count_high: { numerator: 2, denominator: 4 },
+    rounded_low: { numerator: 1, denominator: 2 },
+    rounded_high: { numerator: 500000002, denominator: 1000000002 },
+    relative_width: { numerator: 0, denominator: 1 },
+  });
+  assert.deepEqual((await withMassSection([nearMiss])).measures.massConversions, []);
+});
+
+scenario("the_accepted_b2_2_piece_interval_is_normalized_against_its_own_ingredient", async () => {
+  // The real accepted shape: 250 g at an approved 150-160 g per piece is 25/16..5/3 exact,
+  // rounded to 3/2..7/4 -- the interval the released page could not draw.
+  const ingredients = [{ name: "тестовый корень", amount: "250 г" }];
+  const item = {
+    position: 0,
+    name: "тестовый корень",
+    source: "250 г",
+    mass_g: { numerator: 250, denominator: 1 },
+    ingredient: { id: "test_root", display_name: "тестовый корень", match: "matched" },
+    status: "reference_approximate",
+    reason: "converted",
+    conditional: false,
+    assumption: null,
+    conversion: {
+      kind: "count",
+      piece: { id: "test_root_piece", size_class: null, reference_kind: "measured_interval" },
+      display: "interval",
+      count_low: { numerator: 25, denominator: 16 },
+      count_high: { numerator: 5, denominator: 3 },
+      rounded_low: { numerator: 3, denominator: 2 },
+      rounded_high: { numerator: 7, denominator: 4 },
+      relative_width: { numerator: 1, denominator: 12 },
+      reference: { evidence_id: "fixture.test" },
+    },
+  };
+  const { env } = await withSteppedFavorite(
+    H.stepBlock(3, [], { mass_conversions: massSection([item]) }),
+    { extra: { ingredients } }
+  );
+  const current = env.view().favorites.current;
+
+  assert.equal(current.status, "ready");
+  assert.deepEqual(current.ingredients, ingredients);
+  assert.deepEqual(current.measures.massConversions, [
+    {
+      kind: "count",
+      display: "interval",
+      low: { numerator: 3, denominator: 2 },
+      high: { numerator: 7, denominator: 4 },
+      conditional: false,
+      assumptionLabel: null,
+      position: 0,
+      name: "тестовый корень",
+    },
+  ]);
+});
+
+// UI-02: an item is about a line only when its own name and amount are that line's stored
+// originals. No trimming, case folding or fuzzy match.
+scenario("a_mass_item_is_bound_to_the_stored_ingredient_name_and_amount_exactly", async () => {
+  const mismatches = {
+    "another ingredient's name": massVolumeItem({ name: "сахар" }),
+    "another amount": massVolumeItem({ source: "200 г" }),
+    "an amount with a leading space": massVolumeItem({ source: " 300 г" }),
+    "a case-folded name": massVolumeItem({ name: "Капуста" }),
+  };
+  for (const [label, item] of Object.entries(mismatches)) {
+    const current = await withMassSection([item]);
+    assert.deepEqual(current.measures.massConversions, [], label);
+    assert.equal(current.measures.ingredients.length, 1, label + ": B1.1 untouched");
+  }
+  // The same item with the stored originals is drawn.
+  assert.equal((await withMassSection([massVolumeItem()])).measures.massConversions.length, 1);
+});
+
+scenario("a_mismatched_mass_item_costs_only_itself_and_valid_siblings_stay", async () => {
+  // A wrong name at position 0 does not stop the genuine item at position 1.
+  const invalidFirst = await withMassSection([
+    massVolumeItem({ position: 0, name: "сахар", source: "2 шт." }),
+    massVolumeItem(),
+  ]);
+  assert.deepEqual(invalidFirst.measures.massConversions.map((entry) => entry.position), [1]);
+  assert.equal(invalidFirst.measures.ingredients.length, 1, "B1.1 untouched");
+
+  // And a wrong amount at position 1 does not stop the genuine item at position 0.
+  const invalidSecond = await withMassSection([massVolumeItem(BEET_ITEM), massVolumeItem({ source: "не 300 г" })]);
+  assert.deepEqual(invalidSecond.measures.massConversions.map((entry) => entry.position), [0]);
+});
+
+scenario("a_mass_extension_bound_to_another_favorite_version_is_not_drawn", async () => {
+  // The card is version 3; the extension says it was built for version 2.
+  const stale = await withSteppedFavorite(
+    H.stepBlock(2, [], {
+      ingredients: [convertedGlassIngredient()],
+      mass_conversions: massSection([massVolumeItem()]),
+    })
+  );
+  const staleCurrent = stale.env.view().favorites.current;
+  assert.equal(staleCurrent.version, 3);
+  assert.deepEqual(staleCurrent.measures.massConversions, []);
+  assert.equal(staleCurrent.measures.ingredients.length, 1, "B1.1 untouched");
+
+  // The matching version draws normally.
+  const fresh = await withSteppedFavorite(
+    H.stepBlock(3, [], { mass_conversions: massSection([massVolumeItem()]) })
+  );
+  assert.equal(fresh.env.view().favorites.current.measures.massConversions.length, 1);
+});
+
+// KH-F01-B2-3-R2: the B2 gate reads the original top-level `version` the API supplied, not
+// the released fallback of 1 that normalizeFavorite keeps for a missing or invalid one. This
+// opens a real detail whose `version` is exactly the given value -- or absent when
+// `version` is undefined -- and returns the normalized card.
+async function withOriginalVersion(version, block) {
+  const item = steppedFavorite(block);
+  if (version === undefined) {
+    delete item.version;
+  } else {
+    item.version = version;
+  }
+  const env = makeEnv({ structuredRecipes: true }).signedIn([conversation(CONV_A, 0)], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что?"), structuredAnswer()]),
+  });
+  env.net.route("GET", FAVORITES_URL, H.favoritesBody([item]));
+  env.net.route("GET", FAV_URL_1, H.favoriteDetail(item, STRUCTURED_TEXT));
+  await env.boot();
+  await env.ctl.openFavorite(H.FAV_1);
+  await env.settle();
+  return env.view().favorites.current;
+}
+
+function massBlockForFavoriteVersion(favoriteVersion, annotations = []) {
+  return H.stepBlock(favoriteVersion, annotations, {
+    ingredients: [convertedGlassIngredient()],
+    mass_conversions: massSection([massVolumeItem()]),
+  });
+}
+
+scenario("a_mass_hint_needs_a_valid_original_favorite_version_not_the_fallback", async () => {
+  // Every original version below is not a positive safe integer, yet the released fallback
+  // makes the card's own version 1 -- the very value the section names. The B2 hint must
+  // still stay hidden, while the card, its ingredients and its B1.1 hints are unaffected.
+  const fallbackCases = [
+    ["missing", undefined],
+    ["null", null],
+    ["string", "1"],
+    ["zero", 0],
+    ["negative", -1],
+    ["fractional", 1.5],
+    ["boolean", true],
+  ];
+  for (const [label, version] of fallbackCases) {
+    const current = await withOriginalVersion(version, massBlockForFavoriteVersion(1));
+    assert.equal(current.status, "ready", label + ": the card still opens");
+    assert.equal(current.version, 1, label + ": the released fallback is unchanged");
+    assert.deepEqual(current.ingredients, BORSH_RECIPE.ingredients, label + ": ingredients unchanged");
+    assert.equal(current.measures.ingredients.length, 1, label + ": B1.1 untouched");
+    assert.deepEqual(current.measures.massConversions, [], label);
+  }
+
+  // An unsafe integer is not a usable version either. isCount still accepts it for the card
+  // itself (released behavior), so the fallback does not even apply -- and B2 stays hidden.
+  const unsafe = Number.MAX_SAFE_INTEGER + 2;
+  const unsafeCurrent = await withOriginalVersion(unsafe, massBlockForFavoriteVersion(1));
+  assert.equal(unsafeCurrent.version, unsafe, "the released card normalization is unchanged");
+  assert.deepEqual(unsafeCurrent.measures.massConversions, [], "unsafe version");
+
+  // A valid original version that matches the section draws the hint.
+  const one = await withOriginalVersion(1, massBlockForFavoriteVersion(1));
+  assert.equal(one.measures.massConversions.length, 1, "version 1 vs section 1");
+  const two = await withOriginalVersion(2, massBlockForFavoriteVersion(2));
+  assert.equal(two.measures.massConversions.length, 1, "version 2 vs section 2");
+
+  // A valid original version that disagrees with the section draws nothing.
+  const stale = await withOriginalVersion(3, massBlockForFavoriteVersion(2));
+  assert.deepEqual(stale.measures.massConversions, [], "version 3 vs section 2");
+});
+
+scenario("an_invalid_original_version_suppresses_only_b2_and_leaves_the_released_hints", async () => {
+  // The block is bound to the fallback version 1 and carries released step annotations beside
+  // the B2 section. The step hints keep the accepted fallback authorization; only B2 is
+  // refused, because no original version proves the mass numbers were built for this card.
+  const block = H.stepBlock(1, steppedAnnotations(), {
+    ingredients: [convertedGlassIngredient()],
+    mass_conversions: massSection([massVolumeItem()]),
+  });
+
+  for (const version of [undefined, null, "1", 0, -1, 1.5, true]) {
+    const current = await withOriginalVersion(version, block);
+    assert.deepEqual(current.measures.massConversions, [], String(version));
+    // The released B1.1 fields are exactly as they were with a valid version.
+    assert.equal(current.measures.steps.length, 2, String(version));
+    assert.equal(current.measures.steps[0].spans[0].conversion.status, "nominal_household");
+    assert.equal(current.measures.ingredients.length, 1, String(version));
+    assert.deepEqual(current.ingredients, BORSH_RECIPE.ingredients, String(version));
+  }
+
+  // The same block with a valid original version keeps every hint, both B1.1 and B2.
+  const valid = await withOriginalVersion(1, block);
+  assert.equal(valid.measures.steps.length, 2);
+  assert.equal(valid.measures.ingredients.length, 1);
+  assert.equal(valid.measures.massConversions.length, 1);
+});
+
+scenario("a_versionless_or_legacy_block_never_draws_a_mass_hint", async () => {
+  // No favorite_version at all: the B2 extension is refused, the rest is untouched.
+  const noVersion = H.stepBlock(3, [], {
+    ingredients: [convertedGlassIngredient()],
+    mass_conversions: massSection([massVolumeItem()]),
+  });
+  delete noVersion.favorite_version;
+  const first = await withSteppedFavorite(noVersion);
+  assert.deepEqual(first.env.view().favorites.current.measures.massConversions, []);
+  assert.equal(first.env.view().favorites.current.measures.ingredients.length, 1);
+
+  // A released schema_version 1 block with a mass_conversions key is not a B2 carrier.
+  const legacyOuter = H.stepBlock(3, [], { mass_conversions: massSection([massVolumeItem()]) });
+  legacyOuter.schema_version = 1;
+  const second = await withSteppedFavorite(legacyOuter);
+  assert.deepEqual(second.env.view().favorites.current.measures.massConversions, []);
+});
+
+scenario("an_edit_that_changes_the_version_leaves_no_stale_mass_hint", async () => {
+  const { env } = await withSteppedFavorite(
+    H.stepBlock(3, [], { mass_conversions: massSection([massVolumeItem()]) })
+  );
+  assert.equal(env.view().favorites.current.measures.massConversions.length, 1);
+
+  env.ctl.beginEditFavorite();
+  const draft = env.view().favorites.current.editor.draft;
+  // The saved answer is version 4 but still carries the version-3 extension.
+  const updated = structuredFavoriteItem({
+    version: 4,
+    measures: H.stepBlock(3, [], { mass_conversions: massSection([massVolumeItem()]) }),
+  });
+  env.net.route("PATCH", FAV_URL_1, H.favoriteDetail(updated, STRUCTURED_TEXT));
+  assert.deepEqual(await env.ctl.saveFavoriteEdit(draft), { ok: true });
+
+  const current = env.view().favorites.current;
+  assert.equal(current.version, 4);
+  assert.deepEqual(current.measures.massConversions, []);
+});
+
+scenario("an_edit_that_changes_an_amount_drops_a_mass_hint_written_for_the_old_one", async () => {
+  const { env } = await withSteppedFavorite(
+    H.stepBlock(3, [], { mass_conversions: massSection([massVolumeItem()]) })
+  );
+  env.ctl.beginEditFavorite();
+  const draft = env.view().favorites.current.editor.draft;
+  // Version 4 and bound to it, but the hint still says «300 г» after the line became «350 г».
+  const updated = structuredFavoriteItem({
+    version: 4,
+    ingredients: [
+      { name: "свекла", amount: "2 шт." },
+      { name: "капуста", amount: "350 г" },
+    ],
+    measures: H.stepBlock(4, [], { mass_conversions: massSection([massVolumeItem()]) }),
+  });
+  env.net.route("PATCH", FAV_URL_1, H.favoriteDetail(updated, STRUCTURED_TEXT));
+  assert.deepEqual(await env.ctl.saveFavoriteEdit(draft), { ok: true });
+
+  assert.deepEqual(env.view().favorites.current.measures.massConversions, []);
+});
+
+scenario("reopening_a_card_never_doubles_a_mass_hint", async () => {
+  const { env } = await withSteppedFavorite(
+    H.stepBlock(3, [], { mass_conversions: massSection([massVolumeItem()]) })
+  );
+  assert.equal(env.view().favorites.current.measures.massConversions.length, 1);
+  await env.ctl.openFavorite(H.FAV_1);
+  await env.settle();
+  assert.equal(env.view().favorites.current.measures.massConversions.length, 1);
+});
+
+// UI-03: a successful number needs a positive source mass. The accepted engine never emits a
+// converted item for zero grams, so a fabricated one is refused here as well.
+scenario("a_non_positive_source_mass_never_becomes_a_mass_hint", async () => {
+  for (const mass_g of [
+    { numerator: 0, denominator: 1 },
+    { numerator: -5, denominator: 1 },
+  ]) {
+    const current = await withMassSection([massVolumeItem({ mass_g })]);
+    assert.deepEqual(current.measures.massConversions, [], JSON.stringify(mass_g));
+    assert.equal(current.measures.ingredients.length, 1, "B1.1 untouched");
+  }
+  // A positive fractional source mass is supported.
+  const fractional = await withMassSection([massVolumeItem({ mass_g: { numerator: 3, denominator: 2 } })]);
+  assert.equal(fractional.measures.massConversions.length, 1);
+
+  // A zero-mass item beside a valid sibling costs only itself.
+  const mixed = await withMassSection([
+    massVolumeItem({ mass_g: { numerator: 0, denominator: 1 } }),
+    massVolumeItem(BEET_ITEM),
+  ]);
+  assert.deepEqual(mixed.measures.massConversions.map((entry) => entry.position), [0]);
+});
+
+scenario("a_zero_mass_refusal_is_silent_and_keeps_the_released_line", async () => {
+  const refusal = massVolumeItem({
+    status: "unsupported",
+    reason: "zero_mass",
+    ingredient: { id: null, display_name: null, match: "matched" },
+    conversion: null,
+    mass_g: { numerator: 0, denominator: 1 },
+  });
+  const current = await withMassSection([refusal]);
+  assert.deepEqual(current.measures.massConversions, []);
+  assert.equal(current.measures.ingredients.length, 1, "B1.1 untouched");
 });
 
 scenario("a_step_pass_that_failed_is_reported_and_the_valid_ingredient_hints_stay", async () => {

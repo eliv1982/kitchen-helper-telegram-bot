@@ -2336,6 +2336,47 @@
     return null;
   }
 
+  // KH-F01-B2: one ingredient's mass estimate as the line under it, or null when the
+  // server's section carries no number the page may show. Every mass-derived number is
+  // approximate -- a density or an individual piece weight is a reference, not a
+  // measurement of this amount -- so the hint always says "≈". A conditional estimate
+  // carries its validated Russian assumption beside the number, never only in metadata.
+  function massHint(conversion) {
+    if (!conversion) {
+      return null;
+    }
+    var value = null;
+    if (conversion.kind === "volume") {
+      value = Logic.formatMassMeasure(
+        conversion.numerator,
+        conversion.denominator,
+        conversion.targetUnit
+      );
+    } else if (conversion.kind === "count") {
+      var low = Logic.formatFraction(conversion.low.numerator, conversion.low.denominator);
+      if (low === null) {
+        return null;
+      }
+      if (conversion.display === "single") {
+        value = low + " " + Logic.TEXT.massCountUnit;
+      } else {
+        var high = Logic.formatFraction(conversion.high.numerator, conversion.high.denominator);
+        if (high === null) {
+          return null;
+        }
+        value = low + "–" + high + " " + Logic.TEXT.massCountUnit;
+      }
+    }
+    if (value === null) {
+      return null;
+    }
+    var text = filledText(Logic.TEXT.measureApprox, { value: value });
+    if (conversion.assumptionLabel !== null && conversion.assumptionLabel !== undefined) {
+      text += ", " + conversion.assumptionLabel;
+    }
+    return text;
+  }
+
   // One step amount's hint, or null when the server's data does not carry a number this
   // page may show. A hint is drawn only for an amount that was really linked and really
   // converted; an unresolved, ambiguous, shared, unsupported, mass or failed amount keeps
@@ -2616,6 +2657,15 @@
           conversions[conversion.position] = conversion;
         });
       }
+      // KH-F01-B2: the mass estimates travel with the same block but rest on no source
+      // glass, so the safe «Не знаю» answer withdraws none of them. While a newer read is
+      // out they are withheld with every other derived hint, exactly as B1.1 is.
+      var massConversions = {};
+      if (current.measures && (!current.measuresPending || current.sourceGlassUnknown)) {
+        (current.measures.massConversions || []).forEach(function (conversion) {
+          massConversions[conversion.position] = conversion;
+        });
+      }
       var anyHint = false;
       var ingredientList = h(
         "ul",
@@ -2623,14 +2673,21 @@
         current.ingredients.map(function (ingredient, position) {
           var line = h("span", { class: "recipe-ingredient", text: ingredient.name + " — " + ingredient.amount });
           var hint = measureHint(conversions[position]);
-          if (hint === null) {
+          // One amount carries one hint: a mass estimate is drawn only where the released
+          // B1.1 conversion did not already speak for that line.
+          var mass = hint === null ? massHint(massConversions[position]) : null;
+          if (hint === null && mass === null) {
             return h("li", null, [line]);
           }
           anyHint = true;
-          return h("li", { class: "recipe-ingredient-measured" }, [
-            line,
-            h("span", { class: "measure-hint", text: hint }),
-          ]);
+          var children = [line];
+          if (hint !== null) {
+            children.push(h("span", { class: "measure-hint", text: hint }));
+          }
+          if (mass !== null) {
+            children.push(h("span", { class: "measure-hint recipe-mass-hint", text: mass }));
+          }
+          return h("li", { class: "recipe-ingredient-measured" }, children);
         })
       );
       var ingredientsBody = anyHint

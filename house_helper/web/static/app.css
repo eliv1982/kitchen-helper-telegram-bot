@@ -1018,6 +1018,12 @@ textarea[aria-invalid="true"] {
   font-size: 0.95rem;
 }
 
+/* KH-F01-B2: the mass estimate may carry a long Russian assumption label; it wraps under
+   the ingredient like the released B1.1 hint and never widens the column. */
+.recipe-mass-hint {
+  overflow-wrap: anywhere;
+}
+
 /* The source-glass question: asked only when an amount contains an undeclared glass. */
 .measure-clarify {
   min-width: 0;
