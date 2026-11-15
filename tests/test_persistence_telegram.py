@@ -31,6 +31,7 @@ from tests.persistence_support import (  # noqa: F401  (fixtures)
     new_turn_request,
     new_user,
     rejected,
+    rejected_width,
     session,
     utc,
 )
@@ -477,7 +478,7 @@ def test_the_database_refuses_a_group_id_or_zero(session, account):
 def test_the_database_bounds_the_name_and_the_code_digest(session):
     user = enroll(session)
 
-    with rejected(session, "display_name_max_length"):
+    with rejected_width(session, "telegram_links", "display_name"):
         session.add(
             TelegramLink(user_id=user.id, telegram_user_id=ACCOUNT, display_name="x" * 101, created_at=NOW)
         )

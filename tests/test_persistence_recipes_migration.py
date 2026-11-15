@@ -34,6 +34,10 @@ from tests.test_persistence_migrations import (
     _version,
 )
 from tests.test_persistence_schema import TABLES
+from tests.revisions import HEAD_REVISION
+
+# CI-02/R2-09: SQLite-scoped dialect module (the PostgreSQL counterpart is separate).
+pytestmark = [pytest.mark.sqlite]
 
 OLD_COLUMNS = "id, user_id, title, content, source_message_id, created_at"
 STRUCTURED_COLUMNS = (
@@ -128,7 +132,7 @@ def test_the_migration_adds_the_recipes_table_and_keeps_every_legacy_favorite(em
     others_before = _snapshot_of(empty_engine, OTHER_TABLES)
     assert _version(empty_engine) == [ATTACHMENTS]
 
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, HEAD_REVISION)
 
     assert _version(empty_engine) == [HEAD]
     assert _tables(empty_engine) == TABLES | {"alembic_version"}
@@ -157,7 +161,7 @@ def test_the_migrated_and_modeled_schemas_describe_the_same_new_tables(tmp_path)
     migrated = create_db_engine(f"sqlite:///{tmp_path / 'migrated.db'}")
     modeled = create_db_engine(f"sqlite:///{tmp_path / 'modeled.db'}")
     try:
-        upgrade_database(migrated)
+        upgrade_database(migrated, HEAD_REVISION)
         Base.metadata.create_all(modeled)
         a, b = _fingerprint(migrated), _fingerprint(modeled)
 
@@ -183,7 +187,7 @@ def test_the_migrated_and_modeled_schemas_describe_the_same_new_tables(tmp_path)
 
 def test_one_message_may_yield_several_structured_favorites_but_one_position_only(empty_engine):
     found = _at_0009(empty_engine)
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, HEAD_REVISION)
     with create_session_factory(empty_engine)() as db, db.begin():
         for position, title in ((0, "Борщ"), (1, "Щи")):
             raw_insert(
@@ -238,7 +242,7 @@ def test_one_message_may_yield_several_structured_favorites_but_one_position_onl
 
 def test_the_recipes_are_deleted_with_their_message_and_a_favorite_is_not(empty_engine):
     found = _at_0009(empty_engine)
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, HEAD_REVISION)
     with empty_engine.begin() as connection:
         connection.exec_driver_sql(
             "INSERT INTO message_recipes (message_id, message_role, position, title, ingredients, steps, created_at) "
@@ -309,7 +313,7 @@ def _structured_setup(engine, found):
 
 def test_downgrading_refuses_while_a_structured_favorite_exists_and_changes_nothing(empty_engine):
     found = _at_0009(empty_engine)
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, HEAD_REVISION)
     _structured_setup(empty_engine, found)
     before = _favorite_rows(empty_engine, STRUCTURED_COLUMNS)
 
@@ -329,7 +333,7 @@ def test_the_way_back_restores_0009_and_keeps_every_text_favorite(tmp_path):
     try:
         found = _at_0009(migrated)
         upgrade_database(pristine, ATTACHMENTS)
-        upgrade_database(migrated)
+        upgrade_database(migrated, HEAD_REVISION)
         _structured_setup(migrated, found)
         with migrated.begin() as connection:  # the operator removes the structured data first
             connection.exec_driver_sql("DELETE FROM favorite_recipes WHERE kind = 'structured'")
@@ -355,7 +359,7 @@ def test_the_way_back_restores_0009_and_keeps_every_text_favorite(tmp_path):
                     (uuid.uuid4().hex, found["elena"].hex, found["message_one"], stored(CREATED)),
                 )
 
-        upgrade_database(migrated)  # and forward again: an empty recipes table, text rows as text
+        upgrade_database(migrated, HEAD_REVISION)  # and forward again: an empty recipes table, text rows as text
         assert _version(migrated) == [HEAD]
         assert _tables(migrated) == TABLES | {"alembic_version"}
         with migrated.connect() as connection:

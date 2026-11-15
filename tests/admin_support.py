@@ -11,7 +11,9 @@ committed and not what a session happens to have cached.
 import hashlib
 import shutil
 import sqlite3
+import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -25,6 +27,10 @@ from house_helper.persistence.database import (
     create_session_factory,
     upgrade_database,
 )
+from tests import backend_support
+from tests.backend_support import sqlite_only
+from tests.revisions import HEAD_REVISION
+
 
 TABLES = (
     "users",
@@ -40,10 +46,11 @@ TABLES = (
 
 @pytest.fixture(scope="session")
 def migrated_template(tmp_path_factory):
-    """A database at the head, built once; each test gets a copy."""
+    """A SQLite database at the head, built once; each test gets a copy. The SQLite-scoped
+    admin tests (journal mode, PRAGMA, the write-first convention) use it explicitly."""
     path = tmp_path_factory.mktemp("admin-template") / "template.db"
     engine = create_db_engine(f"sqlite:///{path}")
-    upgrade_database(engine)
+    upgrade_database(engine, HEAD_REVISION)  # the revision is stated, not defaulted (CI-08)
     engine.dispose()
     assert not path.with_name(path.name + "-wal").exists()  # fully checkpointed: one file
     return path
@@ -57,8 +64,37 @@ def db_path(tmp_path, migrated_template):
 
 
 @pytest.fixture
-def db_url(db_path):
+def sqlite_db_url(db_path):
+    """The explicit SQLite file (the dialect-scoped admin tests)."""
     return f"sqlite:///{db_path}"
+
+
+@pytest.fixture
+def admin_database(database_backend, tmp_path):
+    """One database on the configured backend (CI-14): PostgreSQL in CI, SQLite locally."""
+    database = database_backend.new_database(schema="migrations", tmp_path=tmp_path)
+    try:
+        yield database
+    finally:
+        database.close()
+
+
+@pytest.fixture
+def db_url(admin_database):
+    """The restricted application login's URL (SQLite: the file)."""
+    return admin_database.url_text
+
+
+@pytest.fixture
+def provision_db_url(admin_database):
+    """The provisioning login's URL (SQLite: the same file, one identity)."""
+    return admin_database.url_text_for("provision")
+
+
+@pytest.fixture
+def purge_db_url(admin_database):
+    """The purge login's URL (SQLite: the same file, one identity)."""
+    return admin_database.url_text_for("purge")
 
 
 @dataclass(frozen=True)
@@ -95,13 +131,28 @@ def provision(capsys, url, email="Elena@example.com", *extra: str) -> Run:
     return run_cli(capsys, url, "--email", email, *extra)
 
 
+def _neutral(value):
+    """A value as the SQLite tests have always seen it, so one assertion serves both
+    backends: UUIDs as 32 hex digits, timestamps as `stored()` text, booleans as 0/1."""
+    if isinstance(value, uuid.UUID):
+        return value.hex
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+    if isinstance(value, bool):
+        return int(value)
+    return value
+
+
 def rows(url, sql: str, **params) -> list:
     """`sql` on a fresh engine, as a list of tuples. (The engine is the persistence
     layer's, which switches the file to WAL: look at the journal mode BEFORE reading.)"""
     engine = create_db_engine(url)
     try:
         with engine.connect() as connection:
-            return [tuple(row) for row in connection.execute(sa.text(sql), params)]
+            return [
+                tuple(_neutral(value) for value in row)
+                for row in connection.execute(sa.text(sql), params)
+            ]
     finally:
         engine.dispose()
 

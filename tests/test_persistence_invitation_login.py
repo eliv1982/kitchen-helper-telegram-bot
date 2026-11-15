@@ -54,7 +54,8 @@ from house_helper.persistence.models import (
     User,
 )
 from house_helper.persistence.models import Session as LoginSession
-from tests.persistence_support import (  # noqa: F401  (fixtures)
+from tests.persistence_support import (
+    fail_inserts,  # noqa: F401  (fixtures)
     digest,
     engine,
     factory,
@@ -566,11 +567,8 @@ def test_a_database_failure_at_the_session_insert_undoes_everything_before_it(en
     with factory() as db, db.begin():
         issued = issue_invitation(db, new_user(db, display_name="Mother").id, now=NOW)
     before = counts(factory)
-    with engine.begin() as connection:  # the claim, the entry and the link succeed; the session cannot
-        connection.exec_driver_sql(
-            "CREATE TRIGGER refuse_sessions BEFORE INSERT ON sessions "
-            "BEGIN SELECT RAISE(ABORT, 'no sessions today'); END"
-        )
+    # the claim, the entry and the link succeed; the session cannot
+    fail_inserts(engine, "sessions", name="refuse_sessions")
 
     with pytest.raises(sa.exc.DBAPIError):
         with factory() as db, db.begin():

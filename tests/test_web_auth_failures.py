@@ -19,6 +19,8 @@ from house_helper.persistence.allowlist import allow
 from house_helper.persistence.models import AllowlistEntry, IdentityLink, OidcState, User
 from house_helper.persistence.models import Session as LoginSession
 from tests.auth_support import (
+    ddl,
+    fail_inserts,
     CLIENT_SECRET,
     SUBJECT,
     START,
@@ -614,13 +616,7 @@ async def test_a_failure_to_spend_the_state_stops_the_login_before_telegram_is_a
 async def test_a_database_error_when_starting_a_login_leaks_no_secret(tmp_path, caplog, monkeypatch):
     watch_logs(caplog)
     async with auth_app(tmp_path) as h:
-        with h.factory() as db, db.begin():
-            db.execute(
-                sa.text(
-                    "CREATE TRIGGER refuse_logins BEFORE INSERT ON oidc_states "
-                    "BEGIN SELECT RAISE(ABORT, 'disk full'); END"
-                )
-            )
+        fail_inserts(h, "oidc_states", name="refuse_logins")
         seen = {}
         real = authn.begin_oidc_login
 
@@ -670,7 +666,7 @@ async def test_with_the_database_closed_every_route_that_needs_it_says_unavailab
 async def test_a_logout_that_cannot_check_the_owner_of_the_session_ends_nothing_and_clears_nothing(tmp_path):
     async with auth_app(tmp_path) as h:
         await sign_in(h.client, h.telegram)
-        with h.factory() as db, db.begin():
+        with ddl(h) as db:
             db.execute(sa.text("ALTER TABLE sessions RENAME TO sessions_gone"))
 
         response = await h.client.post("/auth/logout", headers=logout_as(h.user_id))
@@ -678,7 +674,7 @@ async def test_a_logout_that_cannot_check_the_owner_of_the_session_ends_nothing_
         assert response.status_code == 503
         assert response.json() == {"detail": "temporarily_unavailable"}
         assert "set-cookie" not in response.headers
-        with h.factory() as db, db.begin():
+        with ddl(h) as db:
             db.execute(sa.text("ALTER TABLE sessions_gone RENAME TO sessions"))
         assert [row.revoked_at for row in rows(h, LoginSession)] == [None]  # not ended "to be safe"
 
@@ -688,7 +684,7 @@ async def test_a_session_is_not_reported_as_logged_out_when_the_database_is_down
     # 503, not 401: a client must not take an outage for "your session ended".
     async with auth_app(tmp_path) as h:
         await sign_in(h.client, h.telegram)
-        with h.factory() as db, db.begin():
+        with ddl(h) as db:
             db.execute(sa.text("ALTER TABLE sessions RENAME TO sessions_gone"))
 
         response = await h.client.get("/auth/me")

@@ -28,7 +28,7 @@ from house_helper.persistence.database import (
 from tests.admin_support import (  # noqa: F401  (fixtures)
     counts,
     db_path,
-    db_url,
+    sqlite_db_url as db_url,
     everything,
     journal_mode,
     migrated_template,
@@ -38,6 +38,9 @@ from tests.admin_support import (  # noqa: F401  (fixtures)
     set_journal_mode,
     snapshot,
 )
+
+# CI-02/R2-09: SQLite-scoped - journal mode, sqlite_master, byte snapshots, the SQLite file.
+pytestmark = [pytest.mark.sqlite]
 
 PASSWORD = "SECRETPW"
 PG_URL = f"postgresql://adminuser:{PASSWORD}@db.internal.example:5432/prodkitchen"

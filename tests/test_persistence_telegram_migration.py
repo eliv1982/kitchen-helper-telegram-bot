@@ -36,6 +36,10 @@ from tests.test_persistence_migrations import (
     _version,
 )
 from tests.test_persistence_schema import TABLES
+from tests.revisions import HEAD_REVISION
+
+# CI-02/R2-09: SQLite-scoped dialect module (the PostgreSQL counterpart is separate).
+pytestmark = [pytest.mark.sqlite]
 
 TELEGRAM_TABLES = {"telegram_links", "telegram_link_codes"}
 ACTIVE_TABLES = {"telegram_active_conversations"}
@@ -77,7 +81,7 @@ def test_each_revision_adds_only_its_own_empty_tables_and_changes_no_row(engine)
     assert _tables(engine) == OLD_TABLES | TELEGRAM_TABLES | {"alembic_version"}
     assert _snapshot_of(engine, OLD_TABLES) == before
 
-    upgrade_database(engine)
+    upgrade_database(engine, HEAD_REVISION)
     assert _version(engine) == [HEAD]
     assert _tables(engine) == TABLES | {"alembic_version"}
     assert _snapshot_of(engine, OLD_TABLES) == before  # every row of every old table
@@ -94,7 +98,7 @@ def test_the_migration_and_the_models_describe_the_same_tables(tmp_path):
     migrated = create_db_engine(f"sqlite:///{tmp_path / 'migrated.db'}")
     modeled = create_db_engine(f"sqlite:///{tmp_path / 'modeled.db'}")
     try:
-        upgrade_database(migrated)
+        upgrade_database(migrated, HEAD_REVISION)
         Base.metadata.create_all(modeled)
         a, b = _fingerprint(migrated), _fingerprint(modeled)
 
@@ -108,7 +112,7 @@ def test_the_migration_and_the_models_describe_the_same_tables(tmp_path):
 def test_the_new_tables_have_the_keys_and_checks_the_design_says(tmp_path):
     migrated = create_db_engine(f"sqlite:///{tmp_path / 'migrated.db'}")
     try:
-        upgrade_database(migrated)
+        upgrade_database(migrated, HEAD_REVISION)
         found = _fingerprint(migrated)
 
         links = found["telegram_links"]
@@ -149,7 +153,7 @@ def test_the_new_tables_have_the_keys_and_checks_the_design_says(tmp_path):
 
 
 def test_nothing_that_existed_refers_to_the_new_tables(engine):
-    upgrade_database(engine)
+    upgrade_database(engine, HEAD_REVISION)
 
     inspector = sa.inspect(engine)
     new = TELEGRAM_TABLES | NEW_TABLES | PHOTO_TABLES
@@ -173,7 +177,7 @@ def test_the_0011_migration_adds_two_empty_tables_and_changes_no_row(tmp_path):
         before = _snapshot_of(engine, TABLES - NEW_TABLES - SHOPPING_TABLES)
         assert _version(engine) == [RECIPES]
 
-        upgrade_database(engine)
+        upgrade_database(engine, HEAD_REVISION)
 
         assert _version(engine) == [HEAD]
         assert _tables(engine) == TABLES | {"alembic_version"}
@@ -194,7 +198,7 @@ def test_the_0011_migration_adds_two_empty_tables_and_changes_no_row(tmp_path):
 def test_the_active_conversation_table_has_the_keys_and_checks_the_design_says(tmp_path):
     engine = create_db_engine(f"sqlite:///{tmp_path / 'active_keys.db'}")
     try:
-        upgrade_database(engine)
+        upgrade_database(engine, HEAD_REVISION)
         found = _fingerprint(engine)["telegram_active_conversations"]
 
         assert list(found["columns"]) == ["user_id", "conversation_id", "selected_at"]
@@ -231,7 +235,7 @@ def test_the_active_conversation_table_has_the_keys_and_checks_the_design_says(t
 def test_the_admission_ledger_has_the_keys_and_checks_the_design_says(tmp_path):
     engine = create_db_engine(f"sqlite:///{tmp_path / 'admission_keys.db'}")
     try:
-        upgrade_database(engine)
+        upgrade_database(engine, HEAD_REVISION)
         found = _fingerprint(engine)["telegram_update_admissions"]
 
         assert list(found["columns"]) == [
@@ -275,7 +279,7 @@ def test_the_active_conversation_migration_downgrades_to_the_same_schema(tmp_pat
         with create_session_factory(migrated)() as db, db.begin():
             db.add(User(display_name="Elena"))
         before = _snapshot_of(migrated, TABLES - NEW_TABLES - SHOPPING_TABLES)
-        upgrade_database(migrated)
+        upgrade_database(migrated, HEAD_REVISION)
 
         downgrade_database(migrated, RECIPES)
 
@@ -284,7 +288,7 @@ def test_the_active_conversation_migration_downgrades_to_the_same_schema(tmp_pat
         assert _fingerprint(migrated) == _fingerprint(pristine)  # the 0010 schema, exactly
         assert _snapshot_of(migrated, TABLES - NEW_TABLES - SHOPPING_TABLES) == before
 
-        upgrade_database(migrated)  # and forward again: empty tables, as they began
+        upgrade_database(migrated, HEAD_REVISION)  # and forward again: empty tables, as they began
         assert _version(migrated) == [HEAD]
         with migrated.connect() as connection:
             assert connection.exec_driver_sql(
@@ -306,7 +310,7 @@ def test_the_way_back_drops_only_what_each_revision_added(tmp_path):
         _at_0007(migrated)
         upgrade_database(at_0007, FAVORITES)
         upgrade_database(at_0008, TELEGRAM)
-        upgrade_database(migrated)
+        upgrade_database(migrated, HEAD_REVISION)
         before = _snapshot_of(migrated, OLD_TABLES)
 
         downgrade_database(migrated, TELEGRAM)
@@ -320,7 +324,7 @@ def test_the_way_back_drops_only_what_each_revision_added(tmp_path):
         assert _fingerprint(migrated) == _fingerprint(at_0007)
         assert _snapshot_of(migrated, OLD_TABLES) == before  # the old rows are as they were
 
-        upgrade_database(migrated)  # and forward again: empty tables, as they began
+        upgrade_database(migrated, HEAD_REVISION)  # and forward again: empty tables, as they began
         assert _version(migrated) == [HEAD] and _tables(migrated) == TABLES | {"alembic_version"}
     finally:
         for opened in (migrated, at_0007, at_0008):

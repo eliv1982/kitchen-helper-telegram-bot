@@ -53,6 +53,7 @@ from house_helper.persistence.invitations import (
 from house_helper.persistence.models import User
 from tests.persistence_support import utc
 from tests.postgres_harness import POSTGRES_URL_ENV, leaked
+from tests.revisions import HEAD_REVISION
 from tests.test_admin_postgres import (  # noqa: F401  (fixtures and helpers)
     DATABASE_DEFAULT,
     _KEY,
@@ -66,10 +67,13 @@ from tests.test_admin_postgres import (  # noqa: F401  (fixtures and helpers)
     waiters,
 )
 
-pytestmark = pytest.mark.skipif(
-    not os.environ.get(POSTGRES_URL_ENV),
-    reason=f"opt-in: set {POSTGRES_URL_ENV} to a local throwaway PostgreSQL (see tests/test_admin_postgres.py)",
-)
+pytestmark = [
+    pytest.mark.postgres,
+    pytest.mark.skipif(
+        not os.environ.get(POSTGRES_URL_ENV),
+        reason=f"opt-in: set {POSTGRES_URL_ENV} to a local throwaway PostgreSQL (see tests/test_admin_postgres.py)",
+    ),
+]
 
 NOW = utc(2026, 10, 19, 12)
 LATER = NOW + timedelta(minutes=5)
@@ -111,7 +115,7 @@ def run_on(scratch, work):
 
 
 def enroll_on(scratch, name):
-    engine = scratch.engine()
+    engine = scratch.provision_engine()
     try:
         return enrollment.enroll_user(create_session_factory(engine), name, now=NOW)
     finally:
@@ -149,12 +153,12 @@ def test_the_migrations_end_at_the_head_and_the_table_and_its_partial_index_are_
 
 def test_the_invitation_revision_downgrades_and_upgrades_again(scratch_rc, monitor_rc):
     user_id, issued = make_invited_user(scratch_rc)
-    engine = scratch_rc.engine()
+    engine = scratch_rc.migrate_engine()
     try:
         downgrade_database(engine, "0004_email_identity_case")
         assert scalar(monitor_rc, "SELECT to_regclass('identity_invitations') IS NULL") is True
         assert scalar(monitor_rc, "SELECT count(*) FROM users") == 1  # nothing else was touched
-        upgrade_database(engine)
+        upgrade_database(engine, HEAD_REVISION)
     finally:
         engine.dispose()
 
@@ -277,7 +281,7 @@ def test_enrollment_and_provision_email_wait_on_the_same_lock_so_they_cannot_bot
     scratch, monitor
 ):
     def provision():
-        engine = scratch.engine()
+        engine = scratch.provision_engine()
         try:
             return provision_email(create_session_factory(engine), prepare_request("Elena@example.com"))
         finally:
@@ -300,7 +304,7 @@ def test_enrollment_and_provision_email_wait_on_the_same_lock_so_they_cannot_bot
 def test_a_refusal_for_a_full_house_changes_nothing_and_releases_the_lock(scratch, monitor):
     enroll_on(scratch, "Elena")
     enroll_on(scratch, "Мама")
-    engine = scratch.engine()
+    engine = scratch.provision_engine()
     try:
         factory = create_session_factory(engine)
         with pytest.raises(EnrollmentRefusal) as refused:
@@ -324,7 +328,7 @@ def test_a_failure_after_the_writes_rolls_the_user_and_the_invitation_back_and_r
         raise RuntimeError("boom")
 
     monkeypatch.setattr(enrollment.invitations, "issue_invitation", failing)
-    engine = scratch.engine()
+    engine = scratch.provision_engine()
     try:
         with pytest.raises(RuntimeError):
             enrollment.enroll_user(create_session_factory(engine), "Elena", now=NOW)
@@ -570,7 +574,7 @@ def test_revoking_leaves_an_expired_invitation_alone_and_reissuing_supersedes_it
 
 def test_the_report_names_the_usable_invitation_when_the_newest_one_carries_the_earliest_time(scratch_rc):
     user_id, _ = make_invited_user(scratch_rc)  # issued at NOW
-    engine = scratch_rc.engine()
+    engine = scratch_rc.provision_engine()
     try:
         factory = create_session_factory(engine)
         enrollment.reissue_invitation(factory, user_id, now=NOW + timedelta(minutes=10))
@@ -591,7 +595,7 @@ def test_a_run_queued_behind_the_lock_reads_the_clock_only_once_it_holds_the_loc
         return LATER
 
     def reissue():
-        engine = scratch.engine()
+        engine = scratch.provision_engine()
         try:
             return enrollment.reissue_invitation(create_session_factory(engine), user_id, now=clock)
         finally:
@@ -624,7 +628,7 @@ def test_a_run_queued_behind_the_lock_reads_the_clock_only_once_it_holds_the_loc
 
 
 def test_the_command_line_enrolls_reissues_revokes_and_reports(scratch, monitor, capsys):
-    environ = {DATABASE_URL_ENV: scratch.url_text}
+    environ = {DATABASE_URL_ENV: scratch.url_text_for("provision")}
 
     assert main(["enroll-user", "--display-name", "Elena"], environ=environ) == 0
     enrolled = capsys.readouterr()

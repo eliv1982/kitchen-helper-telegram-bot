@@ -17,6 +17,9 @@ from house_helper.persistence.models import Conversation, User
 from tests.persistence_support import new_conversation, new_user
 from tests.test_persistence_schema import TABLES
 
+# CI-02/R2-09: SQLite-scoped - engine setup, PRAGMA, files and the SQLite store itself.
+pytestmark = [pytest.mark.sqlite]
+
 
 def _sqlite_url(path) -> str:
     return f"sqlite:///{path}"

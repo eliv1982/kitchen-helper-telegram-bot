@@ -17,6 +17,8 @@ import httpx
 from house_helper.persistence.database import create_db_engine, upgrade_database
 from house_helper.web.database import WebDatabase
 from house_helper.web.settings import WebSettings
+from tests import backend_support
+from tests.revisions import HEAD_REVISION
 
 TIMEOUT = 10  # seconds; only ever reached when a test is already failing
 
@@ -71,14 +73,36 @@ async def serving(app):
 
 
 @asynccontextmanager
-async def opened_database(tmp_path, *, migrated: bool = True, **options):
-    """A WebDatabase on a fresh file (with the real, migrated schema unless
-    migrated=False). Yields (database, engine); closes the database on exit."""
-    engine = create_db_engine(sqlite_url(tmp_path / "web.db"))
-    if migrated:
-        upgrade_database(engine)
+async def opened_database(tmp_path, *, migrated: bool = True, backend=None, sqlite: bool = False, **options):
+    """A WebDatabase on a fresh database (with the real, migrated schema unless
+    migrated=False). Yields (database, engine); closes the database on exit.
+
+    R2-02: there is no implicit SQLite default. The helper uses the configured backend
+    (tests/backend_support.py), so a PostgreSQL-configured run gets PostgreSQL even here;
+    a test that asserts SQLite itself must say `sqlite=True`, which is the only way to
+    get the explicit SQLite file.
+    """
+    if sqlite:
+        engine = create_db_engine(sqlite_url(tmp_path / "web.db"))
+        if migrated:
+            upgrade_database(engine, HEAD_REVISION)  # the revision is stated, not defaulted (CI-08)
+        database = WebDatabase(engine, **options)
+        try:
+            yield database, engine
+        finally:
+            await database.aclose()
+        return
+
+    if backend is None:
+        backend = backend_support.backend()
+    scratch = backend.new_database(
+        schema="migrations" if migrated else "empty", tmp_path=tmp_path
+    )
+    engine = scratch.app_engine()
+    backend_support.verify_database(engine, scratch)
     database = WebDatabase(engine, **options)
     try:
         yield database, engine
     finally:
         await database.aclose()
+        scratch.close()

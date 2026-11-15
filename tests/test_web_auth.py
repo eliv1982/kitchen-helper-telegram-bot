@@ -51,7 +51,7 @@ from tests.auth_support import (
     seed_user,
     sign_in,
 )
-from tests.web_support import LifespanFailed, running, serving, settings_for, sqlite_url
+from tests.web_support import LifespanFailed, running, serving, settings_for
 
 HOST = "kitchen.example.test"
 PRIVATE = {"cache-control": "no-store", "referrer-policy": "no-referrer"}
@@ -157,7 +157,7 @@ async def test_the_http_client_for_telegram_is_closed_when_the_application_stops
 
 
 @pytest.mark.asyncio
-async def test_the_database_is_closed_even_if_closing_the_http_client_fails(tmp_path, monkeypatch):
+async def test_the_database_is_closed_even_if_closing_the_http_client_fails(monkeypatch):
     app = None
     closed = []
     real_aclose = httpx.AsyncClient.aclose
@@ -172,7 +172,11 @@ async def test_the_database_is_closed_even_if_closing_the_http_client_fails(tmp_
     settings = auth_settings()
     telegram = FakeTelegram(FakeClock(), settings)
     app = create_app(
-        WebSettings(database_url=sqlite_url(tmp_path / "x.db"), auth=settings),
+        # R3-03: the database is never opened here; the settings only have to be valid.
+        WebSettings(
+            database_url="postgresql+psycopg://hh_test:not-a-secret@127.0.0.1:55432/postgres",
+            auth=settings,
+        ),
         provider_transport=telegram.transport(),
     )
 

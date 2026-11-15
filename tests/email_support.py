@@ -22,11 +22,7 @@ from uuid import UUID
 import httpx
 
 from house_helper.persistence.allowlist import allow
-from house_helper.persistence.database import (
-    create_db_engine,
-    create_session_factory,
-    upgrade_database,
-)
+from house_helper.persistence.database import create_session_factory
 from house_helper.persistence.models import User
 from house_helper.web.app import create_app
 from house_helper.web.mailer import OutgoingEmail
@@ -38,7 +34,8 @@ from tests.auth_support import (
     auth_settings,
     cookie_attributes,  # noqa: F401  (re-exported for the tests)
 )
-from tests.web_support import TIMEOUT, running, sqlite_url
+from tests import backend_support
+from tests.web_support import TIMEOUT, running
 
 ADDRESS = "elena@example.com"
 SENDER = "login@kitchen.example.test"
@@ -117,6 +114,7 @@ class EmailHarness:
     origin: str = ORIGIN
     telegram: Optional[FakeTelegram] = None
     extra_clients: list[httpx.AsyncClient] = field(default_factory=list)
+    database: Any = None  # the backend handle (tests/backend_support.py)
 
     def new_client(self) -> httpx.AsyncClient:
         """Another browser (or device): its own cookie jar, the same application."""
@@ -188,9 +186,10 @@ async def email_app(
     """The application with email login on (and Telegram login too, if asked),
     started, and a client for it. `options` go to EmailSettings. `configure(app)` runs
     before the application starts."""
-    url = sqlite_url(tmp_path / "email.db")
-    engine = create_db_engine(url)
-    upgrade_database(engine)
+    database = backend_support.backend().new_database(schema="migrations", tmp_path=tmp_path)
+    url = database.url_text
+    engine = database.app_engine()
+    backend_support.verify_database(engine, database)  # the effective dialect and identity (R2-02)
     factory = create_session_factory(engine)
     user_id = seed_email_user(factory) if seed else None
     clock = FakeClock()
@@ -213,7 +212,8 @@ async def email_app(
                 transport=httpx.ASGITransport(app=app), base_url=origin, timeout=TIMEOUT
             )
             harness = EmailHarness(
-                app, client, mailer, clock, settings, factory, user_id, origin, fake_telegram
+                app, client, mailer, clock, settings, factory, user_id, origin, fake_telegram,
+                database=database,
             )
             try:
                 yield harness
@@ -222,6 +222,8 @@ async def email_app(
                     await asyncio.wait_for(opened.aclose(), TIMEOUT)
     finally:
         engine.dispose()
+        # The database is dropped by the test's teardown (tests/backend_support.py), so a
+        # test may still read it after this context has closed.
 
 
 def minutes(count: float) -> timedelta:

@@ -27,6 +27,15 @@ DATABASE_URL_ENV = "HOUSE_HELPER_DATABASE_URL"
 # pass a URL) to put the database somewhere fixed.
 DEFAULT_DATABASE_URL = "sqlite:///house_helper.db"
 
+# HH-DB-01 CI-15: the PostgreSQL pool is stated, not left to SQLAlchemy's defaults.
+# The web layer admits at most MAX_CONCURRENT_UNITS_OF_WORK (10) units of work at once
+# (house_helper.web.database), each of which may hold one connection, so
+# pool_size + max_overflow stays above that limit: a call waits for a slot on the event
+# loop, never for a connection inside the pool. tests/test_web_database.py pins both the
+# SQLite pool and this configuration against the constant.
+POSTGRES_POOL_SIZE = 5
+POSTGRES_MAX_OVERFLOW = 12
+
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 
 
@@ -79,7 +88,15 @@ def _begin_sqlite_transaction(connection: sa.Connection) -> None:
 
 def create_db_engine(url: Optional[str] = None) -> Engine:
     """An engine for `url` (default: the environment, then a local SQLite file)."""
-    engine = sa.create_engine(url or database_url_from_environment())
+    text = url or database_url_from_environment()
+    # The pool sizes are explicit for PostgreSQL only: SQLite keeps the pool SQLAlchemy
+    # chooses for the file, which the existing tests pin.
+    pool_options = (
+        {"pool_size": POSTGRES_POOL_SIZE, "max_overflow": POSTGRES_MAX_OVERFLOW}
+        if make_url(text).get_backend_name() == "postgresql"
+        else {}
+    )
+    engine = sa.create_engine(text, **pool_options)
     if engine.dialect.name == "sqlite":
         sa.event.listen(engine, "connect", _configure_sqlite_connection)
         sa.event.listen(engine, "begin", _begin_sqlite_transaction)

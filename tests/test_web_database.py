@@ -17,9 +17,10 @@ from sqlalchemy.pool import QueuePool
 
 from house_helper.persistence import turns
 from house_helper.persistence.database import (
+    POSTGRES_MAX_OVERFLOW,
+    POSTGRES_POOL_SIZE,
     create_db_engine,
     create_session_factory,
-    upgrade_database,
 )
 from house_helper.persistence.models import Conversation, Message, TurnRequest, User
 from house_helper.web.database import (
@@ -27,8 +28,9 @@ from house_helper.web.database import (
     DatabaseClosed,
     WebDatabase,
 )
+from tests import backend_support
 from tests.persistence_support import count
-from tests.web_support import TIMEOUT, opened_database, sqlite_url
+from tests.web_support import TIMEOUT, opened_database
 
 # How long a test lets a defective implementation show that it started something it
 # should not have. The absence of an event cannot be waited for, only given time to
@@ -299,13 +301,45 @@ async def test_the_event_loop_keeps_running_while_the_database_is_busy(tmp_path)
 
 
 @pytest.mark.asyncio
+@pytest.mark.sqlite  # asserts SQLite's own pool (CI-02); the PostgreSQL pool is below
 async def test_the_limit_stays_below_the_pool_it_protects(tmp_path):
     parameters = inspect.signature(QueuePool.__init__).parameters
     capacity = parameters["pool_size"].default + parameters["max_overflow"].default
 
-    async with opened_database(tmp_path) as (_, engine):
+    async with opened_database(tmp_path, sqlite=True) as (_, engine):
         assert isinstance(engine.pool, QueuePool)  # what a SQLite file gets
         assert MAX_CONCURRENT_UNITS_OF_WORK < capacity
+
+
+@pytest.mark.asyncio
+async def test_the_web_database_uses_the_selected_backend_not_an_implicit_sqlite_file(
+    tmp_path, database_backend
+):
+    """R2-02: the helper no longer falls back to a SQLite file of its own. In CI the
+    engine is PostgreSQL, and the application login is the restricted one."""
+    expected = {"postgres": "postgresql", "sqlite": "sqlite"}[database_backend.name]
+
+    async with opened_database(tmp_path) as (_, engine):
+        assert engine.dialect.name == expected
+        if expected == "postgresql":
+            with engine.connect() as connection:
+                user = connection.execute(sa.text("SELECT current_user")).scalar()
+                connection.rollback()
+            assert user.endswith("_app")
+
+
+def test_the_postgresql_pool_is_configured_explicitly_below_the_unit_limit():
+    # HH-DB-01 CI-15: a PostgreSQL engine gets the stated sizes, not SQLAlchemy's
+    # defaults (5 + 10), and the unit-of-work limit still stays below their sum. No
+    # connection is opened: the engine and its pool are built without a server.
+    engine = create_db_engine("postgresql+psycopg://hh_test:not-a-secret@127.0.0.1:55432/postgres")
+    try:
+        assert isinstance(engine.pool, QueuePool)
+        assert engine.pool.size() == POSTGRES_POOL_SIZE == 5
+        assert engine.pool._max_overflow == POSTGRES_MAX_OVERFLOW == 12  # not the default 10
+        assert MAX_CONCURRENT_UNITS_OF_WORK < POSTGRES_POOL_SIZE + POSTGRES_MAX_OVERFLOW
+    finally:
+        engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -725,10 +759,14 @@ async def test_a_unit_withdrawn_from_the_queue_by_a_bare_cancel_gives_its_slot_b
         assert ran == []
 
 
-def test_a_unit_that_outlives_the_event_loop_ends_quietly(tmp_path, caplog):
+def test_a_unit_that_outlives_the_event_loop_ends_quietly(tmp_path, caplog, database_backend):
     # A server stopped while a function is still running: when it ends there is no
-    # loop left to hand its slot back to, and that is not an error.
+    # loop left to hand its slot back to, and that is not an error. (R3-03: the test is
+    # generic - it runs on the configured backend and asserts that backend's identity.)
     started, release = threading.Event(), threading.Event()
+    scratch = database_backend.new_database(schema="migrations", tmp_path=tmp_path)
+    engine = scratch.app_engine()
+    backend_support.verify_database(engine, scratch)
 
     def hold(session):
         session.execute(sa.text("SELECT 1"))
@@ -736,20 +774,19 @@ def test_a_unit_that_outlives_the_event_loop_ends_quietly(tmp_path, caplog):
         assert release.wait(TIMEOUT)
 
     async def scenario():
-        engine = create_db_engine(sqlite_url(tmp_path / "web.db"))
-        upgrade_database(engine)
         database = WebDatabase(engine)
         task = submit(database, hold)
         await until(started.is_set)
         await cancelled_at_once([task])
-        return database, engine
+        return database
 
-    database, engine = asyncio.run(scenario())  # the loop is closed, the unit goes on
+    database = asyncio.run(scenario())  # the loop is closed, the unit goes on
     try:
         release.set()
         database._pool.shutdown(wait=True)  # returns once the thread has ended
     finally:
         engine.dispose()
+        scratch.close()
 
     assert [record for record in caplog.records if record.levelno >= logging.ERROR] == []
 
@@ -761,16 +798,17 @@ def test_a_unit_that_outlives_the_event_loop_ends_quietly(tmp_path, caplog):
 async def test_closing_lets_admitted_work_finish_and_refuses_what_was_queued(tmp_path, monkeypatch):
     limit = 2
     events = []
-    real_dispose = sa.engine.Engine.dispose
-
-    def recording_dispose(self, *args, **kwargs):
-        events.append(("disposed", units.finished))
-        return real_dispose(self, *args, **kwargs)
-
-    monkeypatch.setattr(sa.engine.Engine, "dispose", recording_dispose)
     ran = []
 
     async with opened_database(tmp_path, max_concurrent=limit) as (database, engine):
+        # Patched only now: opening the database creates and disposes its own setup engines.
+        real_dispose = sa.engine.Engine.dispose
+
+        def recording_dispose(self, *args, **kwargs):
+            events.append(("disposed", units.finished))
+            return real_dispose(self, *args, **kwargs)
+
+        monkeypatch.setattr(sa.engine.Engine, "dispose", recording_dispose)
         pool = engine.pool  # aclose() replaces it
         units = Units(engine)
         admitted = [submit(database, units.write_then_hold), submit(database, units.hold)]
@@ -928,15 +966,16 @@ async def test_closing_ends_the_threads_the_database_started(tmp_path):
 @pytest.mark.asyncio
 async def test_closing_refuses_further_work_and_disposes_the_engine_once(tmp_path, monkeypatch):
     disposed = []
-    real_dispose = sa.engine.Engine.dispose
-
-    def recording_dispose(self, *args, **kwargs):
-        disposed.append(self)
-        return real_dispose(self, *args, **kwargs)
-
-    monkeypatch.setattr(sa.engine.Engine, "dispose", recording_dispose)
 
     async with opened_database(tmp_path) as (database, engine):
+        # Patched only now: opening the database creates and disposes its own setup engines.
+        real_dispose = sa.engine.Engine.dispose
+
+        def recording_dispose(self, *args, **kwargs):
+            disposed.append(self)
+            return real_dispose(self, *args, **kwargs)
+
+        monkeypatch.setattr(sa.engine.Engine, "dispose", recording_dispose)
         await database.run(add_user)
         assert not database.closed
         assert disposed == []
@@ -995,7 +1034,6 @@ async def test_closing_waits_for_the_work_in_flight_before_it_disposes_the_engin
         events.append("disposed")
         return real_dispose(self, *args, **kwargs)
 
-    monkeypatch.setattr(sa.engine.Engine, "dispose", recording_dispose)
     started, release = threading.Event(), threading.Event()
 
     def busy(session):
@@ -1006,6 +1044,8 @@ async def test_closing_waits_for_the_work_in_flight_before_it_disposes_the_engin
         return "finished"
 
     async with opened_database(tmp_path) as (database, engine):
+        # Patched only now: opening the database creates and disposes its own setup engines.
+        monkeypatch.setattr(sa.engine.Engine, "dispose", recording_dispose)
         work = asyncio.ensure_future(database.run(busy))
         while not started.is_set():
             await asyncio.sleep(0)

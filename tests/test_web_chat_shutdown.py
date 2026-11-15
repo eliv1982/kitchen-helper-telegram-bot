@@ -27,7 +27,7 @@ from house_helper.web.database import WebDatabase
 from house_helper.web.diagnostics import ApiError
 from house_helper.web.turn_runner import WebTurnRunner
 from tests.chat_support import ScriptedBackend, cancel_turns, gate_on, reached, runner_env
-from tests.web_support import TIMEOUT, sqlite_url
+from tests.web_support import TIMEOUT
 
 pytestmark = pytest.mark.asyncio
 
@@ -321,25 +321,25 @@ async def test_when_the_database_has_closed_before_the_late_claim_ends_the_lease
         assert "DatabaseClosed" in caplog.text and "SECRET" not in caplog.text
         assert env.count(Message) == 1
 
-    # the next process: a new engine over the same file, and the lease has run out
-    engine = create_db_engine(sqlite_url(tmp_path / "web.db"))
-    database = WebDatabase(engine)
-    try:
-        runner = WebTurnRunner(database, backend, env.clock)
+        # the next process: a new engine on the same database, and the lease has run out
+        engine = create_db_engine(env.handle.url_text)
+        database = WebDatabase(engine)
         try:
-            with pytest.raises(ApiError) as early:
-                await env.submit(runner=runner)  # still within the lease
-            assert early.value.code == "turn_in_progress"
-            env.clock.advance(seconds=91)
-            retry = await env.submit(runner=runner)
+            runner = WebTurnRunner(database, backend, env.clock)
+            try:
+                with pytest.raises(ApiError) as early:
+                    await env.submit(runner=runner)  # still within the lease
+                assert early.value.code == "turn_in_progress"
+                env.clock.advance(seconds=91)
+                retry = await env.submit(runner=runner)
+            finally:
+                await runner.aclose()
+            with create_session_factory(engine)() as db:
+                row = db.scalars(sa.select(TurnRequest)).one()
         finally:
-            await runner.aclose()
-        with create_session_factory(engine)() as db:
-            row = db.scalars(sa.select(TurnRequest)).one()
-    finally:
-        await database.aclose()
-    assert retry.completed.assistant_message.text == "Омлет."
-    assert (row.status, row.attempt_count) == ("completed", 2)
+            await database.aclose()
+        assert retry.completed.assistant_message.text == "Омлет."
+        assert (row.status, row.attempt_count) == ("completed", 2)
 
 
 async def test_drain_waits_for_a_unit_that_is_still_running_even_after_its_turn_is_gone(tmp_path, monkeypatch):

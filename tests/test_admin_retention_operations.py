@@ -39,7 +39,10 @@ from house_helper.persistence.database import (
     create_session_factory,
 )
 from house_helper.persistence.models import Message, Session
-from tests.admin_support import db_path, db_url, migrated_template, run_admin  # noqa: F401  (fixtures)
+from tests.admin_support import db_path, sqlite_db_url as db_url, migrated_template, run_admin  # noqa: F401  (fixtures)
+
+# CI-02/R2-09: SQLite-scoped (the SQLite file, its engine, and its byte snapshots).
+pytestmark = [pytest.mark.sqlite]
 from tests.deploy_support import (
     BEHIND,
     DBTOOL_PATH,

@@ -30,6 +30,7 @@ from house_helper.persistence.turns import (
     TurnSuperseded,
     TurnUnusable,
 )
+from tests.backend_support import sqlite_only
 from tests.persistence_support import (  # noqa: F401  (fixtures)
     engine,
     factory,
@@ -149,6 +150,8 @@ def test_the_365_day_deadline_is_recorded_when_the_message_and_its_request_are_m
     assert assistant.expires_at == later + timedelta(seconds=4) + YEAR  # from its own creation
 
 
+@sqlite_only
+@pytest.mark.sqlite
 def test_a_writer_starts_with_a_write_and_the_write_decides_ownership(engine, factory, user_id, conversation_id):
     seen = []
     sa.event.listen(

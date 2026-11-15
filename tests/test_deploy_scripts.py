@@ -38,7 +38,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.deploy_support import DEPLOY, REPO_ROOT, env_for, make_database, tables
+from tests.deploy_support import DEPLOY, REPO_ROOT, env_for, make_database, make_head_database, tables
 from tests.deploy_support import run as run_dbtool
 
 
@@ -1464,7 +1464,7 @@ def test_concurrent_backups_to_one_name_have_exactly_one_publisher_and_nothing_i
 
 @needs_bash
 def test_a_published_backup_is_a_database_the_restore_accepts_and_its_checksum_verifies(harness, tmp_path, capsys):
-    source = make_database(tmp_path / "source.db")
+    source = make_head_database(tmp_path / "source.db")
     done = harness.backup(FAKE_BACKUP_FROM=str(source))
     assert done.returncode == 0, done.stderr
     published = Path(done.stdout.strip())

@@ -49,6 +49,10 @@ from tests.test_persistence_migrations import (
     _version,
 )
 from tests.test_persistence_schema import TABLES
+from tests.revisions import HEAD_REVISION
+
+# CI-02/R2-09: SQLite-scoped dialect module (the PostgreSQL counterpart is separate).
+pytestmark = [pytest.mark.sqlite]
 
 NOW = utc(2026, 11, 8, 12)
 SHOPPING_TABLES = {"shopping_lists", "shopping_list_items", "shopping_list_requests"}
@@ -118,7 +122,7 @@ def test_0012_adds_three_empty_tables_and_changes_no_other_row(engine):
 
 
 def test_the_migrated_schema_is_the_models_schema_exactly(engine, tmp_path):
-    upgrade_database(engine)
+    upgrade_database(engine, HEAD_REVISION)
     modeled = create_db_engine(f"sqlite:///{tmp_path / 'modeled.db'}")
     try:
         from house_helper.persistence.base import Base
@@ -130,7 +134,7 @@ def test_the_migrated_schema_is_the_models_schema_exactly(engine, tmp_path):
 
 
 def test_the_tables_have_the_keys_and_rules_the_design_says(engine):
-    upgrade_database(engine)
+    upgrade_database(engine, HEAD_REVISION)
     fingerprint = _fingerprint(engine)
     lists, items = fingerprint["shopping_lists"], fingerprint["shopping_list_items"]
 
@@ -266,7 +270,7 @@ def test_the_way_back_drops_all_three_tables_and_every_saved_list(tmp_path):
     pristine = create_db_engine(f"sqlite:///{tmp_path / 'pristine.db'}")
     try:
         found = _at_0011(migrated)
-        upgrade_database(migrated)
+        upgrade_database(migrated, HEAD_REVISION)
         upgrade_database(pristine, TELEGRAM_ACTIVE)
         before = _snapshot_of(migrated, TABLES - SHOPPING_TABLES)
 
@@ -319,7 +323,7 @@ def test_the_way_back_drops_all_three_tables_and_every_saved_list(tmp_path):
             assert connection.exec_driver_sql("PRAGMA foreign_key_check").all() == []
             assert connection.exec_driver_sql("PRAGMA integrity_check").scalars().all() == ["ok"]
 
-        upgrade_database(migrated)  # forward again: empty tables, as they began
+        upgrade_database(migrated, HEAD_REVISION)  # forward again: empty tables, as they began
         with migrated.connect() as connection:
             for table in SHOPPING_TABLES:
                 assert connection.exec_driver_sql(f"SELECT count(*) FROM {table}").scalar() == 0
@@ -362,7 +366,7 @@ def test_the_whole_database_backup_carries_the_lists_and_their_items(tmp_path):
     live = tmp_path / "live.db"
     engine = create_db_engine(f"sqlite:///{live}")
     try:
-        upgrade_database(engine)
+        upgrade_database(engine, HEAD_REVISION)
         with create_session_factory(engine)() as db, db.begin():
             user = new_user(db)
             list_id = uuid.uuid4()

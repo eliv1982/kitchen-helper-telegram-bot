@@ -18,3 +18,7 @@ anyio==4.15.1
 httpx==0.28.1
 PyJWT[crypto]==2.15.1
 cryptography==49.0.0
+# PostgreSQL driver (HH-DB-01 CI-04): the runtime image and CI must use the same
+# tested driver. The URL scheme is postgresql+psycopg://. The binary extra carries
+# the libpq build the tests exercise; 3.3.6 supports Python 3.10, the oldest CI runs.
+psycopg[binary]==3.3.6

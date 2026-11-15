@@ -17,6 +17,7 @@ from tests.deploy_support import (
     alter,
     dbtool,
     make_database,
+    make_head_database,
     run,
     run_tool,
     set_revision,
@@ -215,7 +216,7 @@ def test_not_enough_scratch_space_is_refused_before_the_rewrite(snapshot, stagin
 
 
 def test_sanitize_of_an_empty_but_migrated_database_works(tmp_path, staging, capsys):
-    path = make_database(tmp_path / "empty.db")
+    path = make_head_database(tmp_path / "empty.db")
     snap = tmp_path / "snap.db"
     dbtool.snapshot_database(path, snap)
     done = run(capsys, ["sanitize", "--input", str(snap), "--output", "-"], env(staging))

@@ -31,6 +31,7 @@ from house_helper.persistence.models import Session as LoginSession
 from house_helper.web.app import create_app
 from house_helper.web.logsafety import ACCESS_LOGGER, RedactAuthQuery, install_access_log_redaction
 from tests.auth_support import (
+    ddl,
     CLIENT_ID,
     CLIENT_SECRET,
     app_log_text,
@@ -98,10 +99,10 @@ async def test_nothing_secret_is_logged_whatever_happens(tmp_path, caplog):
         h.telegram.token_failure = lambda request: httpx.Response(503, text=CLIENT_SECRET)
         assert (await one(h.new_client()))[1].status_code == 502
         h.telegram.token_failure = None
-        with h.factory() as db, db.begin():
+        with ddl(h) as db:
             db.execute(sa.text("ALTER TABLE sessions RENAME TO sessions_gone"))
         assert (await one(h.new_client()))[1].status_code == 503
-        with h.factory() as db, db.begin():
+        with ddl(h) as db:
             db.execute(sa.text("ALTER TABLE sessions_gone RENAME TO sessions"))
 
         # everything that is stored, and everything the browsers held

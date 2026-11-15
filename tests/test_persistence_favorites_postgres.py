@@ -30,12 +30,16 @@ from house_helper.persistence.database import (
 from house_helper.persistence.models import FavoriteRecipe, Message, MessageRecipe
 from tests.persistence_support import new_conversation, new_message, new_user, utc
 from tests.postgres_harness import POSTGRES_URL_ENV, Scratch
+from tests.revisions import HEAD_REVISION
 from tests.test_admin_postgres import pg_run, scratch, template  # noqa: F401  (fixtures)
 
-pytestmark = pytest.mark.skipif(
-    not os.environ.get(POSTGRES_URL_ENV),
-    reason=f"opt-in: set {POSTGRES_URL_ENV} to a local throwaway PostgreSQL (see the module docstring)",
-)
+pytestmark = [
+    pytest.mark.postgres,
+    pytest.mark.skipif(
+        not os.environ.get(POSTGRES_URL_ENV),
+        reason=f"opt-in: set {POSTGRES_URL_ENV} to a local throwaway PostgreSQL (see the module docstring)",
+    ),
+]
 
 ATTACHMENTS = "0009_message_attachments"
 NOW = utc(2026, 11, 1, 12)
@@ -96,11 +100,18 @@ def make_answered(factory):
 
 
 def test_a_legacy_favorite_survives_0009_to_0010_on_postgres(scratch):
-    engine = scratch.engine()
+    # The downgrade and the upgrade are DDL and run as the migration login; the legacy
+    # row is written and read as the restricted application login.
+    migration = scratch.migrate_engine()
     try:
-        downgrade_database(engine, ATTACHMENTS)
+        downgrade_database(migration, ATTACHMENTS)
+    finally:
+        migration.dispose()
+
+    app = scratch.app_engine()
+    try:
         legacy_id = uuid.uuid4()
-        with create_session_factory(engine)() as db, db.begin():
+        with create_session_factory(app)() as db, db.begin():
             user = new_user(db, display_name="Elena")
             conversation = new_conversation(db, user, created_at=NOW, updated_at=NOW)
             answer = new_message(db, conversation, role="assistant", content="Борщ", created_at=NOW)
@@ -116,9 +127,13 @@ def test_a_legacy_favorite_survives_0009_to_0010_on_postgres(scratch):
             )
             owner = user.id
 
-        upgrade_database(engine)
+        migration = scratch.migrate_engine()
+        try:
+            upgrade_database(migration, HEAD_REVISION)  # the revision is stated (CI-08)
+        finally:
+            migration.dispose()
 
-        with create_session_factory(engine)() as db:
+        with create_session_factory(app)() as db:
             row = db.get(FavoriteRecipe, legacy_id)
             assert row.user_id == owner
             assert row.content == "Борщ: свёкла."
@@ -126,7 +141,7 @@ def test_a_legacy_favorite_survives_0009_to_0010_on_postgres(scratch):
             assert (row.servings, row.ingredients, row.steps, row.notes) == (None, None, None, None)
             assert row.updated_at == row.created_at == NOW
     finally:
-        engine.dispose()
+        app.dispose()
 
 
 def test_the_composite_key_refuses_a_recipe_of_a_user_message_on_postgres(scratch):
@@ -161,8 +176,12 @@ def test_the_downgrade_refuses_structured_data_on_postgres(scratch):
                 db, user_id, conversation_id, answer_id, now=NOW, recipe_index=0
             )
 
-        with pytest.raises(RuntimeError, match="structured favorite"):
-            downgrade_database(engine, ATTACHMENTS)
+        migration = scratch.migrate_engine()
+        try:
+            with pytest.raises(RuntimeError, match="structured favorite"):
+                downgrade_database(migration, ATTACHMENTS)
+        finally:
+            migration.dispose()
 
         with create_session_factory(engine)() as db:
             assert db.scalar(sa.select(sa.func.count()).select_from(FavoriteRecipe)) == 1

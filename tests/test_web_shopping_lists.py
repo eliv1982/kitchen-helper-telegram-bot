@@ -108,8 +108,10 @@ def expire(chat, message_id: int) -> None:
     """
     now = chat.clock()
     with chat.base.factory() as db, db.begin():
-        db.connection().exec_driver_sql(
-            "UPDATE messages SET created_at = ?, expires_at = ? WHERE id = ?",
+        connection = db.connection()
+        mark = "?" if connection.dialect.paramstyle == "qmark" else "%s"
+        connection.exec_driver_sql(
+            f"UPDATE messages SET created_at = {mark}, expires_at = {mark} WHERE id = {mark}",
             (stored(now - timedelta(days=400)), stored(now - timedelta(days=35)), message_id),
         )
 

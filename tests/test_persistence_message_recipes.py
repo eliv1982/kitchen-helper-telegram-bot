@@ -29,6 +29,7 @@ from tests.persistence_support import (  # noqa: F401  (fixtures)
     new_message,
     new_user,
     rejected,
+    rejected_width,
     session,
     utc,
 )
@@ -318,7 +319,12 @@ def test_the_database_refuses_a_recipe_the_protocol_could_not_have_produced(sess
         **fields,
     }
 
-    with rejected(session, constraint):
+    reject = (
+        rejected_width(session, "message_recipes", constraint[len("ck_message_recipes_") : -len("_max_length")])
+        if constraint.startswith("ck_message_recipes_") and constraint.endswith("_max_length")
+        else rejected(session, constraint)
+    )
+    with reject:
         session.add(MessageRecipe(**values))
 
 

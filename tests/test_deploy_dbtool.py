@@ -32,6 +32,7 @@ import pytest
 
 from house_helper.persistence.database import create_db_engine, create_session_factory
 from house_helper.persistence.models import User
+from tests.backend_support import sqlite_only
 from tests.deploy_support import (
     BEHIND,
     DBTOOL_PATH,
@@ -42,6 +43,7 @@ from tests.deploy_support import (
     env_for,
     listing,
     make_database,
+    make_head_database,
     posix_only,
     run,
     set_revision,
@@ -58,7 +60,7 @@ def live(tmp_path):
     """A migrated database at an absolute path, and the environment that names it."""
     data = tmp_path / "data"
     data.mkdir()
-    path = make_database(data / "house_helper.db")
+    path = make_head_database(data / "house_helper.db")
     return path, env_for(path)
 
 
@@ -105,7 +107,7 @@ def test_check_config_describes_a_usable_directory_and_refuses_a_missing_one(tmp
     fresh = run(capsys, ["check-config"], env_for(absent))
     assert fresh.code == 0 and "absent or empty" in fresh.out
 
-    make_database(absent)
+    make_head_database(absent)
     existing = run(capsys, ["check-config"], env_for(absent))
     assert existing.code == 0 and "present" in existing.out
 
@@ -145,7 +147,7 @@ def test_check_schema_tells_behind_from_ahead(tmp_path, capsys):
     assert result.code == 4 and "[schema_not_head]" in result.err
     assert BEHIND in result.err and "BEHIND" in result.err and "Upgrade" in result.err
 
-    ahead = make_database(tmp_path / "data" / "ahead.db")
+    ahead = make_head_database(tmp_path / "data" / "ahead.db")
     set_revision(ahead, "0007_future")
     result = run(capsys, ["check-schema"], env_for(ahead))
     assert result.code == 4 and "[schema_not_head]" in result.err
@@ -155,6 +157,9 @@ def test_check_schema_tells_behind_from_ahead(tmp_path, capsys):
 # --- backup -------------------------------------------------------------------------------
 
 
+# SQLite-scoped: the -wal file and a file-level copy (CI-02)
+@pytest.mark.sqlite
+@sqlite_only
 def test_a_backup_holds_what_exists_only_in_the_wal_and_a_file_copy_does_not(
     live, tmp_path, capsys
 ):

@@ -49,7 +49,7 @@ from house_helper.web.settings import (
 from tests.chat_support import ScriptedBackend, chat_app, error_of, post_headers
 from tests.telegram_support import MOTHER, telegram_app
 from tests.test_openai_chat import FakeClient, response
-from tests.web_support import serving, sqlite_url
+from tests.web_support import serving
 
 pytestmark = pytest.mark.asyncio
 
@@ -475,12 +475,16 @@ async def test_the_shell_tells_the_page_whether_controls_exist():
     )
 
 
-async def test_the_page_served_by_an_enabled_application_says_so(tmp_path):
-    settings = WebSettings(
-        database_url=sqlite_url(tmp_path / "page.db"), structured_recipes=True
-    )
-    async with serving(create_app(settings)) as client:
-        shell = (await client.get("/")).text
+async def test_the_page_served_by_an_enabled_application_says_so(tmp_path, database_backend):
+    # R3-03: a generic page test; the database is the configured backend, not a SQLite
+    # file chosen on the side (the page itself opens no connection).
+    database = database_backend.new_database(schema="migrations", tmp_path=tmp_path)
+    try:
+        settings = WebSettings(database_url=database.url_text, structured_recipes=True)
+        async with serving(create_app(settings)) as client:
+            shell = (await client.get("/")).text
+    finally:
+        database.close()
 
     assert 'data-structured-recipes="1"' in shell
 

@@ -42,6 +42,10 @@ from tests.test_persistence_migrations import (
     _version,
 )
 from tests.test_persistence_schema import TABLES
+from tests.revisions import HEAD_REVISION
+
+# CI-02/R2-09: SQLite-scoped dialect module (the PostgreSQL counterpart is separate).
+pytestmark = [pytest.mark.sqlite]
 
 START = utc(2026, 11, 11, 9)
 EXPIRES = START + timedelta(days=180)
@@ -223,7 +227,7 @@ def test_the_measure_migration_adds_three_columns_and_changes_no_other_value(mea
     before = _snapshot(measure_engine)
     assert _version(measure_engine) == [PROFILE]
 
-    upgrade_database(measure_engine)
+    upgrade_database(measure_engine, HEAD_REVISION)
 
     assert _version(measure_engine) == [MEASURES]
     assert _tables(measure_engine) == TABLES | {"alembic_version"}
@@ -276,7 +280,7 @@ def test_the_migration_does_not_rebuild_users_and_so_cascades_nothing(measure_en
         }
     assert before["users"] == 2 and before["shopping_lists"] == 1
 
-    upgrade_database(measure_engine)
+    upgrade_database(measure_engine, HEAD_REVISION)
 
     with measure_engine.connect() as connection:
         after = {
@@ -287,7 +291,7 @@ def test_the_migration_does_not_rebuild_users_and_so_cascades_nothing(measure_en
 
 
 def test_each_range_is_a_named_database_rule_and_the_three_are_independent(measure_engine):
-    upgrade_database(measure_engine)
+    upgrade_database(measure_engine, HEAD_REVISION)
     with create_session_factory(measure_engine)() as db, db.begin():
         user = new_user(db, display_name="Кто-то")
     user_id = user.id.hex
@@ -325,7 +329,7 @@ def test_downgrading_drops_only_the_three_columns_and_restores_the_0013_schema(t
     try:
         found = _database_at_0013(migrated)
         upgrade_database(pristine, PROFILE)
-        upgrade_database(migrated)
+        upgrade_database(migrated, HEAD_REVISION)
         with create_session_factory(migrated)() as db, db.begin():
             db.get(User, found["elena"]).measure_glass_ml = 240
             db.get(User, found["elena"]).measure_teaspoon_ml = 6
@@ -344,7 +348,7 @@ def test_downgrading_drops_only_the_three_columns_and_restores_the_0013_schema(t
             assert connection.exec_driver_sql("PRAGMA foreign_key_check").all() == []
             assert connection.exec_driver_sql("PRAGMA integrity_check").scalars().all() == ["ok"]
 
-        upgrade_database(migrated)  # forward again: the capacities are gone, the defaults are back
+        upgrade_database(migrated, HEAD_REVISION)  # forward again: the capacities are gone, the defaults are back
         with create_session_factory(migrated)() as db:
             elena = db.get(User, found["elena"])
             assert (elena.measure_glass_ml, elena.measure_teaspoon_ml, elena.measure_tablespoon_ml) == (

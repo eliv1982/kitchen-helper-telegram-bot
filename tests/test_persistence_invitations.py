@@ -50,6 +50,7 @@ from house_helper.persistence.invitations import (
 )
 from house_helper.persistence.models import AllowlistEntry, IdentityInvitation, IdentityLink, User
 from house_helper.persistence.models import Session as LoginSession
+from tests.backend_support import sqlite_only
 from tests.persistence_support import (  # noqa: F401  (fixtures)
     count,
     digest,
@@ -955,6 +956,8 @@ def first_statement(engine, factory, action):
     return seen
 
 
+@sqlite_only
+@pytest.mark.sqlite
 def test_issuing_and_claiming_begin_with_a_write_that_changes_nothing(engine, factory):
     issuing = first_statement(engine, factory, lambda db, owner, issued: issue_invitation(db, owner.id, now=LATER))
     claiming = first_statement(engine, factory, lambda db, owner, issued: claim(db, issued))

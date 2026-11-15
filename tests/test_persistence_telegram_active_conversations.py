@@ -29,11 +29,7 @@ import sqlalchemy as sa
 from house_helper.admin.retention import purge_expired
 from house_helper.persistence import conversations as cv
 from house_helper.persistence import telegram as tg
-from house_helper.persistence.database import (
-    create_db_engine,
-    create_session_factory,
-    upgrade_database,
-)
+from house_helper.persistence.database import create_session_factory
 from house_helper.persistence.models import (
     Conversation,
     TelegramActiveConversation,
@@ -565,14 +561,20 @@ def test_a_stale_cursor_is_removed_only_when_there_is_no_link(factory, user_id):
 # --- retention ---------------------------------------------------------------------------------
 
 
-def test_the_retention_run_leaves_the_cursor_and_merely_nulls_a_deleted_conversation(tmp_path):
+def test_the_retention_run_leaves_the_cursor_and_merely_nulls_a_deleted_conversation(
+    tmp_path, database_backend
+):
     """The new table has no deadline and is not named by the purge; deleting the old empty
     conversation it points at is the database's ON DELETE SET NULL, not a second cursor
-    rule. The row stays as the explicit "selected, then deleted" state."""
-    engine = create_db_engine(f"sqlite:///{tmp_path / 'retention_active.db'}")
+    rule. The row stays as the explicit "selected, then deleted" state.
+
+    R3-03: generic behavior - the configured backend, seeded as the application login and
+    purged as the purge login (on SQLite both are the one file)."""
+    database = database_backend.new_database(schema="migrations", tmp_path=tmp_path)
+    app = database.app_engine()
+    purge = database.purge_engine()
     try:
-        upgrade_database(engine)
-        factory = create_session_factory(engine)
+        factory = create_session_factory(app)
         old = NOW - timedelta(days=400)
 
         with factory() as db, db.begin():
@@ -583,7 +585,7 @@ def test_the_retention_run_leaves_the_cursor_and_merely_nulls_a_deleted_conversa
             tg.select_conversation(db, user.id, conversation.id, now=old)
             user_id, conversation_id = user.id, conversation.id
 
-        report = purge_expired(engine, now=NOW)
+        report = purge_expired(purge, now=NOW)
 
         assert report.deleted["conversations"] == 1
         with factory() as db:
@@ -591,4 +593,6 @@ def test_the_retention_run_leaves_the_cursor_and_merely_nulls_a_deleted_conversa
             assert row.user_id == user_id and row.conversation_id is None
             assert db.get(Conversation, conversation_id) is None
     finally:
-        engine.dispose()
+        purge.dispose()
+        app.dispose()
+        database.close()

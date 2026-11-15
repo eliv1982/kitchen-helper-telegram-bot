@@ -52,6 +52,7 @@ from tests.persistence_support import (
     utc,
 )
 from tests.postgres_harness import POSTGRES_URL_ENV, Scratch
+from tests.revisions import HEAD_REVISION
 from tests.test_admin_enrollment_postgres import (  # noqa: F401  (fixtures)
     monitor_rc,
     run_on,
@@ -63,11 +64,14 @@ from tests.test_admin_postgres import (  # noqa: F401  (fixtures and helpers)
     template,
 )
 
-pytestmark = pytest.mark.skipif(
-    not os.environ.get(POSTGRES_URL_ENV),
-    reason=f"opt-in: set {POSTGRES_URL_ENV} to a local throwaway PostgreSQL "
-    "(see tests/test_admin_postgres.py)",
-)
+pytestmark = [
+    pytest.mark.postgres,
+    pytest.mark.skipif(
+        not os.environ.get(POSTGRES_URL_ENV),
+        reason=f"opt-in: set {POSTGRES_URL_ENV} to a local throwaway PostgreSQL "
+        "(see tests/test_admin_postgres.py)",
+    ),
+]
 
 NOW = utc(2026, 11, 7, 12)
 PREVIOUS = "0010_structured_recipe_favorites"
@@ -84,12 +88,29 @@ def test_the_selection_revision_fits_the_version_column():
 
 
 def test_a_populated_0010_database_upgrades_downgrades_and_upgrades_again(pg_run):
-    name = pg_run.create_database()
+    name = pg_run.create_database(runtime_roles=("app",))
     scratch = Scratch(pg_run, name)
-    try:
-        engine = scratch.engine()
+
+    def migrate(revision):
+        migration = scratch.migrate_engine()
         try:
-            upgrade_database(engine, PREVIOUS)
+            upgrade_database(migration, revision)  # the revision is stated, not defaulted (CI-08)
+            if revision == PREVIOUS:
+                pg_run.apply_privileges(migration)  # the ACLs and defaults the app needs next
+        finally:
+            migration.dispose()
+
+    def downgrade(revision):
+        migration = scratch.migrate_engine()
+        try:
+            downgrade_database(migration, revision)
+        finally:
+            migration.dispose()
+
+    try:
+        migrate(PREVIOUS)
+        engine = scratch.app_engine()
+        try:
             factory = create_session_factory(engine)
             with factory() as db, db.begin():
                 user = new_user(db, display_name="Elena")
@@ -135,7 +156,7 @@ def test_a_populated_0010_database_upgrades_downgrades_and_upgrades_again(pg_run
             before = snapshot()
             assert scalar(engine, "SELECT version_num FROM alembic_version") == PREVIOUS
 
-            upgrade_database(engine)  # the fix: the identifier fits VARCHAR(32)
+            migrate(HEAD_REVISION)  # the fix: the identifier fits VARCHAR(32)
 
             assert scalar(engine, "SELECT version_num FROM alembic_version") == HEAD
             assert snapshot() == before  # every old row is unchanged
@@ -153,14 +174,14 @@ def test_a_populated_0010_database_upgrades_downgrades_and_upgrades_again(pg_run
                 == 5
             )
 
-            downgrade_database(engine, PREVIOUS)
+            downgrade(PREVIOUS)
 
             assert scalar(engine, "SELECT version_num FROM alembic_version") == PREVIOUS
             for table in ("telegram_active_conversations", "telegram_update_admissions"):
                 assert scalar(engine, f"SELECT to_regclass('{table}') IS NULL") is True
             assert snapshot() == before
 
-            upgrade_database(engine)  # and forward again: empty tables, as they began
+            migrate(HEAD_REVISION)  # and forward again: empty tables, as they began
 
             assert scalar(engine, "SELECT version_num FROM alembic_version") == HEAD
             assert snapshot() == before
@@ -492,7 +513,7 @@ def test_the_purge_deletes_aged_markers_and_keeps_the_cutover_row_on_postgresql(
 
     run_on(scratch_rc, seed)
 
-    engine = scratch_rc.engine()
+    engine = scratch_rc.purge_engine()  # R2-03: the purge command's own identity
     try:
         report = purge_expired(engine, now=NOW, pause=lambda: None)
     finally:

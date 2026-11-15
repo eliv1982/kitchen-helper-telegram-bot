@@ -43,6 +43,7 @@ from house_helper.persistence.authn import (
     revoke_session_of,
 )
 from house_helper.persistence.models import AllowlistEntry, IdentityLink, OidcState, Session, User
+from tests.backend_support import sqlite_only
 from tests.persistence_support import (  # noqa: F401  (fixtures)
     count,
     engine,
@@ -667,6 +668,8 @@ def test_revoking_an_identity_that_never_signed_in_touches_only_its_entry(sessio
     assert stored_session(session, issued).revoked_at is None
 
 
+@sqlite_only
+@pytest.mark.sqlite
 def test_a_session_without_provenance_never_authenticates(session, user, issued):
     # The CHECK makes such a row impossible unless revoked; switch it off to prove
     # that authenticate would refuse the row on its own.

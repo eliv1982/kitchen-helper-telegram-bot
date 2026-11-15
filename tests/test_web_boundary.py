@@ -48,6 +48,7 @@ from tests.test_persistence_boundary import (
     _names_imported_by,
     _python_files,
 )
+from tests.revisions import HEAD_REVISION
 
 WEB_DIR = Path(house_helper.web.__file__).parent
 
@@ -123,7 +124,7 @@ def test_the_scan_sees_the_files_it_is_meant_to_scan():
     "source, expected",
     [
         ("from house_helper.persistence.database import init_database", {"init_database"}),
-        ("database.upgrade_database(engine)", {"upgrade_database"}),
+        ("database.upgrade_database(engine, HEAD_REVISION)", {"upgrade_database"}),
         ("Base.metadata.create_all(engine)", {"create_all"}),
         ("from x import create_all as make", {"create_all"}),
     ],

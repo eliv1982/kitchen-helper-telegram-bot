@@ -36,11 +36,12 @@ from house_helper.core.backend import BackendConnectionError, BackendReply
 from house_helper.core.recipes import Ingredient, Recipe, render_recipe
 from house_helper.persistence import authn
 from house_helper.persistence.base import utcnow
-from house_helper.persistence.database import create_db_engine, create_session_factory, upgrade_database
+from house_helper.persistence.database import create_session_factory
 from house_helper.persistence.models import Conversation, Message
 from house_helper.persistence.models import Session as LoginSession
 from house_helper.web.app import create_app
 from house_helper.web.settings import WebSettings
+from tests import backend_support
 from tests.auth_support import auth_settings, seed_user
 
 NODE = shutil.which("node")
@@ -89,17 +90,22 @@ def _free_port() -> int:
 
 
 class LiveServer:
-    def __init__(self, directory: Path) -> None:
+    def __init__(self, directory: Path, database) -> None:
         self.port = _free_port()
         self.origin = f"http://127.0.0.1:{self.port}"
-        url = f"sqlite:///{directory / 'live.db'}"
-        self.engine = create_db_engine(url)
-        upgrade_database(self.engine)
+        # R2-02: the server and this harness share the selected backend's database, and the
+        # application is configured with the restricted application login's URL - never the
+        # bootstrap, provisioning or purge credential. The dialect and the database identity
+        # are asserted, not taken from the configured URL.
+        self.handle = database
+        self.url = database.url_text
+        self.engine = database.app_engine()
+        backend_support.verify_database(self.engine, database)
         self.factory = create_session_factory(self.engine)
         self.backend = LiveBackend()
         self.lost_acknowledgements: set[str] = set()
         app = create_app(
-            WebSettings(database_url=url, auth=auth_settings(self.origin)),
+            WebSettings(database_url=self.url, auth=auth_settings(self.origin)),
             chat_backend=self.backend,
         )
         self.app = app
@@ -176,13 +182,18 @@ class LiveServer:
 
 
 @pytest.fixture(scope="module")
-def live(tmp_path_factory):
-    server = LiveServer(tmp_path_factory.mktemp("live"))
+def live(tmp_path_factory, database_backend):
+    directory = tmp_path_factory.mktemp("live")
+    database = backend_support.untrack(
+        database_backend.new_database(schema="migrations", tmp_path=directory)
+    )
+    server = LiveServer(directory, database)
     server.start()
     try:
         yield server
     finally:
-        server.stop()
+        server.stop()  # the server first, then the database it used
+        database.close()
 
 
 def _names() -> list[str]:

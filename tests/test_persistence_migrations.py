@@ -64,6 +64,10 @@ from tests.persistence_support import (
     utc,
 )
 from tests.test_persistence_schema import TABLES
+from tests.revisions import HEAD_REVISION
+
+# CI-02/R2-09: SQLite-scoped dialect module (the PostgreSQL counterpart is separate).
+pytestmark = [pytest.mark.sqlite]
 
 INITIAL = "0001_persistence_foundation"
 PROVENANCE = "0002_session_provenance"
@@ -80,6 +84,23 @@ SHOPPING = "0012_shopping_lists"
 PROFILE = "0013_user_text_size"
 MEASURES = "0014_user_measure_overrides"
 HEAD = MEASURES
+# The whole history, in the order it applies (HH-DB-01 CI-09 walks it one step at a time).
+CHAIN = (
+    INITIAL,
+    PROVENANCE,
+    CHALLENGES,
+    EMAIL_CASE,
+    INVITATIONS,
+    OIDC_STATE,
+    FAVORITES,
+    TELEGRAM,
+    ATTACHMENTS,
+    RECIPES,
+    TELEGRAM_ACTIVE,
+    SHOPPING,
+    PROFILE,
+    MEASURES,
+)
 # alembic_version.version_num is VARCHAR(32); a longer identifier fails the upgrade on
 # PostgreSQL with SQLSTATE 22001 (character varying(32), value too long).
 MAX_REVISION_LENGTH = 32
@@ -167,22 +188,35 @@ def test_migrations_do_not_import_the_application():
 
 
 def test_upgrade_creates_every_table_and_records_the_revision(empty_engine):
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, HEAD_REVISION)
 
     assert _tables(empty_engine) == TABLES | {"alembic_version"}
     assert _version(empty_engine) == [HEAD]
 
 
 def test_upgrading_again_changes_nothing(empty_engine):
-    upgrade_database(empty_engine)
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, HEAD_REVISION)
+    upgrade_database(empty_engine, HEAD_REVISION)
 
     assert _tables(empty_engine) == TABLES | {"alembic_version"}
     assert _version(empty_engine) == [HEAD]
 
 
+def test_the_chain_applies_from_empty_one_revision_at_a_time_on_sqlite(empty_engine):
+    # HH-DB-01 CI-09: the SQLite half of the chain test. The PostgreSQL half runs on a
+    # real server in tests/test_persistence_migrations_postgres.py.
+    assert _tables(empty_engine) == set()
+
+    for revision in CHAIN:
+        upgrade_database(empty_engine, revision)
+        assert _version(empty_engine) == [revision], revision
+
+    assert _version(empty_engine) == [HEAD]
+    assert _tables(empty_engine) == TABLES | {"alembic_version"}
+
+
 def test_the_migrated_schema_has_no_drift_from_the_models(empty_engine):
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, HEAD_REVISION)
 
     with empty_engine.connect() as connection:
         context = MigrationContext.configure(connection, opts={"compare_type": True})
@@ -195,14 +229,14 @@ def test_alembic_check_agrees_when_env_py_is_run_on_its_own(tmp_path):
     # env.py must register the models itself. Run in a fresh interpreter where
     # nothing else has imported them: with an empty Base.metadata the check
     # would report every table as unexpected.
-    script = """
+    script = f"""
 import sys
 sys.path.insert(0, sys.argv[1])
 from alembic import command
 from house_helper.persistence.database import alembic_config, create_db_engine, upgrade_database
 
 engine = create_db_engine("sqlite:///" + sys.argv[2])
-upgrade_database(engine)
+upgrade_database(engine, {HEAD_REVISION!r})  # stated, not defaulted (CI-08)
 config = alembic_config()
 with engine.connect() as connection:
     config.attributes["connection"] = connection
@@ -263,7 +297,7 @@ def test_migrations_and_models_build_the_same_schema(tmp_path):
     migrated = create_db_engine(f"sqlite:///{tmp_path / 'migrated.db'}")
     modeled = create_db_engine(f"sqlite:///{tmp_path / 'modeled.db'}")
     try:
-        upgrade_database(migrated)
+        upgrade_database(migrated, HEAD_REVISION)
         Base.metadata.create_all(modeled)
 
         assert _fingerprint(migrated) == _fingerprint(modeled)
@@ -275,7 +309,7 @@ def test_migrations_and_models_build_the_same_schema(tmp_path):
 def test_the_comparison_sees_the_constraints_it_is_meant_to_compare(empty_engine):
     # Guard the guard: a fingerprint that quietly came back empty would make the
     # equality above meaningless.
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, HEAD_REVISION)
     fingerprint = _fingerprint(empty_engine)
     turn_requests = fingerprint["turn_requests"]
 
@@ -308,7 +342,7 @@ def test_the_comparison_sees_the_constraints_it_is_meant_to_compare(empty_engine
 def test_the_comparison_sees_the_email_rule_of_both_identity_tables(empty_engine):
     # Guard the guard: the one CHECK that revision 0004 replaced must be what the
     # fingerprint equality compares, in the migrated schema as in the models'.
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, HEAD_REVISION)
     fingerprint = _fingerprint(empty_engine)
 
     for table in ("allowlist_entries", "identity_links"):
@@ -320,7 +354,7 @@ def test_the_comparison_sees_the_email_rule_of_both_identity_tables(empty_engine
 def test_the_comparison_sees_the_storage_class_and_timestamp_rules(empty_engine):
     # Guard the guard, again: the SQLite-only parts of the printable-ASCII and
     # retention CHECKs are what the fingerprint equality must be able to notice.
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, HEAD_REVISION)
     fingerprint = _fingerprint(empty_engine)
     retention = dict(fingerprint["messages"]["checks"])["ck_messages_expires_within_retention"]
     turn_retention = dict(fingerprint["turn_requests"]["checks"])["ck_turn_requests_expires_within_retention"]
@@ -398,7 +432,7 @@ def test_the_provenance_migration_revokes_every_existing_session_and_infers_noth
     tokens = _r3a_database(empty_engine)
     before = datetime.now(timezone.utc) - timedelta(seconds=2)
 
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, HEAD_REVISION)
 
     after = datetime.now(timezone.utc) + timedelta(seconds=2)
     with create_session_factory(empty_engine)() as db:
@@ -426,7 +460,7 @@ def test_the_provenance_migration_leaves_every_other_row_alone(empty_engine):
             "FROM identity_links ORDER BY id"
         ).all()
 
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, HEAD_REVISION)
 
     assert _counts(empty_engine) == before == {
         "users": 2,
@@ -446,7 +480,7 @@ def test_the_provenance_migration_leaves_every_other_row_alone(empty_engine):
 
 def test_after_the_migration_a_person_signs_in_again_and_gets_a_session_with_provenance(empty_engine):
     _r3a_database(empty_engine)
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, HEAD_REVISION)
     now = CREATED + timedelta(days=2)
 
     with create_session_factory(empty_engine)() as db, db.begin():
@@ -460,7 +494,7 @@ def test_after_the_migration_a_person_signs_in_again_and_gets_a_session_with_pro
 
 def test_a_session_that_the_migration_revoked_cannot_be_made_live_again(empty_engine):
     _r3a_database(empty_engine)
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, HEAD_REVISION)
 
     with pytest.raises(sa.exc.IntegrityError, match="ck_sessions_provenance_or_revoked"):
         with empty_engine.begin() as connection:
@@ -473,7 +507,7 @@ def test_downgrading_the_provenance_keeps_every_row_and_the_old_schema(tmp_path)
     try:
         tokens = _r3a_database(migrated)
         upgrade_database(pristine, INITIAL)
-        upgrade_database(migrated)
+        upgrade_database(migrated, HEAD_REVISION)
         with create_session_factory(migrated)() as db, db.begin():
             issued = complete_login(db, "telegram", "42", now=CREATED + timedelta(days=2))
         before = _counts(migrated)
@@ -492,7 +526,7 @@ def test_downgrading_the_provenance_keeps_every_row_and_the_old_schema(tmp_path)
         assert [revoked[hash_secret(token)] for token in tokens.values()] == [1, 1, 1, 1]
         assert revoked[hash_secret(issued.token)] == 0
 
-        upgrade_database(migrated)  # and it can go forward again; the provenance is gone, so
+        upgrade_database(migrated, HEAD_REVISION)  # and it can go forward again; the provenance is gone, so
         with create_session_factory(migrated)() as db:
             assert authenticate(db, issued.token, now=CREATED + timedelta(days=2)) is None
     finally:
@@ -680,7 +714,7 @@ def test_the_email_case_migration_revokes_every_email_identity_and_what_came_thr
     found = _r3b2_database(empty_engine)
     before = datetime.now(timezone.utc) - timedelta(seconds=2)
 
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, HEAD_REVISION)
 
     after = datetime.now(timezone.utc) + timedelta(seconds=2)
     assert _version(empty_engine) == [HEAD]
@@ -718,7 +752,7 @@ def test_the_email_case_migration_does_not_touch_telegram_or_anything_else(empty
     telegram_before = [row for row in telegram_before if "telegram" in row]
     sessions_before = _rows_of(empty_engine, "sessions", omit=("revoked_at",))
 
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, HEAD_REVISION)
 
     for table in unchanged:
         assert _rows_of(empty_engine, table) == before[table], table  # byte for byte
@@ -743,7 +777,7 @@ def test_the_email_case_migration_does_not_touch_telegram_or_anything_else(empty
 
 def test_re_verifying_the_stored_spelling_lifts_the_revocation_and_revives_nothing(empty_engine):
     found = _r3b2_database(empty_engine)
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, HEAD_REVISION)
     unused = found["unused_link"]
 
     with create_session_factory(empty_engine)() as db, db.begin():
@@ -777,7 +811,7 @@ def test_re_verifying_the_stored_spelling_lifts_the_revocation_and_revives_nothi
 
 def test_re_verifying_another_spelling_is_a_new_identity_and_the_legacy_one_stays_revoked(empty_engine):
     found = _r3b2_database(empty_engine)
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, HEAD_REVISION)
 
     with create_session_factory(empty_engine)() as db, db.begin():
         approved = allow(db, db.get(User, found["elena"]), "email", "Elena@example.com")
@@ -796,7 +830,7 @@ def test_re_verifying_another_spelling_is_a_new_identity_and_the_legacy_one_stay
 
 def test_the_legacy_spelling_is_not_handed_to_another_user_by_asking_again(empty_engine):
     found = _r3b2_database(empty_engine)
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, HEAD_REVISION)
 
     with create_session_factory(empty_engine)() as db, db.begin():
         with pytest.raises(ValueError, match="another user"):
@@ -808,7 +842,7 @@ def test_the_legacy_spelling_is_not_handed_to_another_user_by_asking_again(empty
 
 
 def test_after_the_migration_two_case_distinct_addresses_belong_to_two_users(empty_engine):
-    upgrade_database(empty_engine)  # an empty database: the schema is what is shown
+    upgrade_database(empty_engine, HEAD_REVISION)  # an empty database: the schema is what is shown
 
     with create_session_factory(empty_engine)() as db, db.begin():
         first, second = new_user(db, display_name="First"), new_user(db, display_name="Second")
@@ -839,7 +873,7 @@ def test_the_migration_is_refused_whole_when_the_stored_definition_is_not_the_ex
         connection.exec_driver_sql("PRAGMA writable_schema = OFF")
 
     with pytest.raises(RuntimeError, match="identity_links"):
-        upgrade_database(empty_engine)
+        upgrade_database(empty_engine, HEAD_REVISION)
 
     # nothing is half applied: the data step is rolled back with the schema step
     assert _version(empty_engine) == [CHALLENGES]
@@ -866,7 +900,7 @@ def test_a_sqlite_that_refuses_to_edit_its_schema_stops_the_migration_whole(empt
 
     sa.event.listen(empty_engine, "connect", defensive)
     with pytest.raises((sa.exc.OperationalError, RuntimeError)):
-        upgrade_database(empty_engine)
+        upgrade_database(empty_engine, HEAD_REVISION)
 
     assert _version(empty_engine) == [CHALLENGES]
     with create_session_factory(empty_engine)() as db:
@@ -885,7 +919,7 @@ def test_downgrading_the_email_case_restores_the_0003_schema_and_keeps_the_revoc
     try:
         found = _r3b2_database(migrated)
         upgrade_database(pristine, CHALLENGES)
-        upgrade_database(migrated)
+        upgrade_database(migrated, HEAD_REVISION)
 
         downgrade_database(migrated, CHALLENGES)
 
@@ -900,7 +934,7 @@ def test_downgrading_the_email_case_restores_the_0003_schema_and_keeps_the_revoc
         with migrated.connect() as connection:
             assert connection.exec_driver_sql("PRAGMA integrity_check").scalars().all() == ["ok"]
             assert connection.exec_driver_sql("PRAGMA foreign_key_check").all() == []
-        upgrade_database(migrated)  # and forward again: the models' schema once more
+        upgrade_database(migrated, HEAD_REVISION)  # and forward again: the models' schema once more
         assert _version(migrated) == [HEAD]
         Base.metadata.create_all(modeled)
         assert _fingerprint(migrated) == _fingerprint(modeled)
@@ -911,7 +945,7 @@ def test_downgrading_the_email_case_restores_the_0003_schema_and_keeps_the_revoc
 
 
 def test_downgrading_is_refused_while_an_address_with_a_capital_in_its_local_part_exists(empty_engine):
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, HEAD_REVISION)
     with create_session_factory(empty_engine)() as db, db.begin():
         allow(db, new_user(db, display_name="Victim"), "email", "Victim@example.com")
         allow(db, new_user(db, display_name="Other"), "email", "fine@example.com")
@@ -982,7 +1016,7 @@ def test_the_invitation_migration_adds_one_empty_table_and_changes_nothing_else(
 
 
 def test_the_invitation_migration_puts_no_limit_on_the_number_of_users_in_the_schema(empty_engine):
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, HEAD_REVISION)
 
     with create_session_factory(empty_engine)() as db, db.begin():
         users = [new_user(db, display_name=f"User {number}") for number in range(5)]
@@ -1046,7 +1080,7 @@ def test_the_one_outstanding_rule_is_the_same_partial_index_in_the_migrated_and_
     migrated = create_db_engine(f"sqlite:///{tmp_path / 'migrated.db'}")
     modeled = create_db_engine(f"sqlite:///{tmp_path / 'modeled.db'}")
     try:
-        upgrade_database(migrated)
+        upgrade_database(migrated, HEAD_REVISION)
         Base.metadata.create_all(modeled)
 
         name = "uq_identity_invitations_one_outstanding"
@@ -1139,7 +1173,7 @@ def test_the_oidc_state_migration_adds_one_nullable_column_and_changes_no_row(em
     states_before = _snapshot_of(empty_engine, ["oidc_states"])["oidc_states"]
     assert _version(empty_engine) == [INVITATIONS]
 
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, HEAD_REVISION)
 
     assert _version(empty_engine) == [HEAD]
     assert _tables(empty_engine) == TABLES | {"alembic_version"}
@@ -1158,7 +1192,7 @@ def test_the_oidc_state_migration_adds_one_nullable_column_and_changes_no_row(em
 
 def test_a_login_that_was_in_flight_during_the_migration_is_finished_by_the_new_code(empty_engine):
     _r4c_database(empty_engine)
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, HEAD_REVISION)
 
     with create_session_factory(empty_engine)() as db, db.begin():
         secrets = consume_oidc_login(db, "telegram", "inflight-1", now=CREATED + timedelta(minutes=1))
@@ -1171,7 +1205,7 @@ def test_the_oidc_state_key_and_index_are_the_same_in_the_migrated_and_the_model
     migrated = create_db_engine(f"sqlite:///{tmp_path / 'migrated.db'}")
     modeled = create_db_engine(f"sqlite:///{tmp_path / 'modeled.db'}")
     try:
-        upgrade_database(migrated)
+        upgrade_database(migrated, HEAD_REVISION)
         Base.metadata.create_all(modeled)
 
         for engine in (migrated, modeled):
@@ -1194,7 +1228,7 @@ def test_downgrading_the_oidc_state_binding_deletes_the_bound_logins_and_restore
     try:
         found = _r4c_database(migrated)
         upgrade_database(pristine, INVITATIONS)
-        upgrade_database(migrated)
+        upgrade_database(migrated, HEAD_REVISION)
         with create_session_factory(migrated)() as db, db.begin():  # one login is bound to the invitation
             invitation = db.execute(sa.text("SELECT id FROM identity_invitations")).scalar()
             db.execute(
@@ -1216,7 +1250,7 @@ def test_downgrading_the_oidc_state_binding_deletes_the_bound_logins_and_restore
         with create_session_factory(migrated)() as db:
             assert authenticate(db, found["telegram"].token, now=LATER) is not None
 
-        upgrade_database(migrated)  # and forward again: the models' schema once more
+        upgrade_database(migrated, HEAD_REVISION)  # and forward again: the models' schema once more
         assert _version(migrated) == [HEAD]
         modeled = create_db_engine(f"sqlite:///{tmp_path / 'modeled.db'}")
         try:
@@ -1233,7 +1267,7 @@ def test_downgrading_the_oidc_state_binding_deletes_the_bound_logins_and_restore
 
 
 def test_downgrade_removes_every_table_and_empties_the_version_table(empty_engine):
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, HEAD_REVISION)
 
     downgrade_database(empty_engine, "base")
 
@@ -1242,16 +1276,16 @@ def test_downgrade_removes_every_table_and_empties_the_version_table(empty_engin
 
 
 def test_a_downgraded_database_can_be_upgraded_again(empty_engine):
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, HEAD_REVISION)
     downgrade_database(empty_engine, "base")
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, HEAD_REVISION)
 
     assert _tables(empty_engine) == TABLES | {"alembic_version"}
     assert _version(empty_engine) == [HEAD]
 
 
 def test_downgrading_a_database_that_holds_rows_removes_them_with_their_tables(empty_engine):
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, HEAD_REVISION)
     with create_session_factory(empty_engine)() as session:
         new_message(session, new_conversation(session, new_user(session)))
         session.commit()
@@ -1466,6 +1500,35 @@ def test_rendering_sql_offline_creates_no_database_file(tmp_path, monkeypatch):
     _offline_sql("up")
 
     assert list(tmp_path.iterdir()) == []
+
+
+def test_the_0004_sqlite_offline_render_is_refused_with_its_documented_error():
+    # HH-DB-01 CI-11: 0004 edits a SQLite database in place, which offline SQL cannot
+    # express, so rendering it for SQLite is refused with its own message. The range
+    # names 0004 alone: a whole-chain offline render would stop earlier, at 0002's batch
+    # reflection, which is a different refusal and not the behavior asserted here. The
+    # chain test never attempts SQLite offline for this revision.
+    config = alembic_config("sqlite:///never-created.db")
+    config.output_buffer = io.StringIO()
+
+    with pytest.raises(RuntimeError, match="no offline SQL"):
+        command.upgrade(config, f"{CHALLENGES}:{EMAIL_CASE}", sql=True)
+
+
+def test_the_0004_postgresql_offline_sql_swaps_the_check_with_postgresql_spellings():
+    # CI-11: the other dialect has offline SQL, and it is PostgreSQL's own (no SQLite
+    # spelling may leak into a script meant for the server).
+    up = _offline_sql("up")
+    revision = up.split(f"Running upgrade {CHALLENGES} -> {EMAIL_CASE}")[1].split("-- Running upgrade")[0]
+
+    for table in ("allowlist_entries", "identity_links"):
+        name = f"ck_{table}_email_subject_normalized"
+        assert f"ALTER TABLE {table} DROP CONSTRAINT {name}" in revision
+        assert f"ALTER TABLE {table} ADD CONSTRAINT {name} CHECK" in revision
+    assert "strpos(subject, '@')" in revision
+    assert "instr(" not in revision
+    assert "writable_schema" not in revision and "sqlite_master" not in revision
+    assert "PRAGMA" not in revision
 
 
 # The PostgreSQL schema cannot be created here, so the next best thing is to show

@@ -41,7 +41,10 @@ from house_helper.persistence.database import (
     create_session_factory,
 )
 from house_helper.persistence.models import TELEGRAM_CUTOVER_UPDATE_ID
-from tests.admin_support import db_path, db_url, migrated_template, snapshot  # noqa: F401  (fixtures)
+from tests.admin_support import db_path, sqlite_db_url as db_url, migrated_template, snapshot  # noqa: F401  (fixtures)
+
+# CI-02/R2-09: SQLite-scoped (the SQLite file, its engine, and its byte snapshots).
+pytestmark = [pytest.mark.sqlite]
 from tests.persistence_support import stored
 from tests.retention_support import (
     CUTOFF,

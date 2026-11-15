@@ -31,6 +31,7 @@ from house_helper.persistence.identifiers import (
 )
 from house_helper.persistence.models import AllowlistEntry, TurnRequest
 from house_helper.persistence.sqlchecks import PrintableAscii
+from tests.backend_support import sqlite_only
 from tests.persistence_support import (  # noqa: F401  (fixtures)
     conversation_row,
     count,
@@ -45,6 +46,7 @@ from tests.persistence_support import (  # noqa: F401  (fixtures)
     new_turn_request,
     raw_insert,
     rejected,
+    rejected_width,
     session,
     stored,
     turn_row,
@@ -84,6 +86,9 @@ def user(session):
 @pytest.fixture
 def conversation(session, user):
     return new_conversation(session, user)
+
+
+pytestmark = [sqlite_only, pytest.mark.sqlite]  # SQLite storage classes, typeof()/GLOB and NUL semantics (CI-02)
 
 
 # --- idempotency keys -------------------------------------------------------------
@@ -653,7 +658,7 @@ def test_a_text_column_takes_exactly_the_width_it_declares(session, ctx, table, 
     raw_insert(session, table, **build(ctx, "x" * limit))
     session.rollback()
 
-    with rejected(session, f"ck_{table}_{column}_max_length"):
+    with rejected_width(session, table, column):
         raw_insert(session, table, **build(ctx, "x" * (limit + 1)))
 
 

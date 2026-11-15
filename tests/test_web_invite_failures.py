@@ -31,6 +31,8 @@ from house_helper.persistence.invitations import issue_invitation, revoke_invita
 from house_helper.persistence.models import AllowlistEntry, IdentityInvitation, User
 from house_helper.web import invite_pages
 from tests.auth_support import (
+    ddl,
+    fail_inserts,
     ORIGIN,
     begin_sign_in,
     auth_app,
@@ -314,7 +316,7 @@ async def test_a_database_that_cannot_say_whether_it_was_an_invitation_gives_the
         mother = enroll(h)
         client, callback = await begun(h, mother)
         attacker = h.new_client()
-        with h.factory() as db, db.begin():  # the table that holds the logins cannot be read
+        with ddl(h) as db:  # the table that holds the logins cannot be read
             db.execute(sa.text("ALTER TABLE oidc_states RENAME TO oidc_states_gone"))
 
         response = await attacker.get(callback)  # not this browser's login: refused before anything is looked up...
@@ -544,17 +546,15 @@ async def test_the_ordinary_login_refuses_a_browser_signed_in_as_somebody_else_a
 
 
 def trigger(h, table, name="refuse"):
-    with h.factory() as db, db.begin():
-        db.execute(
-            sa.text(
-                f"CREATE TRIGGER {name} BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT, 'disk full'); END"
-            )
-        )
+    fail_inserts(h, table, name=name)
 
 
-def drop_trigger(h, name="refuse"):
-    with h.factory() as db, db.begin():
-        db.execute(sa.text(f"DROP TRIGGER {name}"))
+def drop_trigger(h, table, name="refuse"):
+    with ddl(h) as db:
+        if h.database.url_text.startswith("sqlite"):
+            db.execute(sa.text(f"DROP TRIGGER {name}"))
+        else:
+            db.execute(sa.text(f"DROP TRIGGER {name} ON {table}"))
 
 
 @pytest.mark.parametrize(
@@ -580,7 +580,7 @@ async def test_a_database_failure_at_any_step_of_the_end_undoes_every_step_befor
         assert_page(response, page())
         assert_nothing_linked(h, mother)
         assert invitation_row(h, mother).consumed_at is None  # the claim was undone with the rest
-        drop_trigger(h)
+        drop_trigger(h, table)
         # and the person simply opens the link again
         assert (await follow(client, h.telegram, mother, MOTHER_SUB)).status_code == 303
         assert entries_of(h, mother.user_id) == [("telegram", MOTHER_SUB, False)]

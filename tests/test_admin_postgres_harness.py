@@ -26,6 +26,7 @@ from sqlalchemy.engine import make_url
 from house_helper.persistence.database import DATABASE_URL_ENV
 from tests import network_guard
 from tests import postgres_harness as harness
+from tests import postgres_identity as identity
 from tests.postgres_harness import (
     POSTGRES_URL_ENV,
     ROUTING_ENV,
@@ -48,6 +49,159 @@ PASSWORD = "not-a-real-password"
 REMOTE = "203.0.113.10"  # (documentation range: nothing is there)
 BASE = f"postgresql+psycopg://postgres:{PASSWORD}@localhost:55432/postgres"
 TOKEN = "0123456789abcdef0123456789abcdef"
+
+# R3-01: what the container's control file says, and the container the harness inspects.
+CLUSTER_IDENTIFIER = "7000000000000000001"
+OTHER_IDENTIFIER = "7000000000000000002"
+CONTAINER = "a" * 64
+
+
+class _IdentityTarget:
+    """The two fields the identity contract reads from a harness Target."""
+
+    port = 55432
+    address = "127.0.0.1"
+
+
+def cluster_identity() -> identity.ClusterIdentity:
+    """A genuinely established identity (R4-01 seals it at creation). The fake Docker
+    answers the documented Compose facts, so the run treats this exactly as it treats the
+    identity of a real, verified cluster."""
+    return identity.establish(_IdentityTarget(), environ={}, docker=FakeDocker())
+
+
+class FakeDocker:
+    """Stands in for the Docker CLI. `inspect` answers with the Compose facts; every
+    disagreement the identity contract can refuse is a constructor argument, so an
+    adversarial test says exactly what lies. The facts are the fields Docker actually
+    returns (R4-04): `Id`, `Config.Image`, `State`, `Mounts`, `NetworkSettings.Ports` -
+    a container inspection has no `RepoDigests` field, so none is faked."""
+
+    def __init__(
+        self,
+        *,
+        compose=None,
+        identifier=CLUSTER_IDENTIFIER,
+        image=identity.PINNED_IMAGE,
+        volume=identity.DATA_VOLUME,
+        volume_writable=True,
+        labels=None,
+        host_ip="127.0.0.1",
+        port=55432,
+        running=True,
+        inspect_fails=False,
+        control_fails=False,
+        inspected_id=None,
+        volume_labels=None,  # None: derive from the container's Compose provenance
+        shared_with=(),
+        volume_name=None,  # override the volume's own Name (the mount names something else)
+    ):
+        self.compose = [CONTAINER] if compose is None else list(compose)
+        self.identifier = identifier
+        self.image = image
+        self.data_volume = volume
+        self.volume_writable = volume_writable
+        self.labels = (
+            {
+                "com.docker.compose.project": identity.COMPOSE_PROJECT,
+                "com.docker.compose.service": identity.COMPOSE_SERVICE,
+                "com.docker.compose.oneoff": "False",
+            }
+            if labels is None
+            else dict(labels)
+        )
+        self.host_ip = host_ip
+        self.port = port
+        self.running = running
+        self.inspect_fails = inspect_fails
+        self.control_fails = control_fails
+        self.inspected_id = CONTAINER if inspected_id is None else inspected_id
+        self.inspections = []
+        # R5-04: the volume's own record. `None` derives Compose provenance from the
+        # container labels (which is what a real Compose-created volume carries).
+        project = self.labels.get(identity.COMPOSE_PROJECT_LABEL)
+        self.volume_labels = (
+            (
+                {
+                    identity.COMPOSE_PROJECT_LABEL: project,
+                    identity.COMPOSE_VOLUME_LABEL: self.data_volume,
+                }
+                if project
+                else {}
+            )
+            if volume_labels is None
+            else dict(volume_labels)
+        )
+        self.shared_with = list(shared_with)
+        self.volume_name = volume_name
+
+    def compose_container_ids(self):
+        return list(self.compose)
+
+    def inspect(self, container_id):
+        self.inspections.append(container_id)
+        if self.inspect_fails:
+            raise identity.IdentityError(
+                "cluster_identity_unavailable", "simulated: the container cannot be inspected."
+            )
+        if container_id not in self.compose:
+            raise identity.IdentityError(
+                "cluster_identity_unavailable", "simulated: no such container."
+            )
+        return {
+            "Id": self.inspected_id,
+            "State": {"Running": self.running, "Status": "running" if self.running else "exited"},
+            "Config": {"Image": self.image, "Labels": dict(self.labels)},
+            "Mounts": [
+                {
+                    "Type": "volume",
+                    "Name": self.data_volume,
+                    "Destination": identity.DATA_PATH,
+                    "RW": self.volume_writable,
+                }
+            ],
+            "NetworkSettings": {
+                "Ports": {
+                    identity.DATABASE_PORT: [
+                        {"HostIp": self.host_ip, "HostPort": str(self.port)}
+                    ]
+                }
+            },
+        }
+
+    def volume(self, name):
+        """R5-04: the volume's own record, with the provenance labels a real Compose
+        project's volume carries (or none for a manually created / CI volume)."""
+        if self.inspect_fails:
+            raise identity.IdentityError(
+                "cluster_identity_unavailable", "simulated: the volume cannot be inspected."
+            )
+        return {
+            "Name": name if self.volume_name is None else self.volume_name,
+            "Driver": "local",
+            "Scope": "local",
+            "Labels": dict(self.volume_labels),
+            "Mountpoint": f"/var/lib/docker/volumes/{name}/_data",
+        }
+
+    def volume_containers(self, name):
+        if self.inspect_fails:
+            raise identity.IdentityError(
+                "cluster_identity_unavailable", "simulated: the volume cannot be inspected."
+            )
+        return [self.inspected_id, *self.shared_with]
+
+    def system_identifier(self, container_id):
+        if self.control_fails:
+            raise identity.IdentityError(
+                "cluster_identity_unavailable",
+                "simulated: the control file cannot be read.",
+            )
+        if container_id not in self.compose:
+            raise identity.IdentityError(
+                "cluster_identity_unavailable", "simulated: no such container."
+            )
+        return self.identifier
 
 
 # --- nothing may be opened: tripwires ---------------------------------------------------------------------
@@ -285,7 +439,7 @@ def test_a_generated_url_gives_the_driver_exactly_the_validated_parameters(host,
         if text:
             url = make_url(url.render_as_string(hide_password=False))
         params = _dialect_params(url)
-        check_connect_params(Expected(target, "house_helper_test_x", run.marker), params)
+        check_connect_params(Expected(target, "house_helper_test_x", run.marker, CLUSTER_IDENTIFIER), params)
         assert (params["host"], params["hostaddr"], params["port"], params["dbname"]) == (
             address,
             address,
@@ -304,7 +458,7 @@ def test_check_connect_params_catches_a_tampered_url_even_if_validation_were_byp
     tampered = make_url(target.url("house_helper_test_x").render_as_string(hide_password=False) + "&" + query)
 
     with pytest.raises(UnsafeTarget) as refused:
-        check_connect_params(Expected(target, "house_helper_test_x", "m"), _dialect_params(tampered))
+        check_connect_params(Expected(target, "house_helper_test_x", "m", CLUSTER_IDENTIFIER), _dialect_params(tampered))
 
     assert refused.value.code == "connect_parameters"
     assert PASSWORD not in str(refused.value) and REMOTE not in str(refused.value)
@@ -315,7 +469,7 @@ def test_check_connect_params_catches_another_password():
     params = target.connect_params("x") | {"password": "another"}
 
     with pytest.raises(UnsafeTarget):
-        check_connect_params(Expected(target, "x", None), params)
+        check_connect_params(Expected(target, "x", None, CLUSTER_IDENTIFIER), params)
 
 
 # --- a stand-in server ----------------------------------------------------------------------------------------
@@ -328,11 +482,37 @@ class Rows:
     def fetchone(self):
         return self.row
 
+    def __iter__(self):
+        return iter(() if self.row is None else (self.row,))
+
+
+class Result:
+    """What a query that returns several rows answers in the fake (only `fetchall`)."""
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def fetchall(self):
+        return self.rows
+
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
+
+
+class SimulatedDatabaseError(RuntimeError):
+    """A failure shaped like a psycopg error: the harness reads `sqlstate`, exactly as it
+    would from `psycopg.errors.DuplicateDatabase` (R5-05)."""
+
+    def __init__(self, message, sqlstate):
+        super().__init__(message)
+        self.sqlstate = sqlstate
+
 
 class FakeConnection:
     def __init__(self, server, params):
         self.server = server
         self.params = params
+        self.user = params.get("user")
         self.closed = False
         self.statements = []
         self.database = server.redirect.get(params["dbname"], params["dbname"])
@@ -351,18 +531,89 @@ class FakeConnection:
         server = self.server
         self.statements.append(sql)
         server.statements.append((self.database, sql))
-        if server.fail_on and server.fail_on in sql:
+        if server.should_fail(sql):
             raise RuntimeError("simulated failure")
         databases = server.databases
+        # --- the cluster's persistent identifier (R3-01) ------------------------------
+        if sql == identity.SYSTEM_IDENTIFIER_SQL:
+            if server.identifier_unavailable:
+                raise RuntimeError("simulated: the control file cannot be read")
+            return Rows(server.system_identifier)
+        # --- identity and ownership (R2-06) -------------------------------------------
         if sql == harness._IDENTITY_SQL:
-            return Rows(server.reported_database or self.database, databases[self.database])
-        if sql == harness._COMMENT_SQL:
-            return Rows(databases[params[0]]) if params[0] in databases else Rows()
-        if match := re.fullmatch(r'CREATE DATABASE "([^"]+)"(?: TEMPLATE "([^"]+)")?', sql):
-            name, template = match.groups()
-            if name in databases or (template is not None and template not in databases):
-                raise RuntimeError("simulated: duplicate_database / no such template")
+            reached = server.reported_database or self.database
+            return Rows(reached, databases[reached], server.owner(reached))
+        if sql == harness._COMMENT_AND_OWNER_SQL:
+            name = params[0]
+            return Rows(databases[name], server.owner(name)) if name in databases else Rows()
+        if sql == harness._ROLE_SQL:
+            return Rows(self.user, server.current_user(self.user))
+        # --- roles (R2-05/R2-06) ------------------------------------------------------
+        if sql == "SELECT rolsuper FROM pg_roles WHERE rolname = current_user":
+            return Rows(True)
+        if sql.startswith("SELECT 1 FROM pg_roles WHERE rolname = %s"):
+            return Rows(1) if params[0] in server.roles else Rows()
+        if match := re.fullmatch(r'CREATE ROLE "([^"]+)"(?: LOGIN PASSWORD \'[^\']*\')?(?: NOLOGIN)?(.*)', sql):
+            server.roles[match.group(1)] = match.group(2)
+        elif match := re.fullmatch(r'GRANT "([^"]+)" TO "([^"]+)" WITH SET TRUE, INHERIT FALSE', sql):
+            server.memberships.append((match.group(2), match.group(1)))
+        elif match := re.fullmatch(r'ALTER ROLE "[^"]+" SET .+', sql):
+            pass
+        elif match := re.fullmatch(r'DROP ROLE "([^"]+)"', sql):
+            name = match.group(1)
+            if name not in server.roles:  # only a role this server has was dropped
+                raise RuntimeError("simulated: no such role")
+            # R4-06: PostgreSQL refuses DROP ROLE while privileges are still granted TO the
+            # role (pg_shdepend). The maintenance CONNECT grant is exactly that, and it is
+            # why cleanup revokes grants before dropping roles.
+            if any(role == name for role, _database in server.maintenance_grants):
+                raise RuntimeError(
+                    "simulated: role cannot be dropped because privileges depend on it"
+                )
+            del server.roles[name]
+            server.dropped_roles.append(name)
+        # --- the dedicated-cluster evidence (R2-06) -----------------------------------
+        elif sql.startswith("SELECT current_user, (SELECT rolsuper"):
+            return Rows(self.user, True, server.owner(self.database), None)
+        elif sql.startswith(
+            "SELECT datname, shobj_description(oid, 'pg_database'), pg_get_userbyid(datdba) "
+            "FROM pg_database WHERE datname NOT IN"
+        ):
+            # R5-04 item 8: the inventory check now sees the actual owner and marker.
+            return Result(
+                [
+                    (name, comment, server.owner(name))
+                    for name, comment in databases.items()
+                    if name not in ("postgres", "template0", "template1")
+                ]
+            )
+        # --- the maintenance-database fence (R2-06) -----------------------------------
+        elif re.fullmatch(r'REVOKE ALL ON DATABASE "[^"]+" FROM PUBLIC', sql):
+            pass
+        elif match := re.fullmatch(r'GRANT CONNECT ON DATABASE "([^"]+)" TO "([^"]+)"', sql):
+            server.maintenance_grants.append((match.group(2), match.group(1)))
+        elif match := re.fullmatch(r'REVOKE CONNECT ON DATABASE "([^"]+)" FROM "([^"]+)"', sql):
+            grant = (match.group(2), match.group(1))
+            if grant not in server.maintenance_grants:
+                raise RuntimeError("simulated: no such grant")
+            server.maintenance_grants.remove(grant)
+        elif sql.startswith("SELECT count(*) FROM aclexplode("):
+            return Rows(0)
+        elif sql.startswith("SELECT rolname, has_database_privilege"):
+            names = params[1]
+            return Result([(name, server.maintenance_connect(name)) for name in names])
+        # --- databases ----------------------------------------------------------------
+        elif match := re.fullmatch(r'CREATE DATABASE "([^"]+)"(?: TEMPLATE "([^"]+)")?(?: OWNER "([^"]+)")?(?: ALLOW_CONNECTIONS false)?', sql):
+            name, template, owner = match.groups()
+            if name in databases:
+                # R5-05: a real psycopg `DuplicateDatabase` carries SQLSTATE 42P04; that is
+                # the one failure proving nothing was created.
+                raise SimulatedDatabaseError("simulated: duplicate_database", "42P04")
+            if template is not None and template not in databases:
+                raise SimulatedDatabaseError("simulated: no such template", "3D000")
             databases[name] = None
+            if owner is not None:
+                server.owners[name] = owner
         elif match := re.fullmatch(r"COMMENT ON DATABASE \"([^\"]+)\" IS '([^']*)'", sql):
             databases[match.group(1)] = match.group(2)
         elif match := re.fullmatch(r'ALTER DATABASE "([^"]+)" SET default_transaction_isolation = \'[a-z ]+\'', sql):
@@ -384,7 +635,14 @@ class FakeServer:
     """What the harness can see of a PostgreSQL server, and the ways it can be made to lie."""
 
     def __init__(self, target):
-        self.databases = {target.maintenance_database: None, "persistent": "somebody else's data"}
+        self.target = target
+        # R4-02: a dedicated, disposable cluster holds nothing but the maintenance database
+        # (and this harness's own scratch databases, which the server adds as they appear).
+        self.databases = {target.maintenance_database: None}
+        self.owners: dict[str, str] = {}  # datname -> pg_database.datdba (default: the bootstrap user)
+        self.roles: dict[str, str] = {}
+        self.memberships: list[tuple[str, str]] = []
+        self.dropped_roles: list[str] = []
         self.statements = []  # (database the statement ran in, text)
         self.connections = []
         self.peer = None  # what the driver says the peer address is (None: the one asked for)
@@ -393,6 +651,31 @@ class FakeServer:
         self.redirect = {}  # database asked for -> database really reached
         self.reported_database = None  # what current_database() says
         self.fail_on = None  # a statement containing this raises
+        self.fail_when = None  # a callable(sql) -> bool (R3-02 failure injection)
+        # R3-01: what the SQL connection reports, and the grants cleanup must revoke.
+        self.system_identifier = CLUSTER_IDENTIFIER
+        self.identifier_unavailable = False
+        self.maintenance_grants: list[tuple[str, str]] = []  # (role, database)
+        self.docker = FakeDocker()
+
+    def should_fail(self, sql) -> bool:
+        if self.fail_on and self.fail_on in sql:
+            return True
+        return bool(self.fail_when and self.fail_when(sql))
+
+    def owner(self, database):
+        return self.owners.get(database, self.target.username)
+
+    @staticmethod
+    def current_user(user):
+        """`current_user` after the harness's role settings: the migration login assumes
+        the NOLOGIN owner, every other login is itself."""
+        return user[: -len("migrate")] + "owner" if user.endswith("_migrate") else user
+
+    @staticmethod
+    def maintenance_connect(role):
+        """Only the migration and restore logins are handed CONNECT on the maintenance database."""
+        return role.endswith(("_migrate", "_restore"))
 
     def connect(self, params):
         connection = FakeConnection(self, params)
@@ -401,6 +684,14 @@ class FakeServer:
 
     def destructive(self):
         return [s for _, s in self.statements if s.split(" ", 1)[0] in ("CREATE", "COMMENT", "ALTER", "DROP")]
+
+    def mutating(self):
+        """Every statement that changes the cluster: databases, roles, ACLs (R3-01)."""
+        return [
+            s
+            for _, s in self.statements
+            if s.split(" ", 1)[0] in ("CREATE", "COMMENT", "ALTER", "DROP", "GRANT", "REVOKE")
+        ]
 
 
 @pytest.fixture
@@ -415,7 +706,16 @@ def server(target):
 
 @pytest.fixture
 def run(target, server):
-    return Run(target, connect=server.connect, token=TOKEN)
+    # R3-01: the fixture's run has already been given the independently verified identity
+    # the fake Docker and the fake server agree on. A test that wants to see the *refusal*
+    # builds its own Run without one (or with a lying FakeDocker).
+    return Run(
+        target,
+        connect=server.connect,
+        token=TOKEN,
+        cluster=cluster_identity(),
+        docker=server.docker,
+    )
 
 
 def test_a_run_opens_nothing_until_it_is_asked_to(target):
@@ -448,7 +748,7 @@ def test_every_connection_checks_where_it_is_before_it_runs_anything_else(run, s
 
     assert server.connections and all(c.closed for c in server.connections)
     assert all(c.statements[0] == harness._IDENTITY_SQL for c in server.connections)
-    assert server.databases == {"postgres": None, "persistent": "somebody else's data"}  # nothing is left, nothing else touched
+    assert server.databases == {"postgres": None}  # nothing is left, nothing else touched
 
 
 def test_the_databases_a_run_makes_are_named_and_marked_by_the_run(run, server):
@@ -481,6 +781,9 @@ def test_the_databases_a_run_makes_are_named_and_marked_by_the_run(run, server):
 def test_a_connection_that_is_not_where_it_should_be_is_closed_and_nothing_destructive_runs(
     lie, code, statements_run, run, server
 ):
+    # Somebody else's data, in a database this harness must never touch (the refusal
+    # below always precedes any inventory or creation statement).
+    server.databases["persistent"] = "somebody else's data"
     for attribute, value in lie.items():
         setattr(server, attribute, value)
 
@@ -499,7 +802,7 @@ def test_a_connection_that_is_not_where_it_should_be_is_closed_and_nothing_destr
 def test_verification_accepts_the_right_connection(run, server, target):
     connection = server.connect(target.connect_params("postgres"))
 
-    verify_connection(connection, Expected(target, "postgres", None))  # (no exception)
+    verify_connection(connection, Expected(target, "postgres", None, CLUSTER_IDENTIFIER))  # (no exception)
 
 
 @pytest.mark.parametrize("tamper", [lambda d, n, m: d.update({n: "somebody else's"}), lambda d, n, m: d.update({n: None})], ids=["foreign-token", "no-token"])
@@ -507,7 +810,7 @@ def test_a_scratch_database_that_is_not_this_runs_is_refused_before_a_migration(
     name = run.create_database()
     tamper(server.databases, name, run.marker)
     dialect = SimpleNamespace(connect=lambda **params: server.connect(params))
-    connect = guarded_connect(Expected(target, name, run.marker))
+    connect = guarded_connect(Expected(target, name, run.marker, CLUSTER_IDENTIFIER))
 
     with pytest.raises(UnsafeTarget) as refused:
         connect(dialect, None, [], target.connect_params(name))  # what upgrade_database's connection goes through
@@ -523,7 +826,7 @@ def test_a_scratch_name_that_resolves_to_another_database_is_refused_before_a_mi
     dialect = SimpleNamespace(connect=lambda **params: server.connect(params))
 
     with pytest.raises(UnsafeTarget) as refused:
-        guarded_connect(Expected(target, name, run.marker))(dialect, None, [], target.connect_params(name))
+        guarded_connect(Expected(target, name, run.marker, CLUSTER_IDENTIFIER))(dialect, None, [], target.connect_params(name))
 
     assert refused.value.code == "wrong_database"
     assert server.connections[-1].closed and server.connections[-1].statements == []
@@ -535,7 +838,7 @@ def test_the_guard_refuses_parameters_that_were_not_validated_before_the_driver_
     params = target.connect_params("postgres") | {"hostaddr": REMOTE}
 
     with pytest.raises(UnsafeTarget):
-        guarded_connect(Expected(target, "postgres", None))(dialect, None, [], params)
+        guarded_connect(Expected(target, "postgres", None, CLUSTER_IDENTIFIER))(dialect, None, [], params)
 
     assert called.calls == []
 
@@ -544,7 +847,7 @@ def test_a_guarded_engine_checks_its_connections_before_it_runs_a_statement(targ
     engine = sa.create_engine("sqlite://")  # not a PostgreSQL URL: its parameters are not the validated ones
     ran = []
     sa.event.listen(engine, "before_cursor_execute", lambda *args: ran.append(args[2]))
-    guard_engine(engine, Expected(target, "postgres", None))
+    guard_engine(engine, Expected(target, "postgres", None, CLUSTER_IDENTIFIER))
 
     with pytest.raises(UnsafeTarget) as refused:
         engine.connect()
@@ -580,7 +883,7 @@ def test_close_drops_what_the_run_made_and_nothing_else(run, server):
 
     run.close()
 
-    assert set(server.databases) == {"postgres", "persistent", "house_helper_test_" + "f" * 32 + "_1"}
+    assert set(server.databases) == {"postgres", "house_helper_test_" + "f" * 32 + "_1"}
     assert sorted(s for s in server.destructive() if s.startswith("DROP")) == sorted(
         f'DROP DATABASE "{name}" WITH (FORCE)' for name in [template, *clones]
     )
@@ -629,15 +932,19 @@ def test_a_database_that_failed_to_be_marked_is_still_cleaned_up(run, server):
 
     run.close()
 
-    assert name not in server.databases and set(server.databases) == {"postgres", "persistent"}
+    assert name not in server.databases and set(server.databases) == {"postgres"}
 
 
 def test_a_database_that_already_existed_under_the_name_is_not_ours_to_drop(run, server):
+    """R5-04 item 8 strengthens this: a scratch-LOOKING name with no marker is now refused
+    by the inventory check before CREATE is even attempted, and the pre-existing database
+    is untouched either way."""
     existing = f"house_helper_test_{TOKEN}_1"
     server.databases[existing] = None  # the name the run is about to generate, taken by someone else
-    with pytest.raises(RuntimeError):
-        run.create_database()  # CREATE DATABASE fails: it exists
+    with pytest.raises(UnsafeTarget) as refused:
+        run.create_database()  # refused: no marker + no per-run owner
 
+    assert refused.value.code == "not_dedicated"
     run.close()
 
     assert existing in server.databases
@@ -652,7 +959,7 @@ def test_a_failed_create_leaves_nothing_registered(run, server):
 
     run.close()
 
-    assert set(server.databases) == {"postgres", "persistent"}
+    assert set(server.databases) == {"postgres"}
     assert [s for s in server.destructive() if not s.startswith("CREATE")] == []  # (the failed attempt itself aside)
 
 
@@ -673,15 +980,933 @@ def test_a_fixture_whose_work_fails_verification_still_gets_its_database_dropped
     connection (the migrations') is refused. Cleanup goes through its own verified
     connection to the maintenance database, so the database is still dropped."""
     name = run.create_database()
+    server.databases["persistent"] = "somebody else's data"  # (created after this run's own database)
     server.redirect[name] = "persistent"  # the scratch connection lands in another database; the control one does not
     dialect = SimpleNamespace(connect=lambda **params: server.connect(params))
     with pytest.raises(UnsafeTarget) as refused:
-        guarded_connect(Expected(target, name, run.marker))(dialect, None, [], target.connect_params(name))
+        guarded_connect(Expected(target, name, run.marker, CLUSTER_IDENTIFIER))(dialect, None, [], target.connect_params(name))
     assert refused.value.code == "wrong_database"
 
     run.close()
 
     assert name not in server.databases and server.databases["persistent"] == "somebody else's data"
+
+
+# --- the ownership fence, and partial preparation (R2-05, R2-06) ----------------------------------------------
+
+
+def test_a_database_that_carries_the_token_but_not_the_owner_is_refused(run, server, target):
+    """R2-06: the COMMENT is not ownership. `pg_database.datdba` must still name the role
+    the database was created for, or the connection (and the cleanup) refuses."""
+    name = run.create_database()
+    server.owners[name] = "somebody-else"
+    dialect = SimpleNamespace(connect=lambda **params: server.connect(params))
+
+    with pytest.raises(UnsafeTarget) as refused:
+        guarded_connect(Expected(target, name, run.marker, CLUSTER_IDENTIFIER))(dialect, None, [], target.connect_params(name))
+    assert refused.value.code == "wrong_owner"
+
+    with pytest.raises(UnsafeTarget) as dropped:
+        run.drop_database(name)
+    assert dropped.value.code == "not_this_run"
+    assert name in server.databases  # nothing was destroyed
+
+
+def test_a_partially_prepared_role_set_cannot_escape_cleanup(target, server):
+    """R2-05: the membership grant fails after two roles exist. The failure itself must run
+    the ownership-verified cleanup: nothing this run created may survive it."""
+    server.databases.pop("persistent", None)  # the dedicated-cluster evidence sees only this run's databases
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker)
+    server.fail_on = 'GRANT "'
+
+    with pytest.raises(RuntimeError):
+        run.prepare_roles()
+
+    assert server.roles == {}  # the two roles created before the failure are gone
+    assert sorted(server.dropped_roles) == sorted(
+        f"hh_t_{TOKEN}_{key}" for key in ("owner", "migrate")
+    )
+    assert all(harness.ROLE_NAME.fullmatch(name) for name in server.dropped_roles)
+
+
+def test_cluster_wide_role_preparation_refuses_a_server_that_is_not_dedicated(target, server):
+    server.databases["house_helper"] = None  # a database this harness never created
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker)
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.prepare_roles()
+
+    assert refused.value.code == "not_dedicated"
+    assert server.roles == {} and server.destructive() == []
+
+
+# --- R3-01: nothing destructive without an independently verified cluster -----------------------------
+
+
+def test_no_database_is_created_without_an_independently_verified_cluster(target, server):
+    """The old evidence (superuser, ownership, an empty inventory, the optional setting)
+    is all present in this fake server; the identity is not. Nothing destructive runs."""
+    server.databases.pop("persistent", None)  # a pristine-looking, empty local cluster
+    run = Run(target, connect=server.connect, token=TOKEN, docker=FakeDocker(compose=()), environ={})
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.create_database()
+
+    assert refused.value.code == "cluster_identity_missing"
+    assert server.statements == [] and server.mutating() == []
+    with pytest.raises(UnsafeTarget):  # the same before any role is created
+        run.prepare_roles()
+    assert server.statements == [] and server.roles == {}
+
+
+def test_a_direct_create_database_call_cannot_bypass_the_identity_gate(target, server):
+    """`create_database()` is public; there is no unguarded path left to it."""
+    run = Run(target, connect=server.connect, token=TOKEN, docker=FakeDocker(compose=[]), environ={})
+
+    for attempt in (lambda: run.create_database(), lambda: run.prepare_roles()):
+        with pytest.raises(UnsafeTarget) as refused:
+            attempt()
+
+        assert refused.value.code == "cluster_identity_missing"
+    assert server.mutating() == [] and server.connections == []
+
+
+@pytest.mark.parametrize(
+    "lie, code",
+    [
+        pytest.param({"compose": []}, "cluster_identity_missing", id="no-container"),
+        pytest.param({"compose": [CONTAINER, "b" * 64]}, "cluster_identity_ambiguous", id="two-containers"),
+        pytest.param({"inspect_fails": True}, "cluster_identity_unavailable", id="inspect-fails"),
+        pytest.param({"control_fails": True}, "cluster_identity_unavailable", id="control-file-unreadable"),
+        pytest.param({"identifier": "not-a-number"}, "cluster_identity_unavailable", id="identifier-not-a-number"),
+        pytest.param({"running": False}, "cluster_identity_unavailable", id="container-stopped"),
+        pytest.param({"image": "postgres@sha256:" + "0" * 64}, "cluster_identity_mismatch", id="other-image"),
+        pytest.param({"volume": "someone-elses-volume"}, "cluster_identity_mismatch", id="other-volume"),
+        pytest.param(
+            {"labels": {"com.docker.compose.project": "another-project"}},
+            "cluster_identity_mismatch",
+            id="other-compose-project",
+        ),
+        pytest.param(
+            {
+                "labels": {
+                    "com.docker.compose.project": identity.COMPOSE_PROJECT,
+                    "com.docker.compose.service": "web",
+                }
+            },
+            "cluster_identity_mismatch",
+            id="other-compose-service",
+        ),
+        pytest.param(
+            {
+                "labels": {
+                    "com.docker.compose.project": identity.COMPOSE_PROJECT,
+                    "com.docker.compose.service": identity.COMPOSE_SERVICE,
+                    "com.docker.compose.oneoff": "True",
+                }
+            },
+            "cluster_identity_mismatch",
+            id="one-off-container",
+        ),
+        pytest.param({"host_ip": "0.0.0.0"}, "cluster_identity_mismatch", id="published-to-the-world"),
+        pytest.param({"port": 55433}, "cluster_identity_mismatch", id="another-host-port"),
+    ],
+)
+def test_a_container_that_disagrees_with_the_contract_blocks_every_destructive_call(
+    lie, code, target, server
+):
+    run = Run(target, connect=server.connect, token=TOKEN, docker=FakeDocker(**lie), environ={})
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.create_database()
+
+    assert refused.value.code == code
+    assert server.mutating() == [] and server.connections == []
+
+
+def test_ci_must_name_the_runner_supplied_service_container(target, server):
+    run = Run(
+        target,
+        connect=server.connect,
+        token=TOKEN,
+        docker=FakeDocker(),
+        environ={identity.GITHUB_ACTIONS_ENV: "true"},
+    )
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.create_database()
+
+    assert refused.value.code == "cluster_identity_missing"
+    assert server.mutating() == []
+
+
+CI_IDENTITY_ENVIRON = {
+    identity.GITHUB_ACTIONS_ENV: "true",
+    identity.CONTAINER_ID_ENV: CONTAINER,
+    identity.RUN_ID_ENV: "1234567890",
+    identity.RUN_ATTEMPT_ENV: "2",
+}
+
+
+def test_the_runner_supplied_service_container_is_accepted_through_the_same_contract(target, server):
+    environ = dict(CI_IDENTITY_ENVIRON)
+    volume = identity.ci_volume(environ)  # R4-02: the run-scoped volume the workflow mounts
+    docker = FakeDocker(labels={}, volume=volume)  # a service container has no Compose labels
+    run = Run(
+        target,
+        connect=server.connect,
+        token=TOKEN,
+        docker=docker,
+        environ=environ,
+    )
+
+    name = run.create_database()
+    run.drop_database(name)
+
+    assert docker.inspections[0] == CONTAINER  # established once, from the runner-named container
+    mutations = server.mutating()
+    assert mutations[0] == f'CREATE DATABASE "{name}"'
+    assert mutations[-1] == f'DROP DATABASE "{name}" WITH (FORCE)'
+    assert [s for s in mutations if s.startswith(("GRANT", "REVOKE", "CREATE ROLE", "DROP ROLE"))] == []
+
+
+def test_a_container_id_alone_does_not_select_the_ci_contract(target, server):
+    """R4-02: locally, the id is conflicting evidence, never a weaker contract."""
+    inspected = FakeDocker()
+
+    run = Run(
+        target,
+        connect=server.connect,
+        token=TOKEN,
+        docker=inspected,
+        environ={identity.CONTAINER_ID_ENV: CONTAINER},
+    )
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.create_database()
+
+    assert refused.value.code == "cluster_identity_conflict"
+    assert inspected.inspections == [] and server.mutating() == [] and server.connections == []
+
+
+def test_a_sql_connection_to_another_cluster_is_refused_before_any_statement_of_consequence(target, server):
+    """The container is the verified one, but the connection reaches a different cluster:
+    the independently established identifier wins and nothing destructive is sent."""
+    server.system_identifier = OTHER_IDENTIFIER
+    run = Run(target, connect=server.connect, token=TOKEN, docker=FakeDocker(), environ={})
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.create_database()
+
+    assert refused.value.code == "cluster_identity_changed"
+    # Only the two read-only identity questions were asked; nothing of consequence ran.
+    assert {sql for _, sql in server.statements} == {
+        harness._IDENTITY_SQL,
+        identity.SYSTEM_IDENTIFIER_SQL,
+    }
+    assert server.mutating() == []
+
+
+def test_an_identifier_the_connection_cannot_answer_is_refused(target, server):
+    server.identifier_unavailable = True
+    run = Run(target, connect=server.connect, token=TOKEN, docker=FakeDocker(), environ={})
+
+    with pytest.raises(RuntimeError):  # the fake's read fails; nothing is destroyed or created
+        run.create_database()
+
+    assert server.mutating() == []
+
+
+def test_cleanup_refuses_state_created_without_a_verified_cluster(target, server):
+    """The unguarded-cleanup bypass: recorded state whose identity was never proved is
+    not dropped on a guess."""
+    run = Run(target, connect=server.connect, token=TOKEN, docker=FakeDocker(compose=()), environ={})
+    run._databases["house_helper_test_" + TOKEN + "_1"] = "marked"  # planted record
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.close()
+
+    assert refused.value.code == "cluster_identity_missing"
+    assert server.statements == [] and server.mutating() == []
+    assert run.pending_cleanup()["databases"] == ("house_helper_test_" + TOKEN + "_1",)
+
+
+def test_a_cluster_change_between_setup_and_cleanup_refuses_the_drop_and_keeps_the_record(run, server):
+    name = run.create_database()
+    server.system_identifier = OTHER_IDENTIFIER  # the port now reaches another cluster
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.close()
+
+    assert refused.value.code == "cluster_identity_changed"
+    assert not [s for s in server.mutating() if s.startswith("DROP")]
+    assert name in server.databases and name in run.pending_cleanup()["databases"]
+    server.system_identifier = CLUSTER_IDENTIFIER  # the same cluster again: the retry works
+    run.close()
+    assert name not in server.databases
+
+
+def test_a_replaced_container_between_setup_and_cleanup_refuses_the_drop(run, server):
+    name = run.create_database()
+    server.docker.identifier = OTHER_IDENTIFIER  # `pg_controldata` now names another cluster
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.close()
+
+    assert refused.value.code == "cluster_identity_changed"
+    assert not [s for s in server.mutating() if s.startswith("DROP")]
+    assert name in run.pending_cleanup()["databases"]
+    server.docker.identifier = CLUSTER_IDENTIFIER
+    run.close()
+    assert name not in server.databases
+
+
+# --- R4-01: the one privileged-operation boundary ------------------------------------------------
+
+
+def test_control_before_verification_hands_out_nothing(target, server):
+    """The demonstrated bypass: `Run.control()` used to open a bootstrap connection before
+    any identity existed. It now refuses, and no connection is opened at all."""
+    run = Run(target, connect=server.connect, token=TOKEN, docker=FakeDocker(compose=()), environ={})
+
+    with pytest.raises(UnsafeTarget) as refused:
+        with run.control():
+            pytest.fail("a privileged connection was handed out before verification")
+
+    assert refused.value.code == "cluster_identity_missing"
+    assert server.connections == [] and server.statements == []
+
+
+@pytest.mark.parametrize("attempt", ["control", "create", "roles", "restore-probe"])
+def test_an_unavailable_container_produces_zero_mutations(attempt, target, server):
+    run = Run(target, connect=server.connect, token=TOKEN, docker=FakeDocker(inspect_fails=True), environ={})
+
+    with pytest.raises(UnsafeTarget) as refused:
+        if attempt == "control":
+            with run.control():
+                pytest.fail("a privileged connection was handed out")
+        elif attempt == "create":
+            run.create_database()
+        elif attempt == "roles":
+            run.prepare_roles()
+        else:
+            run.create_database_as("restore")
+
+    assert refused.value.code == "cluster_identity_unavailable"
+    assert server.connections == [] and server.mutating() == []
+
+
+def test_a_hand_built_identity_cannot_open_a_privileged_connection(target, server):
+    """R4-01: copying the facts of a verified identity does not authorize anything; the
+    module's per-instance seal is required."""
+    forged = identity.ClusterIdentity(
+        system_identifier=CLUSTER_IDENTIFIER,
+        container_id=CONTAINER,
+        image=identity.PINNED_IMAGE,
+        volume=identity.DATA_VOLUME,
+        mode="compose",
+        port=55432,
+    )
+    assert identity.issued(forged) is False
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=forged, docker=server.docker)
+
+    with pytest.raises(UnsafeTarget) as refused:
+        with run.control():
+            pytest.fail("a hand-built identity opened a privileged connection")
+
+    assert refused.value.code == "cluster_identity_missing"
+    assert server.connections == [] and server.statements == []
+
+
+def test_a_verified_cluster_still_supports_the_permitted_operations(run, server):
+    name = run.create_database()
+
+    with run.control() as control:  # a privileged connection, verified before it is yielded
+        assert control.execute(harness._IDENTITY_SQL).fetchone()[0] == "postgres"
+
+    run.drop_database(name)
+    assert name not in server.databases
+
+
+def test_privileged_grants_refuse_an_external_engine(target, server):
+    """R4-01 item 4: an arbitrary SQLAlchemy engine is not evidence of a verified cluster."""
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker)
+    run.prepare_roles()
+    before = len(server.mutating())
+    external = sa.create_engine("sqlite://")
+    try:
+        with pytest.raises(UnsafeTarget) as refused:
+            run.apply_privileges(external)
+    finally:
+        external.dispose()
+
+    assert refused.value.code == "unverified_engine"
+    assert server.mutating()[before:] == []  # not one GRANT, REVOKE or ALTER DEFAULT left the run
+
+
+def test_privileged_grants_refuse_an_engine_that_does_not_reach_the_verified_cluster(run, server, monkeypatch):
+    """R4-01 item 5: even an engine this run created is refused when the connection it
+    actually opens is not the verified cluster (here: the engine factory is swapped for
+    SQLite after registration, so its connection parameters are not the validated ones)."""
+    name = run.create_database()
+    run.prepare_roles()  # apply_privileges needs the prepared identities before its engine gate
+    monkeypatch.setattr(harness, "create_db_engine", lambda url_text: sa.create_engine("sqlite://"))
+    engine = run.engine(name)  # registered with the run, but its connections are elsewhere
+    before = len(server.mutating())
+    try:
+        with pytest.raises(UnsafeTarget) as refused:
+            run.apply_privileges(engine)
+    finally:
+        engine.dispose()
+
+    assert refused.value.code in ("connect_parameters", "peer_unknown")
+    assert server.mutating()[before:] == []
+
+
+class EngineConnection:
+    """The parts of a SQLAlchemy `Connection` that `verify_engine_connection` reads."""
+
+    def __init__(self, server, *, peer, database="postgres"):
+        self.server = server
+        self.database = database
+        self.connection = SimpleNamespace(
+            dbapi_connection=SimpleNamespace(
+                info=SimpleNamespace(hostaddr=peer, port=55432, dbname=database)
+            )
+        )
+
+    def exec_driver_sql(self, sql):
+        if sql == harness._IDENTITY_SQL:
+            return Rows(
+                self.database,
+                self.server.databases[self.database],
+                self.server.owner(self.database),
+            )
+        if sql == harness._ROLE_SQL:
+            return Rows("postgres", "postgres")
+        if sql == identity.SYSTEM_IDENTIFIER_SQL:
+            return Rows(self.server.system_identifier)
+        raise AssertionError(f"a statement the verification should not send: {sql}")
+
+
+def test_the_actual_engine_connection_is_what_gets_verified(target, server):
+    """R4-01 item 5, directly: `verify_engine_connection` reads the peer from the driver's
+    own connection, so a foreign destination is refused even when the Run itself is the
+    verified one."""
+    expected = Expected(target, "postgres", None, CLUSTER_IDENTIFIER)
+
+    harness.verify_engine_connection(EngineConnection(server, peer=target.address), expected)
+
+    with pytest.raises(UnsafeTarget) as refused:
+        harness.verify_engine_connection(EngineConnection(server, peer=REMOTE), expected)
+    assert refused.value.code == "wrong_peer"
+
+    server.system_identifier = OTHER_IDENTIFIER
+    with pytest.raises(UnsafeTarget) as refused:
+        harness.verify_engine_connection(EngineConnection(server, peer=target.address), expected)
+    assert refused.value.code == "cluster_identity_changed"
+
+
+# --- R4-01 item 8: the restore-identity lifecycle ------------------------------------------------
+
+
+def test_the_restore_lifecycle_creates_tracks_and_drops_a_disabled_database(target, server):
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker)
+    run.prepare_roles()
+
+    name = run.create_database_as("restore")  # created by the restore login, disabled
+
+    assert name in run.pending_cleanup()["databases"]
+    assert server.databases[name] == run.marker
+    assert server.owners[name] == run.roles["owner"].name
+    assert any("ALLOW_CONNECTIONS false" in sql for _, sql in server.statements)
+    assert any("CREATE DATABASE" in sql for sql in (s for _, s in server.statements))
+
+    run.close()
+
+    assert name not in server.databases and server.roles == {}
+
+
+def test_the_restore_lifecycle_cannot_create_an_untracked_database(target, server):
+    run = Run(target, connect=server.connect, token=TOKEN, docker=FakeDocker(inspect_fails=True), environ={})
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.create_database_as("restore")
+
+    assert refused.value.code == "cluster_identity_unavailable"
+    assert server.mutating() == [] and server.connections == []
+    assert run.pending_cleanup()["databases"] == ()
+
+
+# --- R4-03: every cleanup entry point revalidates -------------------------------------------------
+
+
+def test_a_direct_drop_revalidates_and_refuses_when_docker_is_unavailable(run, server):
+    """The demonstrated bypass: `drop_database()` accepted the cached identity. Now the
+    Docker evidence is re-established first, and nothing is dropped without it."""
+    name = run.create_database()
+    server.docker.inspect_fails = True
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.drop_database(name)
+
+    assert refused.value.code == "cluster_identity_unavailable"
+    assert name in server.databases and name in run.pending_cleanup()["databases"]
+    assert not [s for s in server.mutating() if s.startswith("DROP")]
+
+    server.docker.inspect_fails = False  # the correct environment comes back
+    run.drop_database(name)  # a later safe retry completes
+    assert name not in server.databases and name not in run.pending_cleanup()["databases"]
+
+
+def test_a_direct_drop_refuses_a_substituted_container(run, server):
+    name = run.create_database()
+    server.docker.data_volume = "another-volume"  # the same port, a different cluster's data
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.drop_database(name)
+
+    assert refused.value.code == "cluster_identity_mismatch"
+    assert name in server.databases and name in run.pending_cleanup()["databases"]
+    assert not [s for s in server.mutating() if s.startswith("DROP")]
+
+    server.docker.data_volume = identity.DATA_VOLUME
+    run.drop_database(name)
+    assert name not in server.databases
+
+
+def test_a_direct_drop_refuses_a_changed_system_identifier(run, server):
+    name = run.create_database()
+    server.docker.identifier = OTHER_IDENTIFIER
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.drop_database(name)
+
+    assert refused.value.code == "cluster_identity_changed"
+    assert name in server.databases and not [s for s in server.mutating() if s.startswith("DROP")]
+
+    server.docker.identifier = CLUSTER_IDENTIFIER
+    run.drop_database(name)
+    assert name not in server.databases
+
+
+# --- R4-06: the fake enforces the DROP ROLE dependency ------------------------------------------
+
+
+def test_dropping_roles_before_revoking_their_grants_fails_and_keeps_the_records(target, server):
+    """Negative control: the wrong cleanup order (DROP ROLE before REVOKE) fails the way
+    PostgreSQL fails it - a role that still holds a database privilege cannot be dropped -
+    and nothing is falsely recorded as cleaned."""
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker)
+    run.prepare_roles()
+
+    problems = run._drop_roles()  # the wrong order: the maintenance CONNECT grants still exist
+
+    assert problems
+    assert server.roles  # the grant-holding roles survived
+    assert run.pending_cleanup()["maintenance_grants"]  # and their grants are still tracked
+    assert run.pending_cleanup()["roles"]
+
+    run.close()  # the correct order - revoke first, then drop - completes
+
+    assert server.roles == {} and server.maintenance_grants == []
+    assert run.pending_cleanup()["roles"] == () and run.pending_cleanup()["maintenance_grants"] == ()
+
+
+# --- R3-02: cleanup tracking and failure injection ----------------------------------------------
+
+
+def fail_on_nth(pattern, n):
+    seen = {"count": 0}
+
+    def predicate(sql):
+        if pattern in sql:
+            seen["count"] += 1
+            return seen["count"] == n
+        return False
+
+    return predicate
+
+
+def test_a_failure_after_the_first_maintenance_grant_revokes_it_and_drops_the_roles(target, server):
+    server.databases.pop("persistent", None)
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker)
+    server.fail_when = fail_on_nth('GRANT CONNECT ON DATABASE "postgres"', 2)
+
+    with pytest.raises(RuntimeError):
+        run.prepare_roles()
+
+    assert server.maintenance_grants == []  # the first grant was revoked
+    assert server.roles == {}  # and both roles created before the failure are gone
+    assert run.pending_cleanup()["roles"] == ()
+    assert run.pending_cleanup()["maintenance_grants"] == ()
+
+
+def test_a_failure_after_the_second_maintenance_grant_revokes_both(target, server):
+    server.databases.pop("persistent", None)
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker)
+    server.fail_when = fail_on_nth("SELECT count(*) FROM aclexplode(", 1)  # right after both grants
+
+    with pytest.raises(RuntimeError):
+        run.prepare_roles()
+
+    assert server.maintenance_grants == []
+    assert server.roles == {}
+    assert run.pending_cleanup()["maintenance_grants"] == ()
+
+
+def test_a_revocation_failure_keeps_the_grant_and_the_roles_and_never_hides_the_setup_error(target, server):
+    server.databases.pop("persistent", None)
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker)
+    seen = {"grants": 0}
+
+    def predicate(sql):
+        if 'GRANT CONNECT ON DATABASE "postgres"' in sql:
+            seen["grants"] += 1
+            return seen["grants"] == 2
+        return "REVOKE CONNECT ON DATABASE" in sql  # every revocation fails too
+
+    server.fail_when = predicate
+    with pytest.raises(RuntimeError) as failed:
+        run.prepare_roles()
+
+    # The setup failure is what the caller sees; the cleanup failure is its cause, not lost.
+    assert failed.value.__cause__ is not None
+    assert len(server.maintenance_grants) == 1  # the record whose revocation failed is kept
+    assert set(server.roles)  # nothing was falsely reported as dropped
+    pending = run.pending_cleanup()
+    assert pending["maintenance_grants"] and pending["roles"] and pending["failures"]
+    assert len(server.dropped_roles) == 0
+
+    server.fail_when = None  # the operator (or a retry) can finish it
+    run.close()
+    assert server.maintenance_grants == [] and server.roles == {}
+    assert run.pending_cleanup()["roles"] == () and run.pending_cleanup()["maintenance_grants"] == ()
+
+
+def test_a_role_drop_failure_keeps_only_the_failed_role_record_for_the_retry(target, server):
+    server.databases.pop("persistent", None)
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker)
+    run.prepare_roles()
+    server.fail_when = fail_on_nth('DROP ROLE "', 1)  # the first drop (reverse order) fails
+
+    with pytest.raises(RuntimeError):
+        run.close()
+
+    survivor = run.pending_cleanup()["roles"]
+    assert len(survivor) == 1 and harness.ROLE_NAME.fullmatch(survivor[0])
+    assert list(server.roles) == list(survivor)  # exactly the failed one remains
+    assert run.pending_cleanup()["failures"]
+
+    server.fail_when = None
+    run.close()
+    assert server.roles == {} and run.pending_cleanup()["roles"] == ()
+
+
+# --- R5-02: no privileged expectation without a verified cluster identifier --------------------
+
+
+def test_the_old_optional_identity_shape_no_longer_constructs(target):
+    """The exact Codex shape `Expected(target, "postgres", None)` is structurally gone:
+    the identifier is a required field, not an optional omission."""
+    with pytest.raises(TypeError):
+        Expected(target, "postgres", None)
+
+
+@pytest.mark.parametrize("identifier", [None, "", "not-a-number"])
+def test_an_expectation_without_a_verified_cluster_identifier_cannot_be_built(target, identifier):
+    with pytest.raises(UnsafeTarget) as refused:
+        Expected(target, "postgres", None, identifier)
+
+    assert refused.value.code == "cluster_identity_missing"
+
+
+def test_guarded_connect_refuses_a_missing_identity_before_the_driver(target):
+    """The exact Codex shape: an expectation that omitted the identifier. The common gate
+    refuses it before the dialect is called, so zero statements and zero connections."""
+    called = Tripwire()
+    dialect = SimpleNamespace(connect=called)
+    expected = SimpleNamespace(cluster_identifier=None)  # a lean future/foreign object
+
+    with pytest.raises(UnsafeTarget) as refused:
+        harness.guarded_connect(expected)(dialect, None, [], target.connect_params("postgres"))
+
+    assert refused.value.code == "cluster_identity_missing"
+    assert called.calls == []
+
+
+def test_an_injected_unissued_identity_cannot_build_a_privileged_expectation(target, server):
+    forged = identity.ClusterIdentity(
+        system_identifier=CLUSTER_IDENTIFIER,
+        container_id=CONTAINER,
+        image=identity.PINNED_IMAGE,
+        volume=identity.DATA_VOLUME,
+        mode="compose",
+        port=55432,
+    )
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=forged, docker=server.docker)
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run._expected("postgres", None)
+    assert refused.value.code == "cluster_identity_missing"
+
+    with pytest.raises(UnsafeTarget) as refused:
+        with run.control():
+            pytest.fail("an unissued identity opened a privileged connection")
+    assert refused.value.code == "cluster_identity_missing"
+    assert server.connections == [] and server.mutating() == []
+
+
+def test_an_altered_copy_of_a_verified_identity_authorizes_nothing(target, server):
+    import dataclasses
+
+    altered = dataclasses.replace(cluster_identity(), system_identifier=OTHER_IDENTIFIER)
+    assert identity.issued(altered) is False
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=altered, docker=server.docker)
+
+    with pytest.raises(UnsafeTarget) as refused:
+        with run.control():
+            pytest.fail("a copied proof on altered facts opened a privileged connection")
+
+    assert refused.value.code == "cluster_identity_missing"
+    assert server.connections == [] and server.mutating() == []
+
+
+# --- R5-03: cleanup revalidates the disposable identity at every mutation boundary ---------------
+
+
+def _limit_identity_inspections(server, allowed):
+    """Make the Docker identity evidence disappear after `allowed` successful inspections,
+    so a failure can be injected at a precise point inside cleanup."""
+    original = server.docker.inspect
+    seen = {"count": 0}
+
+    def inspect(container_id):
+        seen["count"] += 1
+        if seen["count"] > allowed:
+            raise identity.IdentityError(
+                "cluster_identity_unavailable", "simulated: Docker became unavailable"
+            )
+        return original(container_id)
+
+    server.docker.inspect = inspect
+    return original
+
+
+def test_docker_unavailable_before_revocation_blocks_every_mutation(target, server):
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker)
+    run.prepare_roles()
+    before = len(server.mutating())
+    server.docker.inspect_fails = True
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.close()
+
+    assert refused.value.code == "cluster_identity_unavailable"
+    assert len(server.mutating()) == before  # nothing revoked, nothing dropped
+    assert server.maintenance_grants and server.roles  # records kept for a safe retry
+
+    server.docker.inspect_fails = False  # the original environment comes back
+    run.close()
+    assert server.maintenance_grants == [] and server.roles == {}
+
+
+def test_docker_loss_between_revocation_and_role_deletion_blocks_role_drops(target, server):
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker)
+    run.prepare_roles()
+    original = _limit_identity_inspections(server, allowed=3)  # close + 2 revocations
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.close()
+
+    assert refused.value.code == "cluster_identity_unavailable"
+    assert server.maintenance_grants == []  # both revocations did run
+    assert len(server.roles) == 7  # not one role was dropped
+    assert not [s for s in server.mutating() if s.startswith("DROP ROLE")]
+    assert run.pending_cleanup()["roles"]  # still tracked for the retry
+
+    server.docker.inspect = original
+    run.close()
+    assert server.roles == {}
+
+
+def test_a_changed_cluster_identifier_during_cleanup_blocks_every_mutation(target, server):
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker)
+    run.prepare_roles()
+    before = len(server.mutating())
+    server.docker.identifier = OTHER_IDENTIFIER  # the control file now names another cluster
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.close()
+
+    assert refused.value.code == "cluster_identity_changed"
+    assert len(server.mutating()) == before
+    assert server.maintenance_grants and server.roles
+
+    server.docker.identifier = CLUSTER_IDENTIFIER
+    run.close()
+    assert server.maintenance_grants == [] and server.roles == {}
+
+
+# --- R5-05: an attempted CREATE is never evidence of ownership ---------------------------------
+
+
+def _run_with_roles(target, server):
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker)
+    run.prepare_roles()
+    return run
+
+
+def test_a_failed_create_against_a_preexisting_database_is_never_adopted_or_dropped(
+    target, server, monkeypatch
+):
+    """The exact reproduction: the expected name is taken by a database with the expected
+    owner and NO marker. CREATE fails with duplicate_database; close() must leave it."""
+    run = _run_with_roles(target, server)
+    existing = f"house_helper_test_{TOKEN}_1"
+    server.databases[existing] = None  # no marker at all
+    server.owners[existing] = run.identity("owner").name
+    # The inventory gate now refuses this database on its own (tested separately); the
+    # CREATE lifecycle is the subject here, so reach it directly.
+    monkeypatch.setattr(run, "_require_clean_inventory", lambda control: None)
+
+    with pytest.raises(SimulatedDatabaseError) as failed:
+        run.create_database_as("restore")
+
+    assert failed.value.sqlstate == "42P04"
+    assert run.pending_cleanup()["databases"] == ()  # not recorded as owned
+    assert run.pending_cleanup()["ambiguous"] == ()
+
+    run.close()
+
+    assert existing in server.databases  # the pre-existing database survived
+    assert not [s for s in server.mutating() if s.startswith("DROP DATABASE")]
+    assert run.pending_cleanup()["databases"] == ()
+
+
+def test_an_ambiguous_creation_is_preserved_and_reported(target, server, monkeypatch):
+    run = _run_with_roles(target, server)
+    existing = f"house_helper_test_{TOKEN}_1"
+    server.owners[existing] = run.identity("owner").name
+    monkeypatch.setattr(run, "_require_clean_inventory", lambda control: None)
+    server.fail_on = "CREATE DATABASE"
+
+    with pytest.raises(RuntimeError):
+        run.create_database_as("restore")
+    server.fail_on = None
+    # Model a statement that did take effect before its answer was lost.
+    server.databases[existing] = None
+
+    assert run.pending_cleanup()["databases"] == ()
+    assert run.pending_cleanup()["ambiguous"] == (existing,)
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.close()
+
+    assert refused.value.code == "ambiguous_create"
+    assert existing in server.databases
+    assert not [s for s in server.mutating() if s.startswith("DROP DATABASE")]
+    assert run.pending_cleanup()["ambiguous"] == (existing,)
+
+
+def test_an_ambiguous_creation_that_never_took_effect_is_forgotten(target, server, monkeypatch):
+    run = _run_with_roles(target, server)
+    monkeypatch.setattr(run, "_require_clean_inventory", lambda control: None)
+    server.fail_on = "CREATE DATABASE"
+
+    with pytest.raises(RuntimeError):
+        run.create_database_as("restore")
+    server.fail_on = None
+
+    assert run.pending_cleanup()["ambiguous"]  # recorded while unresolved
+    run.close()
+
+    assert run.pending_cleanup()["ambiguous"] == ()
+    assert server.maintenance_grants == [] and server.roles == {}
+
+
+# --- R5-04: volume provenance and runner evidence at the harness level -------------------------
+
+
+def test_a_foreign_volume_with_the_expected_name_blocks_every_destructive_call(target, server):
+    run = Run(
+        target,
+        connect=server.connect,
+        token=TOKEN,
+        docker=FakeDocker(volume_labels={}),  # right name, no Compose provenance
+        environ={},
+    )
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.create_database()
+
+    assert refused.value.code == "cluster_identity_mismatch"
+    assert server.mutating() == [] and server.connections == []
+
+
+def test_a_data_volume_shared_with_another_container_blocks_the_run(target, server):
+    run = Run(
+        target,
+        connect=server.connect,
+        token=TOKEN,
+        docker=FakeDocker(shared_with=["b" * 64]),
+        environ={},
+    )
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.create_database()
+
+    assert refused.value.code == "cluster_identity_mismatch"
+    assert server.mutating() == [] and server.connections == []
+
+
+def test_runner_scoped_evidence_in_local_mode_blocks_the_run(target, server):
+    run = Run(
+        target,
+        connect=server.connect,
+        token=TOKEN,
+        docker=FakeDocker(),
+        environ={identity.RUN_ID_ENV: "1234567890"},
+    )
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.create_database()
+
+    assert refused.value.code == "cluster_identity_conflict"
+    assert server.mutating() == [] and server.connections == []
+
+
+def test_another_compose_projects_container_cannot_use_the_ci_contract(target, server):
+    volume = identity.ci_volume(CI_IDENTITY_ENVIRON)
+    docker = FakeDocker(
+        labels={
+            identity.COMPOSE_PROJECT_LABEL: "another-project",
+            identity.COMPOSE_SERVICE_LABEL: "postgres",
+            identity.COMPOSE_ONEOFF_LABEL: "False",
+        },
+        volume=volume,
+        volume_labels={},
+    )
+    run = Run(target, connect=server.connect, token=TOKEN, docker=docker, environ=CI_IDENTITY_ENVIRON)
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.create_database()
+
+    assert refused.value.code == "cluster_identity_conflict"
+    assert server.mutating() == [] and server.connections == []
+
+
+def test_a_scratch_looking_foreign_database_blocks_role_preparation(target, server):
+    """R5-04 item 8: the inventory check reads the actual owner and marker, not the shape
+    of the name."""
+    server.databases[f"house_helper_test_{'f' * 32}_1"] = None  # scratch-looking, no marker
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker)
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.prepare_roles()
+
+    assert refused.value.code == "not_dedicated"
+    assert server.roles == {} and server.mutating() == []
 
 
 # --- output that must not show a secret ------------------------------------------------------------------------

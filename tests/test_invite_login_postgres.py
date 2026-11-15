@@ -47,14 +47,18 @@ from house_helper.persistence.invitations import (
 from house_helper.persistence.models import AllowlistEntry, IdentityLink, OidcState, User
 from house_helper.persistence.models import Session as LoginSession
 from tests.persistence_support import utc
+from tests.revisions import HEAD_REVISION
 from tests.postgres_harness import POSTGRES_URL_ENV
 from tests.test_admin_enrollment_postgres import monitor_rc, run_on, scratch_rc  # noqa: F401  (fixtures)
 from tests.test_admin_postgres import pg_run, scalar, template  # noqa: F401  (fixtures and helpers)
 
-pytestmark = pytest.mark.skipif(
-    not os.environ.get(POSTGRES_URL_ENV),
-    reason=f"opt-in: set {POSTGRES_URL_ENV} to a local throwaway PostgreSQL (see tests/test_admin_postgres.py)",
-)
+pytestmark = [
+    pytest.mark.postgres,
+    pytest.mark.skipif(
+        not os.environ.get(POSTGRES_URL_ENV),
+        reason=f"opt-in: set {POSTGRES_URL_ENV} to a local throwaway PostgreSQL (see tests/test_admin_postgres.py)",
+    ),
+]
 
 NOW = utc(2026, 10, 21, 12)
 LATER = NOW + timedelta(minutes=5)
@@ -141,7 +145,7 @@ def test_the_revision_downgrades_deleting_bound_logins_and_upgrades_again(scratc
 
     run_on(scratch_rc, logins)
     assert scalar(monitor_rc, "SELECT count(*) FROM oidc_states") == 2
-    engine = scratch_rc.engine()
+    engine = scratch_rc.migrate_engine()
     try:
         downgrade_database(engine, INVITATIONS)
         assert scalar(monitor_rc, "SELECT version_num FROM alembic_version") == INVITATIONS
@@ -149,7 +153,7 @@ def test_the_revision_downgrades_deleting_bound_logins_and_upgrades_again(scratc
         assert scalar(monitor_rc, "SELECT state_hash FROM oidc_states") == hash_secret("plain-state")
         assert scalar(monitor_rc, "SELECT count(*) FROM information_schema.columns WHERE table_name = 'oidc_states' AND column_name = 'invitation_id'") == 0
         assert scalar(monitor_rc, "SELECT count(*) FROM identity_invitations") == 2  # nothing else was touched
-        upgrade_database(engine)
+        upgrade_database(engine, HEAD_REVISION)  # the revision is stated, not defaulted (CI-08)
     finally:
         engine.dispose()
 

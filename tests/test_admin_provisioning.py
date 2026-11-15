@@ -25,6 +25,7 @@ from types import SimpleNamespace
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql, sqlite
+from sqlalchemy.engine import make_url
 
 from house_helper.admin import provisioning
 from house_helper.admin.cli import INTERRUPTED, ExitCode, main
@@ -44,9 +45,14 @@ from house_helper.persistence.database import DATABASE_URL_ENV
 from house_helper.persistence.email_login import issue_email_login
 from house_helper.persistence.models import User
 from tests.admin_support import (  # noqa: F401  (fixtures)
+    admin_database,
     counts,
     db_path,
     db_url,
+    provision_db_url,
+    purge_db_url,
+    sqlite_db_url,
+    sqlite_only,
     everything,
     journal_mode,
     migrated_template,
@@ -130,8 +136,8 @@ def test_the_first_run_creates_one_user_and_one_approved_email_entry(capsys, db_
     assert str(uuid.UUID(user_id)) in result.out  # the database holds bare hex, the output dashes
 
 
-def test_the_entry_is_what_the_allowlist_itself_accepts(capsys, db_url):
-    provision(capsys, db_url)
+def test_the_entry_is_what_the_allowlist_itself_accepts(capsys, db_url, provision_db_url):
+    provision(capsys, provision_db_url)
 
     engine, factory = open_factory(db_url)
     try:
@@ -144,17 +150,17 @@ def test_the_entry_is_what_the_allowlist_itself_accepts(capsys, db_url):
         engine.dispose()
 
 
-def test_a_display_name_and_a_note_are_optional(capsys, db_url):
-    provision(capsys, db_url)
+def test_a_display_name_and_a_note_are_optional(capsys, db_url, provision_db_url):
+    provision(capsys, provision_db_url)
 
     assert rows(db_url, "SELECT display_name FROM users") == [(None,)]
     assert entry_of(db_url)[4] is None
 
 
-def test_the_longest_accepted_display_name_and_note_are_stored(capsys, db_url):
+def test_the_longest_accepted_display_name_and_note_are_stored(capsys, db_url, provision_db_url):
     name, note = "n" * MAX_DISPLAY_NAME_LENGTH, "t" * MAX_NOTE_LENGTH
 
-    result = provision(capsys, db_url, ADDRESS, "--display-name", name, "--note", note)
+    result = provision(capsys, provision_db_url, ADDRESS, "--display-name", name, "--note", note)
 
     assert result.code == 0
     assert rows(db_url, "SELECT display_name FROM users") == [(name,)]
@@ -176,36 +182,36 @@ def fail_after(monkeypatch, error, name="allow"):
     monkeypatch.setattr(provisioning, name, failing)
 
 
-def test_a_failure_after_the_writes_rolls_the_whole_run_back(capsys, db_url, monkeypatch):
+def test_a_failure_after_the_writes_rolls_the_whole_run_back(capsys, db_url, provision_db_url, monkeypatch):
     fail_after(monkeypatch, RuntimeError("SECRET text of the error"))
     before = everything(db_url)
 
-    result = provision(capsys, db_url)
+    result = provision(capsys, provision_db_url)
 
     assert result.code == ExitCode.INTERNAL
     assert everything(db_url) == before
     assert counts(db_url)["users"] == 0 and counts(db_url)["allowlist_entries"] == 0
 
 
-def test_a_failure_while_reapproving_puts_the_revocation_back(capsys, db_url, monkeypatch):
-    create_first_user(capsys, db_url)
+def test_a_failure_while_reapproving_puts_the_revocation_back(capsys, db_url, provision_db_url, monkeypatch):
+    create_first_user(capsys, provision_db_url)
     with write(db_url) as session:
         revoke(session, "email", ADDRESS)
     before = everything(db_url)
     fail_after(monkeypatch, RuntimeError("boom"))
 
-    result = provision(capsys, db_url, ADDRESS, "--reapprove-revoked", "--verified-mailbox")
+    result = provision(capsys, provision_db_url, ADDRESS, "--reapprove-revoked", "--verified-mailbox")
 
     assert result.code == ExitCode.INTERNAL
     assert everything(db_url) == before
     assert entry_of(db_url)[5] is not None
 
 
-def test_a_refusal_leaves_every_table_as_it_was(capsys, db_url):
-    create_first_user(capsys, db_url)
+def test_a_refusal_leaves_every_table_as_it_was(capsys, db_url, provision_db_url):
+    create_first_user(capsys, provision_db_url)
     before = everything(db_url)
 
-    result = provision(capsys, db_url, "someone.else@example.com")
+    result = provision(capsys, provision_db_url, "someone.else@example.com")
 
     assert result.code == ExitCode.REFUSED
     assert everything(db_url) == before
@@ -214,11 +220,11 @@ def test_a_refusal_leaves_every_table_as_it_was(capsys, db_url):
 # --- running it again ------------------------------------------------------------------------
 
 
-def test_repeating_the_command_changes_nothing_not_even_a_differing_name_or_note(capsys, db_url):
-    create_first_user(capsys, db_url, ADDRESS, "--display-name", "Елена", "--note", "first")
+def test_repeating_the_command_changes_nothing_not_even_a_differing_name_or_note(capsys, db_url, provision_db_url):
+    create_first_user(capsys, provision_db_url, ADDRESS, "--display-name", "Елена", "--note", "first")
     before = everything(db_url)
 
-    again = provision(capsys, db_url, ADDRESS, "--display-name", "Другая", "--note", "second")
+    again = provision(capsys, provision_db_url, ADDRESS, "--display-name", "Другая", "--note", "second")
 
     assert again.code == ExitCode.OK
     assert again.err == ""
@@ -230,11 +236,11 @@ def test_repeating_the_command_changes_nothing_not_even_a_differing_name_or_note
     assert entry_of(db_url)[4] == "first"
 
 
-def test_the_reapproval_flags_are_without_effect_on_an_address_that_is_not_revoked(capsys, db_url):
-    create_first_user(capsys, db_url)
+def test_the_reapproval_flags_are_without_effect_on_an_address_that_is_not_revoked(capsys, db_url, provision_db_url):
+    create_first_user(capsys, provision_db_url)
     before = everything(db_url)
 
-    again = provision(capsys, db_url, ADDRESS, "--reapprove-revoked", "--verified-mailbox")
+    again = provision(capsys, provision_db_url, ADDRESS, "--reapprove-revoked", "--verified-mailbox")
 
     assert again.code == 0
     assert "ok [unchanged]" in again.out
@@ -242,8 +248,8 @@ def test_the_reapproval_flags_are_without_effect_on_an_address_that_is_not_revok
     assert everything(db_url) == before
 
 
-def test_an_unused_flag_on_the_first_run_is_reported_as_without_effect(capsys, db_url):
-    result = provision(capsys, db_url, ADDRESS, "--reapprove-revoked", "--verified-mailbox")
+def test_an_unused_flag_on_the_first_run_is_reported_as_without_effect(capsys, db_url, provision_db_url):
+    result = provision(capsys, provision_db_url, ADDRESS, "--reapprove-revoked", "--verified-mailbox")
 
     assert result.code == 0
     assert "ok [created]" in result.out
@@ -263,20 +269,20 @@ def test_an_unused_flag_on_the_first_run_is_reported_as_without_effect(capsys, d
     ],
 )
 def test_the_local_part_is_kept_exactly_and_only_the_domain_is_lower_cased(
-    capsys, db_url, typed, stored
+    capsys, db_url, provision_db_url, typed, stored
 ):
-    result = provision(capsys, db_url, typed)
+    result = provision(capsys, provision_db_url, typed)
 
     assert result.code == 0, result.text
     assert rows(db_url, "SELECT subject FROM allowlist_entries") == [(stored,)]
     assert f"approved {stored} for email sign-in" in result.out
 
 
-def test_the_same_address_in_any_domain_case_is_the_same_address(capsys, db_url):
-    create_first_user(capsys, db_url, "Elena@example.com")
+def test_the_same_address_in_any_domain_case_is_the_same_address(capsys, db_url, provision_db_url):
+    create_first_user(capsys, provision_db_url, "Elena@example.com")
 
     for spelling in ("Elena@EXAMPLE.COM", " Elena@example.com ", "Elena@Example.com"):
-        again = provision(capsys, db_url, spelling)
+        again = provision(capsys, provision_db_url, spelling)
         assert again.code == 0 and "ok [unchanged]" in again.out
 
     assert counts(db_url)["users"] == 1 and counts(db_url)["allowlist_entries"] == 1
@@ -292,11 +298,11 @@ def test_the_same_address_in_any_domain_case_is_the_same_address(capsys, db_url)
         "Elena@example.org",
     ],
 )
-def test_another_spelling_is_another_address_and_is_never_merged(capsys, db_url, other):
-    create_first_user(capsys, db_url, "Elena@example.com")
+def test_another_spelling_is_another_address_and_is_never_merged(capsys, db_url, provision_db_url, other):
+    create_first_user(capsys, provision_db_url, "Elena@example.com")
     before = everything(db_url)
 
-    result = provision(capsys, db_url, other)
+    result = provision(capsys, provision_db_url, other)
 
     assert result.code == ExitCode.REFUSED
     assert result.err.startswith("refused [user_exists]: ")
@@ -304,11 +310,11 @@ def test_another_spelling_is_another_address_and_is_never_merged(capsys, db_url,
     assert everything(db_url) == before
 
 
-def test_no_provider_specific_alias_folding(capsys, db_url):
-    create_first_user(capsys, db_url, "elena@gmail.com")
+def test_no_provider_specific_alias_folding(capsys, db_url, provision_db_url):
+    create_first_user(capsys, provision_db_url, "elena@gmail.com")
 
     for alias in ("e.lena@gmail.com", "elena+kitchen@gmail.com", "elena@googlemail.com"):
-        assert provision(capsys, db_url, alias).code == ExitCode.REFUSED
+        assert provision(capsys, provision_db_url, alias).code == ExitCode.REFUSED
 
     assert rows(db_url, "SELECT subject FROM allowlist_entries") == [("elena@gmail.com",)]
 
@@ -317,14 +323,14 @@ def test_no_provider_specific_alias_folding(capsys, db_url):
 
 
 def test_an_existing_user_with_a_different_address_is_refused_and_no_second_user_made(
-    capsys, db_url
+    capsys, db_url, provision_db_url
 ):
     with write(db_url) as session:
         user = new_user(session, display_name="Elena")
         allow(session, user, "telegram", "123456789")
     before = everything(db_url)
 
-    result = provision(capsys, db_url)
+    result = provision(capsys, provision_db_url)
 
     assert result.code == ExitCode.REFUSED
     assert result.err.startswith("refused [user_exists]: ")
@@ -332,16 +338,16 @@ def test_an_existing_user_with_a_different_address_is_refused_and_no_second_user
     assert counts(db_url)["users"] == 1
 
 
-def test_an_existing_user_without_any_entry_is_still_a_user(capsys, db_url):
+def test_an_existing_user_without_any_entry_is_still_a_user(capsys, db_url, provision_db_url):
     with write(db_url) as session:
         new_user(session)
 
-    assert provision(capsys, db_url).code == ExitCode.REFUSED
+    assert provision(capsys, provision_db_url).code == ExitCode.REFUSED
     assert counts(db_url)["users"] == 1 and counts(db_url)["allowlist_entries"] == 0
 
 
 @pytest.mark.parametrize("address_belongs_to", ["the first user", "the second user"])
-def test_with_several_users_the_command_refuses_everything(capsys, db_url, address_belongs_to):
+def test_with_several_users_the_command_refuses_everything(capsys, db_url, provision_db_url, address_belongs_to):
     with write(db_url) as session:
         first = new_user(session, display_name="first")
         second = new_user(session, display_name="second")
@@ -349,7 +355,7 @@ def test_with_several_users_the_command_refuses_everything(capsys, db_url, addre
         allow(session, owner, "email", ADDRESS)
     before = everything(db_url)
 
-    result = provision(capsys, db_url, ADDRESS)
+    result = provision(capsys, provision_db_url, ADDRESS)
 
     assert result.code == ExitCode.REFUSED
     assert result.err.startswith("refused [multiple_users]: ")
@@ -375,25 +381,31 @@ def insert_orphan_entry(path: Path, user_id: str, subject: str) -> None:
         connection.close()
 
 
-def test_an_address_listed_for_a_user_who_is_not_the_user_is_refused(capsys, db_url, db_path):
+@sqlite_only
+@pytest.mark.sqlite
+def test_an_address_listed_for_a_user_who_is_not_the_user_is_refused(capsys, sqlite_db_url, db_path):
+    # R2-01: the setup (the sqlite3 module on the file) and the command must be the SAME
+    # database. The URL is the explicit SQLite file, and the row is read back through it.
+    assert make_url(sqlite_db_url).database == str(db_path)
     insert_orphan_entry(db_path, uuid.uuid4().hex, ADDRESS)  # no user at all
-    before = everything(db_url)
+    assert rows(sqlite_db_url, "SELECT subject FROM allowlist_entries") == [(ADDRESS,)]
+    before = everything(sqlite_db_url)
 
-    none_at_all = provision(capsys, db_url)
+    none_at_all = provision(capsys, sqlite_db_url)
 
     assert none_at_all.code == ExitCode.REFUSED
     assert none_at_all.err.startswith("refused [identity_other_user]: ")
-    assert everything(db_url) == before
+    assert everything(sqlite_db_url) == before
 
-    with write(db_url) as session:  # now there is one user, and the entry is not theirs
+    with write(sqlite_db_url) as session:  # now there is one user, and the entry is not theirs
         new_user(session)
-    before = everything(db_url)
+    before = everything(sqlite_db_url)
 
-    someone_else = provision(capsys, db_url)
+    someone_else = provision(capsys, sqlite_db_url)
 
     assert someone_else.code == ExitCode.REFUSED
     assert someone_else.err.startswith("refused [identity_other_user]: ")
-    assert everything(db_url) == before
+    assert everything(sqlite_db_url) == before
 
 
 # --- a revoked address ----------------------------------------------------------------------------
@@ -412,13 +424,13 @@ def revoke_with_traces(url, address=ADDRESS):
         return login.id.hex, issued.link.challenge_id.hex
 
 
-def test_a_revoked_address_stays_revoked_by_default(capsys, db_url):
-    create_first_user(capsys, db_url)
+def test_a_revoked_address_stays_revoked_by_default(capsys, db_url, provision_db_url):
+    create_first_user(capsys, provision_db_url)
     with write(db_url) as session:
         revoke(session, "email", ADDRESS)
     before = everything(db_url)
 
-    result = provision(capsys, db_url)
+    result = provision(capsys, provision_db_url)
 
     assert result.code == ExitCode.REFUSED
     assert result.err.startswith("refused [email_revoked]: ")
@@ -435,27 +447,27 @@ def test_one_reapproval_flag_alone_is_a_usage_error_and_touches_no_database(caps
     assert "together" in result.err
 
 
-def test_one_reapproval_flag_alone_does_not_reapprove(capsys, db_url):
-    create_first_user(capsys, db_url)
+def test_one_reapproval_flag_alone_does_not_reapprove(capsys, db_url, provision_db_url):
+    create_first_user(capsys, provision_db_url)
     with write(db_url) as session:
         revoke(session, "email", ADDRESS)
     before = everything(db_url)
 
     for flag in ("--reapprove-revoked", "--verified-mailbox"):
-        assert provision(capsys, db_url, ADDRESS, flag).code == ExitCode.USAGE
+        assert provision(capsys, provision_db_url, ADDRESS, flag).code == ExitCode.USAGE
 
     assert everything(db_url) == before
 
 
 @pytest.mark.parametrize("flags", [{"reapprove_revoked": True}, {"verified_mailbox": True}])
 def test_the_function_itself_needs_both_flags_and_does_not_rely_on_the_command_line(
-    capsys, db_url, flags
+    capsys, db_url, provision_db_url, flags
 ):
-    create_first_user(capsys, db_url)
+    create_first_user(capsys, provision_db_url)
     with write(db_url) as session:
         revoke(session, "email", ADDRESS)
     before = everything(db_url)
-    engine, factory = open_factory(db_url)
+    engine, factory = open_factory(provision_db_url)  # the command's own identity (R2-03)
     try:
         with pytest.raises(Refusal) as refused:
             provision_email(factory, prepare_request(ADDRESS, **flags))
@@ -466,8 +478,8 @@ def test_the_function_itself_needs_both_flags_and_does_not_rely_on_the_command_l
     assert everything(db_url) == before
 
 
-def test_both_flags_lift_the_revocation_on_the_same_row_and_revive_nothing(capsys, db_url):
-    user_id = create_first_user(capsys, db_url, ADDRESS, "--display-name", "Елена", "--note", "old")
+def test_both_flags_lift_the_revocation_on_the_same_row_and_revive_nothing(capsys, db_url, provision_db_url):
+    user_id = create_first_user(capsys, provision_db_url, ADDRESS, "--display-name", "Елена", "--note", "old")
     session_id, challenge_id = revoke_with_traces(db_url)
     entry_before = entry_of(db_url)
     assert entry_before[5] is not None
@@ -515,19 +527,19 @@ def test_both_flags_lift_the_revocation_on_the_same_row_and_revive_nothing(capsy
         engine.dispose()
 
 
-def test_reapproving_without_a_note_keeps_the_stored_one(capsys, db_url):
-    create_first_user(capsys, db_url, ADDRESS, "--note", "kept")
+def test_reapproving_without_a_note_keeps_the_stored_one(capsys, db_url, provision_db_url):
+    create_first_user(capsys, provision_db_url, ADDRESS, "--note", "kept")
     with write(db_url) as session:
         revoke(session, "email", ADDRESS)
 
-    result = provision(capsys, db_url, ADDRESS, "--reapprove-revoked", "--verified-mailbox")
+    result = provision(capsys, provision_db_url, ADDRESS, "--reapprove-revoked", "--verified-mailbox")
 
     assert result.code == 0 and "ok [reapproved]" in result.out
     assert entry_of(db_url)[4] == "kept"
 
 
-def test_reapproving_one_spelling_does_not_approve_another(capsys, db_url):
-    create_first_user(capsys, db_url, "elena@example.com")
+def test_reapproving_one_spelling_does_not_approve_another(capsys, db_url, provision_db_url):
+    create_first_user(capsys, provision_db_url, "elena@example.com")
     with write(db_url) as session:
         revoke(session, "email", "elena@example.com")
     before = everything(db_url)
@@ -557,26 +569,26 @@ def disable_user(url):
     assert rows_changed == 1
 
 
-def test_a_disabled_user_is_refused(capsys, db_url):
-    create_first_user(capsys, db_url)
+def test_a_disabled_user_is_refused(capsys, db_url, provision_db_url):
+    create_first_user(capsys, provision_db_url)
     disable_user(db_url)
     before = everything(db_url)
 
-    result = provision(capsys, db_url)
+    result = provision(capsys, provision_db_url)
 
     assert result.code == ExitCode.REFUSED
     assert result.err.startswith("refused [user_disabled]: ")
     assert everything(db_url) == before
 
 
-def test_a_disabled_user_is_not_enabled_by_reapproval_either(capsys, db_url):
-    create_first_user(capsys, db_url)
+def test_a_disabled_user_is_not_enabled_by_reapproval_either(capsys, db_url, provision_db_url):
+    create_first_user(capsys, provision_db_url)
     with write(db_url) as session:
         revoke(session, "email", ADDRESS)
     disable_user(db_url)
     before = everything(db_url)
 
-    result = provision(capsys, db_url, ADDRESS, "--reapprove-revoked", "--verified-mailbox")
+    result = provision(capsys, provision_db_url, ADDRESS, "--reapprove-revoked", "--verified-mailbox")
 
     assert result.code == ExitCode.REFUSED
     assert result.err.startswith("refused [user_disabled]: ")
@@ -584,11 +596,11 @@ def test_a_disabled_user_is_not_enabled_by_reapproval_either(capsys, db_url):
     assert entry_of(db_url)[5] is not None
 
 
-def test_a_disabled_user_blocks_a_different_address_too(capsys, db_url):
-    create_first_user(capsys, db_url)
+def test_a_disabled_user_blocks_a_different_address_too(capsys, db_url, provision_db_url):
+    create_first_user(capsys, provision_db_url)
     disable_user(db_url)
 
-    assert provision(capsys, db_url, "other@example.com").code == ExitCode.REFUSED
+    assert provision(capsys, provision_db_url, "other@example.com").code == ExitCode.REFUSED
     assert counts(db_url)["users"] == 1
 
 
@@ -727,13 +739,13 @@ def test_help_works_and_documents_the_exit_statuses(capsys):
     assert DATABASE_URL_ENV in out and "never creates a database" in out
 
 
-def test_a_keyboard_interrupt_is_reported_without_a_traceback(capsys, db_url, monkeypatch):
+def test_a_keyboard_interrupt_is_reported_without_a_traceback(capsys, db_url, provision_db_url, monkeypatch):
     def interrupted(*args, **kwargs):
         raise KeyboardInterrupt
 
     monkeypatch.setattr(provisioning, "allow", interrupted)
 
-    result = provision(capsys, db_url)
+    result = provision(capsys, provision_db_url)
 
     assert result.code == INTERRUPTED
     assert "Traceback" not in result.err
@@ -743,7 +755,7 @@ def test_a_keyboard_interrupt_is_reported_without_a_traceback(capsys, db_url, mo
 # --- what is never printed --------------------------------------------------------------------------
 
 
-def test_an_unexpected_failure_prints_its_class_and_none_of_its_text(capsys, db_url, monkeypatch):
+def test_an_unexpected_failure_prints_its_class_and_none_of_its_text(capsys, db_url, provision_db_url, monkeypatch):
     error = sa.exc.IntegrityError(
         "INSERT INTO users (display_name) VALUES (?)",
         {"display_name": SECRET},
@@ -751,7 +763,7 @@ def test_an_unexpected_failure_prints_its_class_and_none_of_its_text(capsys, db_
     )
     fail_after(monkeypatch, error)
 
-    result = provision(capsys, db_url, ADDRESS, "--display-name", "Елена")
+    result = provision(capsys, provision_db_url, ADDRESS, "--display-name", "Елена")
 
     assert result.code == ExitCode.INTERNAL
     assert result.out == ""
@@ -763,22 +775,25 @@ def test_an_unexpected_failure_prints_its_class_and_none_of_its_text(capsys, db_
 @pytest.mark.parametrize(
     "scenario", ["created", "unchanged", "refused", "revoked", "disabled", "reapproved"]
 )
-def test_no_outcome_prints_the_database_location(capsys, db_url, db_path, scenario):
+# SQLite-scoped: the database file path is part of what must not leak (CI-02)
+@pytest.mark.sqlite
+@sqlite_only
+def test_no_outcome_prints_the_database_location(capsys, db_url, provision_db_url, db_path, scenario):
     arrange = {
         "created": lambda: None,
-        "unchanged": lambda: create_first_user(capsys, db_url),
-        "refused": lambda: create_first_user(capsys, db_url, "other@example.com"),
-        "revoked": lambda: (create_first_user(capsys, db_url), _revoke(db_url)),
-        "disabled": lambda: (create_first_user(capsys, db_url), disable_user(db_url)),
-        "reapproved": lambda: (create_first_user(capsys, db_url), _revoke(db_url)),
+        "unchanged": lambda: create_first_user(capsys, provision_db_url),
+        "refused": lambda: create_first_user(capsys, provision_db_url, "other@example.com"),
+        "revoked": lambda: (create_first_user(capsys, provision_db_url), _revoke(db_url)),
+        "disabled": lambda: (create_first_user(capsys, provision_db_url), disable_user(db_url)),
+        "reapproved": lambda: (create_first_user(capsys, provision_db_url), _revoke(db_url)),
     }[scenario]
     arrange()
     extra = ("--reapprove-revoked", "--verified-mailbox") if scenario == "reapproved" else ()
 
-    result = provision(capsys, db_url, ADDRESS, *extra)
+    result = provision(capsys, provision_db_url, ADDRESS, *extra)
 
     assert result.code in (0, 3)
-    for leaked in (str(db_path), db_path.name, "sqlite:", db_url, str(db_path.parent)):
+    for leaked in (str(db_path), db_path.name, "sqlite:", db_url, provision_db_url, str(db_path.parent)):
         assert leaked not in result.text
 
 
@@ -790,8 +805,10 @@ def _revoke(url):
 # --- the first statement of the transaction -----------------------------------------------------------
 
 
-def test_on_sqlite_the_transaction_starts_with_a_write(db_url):
-    engine, factory = open_factory(db_url)
+@sqlite_only
+@pytest.mark.sqlite
+def test_on_sqlite_the_transaction_starts_with_a_write(sqlite_db_url):
+    engine, factory = open_factory(sqlite_db_url)
     try:
         with statements(engine) as seen:
             provision_email(factory, prepare_request(ADDRESS))
@@ -802,9 +819,9 @@ def test_on_sqlite_the_transaction_starts_with_a_write(db_url):
     assert "WHERE 0 = 1" in seen[0]
 
 
-def test_the_noop_write_changes_nothing_when_the_run_is_refused(capsys, db_url):
-    create_first_user(capsys, db_url)
-    engine, factory = open_factory(db_url)
+def test_the_noop_write_changes_nothing_when_the_run_is_refused(capsys, db_url, provision_db_url):
+    create_first_user(capsys, provision_db_url)
+    engine, factory = open_factory(provision_db_url)  # the command's own identity (R2-03)
     try:
         before = everything(db_url)
         with pytest.raises(Refusal) as refused:
@@ -914,6 +931,9 @@ def run_all_at_once(url, spellings, open_engine=open_factory):
     return results, errors
 
 
+# SQLite-scoped (write-first serialisation and file locking); the same rule on PostgreSQL is covered by tests/test_admin_postgres.py
+@pytest.mark.sqlite
+@sqlite_only
 @pytest.mark.parametrize("round_number", range(ROUNDS))
 def test_concurrent_first_runs_with_different_spellings_create_exactly_one_user(
     tmp_path, migrated_template, round_number
@@ -944,6 +964,9 @@ def test_concurrent_first_runs_with_different_spellings_create_exactly_one_user(
     assert all(error.reason is RefusalReason.USER_EXISTS for error in errors)
 
 
+# SQLite-scoped (write-first serialisation and file locking); the same rule on PostgreSQL is covered by tests/test_admin_postgres.py
+@pytest.mark.sqlite
+@sqlite_only
 def test_concurrent_runs_of_the_same_address_agree_on_one_user(tmp_path, migrated_template):
     import shutil
 
@@ -958,6 +981,9 @@ def test_concurrent_runs_of_the_same_address_agree_on_one_user(tmp_path, migrate
     assert counts(url)["users"] == 1
 
 
+# SQLite-scoped (write-first serialisation and file locking); the same rule on PostgreSQL is covered by tests/test_admin_postgres.py
+@pytest.mark.sqlite
+@sqlite_only
 def test_concurrent_first_runs_on_a_rollback_journal_database_still_create_exactly_one_user(
     tmp_path, migrated_template
 ):
@@ -1004,6 +1030,9 @@ def run_module(url, *argv):
     )
 
 
+# SQLite-scoped (write-first serialisation and file locking); the same rule on PostgreSQL is covered by tests/test_admin_postgres.py
+@pytest.mark.sqlite
+@sqlite_only
 def test_separate_processes_racing_with_different_spellings_make_one_user(
     tmp_path, migrated_template
 ):

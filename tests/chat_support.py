@@ -26,6 +26,7 @@ from house_helper.persistence.database import create_session_factory
 from house_helper.persistence.models import Conversation, Message, TurnRequest
 from house_helper.web.database import WebDatabase
 from house_helper.web.turn_runner import WebTurnRunner
+from tests import backend_support
 from tests.auth_support import ORIGIN, START, FakeClock, Harness, auth_app, seed_user, sign_in
 from tests.web_support import TIMEOUT, opened_database
 
@@ -244,6 +245,7 @@ class RunnerEnv:
     user_id: UUID
     conversation_id: UUID
     database: WebDatabase
+    handle: object  # the backend's database handle (tests/backend_support.py)
 
     async def submit(self, text="Что из яиц?", key="k-1", runner=None):
         return await (runner or self.runner).submit(
@@ -268,17 +270,24 @@ class RunnerEnv:
 async def runner_env(tmp_path, backend, *, database_options=None, **options):
     """A WebTurnRunner over a real migrated SQLite file, with a clock of the test's own;
     `options` go to the runner, `database_options` to the WebDatabase."""
-    async with opened_database(tmp_path, **(database_options or {})) as (database, engine):
-        factory = create_session_factory(engine)
-        user_id = seed_user(factory)
-        with factory() as db, db.begin():
-            conversation = create_conversation(db, user_id, now=START)
-        clock = FakeClock()
-        runner = WebTurnRunner(database, backend, clock, **options)
-        try:
-            yield RunnerEnv(runner, backend, clock, factory, user_id, conversation.id, database)
-        finally:
-            await runner.aclose()
+    scratch = backend_support.backend().new_database(schema="migrations", tmp_path=tmp_path)
+    engine = scratch.app_engine()
+    backend_support.verify_database(engine, scratch)  # the effective dialect and identity (R2-02)
+    database = WebDatabase(engine, **(database_options or {}))
+    factory = create_session_factory(engine)
+    user_id = seed_user(factory)
+    with factory() as db, db.begin():
+        conversation = create_conversation(db, user_id, now=START)
+    clock = FakeClock()
+    runner = WebTurnRunner(database, backend, clock, **options)
+    try:
+        yield RunnerEnv(
+            runner, backend, clock, factory, user_id, conversation.id, database, scratch
+        )
+    finally:
+        await runner.aclose()
+        await database.aclose()
+        # `scratch` is dropped by the test's teardown (tests/backend_support.py).
 
 
 def gate_on(monkeypatch, name: str, *, fail: Optional[BaseException] = None):

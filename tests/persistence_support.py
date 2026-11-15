@@ -17,9 +17,12 @@ every listener, so what refuses them is the database's own constraints.
 
 import hashlib
 import json
+import re
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 import pytest
 import sqlalchemy as sa
@@ -27,11 +30,7 @@ from sqlalchemy.orm import Session as OrmSession
 
 from house_helper.persistence.allowlist import allow
 from house_helper.persistence.base import Base
-from house_helper.persistence.database import (
-    create_db_engine,
-    create_session_factory,
-    upgrade_database,
-)
+from house_helper.persistence.database import create_session_factory
 from house_helper.persistence.models import (
     MESSAGE_RETENTION,
     Conversation,
@@ -56,14 +55,24 @@ def digest(text: str) -> str:
 
 
 @pytest.fixture(params=SCHEMAS)
-def engine(request, tmp_path):
-    engine = create_db_engine(f"sqlite:///{tmp_path / 'test.db'}")
-    if request.param == "migrated":
-        upgrade_database(engine)
-    else:
-        Base.metadata.create_all(engine)
-    yield engine
-    engine.dispose()
+def engine(request, tmp_path, database_backend):
+    """A schema on the configured backend (PostgreSQL when the test server is set, CI-14).
+
+    `created_from_models` builds the DDL from Base.metadata; `migrated` runs the Alembic
+    chain to the stated head. On PostgreSQL the DDL runs as the migration/owner login and
+    the returned engine is the restricted application login.
+    """
+    database = database_backend.new_database(
+        schema="models" if request.param == "created_from_models" else "migrations",
+        tmp_path=tmp_path,
+    )
+    engine = database.app_engine()
+    engine._hh_database = database  # for the DDL a test needs (a simulated outage)
+    try:
+        yield engine
+    finally:
+        engine.dispose()
+        database.close()
 
 
 @pytest.fixture
@@ -77,21 +86,225 @@ def session(factory):
         yield session
 
 
+@dataclass(frozen=True)
+class Failure:
+    """A driver error as plain values (HH-DB-01 R3-04). Read once, from the exception in
+    hand: PostgreSQL's structured diagnostics are preferred to anything a message says,
+    and a message may quote row data that a regex must never mistake for a rule."""
+
+    message: str
+    state: Optional[str]  # SQLSTATE
+    constraint_name: str
+    column_name: str
+    table_name: str
+    detail: str  # the server's DETAIL field (structured, not the row's text)
+    statement: Optional[str]
+    params: object
+
+
+def describe(error: BaseException) -> Failure:
+    orig = getattr(error, "orig", error)
+    diag = getattr(orig, "diag", None)
+    return Failure(
+        message=str(orig),
+        state=getattr(orig, "sqlstate", None),
+        constraint_name=getattr(diag, "constraint_name", None) or "",
+        column_name=getattr(diag, "column_name", None) or "",
+        table_name=getattr(diag, "table_name", None) or "",
+        detail=getattr(diag, "message_detail", None) or "",
+        statement=getattr(error, "statement", None),
+        params=getattr(error, "params", None),
+    )
+
+
+def assert_expected_rejection(dialect: str, constraint: str, failure: Failure) -> None:
+    """The one decision `rejected` makes, pure and testable offline.
+
+    SQLite names its rule in the message. PostgreSQL's message may also quote row data,
+    so on PostgreSQL the structured SQLSTATE and `diag.constraint_name`/`diag.column_name`
+    decide; the message is never searched for the expected name first."""
+    if dialect != "postgresql":
+        if re.search(constraint, failure.message):
+            return
+        raise AssertionError(f"the database did not name the expected rule: {failure.message}")
+    if (
+        failure.state is None
+        and "printable_ascii" in constraint
+        and "cannot contain NUL" in failure.message
+    ):
+        # The one documented exception (R2-04): psycopg refuses a NUL byte in a text value
+        # before the statement reaches the server, so on PostgreSQL the printable-ASCII
+        # CHECK cannot be the rule that fires for that input. The value is not storable,
+        # which is what the test proves. Nothing else is excused.
+        return
+    if constraint == "CHECK constraint failed":
+        # The test names no particular CHECK; it asserts that a CHECK of the row fired.
+        assert failure.state == "23514", failure.message
+    elif constraint in ("FOREIGN KEY constraint failed", "FOREIGN KEY"):
+        assert failure.state == "23503", failure.message
+    elif constraint.startswith("NOT NULL constraint failed:"):
+        column = constraint.split(":", 1)[1].strip().split(".")[-1]
+        # R3-04: the server names the column in the structured diagnostic. The message is
+        # not evidence: a value of another row could contain the column's name.
+        assert failure.state == "23502" and failure.column_name == column, failure.message
+    elif constraint.startswith("ck_"):
+        # R3-04: THE named CHECK, from `diag.constraint_name` only.
+        assert failure.state == "23514" and failure.constraint_name == constraint, failure.message
+    else:
+        # A column list ("table.provider, table.subject") for a UNIQUE key or a foreign
+        # key. The server names the constrained columns in `diag.constraint_name` or in
+        # the structured DETAIL's `Key (...)` prefix - never in the free-text message,
+        # which can quote the rejected row's values.
+        columns = [part.strip().split(".")[-1] for part in constraint.split(",")]
+        assert failure.state in ("23503", "23505") and failure.constraint_name, failure.message
+        named = failure.constraint_name
+        key = re.match(r"^\s*Key\s*\(([^)]*)\)", failure.detail)
+        if key is not None:
+            named += " " + key.group(1)
+        missing = [column for column in columns if column not in named]
+        assert not missing, f"{failure.message} (DETAIL: {failure.detail})"
+
+
+_INSERT = re.compile(
+    r"^\s*INSERT\s+INTO\s+(?:[A-Za-z_][A-Za-z0-9_]*\.)?\"?([A-Za-z_][A-Za-z0-9_]*)\"?\s*"
+    r"\(([^)]*)\)\s*VALUES\s*\((.*)\)\s*(?:RETURNING\s+.*)?$",
+    re.IGNORECASE | re.DOTALL,
+)
+_NAMED_PARAM = re.compile(r"%\(([^)]+)\)s")
+
+
+def _split_top_level(text: str) -> list[str]:
+    """Split a VALUES/SET list on commas that are not inside single quotes."""
+    parts, current, quoted = [], [], False
+    for character in text:
+        if character == "'":
+            quoted = not quoted
+        if character == "," and not quoted:
+            parts.append("".join(current).strip())
+            current = []
+        else:
+            current.append(character)
+    parts.append("".join(current).strip())
+    return parts
+
+
+def overlong_columns(statement: Optional[str], params: object, table: str) -> Optional[set[str]]:
+    """The columns of `table` whose BOUND value exceeds the column's declared width.
+
+    R3-04: the isolated-input proof for a 22001. `None` means the statement could not be
+    read, which is a refusal (the helper must not accept a width error it cannot attribute
+    to the expected column). A different column of the same declared width is named, so a
+    same-width sibling can never satisfy the assertion."""
+    if not statement or table not in Base.metadata.tables:
+        return None
+    match = _INSERT.match(statement)
+    if match is None or match.group(1).lower() != table:
+        return None
+    columns = [part.strip().strip('"').split(".")[-1].strip('"') for part in match.group(2).split(",")]
+    values = _split_top_level(match.group(3))
+    if len(columns) != len(values):
+        return None
+    names = _NAMED_PARAM.search(match.group(3)) is not None
+    if names:
+        # One dict per row; SQLAlchemy may also hand a tuple of dicts for executemany.
+        entries: list[object] = list(params) if isinstance(params, list) else [params]
+    elif isinstance(params, list):
+        entries = list(params)
+    else:
+        entries = [params]
+    offending: set[str] = set()
+    for entry in entries:
+        for index, placeholder in enumerate(values):
+            column = columns[index]
+            declared = Base.metadata.tables[table].c.get(column)
+            limit = None if declared is None else getattr(declared.type, "length", None)
+            if limit is None:
+                continue
+            if names:
+                if not isinstance(entry, dict):
+                    continue
+                name = _NAMED_PARAM.search(placeholder)
+                if name is None:
+                    continue
+                value = entry.get(name.group(1))
+            else:
+                if not isinstance(entry, (tuple, list)):
+                    continue
+                value = entry[index] if index < len(entry) else None
+            if isinstance(value, str) and len(value) > limit:
+                offending.add(column)
+    return offending
+
+
+def assert_expected_width_rejection(table: str, column: str, failure: Failure) -> None:
+    """The one decision `rejected_width` makes for PostgreSQL, pure and testable."""
+    limit = getattr(Base.metadata.tables[table].c[column].type, "length", None)
+    constraint = f"ck_{table}_{column}_max_length"
+    if limit is None:
+        # A TEXT column: there is no type width to fire first, so the named CHECK is the
+        # rule on PostgreSQL too (and it must be that CHECK, not another one).
+        assert failure.state == "23514" and failure.constraint_name == constraint, failure.message
+        return
+    assert failure.state == "22001", failure.message
+    assert f"character varying({limit})" in failure.message, failure.message
+    # R3-04: the width alone does not name the column; another column of the same width
+    # could have overflowed. The bound statement must show THIS column as the only one
+    # over its declared width.
+    offending = overlong_columns(failure.statement, failure.params, table)
+    assert offending is not None, (
+        "the width refusal could not be attributed to a column: the statement that "
+        f"failed was not readable ({failure.statement!r})"
+    )
+    assert offending == {column}, (
+        f"the width refusal names {sorted(offending)} and not only {column!r}"
+    )
+
+
 @contextmanager
 def rejected(session: OrmSession, constraint: str):
     """The block (plus the flush that follows it) must violate `constraint`.
 
-    `constraint` is matched against the database's message, so a test cannot
-    pass because some other rule happened to fail first. SQLite names a CHECK
-    constraint, and for a UNIQUE one lists its columns.
+    SQLite names a CHECK constraint, and for a UNIQUE one lists its columns. PostgreSQL
+    phrases the same facts differently, so its structured diagnostics decide: the SQLSTATE
+    plus `diag.constraint_name` / `diag.column_name`. The message is not searched for the
+    expected name on PostgreSQL (R3-04: it may quote row data), and an unrelated rule can
+    never satisfy the expectation.
 
     Runs in a SAVEPOINT, so what the test set up before the block survives the
     failure and the block can be repeated.
     """
-    with pytest.raises(sa.exc.IntegrityError, match=constraint):
+    with pytest.raises((sa.exc.IntegrityError, sa.exc.DataError)) as caught:
         with session.begin_nested():
             yield
             session.flush()
+
+    assert_expected_rejection(
+        session.get_bind().dialect.name, constraint, describe(caught.value)
+    )
+
+
+@contextmanager
+def rejected_width(session: OrmSession, table: str, column: str):
+    """The block must be refused because `table.column`'s declared width is exceeded.
+
+    SQLite does not enforce `VARCHAR(n)`, so its `ck_<table>_<column>_max_length` CHECK
+    fires. PostgreSQL refuses the value at the type's width before the CHECK can run
+    (SQLSTATE 22001, "value too long for type character varying(n)"). That is accepted
+    ONLY here, with the exact column's declared limit read from the model, and - R3-04 -
+    only when the failing statement shows this column (and no other column of the same
+    declared width) as the one whose bound value is over its limit.
+    """
+    constraint = f"ck_{table}_{column}_max_length"
+    with pytest.raises((sa.exc.IntegrityError, sa.exc.DataError)) as caught:
+        with session.begin_nested():
+            yield
+            session.flush()
+
+    failure = describe(caught.value)
+    if session.get_bind().dialect.name == "sqlite":
+        assert re.search(constraint, failure.message), failure.message
+        return
+    assert_expected_width_rejection(table, column, failure)
 
 
 def new_user(session: OrmSession, **fields) -> User:
@@ -206,21 +419,73 @@ def stored(moment: datetime) -> str:
     return moment.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
 
 
+def fail_inserts(engine, table: str, *, name: str = None) -> None:
+    """Make every INSERT into `table` fail (a simulated database outage). DDL runs as the
+    migration/owner login on PostgreSQL; on SQLite it is the same file."""
+    name = name or f"hh_fail_{table}"
+    database = getattr(engine, "_hh_database", None)
+    if database is None:  # a test's own SQLite engine
+        ddl_engine = engine
+    else:
+        ddl_engine = database.migrate_engine()
+    if engine.dialect.name == "sqlite":
+        statement = (
+            f"CREATE TRIGGER {name} BEFORE INSERT ON {table} "
+            "BEGIN SELECT RAISE(ABORT, 'disk full'); END"
+        )
+    else:
+        statement = (
+            f"CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $$ "
+            "BEGIN RAISE EXCEPTION 'disk full' USING ERRCODE = '23514'; END $$; "
+            f"CREATE TRIGGER {name} BEFORE INSERT ON {table} "
+            f"FOR EACH ROW EXECUTE FUNCTION {name}()"
+        )
+    try:
+        with ddl_engine.begin() as connection:
+            connection.exec_driver_sql(statement)
+    finally:
+        if ddl_engine is not engine:
+            ddl_engine.dispose()
+
+
+def _mark(connection) -> str:
+    """The driver's positional placeholder (SQLite `?`, psycopg `%s`)."""
+    return "?" if connection.dialect.paramstyle == "qmark" else "%s"
+
+
+def _bind(value):
+    """A Python value as the driver takes it: UUIDs as text, JSON documents as text.
+    (Plain SQL timestamps are `stored()` text, which both dialects accept.)"""
+    if isinstance(value, uuid.UUID):
+        return value.hex
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False)
+    return value
+
+
 def raw_insert(session: OrmSession, table: str, **values) -> None:
     """INSERT one row with plain SQL and bound parameters. No ORM, no type
-    processing (UUIDs are given as hex, timestamps as stored() text), no
-    listener: only the database's constraints stand in the way."""
+    processing beyond what the driver itself accepts, no listener: only the
+    database's constraints stand in the way."""
+    connection = session.connection()
+    mark = _mark(connection)
     columns = ", ".join(values)
-    marks = ", ".join("?" for _ in values)
-    session.connection().exec_driver_sql(
-        f"INSERT INTO {table} ({columns}) VALUES ({marks})", tuple(values.values())
+    marks = ", ".join(mark for _ in values)
+    connection.exec_driver_sql(
+        f"INSERT INTO {table} ({columns}) VALUES ({marks})",
+        tuple(_bind(value) for value in values.values()),
     )
 
 
 def raw_update(session: OrmSession, table: str, where: str, where_args: tuple, **values) -> None:
-    assignments = ", ".join(f"{column} = ?" for column in values)
-    session.connection().exec_driver_sql(
-        f"UPDATE {table} SET {assignments} WHERE {where}", (*values.values(), *where_args)
+    connection = session.connection()
+    mark = _mark(connection)
+    if mark != "?":  # the historical tests spell their conditions SQLite-style
+        where = where.replace("?", mark)
+    assignments = ", ".join(f"{column} = {mark}" for column in values)
+    connection.exec_driver_sql(
+        f"UPDATE {table} SET {assignments} WHERE {where}",
+        (*[_bind(value) for value in values.values()], *[_bind(value) for value in where_args]),
     )
 
 

@@ -26,6 +26,7 @@ from house_helper.persistence.database import (
     upgrade_database,
 )
 from house_helper.persistence.models import Conversation, Message, TurnRequest
+from tests.backend_support import sqlite_only
 from tests.persistence_support import (  # noqa: F401  (fixtures)
     count,
     engine,
@@ -36,6 +37,7 @@ from tests.persistence_support import (  # noqa: F401  (fixtures)
     new_user,
     utc,
 )
+from tests.revisions import HEAD_REVISION
 
 EARLIER = utc(2020, 1, 1)
 NOW = utc(2026, 10, 16, 12)
@@ -76,6 +78,8 @@ def recorded_statements(engine):
 # --- the engine begins a transaction itself ---------------------------------------
 
 
+@sqlite_only
+@pytest.mark.sqlite
 def test_the_first_statement_of_a_transaction_is_begin_even_when_it_is_a_read(engine):
     statements = recorded_statements(engine)
 
@@ -87,6 +91,8 @@ def test_the_first_statement_of_a_transaction_is_begin_even_when_it_is_a_read(en
     assert statements[:2] == ["BEGIN", "SELECT 1"]
 
 
+@sqlite_only
+@pytest.mark.sqlite
 def test_a_savepoint_is_never_the_outermost_one(engine, factory, conversation_id):
     statements = recorded_statements(engine)
 
@@ -338,6 +344,9 @@ def test_losing_a_real_race_for_a_key_leaves_no_orphan_and_a_retry_replays(
 # --- the same holds off the file system, and for migrations ------------------------
 
 
+# SQLite-scoped: the in-memory SQLite engine (CI-02).
+@pytest.mark.sqlite
+@sqlite_only
 def test_an_in_memory_database_has_the_same_transactions():
     engine = create_db_engine("sqlite://")
     try:
@@ -366,6 +375,9 @@ def test_an_in_memory_database_has_the_same_transactions():
         engine.dispose()
 
 
+# SQLite-scoped: the SQLite migration file the failed upgrade leaves
+@pytest.mark.sqlite
+@sqlite_only
 def test_a_failed_upgrade_leaves_no_half_built_schema(tmp_path):
     # SQLite can roll DDL back, but only inside a transaction. Without the BEGIN,
     # every CREATE TABLE before the failing one stayed.
@@ -375,7 +387,7 @@ def test_a_failed_upgrade_leaves_no_half_built_schema(tmp_path):
             connection.exec_driver_sql("CREATE TABLE turn_requests (id INTEGER)")  # built last
 
         with pytest.raises(sa.exc.OperationalError, match="already exists"):
-            upgrade_database(engine)
+            upgrade_database(engine, HEAD_REVISION)
 
         assert set(sa.inspect(engine).get_table_names()) == {"turn_requests"}
     finally:

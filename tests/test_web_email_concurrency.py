@@ -274,22 +274,28 @@ async def test_taking_email_login_out_of_the_configuration_does_not_end_the_sess
     from house_helper.web.app import create_app
     from house_helper.web.settings import WebSettings
     from tests.auth_support import FakeTelegram, auth_settings
-    from tests.web_support import running, sqlite_url
+    from tests.web_support import running
 
     async with email_app(tmp_path) as h:
         await h.sign_in()
         token = h.client.cookies.get(SESSION_COOKIE)
         clock = h.clock
-    telegram_only = auth_settings()
-    app = create_app(
-        WebSettings(database_url=sqlite_url(tmp_path / "email.db"), auth=telegram_only),
-        provider_transport=FakeTelegram(clock, telegram_only).transport(),
-        clock=clock,
-    )
-    async with running(app):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=ORIGIN) as client:
-            client.cookies.set(SESSION_COOKIE, token, domain="kitchen.example.test", path="/")
+        telegram_only = auth_settings()
+        app = create_app(
+            WebSettings(database_url=h.database.url_text, auth=telegram_only),
+            provider_transport=FakeTelegram(clock, telegram_only).transport(),
+            clock=clock,
+        )
+        async with running(app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url=ORIGIN
+            ) as client:
+                client.cookies.set(SESSION_COOKIE, token, domain="kitchen.example.test", path="/")
 
-            assert (await client.get("/auth/me")).status_code == 200  # still signed in
-            assert (await client.post("/auth/email/request", json={"email": ADDRESS})).status_code == 503
-            assert (await client.get("/auth/email/confirm?c=" + str(h.user_id))).status_code == 503
+                assert (await client.get("/auth/me")).status_code == 200  # still signed in
+                assert (
+                    await client.post("/auth/email/request", json={"email": ADDRESS})
+                ).status_code == 503
+                assert (
+                    await client.get("/auth/email/confirm?c=" + str(h.user_id))
+                ).status_code == 503

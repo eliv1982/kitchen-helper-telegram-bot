@@ -6,13 +6,22 @@ otherwise, the advisory lock really serialises concurrent first runs, a refusal 
 failure rolls back and releases the lock, and the connection goes back to the
 database's own isolation level.
 
-To run (use a throwaway server on THIS machine; these tests CREATE and DROP databases on it):
+To run (use the throwaway server of compose.test-postgres.yaml on THIS machine; these
+tests CREATE and DROP roles and databases on it):
 
-    docker run -d --rm --name hh-test-pg -e POSTGRES_PASSWORD=PASSWORD \\
-        -p 127.0.0.1:55432:5432 postgres:16-alpine
-    pip install "psycopg[binary]"          # not in requirements.txt: the driver is optional
-    export HOUSE_HELPER_TEST_POSTGRES_URL="postgresql+psycopg://postgres:PASSWORD@127.0.0.1:55432/postgres"
+    docker compose -f compose.test-postgres.yaml up -d
+    export HOUSE_HELPER_TEST_POSTGRES_URL=postgresql+psycopg://hh_test:hh_test_only_not_a_secret@127.0.0.1:55432/postgres
     pytest tests/test_admin_postgres.py -v -rs
+
+HH-DB-01 R3-01/R4-02: before the first role or database is created, the cluster must be
+independently identified in exactly one explicit mode - the Compose container of that
+file, or (only on the GitHub Actions runner: GITHUB_ACTIONS=true) the run-scoped service
+container named by HH_TEST_POSTGRES_CONTAINER_ID, whose data volume the workflow
+provisions for that run and attempt. Either way the digest-pinned image, the verified
+volume, the loopback port and the system_identifier read from the control file through
+`docker exec ... pg_controldata` must agree. A container id alone never selects the CI
+contract, and a bare `docker run`, a native installation or a tunnel is refused: the
+suite cannot prove it is disposable.
 
 (PowerShell: `$env:HOUSE_HELPER_TEST_POSTGRES_URL = "..."`.) The URL names a server and a
 maintenance database to connect to, and the user needs the CREATEDB privilege. The tests
@@ -69,16 +78,20 @@ from tests.postgres_harness import (
     leaked,
     run_from_environment,
 )
+from tests.revisions import HEAD_REVISION
 from tests.test_admin_provisioning import fail_after
 
 DATABASE_DEFAULT = "repeatable read"  # what each scratch database is set to, below
 ADDRESS = "Elena@example.com"
 SPELLINGS = ["Elena@example.com", "elena@example.com", "ELENA@example.com"]
 
-pytestmark = pytest.mark.skipif(
-    not os.environ.get(POSTGRES_URL_ENV),
-    reason=f"opt-in: set {POSTGRES_URL_ENV} to a local throwaway PostgreSQL (see the module docstring)",
-)
+pytestmark = [
+    pytest.mark.postgres,
+    pytest.mark.skipif(
+        not os.environ.get(POSTGRES_URL_ENV),
+        reason=f"opt-in: set {POSTGRES_URL_ENV} to a local throwaway PostgreSQL (see the module docstring)",
+    ),
+]
 
 # The advisory locks held (or waited for) on KEY in the current database, by anyone.
 _LOCKS = (
@@ -92,13 +105,15 @@ _KEY = sa.literal(ADVISORY_LOCK_KEY, sa.BigInteger)
 # --- databases of our own ---------------------------------------------------------------------------------
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session")
 def pg_run():
-    """This module's run on the configured server. An unsafe configuration fails here, at
-    setup, before anything is opened; whatever the run created is dropped at the end, also
-    when a fixture or a test failed."""
+    """This session's run on the configured server, with the frozen matrix's per-run roles
+    (CI-16, CI-17). An unsafe configuration fails here, at setup, before anything is opened;
+    whatever the run created - databases and roles - is dropped at the end, also when a
+    fixture or a test failed."""
     run = run_from_environment()
     try:
+        run.prepare_roles()  # inside the guard: a partial preparation is cleaned up (R2-05)
         yield run
     finally:
         run.close()
@@ -106,13 +121,14 @@ def pg_run():
 
 @pytest.fixture(scope="module")
 def template(pg_run):
-    """A migrated database that exists for this module only. Every connection the
-    migrations use is verified (loopback peer, this database, this run's token) when it is
-    opened, so before the first statement."""
-    name = pg_run.create_database()
-    engine = pg_run.engine(name)
+    """A migrated database that exists for this module only, carrying the frozen ACL
+    contract so that every clone inherits it. The migrations run as the per-run migration
+    login (session_user = hh_t_..._migrate, current_user = ..._owner)."""
+    name = pg_run.create_database(runtime_roles=("app",))
+    engine = pg_run.migrate_engine(name)
     try:
-        upgrade_database(engine)
+        upgrade_database(engine, HEAD_REVISION)  # the revision is stated, not defaulted (CI-08)
+        pg_run.apply_privileges(engine)
     finally:
         engine.dispose()
     return name
@@ -154,7 +170,7 @@ def assert_the_lock_is_free(engine):
 
 def run_once(scratch, address):
     """A provisioning run on an engine of its own, as a separate process would have."""
-    engine = scratch.engine()
+    engine = scratch.provision_engine()
     try:
         return provision_email(create_session_factory(engine), prepare_request(address))
     finally:
@@ -221,14 +237,16 @@ def test_a_libpq_service_file_set_after_validation_cannot_redirect_a_connection_
 
 
 def test_a_database_without_this_runs_token_is_refused_by_the_real_guard(scratch, monitor):
-    with monitor.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
-        connection.exec_driver_sql(f"COMMENT ON DATABASE \"{scratch.name}\" IS 'somebody else'")
+    # (The comment is changed through the bootstrap connection: no restricted login owns
+    # the database, which is the point of the ownership-marker check below.)
+    with scratch.run.control() as connection:
+        connection.execute(f"COMMENT ON DATABASE \"{scratch.name}\" IS 'somebody else'")
         try:
             with pytest.raises(UnsafeTarget) as refused:
                 scratch.engine().connect()
             assert refused.value.code == "not_this_run"
         finally:
-            connection.exec_driver_sql(f"COMMENT ON DATABASE \"{scratch.name}\" IS '{scratch.run.marker}'")
+            connection.execute(f"COMMENT ON DATABASE \"{scratch.name}\" IS '{scratch.run.marker}'")
     assert scalar(monitor, "SELECT 1") == 1  # (and it is the run's again)
 
 
@@ -240,7 +258,7 @@ def test_the_run_is_read_committed_although_the_database_default_is_repeatable_r
 ):
     # The premise: an ordinary transaction on this database IS repeatable read.
     assert scalar(monitor, "SHOW default_transaction_isolation") == DATABASE_DEFAULT
-    engine = scratch.engine()
+    engine = scratch.provision_engine()
     with engine.connect() as connection:
         assert connection.exec_driver_sql("SHOW transaction_isolation").scalar() == DATABASE_DEFAULT
 
@@ -265,7 +283,7 @@ def test_the_run_is_read_committed_although_the_database_default_is_repeatable_r
 
 
 def test_the_connection_is_back_at_the_database_default_after_the_run(scratch, monkeypatch):
-    engine = scratch.engine()
+    engine = scratch.provision_engine()
     backends = []
     real = provisioning.check_schema_at_head
 
@@ -335,7 +353,7 @@ def test_concurrent_runs_with_different_spellings_create_exactly_one_user(scratc
 def test_a_refusal_changes_nothing_and_releases_the_advisory_lock(scratch, monitor):
     # The engine stays open while the lock is looked at: it must be let go by the end of
     # the transaction, not by the connection closing (the pool keeps the connection).
-    engine = scratch.engine()
+    engine = scratch.provision_engine()
     factory = create_session_factory(engine)
     try:
         assert provision_email(factory, prepare_request(ADDRESS)).outcome is Outcome.CREATED
@@ -356,7 +374,7 @@ def test_a_failure_after_the_writes_rolls_everything_back_and_releases_the_advis
     scratch, monitor, monkeypatch
 ):
     fail_after(monkeypatch, RuntimeError("boom"))  # the user and the entry have been flushed
-    engine = scratch.engine()
+    engine = scratch.provision_engine()
     try:
         with pytest.raises(RuntimeError):
             provision_email(create_session_factory(engine), prepare_request(ADDRESS))
@@ -374,7 +392,7 @@ def test_a_failure_after_the_writes_rolls_everything_back_and_releases_the_advis
 
 def test_the_command_line_provisions_the_first_user_and_repeats_safely(scratch, monitor, capsys):
     # Handed to main() as its environment: the process environment is not read.
-    environ = {DATABASE_URL_ENV: scratch.url_text}
+    environ = {DATABASE_URL_ENV: scratch.url_text_for("provision")}
 
     assert main(["provision-email", "--email", ADDRESS], environ=environ) == 0
     created = capsys.readouterr()

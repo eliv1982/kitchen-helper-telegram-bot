@@ -28,6 +28,7 @@ from tests.persistence_support import (  # noqa: F401  (fixtures)
     new_message,
     new_user,
     rejected,
+    rejected_width,
     session,
     utc,
 )
@@ -399,7 +400,12 @@ def test_the_database_refuses_an_empty_title_a_long_title_and_an_empty_text(sess
     user = new_user(session)
     values = {"title": "ok", "content": "ok", "source_message_id": 1, "created_at": NOW, **fields}
 
-    with rejected(session, constraint):
+    reject = (
+        rejected_width(session, "favorite_recipes", "title")
+        if constraint == "ck_favorite_recipes_title_max_length"
+        else rejected(session, constraint)
+    )
+    with reject:
         session.add(FavoriteRecipe(user_id=user.id, **values))
 
 

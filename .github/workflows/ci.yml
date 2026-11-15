@@ -10,9 +10,44 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # HH-DB-01 R3-08: 10,951 collected tests per leg (164 PostgreSQL-marked, 1,074
+    # SQLite-scoped, 9,713 generic on the PostgreSQL backend), plus the preflight,
+    # the collection assertion, `alembic check` and the per-run role/ACL fixtures. The
+    # estimate is 15-25 minutes on an ubuntu-latest runner; 60 keeps a >2x margin without
+    # removing, splitting or skipping a single mandatory test. A wall-clock failure here
+    # must be treated as a performance finding, not as a reason to weaken coverage.
+    timeout-minutes: 60
     strategy:
       matrix:
         python-version: ["3.10", "3.12"]
+    # HH-DB-01 CI-05: a real PostgreSQL 16 for both matrix legs. A service container
+    # cannot be matrix-conditional, so it runs for every leg; that is what makes the
+    # PostgreSQL suites required rather than skipped. The image is digest-pinned and the
+    # port is the harness's: loopback, 55432 (it refuses 5432), no query parameters.
+    services:
+      postgres:
+        image: postgres@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+        env:
+          POSTGRES_USER: hh_ci
+          POSTGRES_PASSWORD: hh_ci_only_not_a_secret
+          POSTGRES_DB: postgres
+        # HH-DB-01 R4-02: the CI identity contract does not guess. The runner gives the
+        # service container an explicitly provisioned volume that is unique to this run and
+        # attempt; tests/postgres_identity.py computes the same name from GITHUB_RUN_ID and
+        # GITHUB_RUN_ATTEMPT and refuses a container whose data mount is anything else. A
+        # container id alone never selects the CI contract, and a local Compose container
+        # is refused in CI mode.
+        volumes:
+          - "hh-test-postgres-${{ github.run_id }}-${{ github.run_attempt }}:/var/lib/postgresql/data"
+        ports:
+          - "127.0.0.1:55432:5432"
+        options: >-
+          --health-cmd "pg_isready -U hh_ci -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      HOUSE_HELPER_TEST_POSTGRES_URL: postgresql+psycopg://hh_ci:hh_ci_only_not_a_secret@127.0.0.1:55432/postgres
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -30,5 +65,47 @@ jobs:
       - name: Check for syntax errors
         run: python -m compileall -q bot.py config.py api_client.py context_manager.py house_helper
 
+      # HH-DB-01 R3-01: the runner's own service-container id is the independent fact the
+      # harness verifies (image, volume, port and the control file's system_identifier)
+      # before it creates or drops roles and databases. It is passed to every step that
+      # opens the database - the runner starts a different container per leg.
+      - name: PostgreSQL preflight (CI-06)
+        env:
+          HH_TEST_POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
+        run: python -m tests.postgres_preflight
+
+      - name: PostgreSQL suites are collected (CI-07)
+        # A run with no PostgreSQL-marked tests collects nothing and pytest exits 5,
+        # which fails this step: the marker cannot silently stop applying.
+        run: pytest --collect-only -q -m postgres
+
+      - name: Alembic check against PostgreSQL (CI-10)
+        env:
+          HH_TEST_POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
+        run: python -m tests.postgres_preflight --alembic-check
+
+      - name: PostgreSQL suites - roles, ACLs, chain, application (CI-16, CI-17)
+        # The per-run restricted identities are created here; a skipped `postgres` test
+        # while the URL is set fails this step (tests/conftest.py, CI-07).
+        env:
+          HH_TEST_POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
+        run: pytest -q -ra -m postgres
+
       - name: Run test suite
-        run: pytest -v
+        # Everything that is neither `postgres`- nor `sqlite`-marked, on the configured
+        # backend: in CI every integration fixture creates PostgreSQL databases (CI-14),
+        # and `-ra` records every skip. The `sqlite`-marked tests are run ONLY in the
+        # dedicated step below, so this step cannot pass an explicitly SQLite-scoped test
+        # while reporting PostgreSQL-first compliance (R2-02/R2-09).
+        env:
+          HH_TEST_POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
+        run: pytest -q -ra -m "not postgres and not sqlite"
+
+      - name: SQLite-scoped dialect suites (CI-02)
+        # The tests that assert SQLite itself (storage classes, PRAGMA, write-first, the
+        # on-disk snapshot) run with no PostgreSQL URL: the same modules then use their
+        # SQLite fixtures rather than skipping.
+        env:
+          HOUSE_HELPER_TEST_POSTGRES_URL: ""
+          HOUSE_HELPER_TEST_BACKEND: sqlite
+        run: pytest -q -ra -m sqlite

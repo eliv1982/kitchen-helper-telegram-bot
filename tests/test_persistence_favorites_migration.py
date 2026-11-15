@@ -36,6 +36,10 @@ from tests.test_persistence_migrations import (
     _version,
 )
 from tests.test_persistence_schema import TABLES
+from tests.revisions import HEAD_REVISION
+
+# CI-02/R2-09: SQLite-scoped dialect module (the PostgreSQL counterpart is separate).
+pytestmark = [pytest.mark.sqlite]
 
 TABLES_BEFORE_0007 = TABLES - {
     "favorite_recipes",
@@ -69,7 +73,7 @@ def test_the_favorites_migration_adds_one_empty_table_and_changes_no_row(empty_e
     before = _snapshot_of(empty_engine, TABLES_BEFORE_0007)
     assert _version(empty_engine) == [OIDC_STATE]
 
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, HEAD_REVISION)
 
     assert _version(empty_engine) == [HEAD]
     assert _tables(empty_engine) == TABLES | {"alembic_version"}
@@ -86,7 +90,7 @@ def test_the_favorites_table_has_the_keys_and_checks_the_models_say(tmp_path):
     migrated = create_db_engine(f"sqlite:///{tmp_path / 'migrated.db'}")
     modeled = create_db_engine(f"sqlite:///{tmp_path / 'modeled.db'}")
     try:
-        upgrade_database(migrated)
+        upgrade_database(migrated, HEAD_REVISION)
         Base.metadata.create_all(modeled)
 
         for engine in (migrated, modeled):
@@ -128,7 +132,7 @@ def test_the_favorites_table_has_the_keys_and_checks_the_models_say(tmp_path):
 
 
 def test_no_other_table_refers_to_the_favorites(empty_engine):
-    upgrade_database(empty_engine)
+    upgrade_database(empty_engine, HEAD_REVISION)
 
     inspector = sa.inspect(empty_engine)
     referring = [
@@ -146,7 +150,7 @@ def test_downgrading_the_favorites_drops_only_that_table(tmp_path):
     try:
         found = _at_0006(migrated)
         upgrade_database(pristine, OIDC_STATE)
-        upgrade_database(migrated)
+        upgrade_database(migrated, HEAD_REVISION)
         with create_session_factory(migrated)() as db, db.begin():  # a favorite exists
             raw_insert(
                 db,
@@ -169,7 +173,7 @@ def test_downgrading_the_favorites_drops_only_that_table(tmp_path):
         with create_session_factory(migrated)() as db:
             assert authenticate(db, found["telegram"].token, now=LATER) is not None
 
-        upgrade_database(migrated)  # and forward again: an empty table, as it began
+        upgrade_database(migrated, HEAD_REVISION)  # and forward again: an empty table, as it began
         with migrated.connect() as connection:
             assert connection.exec_driver_sql("SELECT count(*) FROM favorite_recipes").scalar() == 0
     finally:

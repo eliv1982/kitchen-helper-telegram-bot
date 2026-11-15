@@ -21,7 +21,7 @@ from house_helper.persistence.models import Session as LoginSession
 from house_helper.web import email_pages
 from house_helper.web.logsafety import ACCESS_LOGGER, RedactAuthQuery
 from house_helper.web.mailer import EmailDeliveryError
-from tests.auth_support import ORIGIN, START, app_log_text, logout_as, rows, watch_logs
+from tests.auth_support import ORIGIN, START, app_log_text, ddl, fail_inserts, logout_as, rows, watch_logs
 from tests.email_support import ADDRESS, email_app, parse_link
 
 SESSION_COOKIE = "__Host-hh_session"
@@ -184,12 +184,12 @@ async def test_a_link_that_cannot_be_withdrawn_is_reported_and_harms_nobody(tmp_
 
 
 def break_table(h, table="email_login_challenges"):
-    with h.factory() as db, db.begin():
+    with ddl(h) as db:
         db.execute(sa.text(f"ALTER TABLE {table} RENAME TO {table}_gone"))
 
 
 def repair_table(h, table="email_login_challenges"):
-    with h.factory() as db, db.begin():
+    with ddl(h) as db:
         db.execute(sa.text(f"ALTER TABLE {table}_gone RENAME TO {table}"))
 
 
@@ -205,7 +205,11 @@ async def test_a_database_failure_when_asking_is_a_503_that_sends_nothing_and_re
         assert response.json()["detail"] == "temporarily_unavailable" and "Сервис" in response.json()["message"]
         assert h.mailer.attempts == 0
         logged = app_log_text(caplog)
-        assert "OperationalError" in logged and "no such table" not in logged and ADDRESS not in logged
+        assert any(
+            name in logged
+            for name in ("OperationalError", "ProgrammingError", "IntegrityError", "DataError")
+        )
+        assert "no such table" not in logged and "does not exist" not in logged and ADDRESS not in logged
         assert "SELECT" not in logged and "UPDATE" not in logged
         repair_table(h)
         assert (await h.ask()).status_code == 202 and len(h.mailer.sent) == 1
@@ -226,16 +230,15 @@ async def test_a_database_failure_when_opening_the_link_is_an_unavailable_page_n
 
 def refuse_sessions(h):
     """A database that takes everything up to the session, then refuses it."""
-    with h.factory() as db, db.begin():
-        db.execute(sa.text(
-            "CREATE TRIGGER refuse_sessions BEFORE INSERT ON sessions "
-            "BEGIN SELECT RAISE(ABORT, 'disk full'); END"
-        ))
+    fail_inserts(h, "sessions", name="refuse_sessions")
 
 
 def accept_sessions(h):
-    with h.factory() as db, db.begin():
-        db.execute(sa.text("DROP TRIGGER refuse_sessions"))
+    with ddl(h) as db:
+        if h.database.url_text.startswith("sqlite"):
+            db.execute(sa.text("DROP TRIGGER refuse_sessions"))
+        else:
+            db.execute(sa.text("DROP TRIGGER refuse_sessions ON sessions"))
 
 
 @pytest.mark.asyncio

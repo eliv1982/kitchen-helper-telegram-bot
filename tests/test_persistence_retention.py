@@ -23,6 +23,7 @@ from house_helper.persistence.models import (
     TurnRequest,
 )
 from house_helper.persistence.sqlchecks import canonical_utc_text_sqlite
+from tests.backend_support import sqlite_only
 from tests.persistence_support import (  # noqa: F401  (fixtures)
     engine,
     factory,
@@ -44,6 +45,9 @@ from tests.persistence_support import (  # noqa: F401  (fixtures)
 @pytest.fixture
 def conversation(session):
     return new_conversation(session, new_user(session))
+
+
+pytestmark = [sqlite_only, pytest.mark.sqlite]  # canonical SQLite text storage (typeof(), stored() text; CI-02)
 
 
 # --- the policy -------------------------------------------------------------------

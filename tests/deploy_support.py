@@ -19,13 +19,14 @@ from typing import List, Optional
 import pytest
 
 from house_helper.persistence.database import create_db_engine, create_session_factory, upgrade_database
+from tests.revisions import HEAD_REVISION
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEPLOY = REPO_ROOT / "deploy"
 DBTOOL_PATH = DEPLOY / "ops" / "dbtool.py"
 URL_ENV = "HOUSE_HELPER_DATABASE_URL"
 STAGING_ENV = "HOUSE_HELPER_STAGING_DIR"
-HEAD = "0014_user_measure_overrides"
+HEAD = HEAD_REVISION  # one spelling of the head, shared with the application fixtures
 BEHIND = "0005_identity_invitations"
 
 posix_only = pytest.mark.skipif(os.name == "nt", reason="POSIX file locks and file modes")
@@ -46,7 +47,10 @@ LOCK = dbtool.LOCK_FILE_NAME
 # --- databases ------------------------------------------------------------------------------
 
 
-def make_database(path: Path, revision: str = "head") -> Path:
+def make_database(path: Path, revision: str) -> Path:
+    """A SQLite database migrated through `revision`, which the caller must state: a
+    historical fixture names the revision it is about. `make_head_database` is the only
+    way to ask for head (HH-DB-01 CI-08)."""
     engine = create_db_engine(f"sqlite:///{path}")
     try:
         upgrade_database(engine, revision)
@@ -55,11 +59,16 @@ def make_database(path: Path, revision: str = "head") -> Path:
     return path
 
 
+def make_head_database(path: Path) -> Path:
+    """A SQLite database at the repository's migration head. The one head fixture."""
+    return make_database(path, HEAD)
+
+
 def make_big_database(path: Path, mebibytes: int) -> Path:
     """A migrated database of at least `mebibytes` MiB, holding ordinary message rows."""
     from house_helper.persistence.models import Conversation, Message, User
 
-    make_database(path)
+    make_head_database(path)
     engine = create_db_engine(f"sqlite:///{path}")
     try:
         factory = create_session_factory(engine)

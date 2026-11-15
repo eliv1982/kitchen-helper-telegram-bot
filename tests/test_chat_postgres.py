@@ -35,20 +35,25 @@ from house_helper.web.diagnostics import ApiError
 from house_helper.web.turn_runner import WebTurnRunner
 from tests.chat_support import ScriptedBackend, gate_on, reached
 from tests.postgres_harness import POSTGRES_URL_ENV, Scratch, run_from_environment
+from tests.revisions import HEAD_REVISION
 
-pytestmark = pytest.mark.skipif(
-    not os.environ.get(POSTGRES_URL_ENV),
-    reason=f"opt-in: set {POSTGRES_URL_ENV} to a local throwaway PostgreSQL (see tests/test_admin_postgres.py)",
-)
+pytestmark = [
+    pytest.mark.postgres,
+    pytest.mark.skipif(
+        not os.environ.get(POSTGRES_URL_ENV),
+        reason=f"opt-in: set {POSTGRES_URL_ENV} to a local throwaway PostgreSQL (see tests/test_admin_postgres.py)",
+    ),
+]
 
 NOW = utcnow().replace(microsecond=0)
 LEASE = timedelta(seconds=90)
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session")
 def pg_run():
     run = run_from_environment()
     try:
+        run.prepare_roles()  # inside the guard: a partial preparation is cleaned up (R2-05)
         yield run
     finally:
         run.close()
@@ -56,10 +61,11 @@ def pg_run():
 
 @pytest.fixture(scope="module")
 def template(pg_run):
-    name = pg_run.create_database()
-    engine = pg_run.engine(name)
+    name = pg_run.create_database(runtime_roles=("app",))
+    engine = pg_run.migrate_engine(name)
     try:
-        upgrade_database(engine)
+        upgrade_database(engine, HEAD_REVISION)  # the revision is stated, not defaulted (CI-08)
+        pg_run.apply_privileges(engine)
     finally:
         engine.dispose()
     return name
@@ -76,7 +82,7 @@ def scratch(pg_run, template):
 
 @pytest.fixture
 def engine(scratch):
-    engine = scratch.engine()
+    engine = scratch.app_engine()
     try:
         yield engine
     finally:

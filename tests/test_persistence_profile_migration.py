@@ -40,6 +40,9 @@ from tests.test_persistence_migrations import (
 )
 from tests.test_persistence_schema import TABLES
 
+# CI-02/R2-09: SQLite-scoped dialect module (the PostgreSQL counterpart is separate).
+pytestmark = [pytest.mark.sqlite]
+
 START = utc(2026, 11, 9, 9)
 EXPIRES = START + timedelta(days=180)
 

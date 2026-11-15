@@ -14,6 +14,7 @@ stored (the ordinary routes answer as they always did).
 """
 
 import json
+import uuid
 
 import pytest
 import sqlalchemy as sa
@@ -22,7 +23,7 @@ from house_helper.persistence.invitations import issue_invitation
 from house_helper.persistence.models import User
 from house_helper.web import invite_pages
 from house_helper.web.app import create_app
-from tests.auth_support import ORIGIN, app_log_text, auth_app, database_text, watch_logs
+from tests.auth_support import ORIGIN, app_log_text, auth_app, database_text, fail_inserts, watch_logs
 from tests.email_support import email_app
 from tests.invite_support import MOTHER_SUB, OWNER_SUB, THIRD_SUB, enroll, follow, shape, start
 from tests.test_web_auth_failures import with_claims
@@ -32,8 +33,14 @@ pytestmark = pytest.mark.asyncio
 
 
 def table_text(h, table: str) -> str:
+    """Every row as text. UUIDs print in their SQLite spelling (32 hex digits), so the
+    same assertion reads the same on either backend."""
     with h.factory() as db:
-        return "\n".join(repr(tuple(row)) for row in db.execute(sa.text(f"SELECT * FROM {table}")).all())
+        rows = db.execute(sa.text(f"SELECT * FROM {table}")).all()
+    return "\n".join(
+        repr(tuple(value.hex if isinstance(value, uuid.UUID) else value for value in row))
+        for row in rows
+    )
 
 
 def evidence(h, responses, caplog):
@@ -212,10 +219,7 @@ async def test_a_failure_log_names_the_class_of_a_database_error_and_not_its_par
     watch_logs(caplog)
     async with auth_app(tmp_path, seed=False) as h:
         mother = enroll(h)
-        with h.factory() as db, db.begin():
-            db.execute(sa.text(
-                "CREATE TRIGGER refuse BEFORE INSERT ON oidc_states BEGIN SELECT RAISE(ABORT, 'disk full'); END"
-            ))
+        fail_inserts(h, "oidc_states", name="refuse")
 
         response = await start(h.client, mother.code)
 

@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from tests.deploy_support import DEPLOY, URL_ENV, STAGING_ENV, dbtool, make_database
+from tests.deploy_support import DEPLOY, URL_ENV, STAGING_ENV, dbtool, make_database, make_head_database
 
 OFFSITE_PATH = DEPLOY / "offsite_backup.py"
 REHEARSAL_PATH = DEPLOY / "offsite_rehearsal.py"
@@ -81,7 +81,7 @@ def make_database_with_deleted_rows(path: Path, kept: int = 12, deleted: int = 4
     from house_helper.persistence.database import create_db_engine, create_session_factory
     from house_helper.persistence.models import Conversation, Message, User
 
-    make_database(path)
+    make_head_database(path)
     engine = create_db_engine(f"sqlite:///{path}")
     try:
         factory = create_session_factory(engine)

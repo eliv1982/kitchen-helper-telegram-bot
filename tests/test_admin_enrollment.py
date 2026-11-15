@@ -57,9 +57,14 @@ from house_helper.persistence.invitations import (
 )
 from house_helper.persistence.models import User
 from tests.admin_support import (  # noqa: F401  (fixtures)
+    admin_database,
     counts,
     db_path,
     db_url,
+    provision_db_url,
+    purge_db_url,
+    sqlite_db_url,
+    sqlite_only,
     everything,
     journal_mode,
     migrated_template,
@@ -217,8 +222,8 @@ def link_in(url, user_id, subject, invitation_id=None, now=LATER):
 # --- enroll-user ------------------------------------------------------------------------------------------
 
 
-def test_enrolling_creates_one_user_and_one_invitation_and_nothing_else(capsys, db_url):
-    result = enroll(capsys, db_url, "  Елена  ")
+def test_enrolling_creates_one_user_and_one_invitation_and_nothing_else(capsys, db_url, provision_db_url):
+    result = enroll(capsys, provision_db_url, "  Елена  ")
 
     user_id, invitation_id, token = issued_from(result)
     assert result.out.startswith(f"ok [enrolled]: created user {user_id} and issued a Telegram invitation")
@@ -241,8 +246,8 @@ def test_enrolling_creates_one_user_and_one_invitation_and_nothing_else(capsys, 
     assert row[6] is None and row[7] is None
 
 
-def test_the_printed_code_is_the_stored_invitation_and_ends_two_hours_after_the_clock(capsys, db_url):
-    result = enroll(capsys, db_url)
+def test_the_printed_code_is_the_stored_invitation_and_ends_two_hours_after_the_clock(capsys, db_url, provision_db_url):
+    result = enroll(capsys, provision_db_url)
 
     user_id, invitation_id, token = issued_from(result)
     assert "valid until 2026-10-19T14:00:00Z (2 hours, single use)" in result.out
@@ -253,8 +258,8 @@ def test_the_printed_code_is_the_stored_invitation_and_ends_two_hours_after_the_
     assert not verifies(db_url, invitation_id, "A" * 43, now=LATER)  # and only this secret
 
 
-def test_the_secret_is_printed_once_on_stdout_and_nowhere_else(capsys, db_url):
-    result = enroll(capsys, db_url)
+def test_the_secret_is_printed_once_on_stdout_and_nowhere_else(capsys, db_url, provision_db_url):
+    result = enroll(capsys, provision_db_url)
 
     _, _, token = issued_from(result)
     assert result.out.count(token) == 1 and token not in result.err
@@ -264,7 +269,7 @@ def test_the_secret_is_printed_once_on_stdout_and_nowhere_else(capsys, db_url):
     assert hash_secret(token) in all_text(db_url)
 
 
-def test_the_secret_is_printed_only_after_the_transaction_committed(capsys, db_url, monkeypatch):
+def test_the_secret_is_printed_only_after_the_transaction_committed(capsys, db_url, provision_db_url, monkeypatch):
     events = []
     real_enroll, real_print = enrollment.enroll_user, cli._print_issued
 
@@ -280,14 +285,14 @@ def test_the_secret_is_printed_only_after_the_transaction_committed(capsys, db_u
     monkeypatch.setattr(enrollment, "enroll_user", enroll_then_note)
     monkeypatch.setattr(cli, "_print_issued", print_then_note)
 
-    assert enroll(capsys, db_url).code == ExitCode.OK
+    assert enroll(capsys, provision_db_url).code == ExitCode.OK
 
     assert events == ["committed", "printing"]
 
 
-def test_two_users_are_two_distinct_users_with_two_different_invitations(capsys, db_url):
-    first = issued_from(enroll(capsys, db_url, "Elena"))
-    second = issued_from(enroll(capsys, db_url, "Мама"))
+def test_two_users_are_two_distinct_users_with_two_different_invitations(capsys, db_url, provision_db_url):
+    first = issued_from(enroll(capsys, provision_db_url, "Elena"))
+    second = issued_from(enroll(capsys, provision_db_url, "Мама"))
 
     assert len({first[0], second[0]}) == 2 and len({first[1], second[1]}) == 2 and first[2] != second[2]
     assert set(users_of(db_url)) == {first[0], second[0]}  # (the same fake clock: no order to assert)
@@ -298,8 +303,8 @@ def test_two_users_are_two_distinct_users_with_two_different_invitations(capsys,
     assert not verifies(db_url, first[1], second[2]) and not verifies(db_url, second[1], first[2])
 
 
-def test_a_user_created_here_can_sign_in_nowhere_until_the_invitation_is_claimed(capsys, db_url):
-    user_id, invitation_id, token = issued_from(enroll(capsys, db_url))
+def test_a_user_created_here_can_sign_in_nowhere_until_the_invitation_is_claimed(capsys, db_url, provision_db_url):
+    user_id, invitation_id, token = issued_from(enroll(capsys, provision_db_url))
     engine, factory = open_factory(db_url)
     try:
         with factory() as db, db.begin():
@@ -317,12 +322,12 @@ def test_a_user_created_here_can_sign_in_nowhere_until_the_invitation_is_claimed
 # --- the enrollment limit ---------------------------------------------------------------------------------
 
 
-def test_a_third_user_is_refused_by_the_limit_and_nothing_changes(capsys, db_url):
-    enroll(capsys, db_url, "Elena")
-    enroll(capsys, db_url, "Мама")
+def test_a_third_user_is_refused_by_the_limit_and_nothing_changes(capsys, db_url, provision_db_url):
+    enroll(capsys, provision_db_url, "Elena")
+    enroll(capsys, provision_db_url, "Мама")
     before = everything(db_url)
 
-    result = enroll(capsys, db_url, "Third")
+    result = enroll(capsys, provision_db_url, "Third")
 
     assert ENROLLMENT_USER_CAP == 2
     assert result.code == ExitCode.REFUSED and result.out == ""  # no secret, no user
@@ -331,44 +336,44 @@ def test_a_third_user_is_refused_by_the_limit_and_nothing_changes(capsys, db_url
     assert everything(db_url) == before
 
 
-def test_the_limit_counts_a_disabled_user(capsys, db_url):
-    enroll(capsys, db_url, "Elena")
-    enroll(capsys, db_url, "Мама")
+def test_the_limit_counts_a_disabled_user(capsys, db_url, provision_db_url):
+    enroll(capsys, provision_db_url, "Elena")
+    enroll(capsys, provision_db_url, "Мама")
     write_sql(db_url, "UPDATE users SET disabled_at = '2026-10-19 11:00:00.000000'")
 
-    assert enroll(capsys, db_url, "Third").err.startswith("refused [enrollment_full]")
+    assert enroll(capsys, provision_db_url, "Third").err.startswith("refused [enrollment_full]")
 
 
-def test_the_limit_counts_the_user_that_provision_email_made(capsys, db_url):
+def test_the_limit_counts_the_user_that_provision_email_made(capsys, db_url, provision_db_url):
     create_first_user(capsys, db_url, "Elena@example.com", "--display-name", "Elena")
 
-    assert enroll(capsys, db_url, "Мама").code == ExitCode.OK  # the second place
-    assert enroll(capsys, db_url, "Third").err.startswith("refused [enrollment_full]")
+    assert enroll(capsys, provision_db_url, "Мама").code == ExitCode.OK  # the second place
+    assert enroll(capsys, provision_db_url, "Third").err.startswith("refused [enrollment_full]")
     assert len(users_of(db_url)) == 2
 
 
-def test_the_limit_is_a_policy_of_the_command_and_not_of_the_database(capsys, db_url):
-    first = issued_from(enroll(capsys, db_url, "Elena"))
-    second = issued_from(enroll(capsys, db_url, "Мама"))
+def test_the_limit_is_a_policy_of_the_command_and_not_of_the_database(capsys, db_url, provision_db_url):
+    first = issued_from(enroll(capsys, provision_db_url, "Elena"))
+    second = issued_from(enroll(capsys, provision_db_url, "Мама"))
 
     with write(db_url) as db:  # other code can still make a third user, and give it conversations
         third = new_user(db, display_name="Third")
         new_conversation(db, third)
     assert len(users_of(db_url)) == 3
     # reissuing is not enrolling: the limit never blocks an invitation for a user that exists
-    result = reissue(capsys, db_url, third.id)
+    result = reissue(capsys, provision_db_url, third.id)
     assert result.code == ExitCode.OK and issued_from(result)[0] == third.id
-    assert reissue(capsys, db_url, first[0]).code == ExitCode.OK
+    assert reissue(capsys, provision_db_url, first[0]).code == ExitCode.OK
     assert counts(db_url)["conversations"] == 1  # and nothing here touched the conversations
     assert second[0] in users_of(db_url)
 
 
-def test_a_repeated_command_is_not_a_second_user_whatever_the_capitals(capsys, db_url):
-    first = issued_from(enroll(capsys, db_url, "Мама"))
+def test_a_repeated_command_is_not_a_second_user_whatever_the_capitals(capsys, db_url, provision_db_url):
+    first = issued_from(enroll(capsys, provision_db_url, "Мама"))
     before = everything(db_url)
 
     for name in ("Мама", "мама", "МАМА", "  мама  "):
-        result = enroll(capsys, db_url, name)
+        result = enroll(capsys, provision_db_url, name)
 
         assert result.code == ExitCode.REFUSED and result.out == "", name
         assert result.err.startswith(f"refused [display_name_in_use]: user {first[0]} already has")
@@ -376,24 +381,24 @@ def test_a_repeated_command_is_not_a_second_user_whatever_the_capitals(capsys, d
     assert everything(db_url) == before
 
 
-def test_a_repeated_command_is_reported_as_a_duplicate_even_when_the_limit_is_reached_too(capsys, db_url):
-    enroll(capsys, db_url, "Elena")
-    enroll(capsys, db_url, "Мама")
+def test_a_repeated_command_is_reported_as_a_duplicate_even_when_the_limit_is_reached_too(capsys, db_url, provision_db_url):
+    enroll(capsys, provision_db_url, "Elena")
+    enroll(capsys, provision_db_url, "Мама")
 
-    assert enroll(capsys, db_url, "мама").err.startswith("refused [display_name_in_use]")
+    assert enroll(capsys, provision_db_url, "мама").err.startswith("refused [display_name_in_use]")
 
 
-def test_a_user_without_a_name_collides_with_nobody(capsys, db_url):
+def test_a_user_without_a_name_collides_with_nobody(capsys, db_url, provision_db_url):
     create_first_user(capsys, db_url, "Elena@example.com")  # no display name
 
-    assert enroll(capsys, db_url, "Elena").code == ExitCode.OK
+    assert enroll(capsys, provision_db_url, "Elena").code == ExitCode.OK
 
 
 @pytest.mark.parametrize(
     "value",
     ["", "   ", "x" * 201, "Ele\x00na", "Ele\nna", "Ele\u202ena", "Ele\u200bna", "Ele\ud800na", f"{SECRET}\x07"],
 )
-def test_an_unusable_name_is_a_usage_error_that_is_not_echoed_and_asks_no_database(capsys, db_url, value):
+def test_an_unusable_name_is_a_usage_error_that_is_not_echoed_and_asks_no_database(capsys, db_url, provision_db_url, value):
     result = run_admin(capsys, None, "enroll-user", "--display-name", value)  # no database configured
 
     assert result.code == ExitCode.USAGE and result.out == ""
@@ -401,19 +406,19 @@ def test_an_unusable_name_is_a_usage_error_that_is_not_echoed_and_asks_no_databa
     assert SECRET not in result.err
     if value.strip():  # (an empty text is "in" every message)
         assert value.strip() not in result.err
-    result = run_admin(capsys, db_url, "enroll-user", "--display-name", value)
+    result = run_admin(capsys, provision_db_url, "enroll-user", "--display-name", value)
     assert result.code == ExitCode.USAGE and counts(db_url)["users"] == 0
 
 
-def test_the_longest_accepted_name_is_200_characters(capsys, db_url):
-    assert enroll(capsys, db_url, "я" * 200).code == ExitCode.OK
+def test_the_longest_accepted_name_is_200_characters(capsys, db_url, provision_db_url):
+    assert enroll(capsys, provision_db_url, "я" * 200).code == ExitCode.OK
     assert rows(db_url, "SELECT length(display_name) FROM users") == [(200,)]
 
 
 # --- rollback ---------------------------------------------------------------------------------------------
 
 
-def test_a_failure_after_the_writes_rolls_the_user_and_the_invitation_back(capsys, db_url, monkeypatch):
+def test_a_failure_after_the_writes_rolls_the_user_and_the_invitation_back(capsys, db_url, provision_db_url, monkeypatch):
     real = enrollment.invitations.issue_invitation
 
     def failing(*args, **kwargs):
@@ -423,7 +428,7 @@ def test_a_failure_after_the_writes_rolls_the_user_and_the_invitation_back(capsy
     monkeypatch.setattr(enrollment.invitations, "issue_invitation", failing)
     before = everything(db_url)
 
-    result = enroll(capsys, db_url, "Елена")
+    result = enroll(capsys, provision_db_url, "Елена")
 
     assert result.code == ExitCode.INTERNAL and result.out == ""  # no secret was printed
     assert result.err.startswith("error [internal]: unexpected RuntimeError. ")
@@ -432,13 +437,13 @@ def test_a_failure_after_the_writes_rolls_the_user_and_the_invitation_back(capsy
     assert everything(db_url) == before
 
 
-def test_a_digest_collision_on_the_second_enrollment_rolls_that_user_back_whole(capsys, db_url, monkeypatch):
+def test_a_digest_collision_on_the_second_enrollment_rolls_that_user_back_whole(capsys, db_url, provision_db_url, monkeypatch):
     monkeypatch.setattr(invitations_module, "new_secret", lambda nbytes: "A" * 43)
-    first = enroll(capsys, db_url, "Elena")
+    first = enroll(capsys, provision_db_url, "Elena")
     assert first.code == ExitCode.OK
     before = everything(db_url)
 
-    second = enroll(capsys, db_url, "Мама")  # the unique digest refuses it, after the user was written
+    second = enroll(capsys, provision_db_url, "Мама")  # the unique digest refuses it, after the user was written
 
     assert second.code == ExitCode.INTERNAL and second.out == ""
     assert second.err.startswith("error [internal]: unexpected IntegrityError. ")
@@ -449,10 +454,10 @@ def test_a_digest_collision_on_the_second_enrollment_rolls_that_user_back_whole(
 # --- reissue-invitation -----------------------------------------------------------------------------------
 
 
-def test_reissuing_replaces_the_outstanding_invitation_in_one_transaction(capsys, db_url):
-    user_id, old_id, old_token = issued_from(enroll(capsys, db_url))
+def test_reissuing_replaces_the_outstanding_invitation_in_one_transaction(capsys, db_url, provision_db_url):
+    user_id, old_id, old_token = issued_from(enroll(capsys, provision_db_url))
 
-    result = reissue(capsys, db_url, user_id)
+    result = reissue(capsys, provision_db_url, user_id)
 
     same_user, new_id, new_token = issued_from(result)
     assert same_user == user_id and new_id != old_id and new_token != old_token
@@ -464,12 +469,12 @@ def test_reissuing_replaces_the_outstanding_invitation_in_one_transaction(capsys
     assert not verifies(db_url, old_id, old_token) and verifies(db_url, new_id, new_token)
 
 
-def test_the_first_invitation_of_a_user_that_has_none_says_so(capsys, db_url):
+def test_the_first_invitation_of_a_user_that_has_none_says_so(capsys, db_url, provision_db_url):
     create_first_user(capsys, db_url, "Elena@example.com", "--display-name", "Elena")
     user_id = users_of(db_url)[0]
     entry_before = entry_of(db_url, "Elena@example.com")
 
-    result = reissue(capsys, db_url, user_id)
+    result = reissue(capsys, provision_db_url, user_id)
 
     assert issued_from(result)[0] == user_id
     assert "No earlier invitation was outstanding" in result.out
@@ -477,10 +482,10 @@ def test_the_first_invitation_of_a_user_that_has_none_says_so(capsys, db_url):
     assert counts(db_url)["users"] == 1
 
 
-def test_a_user_linked_by_invitation_keeps_the_email_identity_next_to_the_telegram_one(capsys, db_url):
+def test_a_user_linked_by_invitation_keeps_the_email_identity_next_to_the_telegram_one(capsys, db_url, provision_db_url):
     create_first_user(capsys, db_url, "Elena@example.com")
     user_id = users_of(db_url)[0]
-    reissue(capsys, db_url, user_id)
+    reissue(capsys, provision_db_url, user_id)
 
     link_in(db_url, user_id, SUB)
 
@@ -488,11 +493,11 @@ def test_a_user_linked_by_invitation_keeps_the_email_identity_next_to_the_telegr
     assert providers == [("email", user_id.hex), ("telegram", user_id.hex)]  # one user, two ways in
 
 
-def test_an_expired_invitation_is_replaced_and_the_new_one_runs_from_the_new_clock(capsys, db_url):
-    user_id, old_id, old_token = issued_from(enroll(capsys, db_url, now=NOW))
+def test_an_expired_invitation_is_replaced_and_the_new_one_runs_from_the_new_clock(capsys, db_url, provision_db_url):
+    user_id, old_id, old_token = issued_from(enroll(capsys, provision_db_url, now=NOW))
     later = NOW + timedelta(hours=3)
 
-    result = reissue(capsys, db_url, user_id, now=later)
+    result = reissue(capsys, provision_db_url, user_id, now=later)
 
     _, new_id, new_token = issued_from(result)
     assert "1 earlier outstanding invitation(s) revoked" in result.out
@@ -501,25 +506,25 @@ def test_an_expired_invitation_is_replaced_and_the_new_one_runs_from_the_new_clo
     assert not verifies(db_url, old_id, old_token, now=NOW + timedelta(minutes=1))  # it is dead for good
 
 
-def test_reissuing_for_one_user_leaves_the_other_users_invitation_alone(capsys, db_url):
-    first = issued_from(enroll(capsys, db_url, "Elena"))
-    second = issued_from(enroll(capsys, db_url, "Мама"))
+def test_reissuing_for_one_user_leaves_the_other_users_invitation_alone(capsys, db_url, provision_db_url):
+    first = issued_from(enroll(capsys, provision_db_url, "Elena"))
+    second = issued_from(enroll(capsys, provision_db_url, "Мама"))
 
-    reissue(capsys, db_url, first[0])
+    reissue(capsys, provision_db_url, first[0])
 
     assert verifies(db_url, second[1], second[2])
     assert [row[0] for row in outstanding(db_url, second[0])] == [uuid.UUID(second[1]).hex]
 
 
-def test_a_failure_while_reissuing_puts_the_earlier_invitation_back(capsys, db_url, monkeypatch):
-    user_id, old_id, old_token = issued_from(enroll(capsys, db_url))
+def test_a_failure_while_reissuing_puts_the_earlier_invitation_back(capsys, db_url, provision_db_url, monkeypatch):
+    user_id, old_id, old_token = issued_from(enroll(capsys, provision_db_url))
     before = everything(db_url)
 
     def failing(nbytes):
         raise RuntimeError(SECRET)  # after the earlier invitation was revoked, before the new one exists
 
     monkeypatch.setattr(invitations_module, "new_secret", failing)
-    result = reissue(capsys, db_url, user_id)
+    result = reissue(capsys, provision_db_url, user_id)
 
     assert result.code == ExitCode.INTERNAL and result.out == "" and SECRET not in result.text
     assert everything(db_url) == before
@@ -527,8 +532,8 @@ def test_a_failure_while_reissuing_puts_the_earlier_invitation_back(capsys, db_u
 
 
 @pytest.mark.parametrize("scenario", ["unknown", "disabled", "telegram", "telegram_revoked"])
-def test_reissuing_refuses_where_an_invitation_would_be_wrong_and_changes_nothing(capsys, db_url, scenario):
-    user_id, _, _ = issued_from(enroll(capsys, db_url))
+def test_reissuing_refuses_where_an_invitation_would_be_wrong_and_changes_nothing(capsys, db_url, provision_db_url, scenario):
+    user_id, _, _ = issued_from(enroll(capsys, provision_db_url))
     target = user_id
     if scenario == "unknown":
         target = uuid.uuid4()
@@ -547,7 +552,7 @@ def test_reissuing_refuses_where_an_invitation_would_be_wrong_and_changes_nothin
     }[scenario]
     before = everything(db_url)
 
-    result = reissue(capsys, db_url, target)
+    result = reissue(capsys, provision_db_url, target)
 
     assert result.code == ExitCode.REFUSED and result.out == ""  # no invitation, so no secret
     assert result.err.startswith(f"refused [{code}]: ")
@@ -569,10 +574,10 @@ def test_a_malformed_user_id_is_a_usage_error_that_is_not_echoed_and_asks_no_dat
             assert value.strip() not in result.err
 
 
-def test_an_upper_case_user_id_is_accepted(capsys, db_url):
-    user_id, _, _ = issued_from(enroll(capsys, db_url))
+def test_an_upper_case_user_id_is_accepted(capsys, db_url, provision_db_url):
+    user_id, _, _ = issued_from(enroll(capsys, provision_db_url))
 
-    result = run_admin(capsys, db_url, "reissue-invitation", "--user-id", str(user_id).upper(), clock=at(LATER))
+    result = run_admin(capsys, provision_db_url, "reissue-invitation", "--user-id", str(user_id).upper(), clock=at(LATER))
 
     assert issued_from(result)[0] == user_id
 
@@ -580,10 +585,10 @@ def test_an_upper_case_user_id_is_accepted(capsys, db_url):
 # --- revoke-invitation ------------------------------------------------------------------------------------
 
 
-def test_revoking_withdraws_the_invitation_for_good_and_repeating_changes_nothing(capsys, db_url):
-    user_id, invitation_id, token = issued_from(enroll(capsys, db_url))
+def test_revoking_withdraws_the_invitation_for_good_and_repeating_changes_nothing(capsys, db_url, provision_db_url):
+    user_id, invitation_id, token = issued_from(enroll(capsys, provision_db_url))
 
-    result = revoke_it(capsys, db_url, user_id)
+    result = revoke_it(capsys, provision_db_url, user_id)
 
     assert result.code == ExitCode.OK and result.err == ""
     assert result.out == f"ok [revoked]: revoked the outstanding invitation of user {user_id}.\n"
@@ -591,15 +596,15 @@ def test_revoking_withdraws_the_invitation_for_good_and_repeating_changes_nothin
     assert outstanding(db_url, user_id) == []
     after_first = everything(db_url)
 
-    again = revoke_it(capsys, db_url, user_id, now=LATER + timedelta(hours=1))
+    again = revoke_it(capsys, provision_db_url, user_id, now=LATER + timedelta(hours=1))
 
     assert again.code == ExitCode.OK and again.out.startswith("ok [unchanged]: ")
     assert everything(db_url) == after_first  # not even the first revocation time moved
 
 
-def test_a_revoked_invitation_cannot_be_claimed_and_a_reissue_is_a_new_one(capsys, db_url):
-    user_id, old_id, old_token = issued_from(enroll(capsys, db_url))
-    revoke_it(capsys, db_url, user_id)
+def test_a_revoked_invitation_cannot_be_claimed_and_a_reissue_is_a_new_one(capsys, db_url, provision_db_url):
+    user_id, old_id, old_token = issued_from(enroll(capsys, provision_db_url))
+    revoke_it(capsys, provision_db_url, user_id)
 
     engine, factory = open_factory(db_url)
     try:
@@ -607,17 +612,17 @@ def test_a_revoked_invitation_cannot_be_claimed_and_a_reissue_is_a_new_one(capsy
             assert claim_invitation(db, old_id, SUB, now=LATER) is None
     finally:
         engine.dispose()
-    _, new_id, new_token = issued_from(reissue(capsys, db_url, user_id, now=LATER + timedelta(minutes=1)))
+    _, new_id, new_token = issued_from(reissue(capsys, provision_db_url, user_id, now=LATER + timedelta(minutes=1)))
     assert new_id != old_id and verifies(db_url, new_id, new_token, now=LATER + timedelta(minutes=2))
     assert not verifies(db_url, old_id, old_token)
 
 
-def test_revoking_does_not_touch_a_used_invitation(capsys, db_url):
-    user_id, invitation_id, _ = issued_from(enroll(capsys, db_url))
+def test_revoking_does_not_touch_a_used_invitation(capsys, db_url, provision_db_url):
+    user_id, invitation_id, _ = issued_from(enroll(capsys, provision_db_url))
     link_in(db_url, user_id, SUB)
     before = everything(db_url)
 
-    result = revoke_it(capsys, db_url, user_id)
+    result = revoke_it(capsys, provision_db_url, user_id)
 
     assert result.out.startswith("ok [unchanged]: ") and everything(db_url) == before
 
@@ -633,11 +638,11 @@ def test_revoking_does_not_touch_a_used_invitation(capsys, db_url):
     ],
     ids=["before", "last-instant", "boundary", "just-after", "long-after"],
 )
-def test_revoking_withdraws_an_invitation_only_while_it_is_valid(capsys, db_url, offset, outcome):
-    user_id, invitation_id, token = issued_from(enroll(capsys, db_url, now=NOW))
+def test_revoking_withdraws_an_invitation_only_while_it_is_valid(capsys, db_url, provision_db_url, offset, outcome):
+    user_id, invitation_id, token = issued_from(enroll(capsys, provision_db_url, now=NOW))
     before = everything(db_url)
 
-    result = revoke_it(capsys, db_url, user_id, now=NOW + offset)
+    result = revoke_it(capsys, provision_db_url, user_id, now=NOW + offset)
 
     assert result.code == ExitCode.OK and result.err == ""
     assert result.out.startswith(f"ok [{outcome}]: ")
@@ -648,25 +653,25 @@ def test_revoking_withdraws_an_invitation_only_while_it_is_valid(capsys, db_url,
         assert everything(db_url) == before  # an expired one is not touched: no revoked_at, no change
 
 
-def test_an_expired_invitation_stays_expired_for_the_report_when_revoking_is_attempted(capsys, db_url):
-    user_id, _, _ = issued_from(enroll(capsys, db_url, now=NOW))
+def test_an_expired_invitation_stays_expired_for_the_report_when_revoking_is_attempted(capsys, db_url, provision_db_url):
+    user_id, _, _ = issued_from(enroll(capsys, provision_db_url, now=NOW))
     later = NOW + timedelta(hours=3)
 
-    assert revoke_it(capsys, db_url, user_id, now=later).out.startswith("ok [unchanged]: ")
+    assert revoke_it(capsys, provision_db_url, user_id, now=later).out.startswith("ok [unchanged]: ")
 
-    line = line_of(status(capsys, db_url, now=later), user_id)
+    line = line_of(status(capsys, provision_db_url, now=later), user_id)
     assert "invitation: expired (ended 2026-10-19T14:00:00Z)" in line  # not "revoked"
 
 
-def test_reissuing_still_supersedes_an_expired_invitation_that_revoking_left_alone(capsys, db_url):
+def test_reissuing_still_supersedes_an_expired_invitation_that_revoking_left_alone(capsys, db_url, provision_db_url):
     # The partial unique index allows one outstanding row per user, and an expired one that was
     # never used or withdrawn is outstanding: only the reissue may take it out of the way.
-    user_id, old_id, old_token = issued_from(enroll(capsys, db_url, now=NOW))
+    user_id, old_id, old_token = issued_from(enroll(capsys, provision_db_url, now=NOW))
     later = NOW + timedelta(hours=3)
-    revoke_it(capsys, db_url, user_id, now=later)
+    revoke_it(capsys, provision_db_url, user_id, now=later)
     assert [row[0] for row in outstanding(db_url, user_id)] == [uuid.UUID(old_id).hex]
 
-    result = reissue(capsys, db_url, user_id, now=later)
+    result = reissue(capsys, provision_db_url, user_id, now=later)
 
     _, new_id, new_token = issued_from(result)
     assert "1 earlier outstanding invitation(s) revoked" in result.out
@@ -678,18 +683,18 @@ def test_reissuing_still_supersedes_an_expired_invitation_that_revoking_left_alo
     assert not verifies(db_url, old_id, old_token, now=NOW + timedelta(minutes=1))
 
 
-def test_revoking_for_an_unknown_user_is_refused(capsys, db_url):
-    result = revoke_it(capsys, db_url, uuid.uuid4())
+def test_revoking_for_an_unknown_user_is_refused(capsys, db_url, provision_db_url):
+    result = revoke_it(capsys, provision_db_url, uuid.uuid4())
 
     assert result.code == ExitCode.REFUSED and result.out == ""
     assert result.err.startswith("refused [unknown_user]: ")
 
 
-def test_revoking_one_users_invitation_leaves_the_other_alone(capsys, db_url):
-    first = issued_from(enroll(capsys, db_url, "Elena"))
-    second = issued_from(enroll(capsys, db_url, "Мама"))
+def test_revoking_one_users_invitation_leaves_the_other_alone(capsys, db_url, provision_db_url):
+    first = issued_from(enroll(capsys, provision_db_url, "Elena"))
+    second = issued_from(enroll(capsys, provision_db_url, "Мама"))
 
-    revoke_it(capsys, db_url, first[0])
+    revoke_it(capsys, provision_db_url, first[0])
 
     assert not verifies(db_url, first[1], first[2]) and verifies(db_url, second[1], second[2])
 
@@ -729,10 +734,10 @@ def line_of(result, user_id):
     return line
 
 
-def test_the_report_says_where_every_user_stands(capsys, db_url):
+def test_the_report_says_where_every_user_stands(capsys, db_url, provision_db_url):
     ids = build_states(db_url)
 
-    result = status(capsys, db_url)
+    result = status(capsys, provision_db_url)
 
     assert result.code == ExitCode.OK and result.err == ""
     assert result.out.splitlines()[0].startswith("ok [status]: 6 user(s). The enrollment limit is 2 users")
@@ -752,29 +757,29 @@ def test_the_report_says_where_every_user_stands(capsys, db_url):
             assert part in line, (name, part)
 
 
-def test_the_report_shows_the_latest_invitation_of_a_user_who_has_had_several(capsys, db_url):
-    user_id, _, _ = issued_from(enroll(capsys, db_url, now=NOW))
-    reissue(capsys, db_url, user_id, now=LATER)  # the first one is revoked, the second is the user's now
+def test_the_report_shows_the_latest_invitation_of_a_user_who_has_had_several(capsys, db_url, provision_db_url):
+    user_id, _, _ = issued_from(enroll(capsys, provision_db_url, now=NOW))
+    reissue(capsys, provision_db_url, user_id, now=LATER)  # the first one is revoked, the second is the user's now
 
-    result = status(capsys, db_url, now=LATER + timedelta(minutes=1))
+    result = status(capsys, provision_db_url, now=LATER + timedelta(minutes=1))
 
     line = line_of(result, user_id)
     assert "invitation: active (until 2026-10-19T14:05:00Z)" in line
     assert "revoked" not in line  # the superseded one is history, not the user's state
 
 
-def test_the_report_names_the_usable_invitation_after_reissues_whose_clocks_ran_backwards(capsys, db_url):
+def test_the_report_names_the_usable_invitation_after_reissues_whose_clocks_ran_backwards(capsys, db_url, provision_db_url):
     # Two reissues that read the clock before the lock: the one that took the lock first had the
     # LATER reading, so the invitation created last carries the EARLIER created_at, and the one
     # it revoked (revoked_at earlier than its own created_at) carries the later.
-    user_id, _, _ = issued_from(enroll(capsys, db_url, now=NOW))
-    reissue(capsys, db_url, user_id, now=NOW + timedelta(minutes=10))
-    last = issued_from(reissue(capsys, db_url, user_id, now=NOW + timedelta(minutes=5)))
+    user_id, _, _ = issued_from(enroll(capsys, provision_db_url, now=NOW))
+    reissue(capsys, provision_db_url, user_id, now=NOW + timedelta(minutes=10))
+    last = issued_from(reissue(capsys, provision_db_url, user_id, now=NOW + timedelta(minutes=5)))
     assert len(outstanding(db_url, user_id)) == 1
     created = rows(db_url, "SELECT created_at, revoked_at FROM identity_invitations ORDER BY created_at")
     assert created[-1] == (stored(NOW + timedelta(minutes=10)), stored(NOW + timedelta(minutes=5)))  # revoked, newest
 
-    result = status(capsys, db_url, now=NOW + timedelta(minutes=15))
+    result = status(capsys, provision_db_url, now=NOW + timedelta(minutes=15))
 
     line = line_of(result, user_id)
     assert "invitation: active (until 2026-10-19T14:05:00Z)" in line and "revoked" not in line
@@ -785,13 +790,13 @@ def test_the_report_names_the_usable_invitation_after_reissues_whose_clocks_ran_
     "revoked_id, active_id", [(FIRST_ID, LAST_ID), (LAST_ID, FIRST_ID)], ids=["revoked-id-first", "active-id-first"]
 )
 def test_equal_issue_times_do_not_let_the_ids_decide_whether_the_usable_invitation_is_reported(
-    capsys, db_url, revoked_id, active_id
+    capsys, db_url, provision_db_url, revoked_id, active_id
 ):
     user_id = user_without_invitation(db_url)
     insert_invitation(db_url, user_id, created=NOW, revoked=LATER, invitation_id=revoked_id)
     insert_invitation(db_url, user_id, created=NOW, invitation_id=active_id)
 
-    result = status(capsys, db_url, now=LATER)
+    result = status(capsys, provision_db_url, now=LATER)
 
     assert "invitation: active (until 2026-10-19T14:00:00Z)" in line_of(result, user_id)
 
@@ -802,60 +807,60 @@ def test_equal_issue_times_do_not_let_the_ids_decide_whether_the_usable_invitati
     ids=["older", "same-time", "newer"],
 )
 def test_an_active_invitation_outweighs_a_revoked_one_whenever_the_revoked_one_was_created(
-    capsys, db_url, revoked_created
+    capsys, db_url, provision_db_url, revoked_created
 ):
     user_id = user_without_invitation(db_url)
     insert_invitation(db_url, user_id, created=revoked_created, revoked=NOW + timedelta(minutes=30))
     insert_invitation(db_url, user_id, created=NOW)
 
-    result = status(capsys, db_url, now=NOW + timedelta(minutes=45))
+    result = status(capsys, provision_db_url, now=NOW + timedelta(minutes=45))
 
     line = line_of(result, user_id)
     assert "invitation: active (until 2026-10-19T14:00:00Z)" in line and "revoked" not in line
 
 
-def test_the_same_invitation_is_reported_as_expired_once_its_two_hours_are_over(capsys, db_url):
+def test_the_same_invitation_is_reported_as_expired_once_its_two_hours_are_over(capsys, db_url, provision_db_url):
     user_id = user_without_invitation(db_url)
     insert_invitation(db_url, user_id, created=NOW - timedelta(minutes=10), revoked=NOW)  # superseded, then
     insert_invitation(db_url, user_id, created=NOW)
 
-    last_instant = status(capsys, db_url, now=NOW + TWO_HOURS - timedelta(microseconds=1))
-    over = status(capsys, db_url, now=NOW + TWO_HOURS)  # exclusive
+    last_instant = status(capsys, provision_db_url, now=NOW + TWO_HOURS - timedelta(microseconds=1))
+    over = status(capsys, provision_db_url, now=NOW + TWO_HOURS)  # exclusive
 
     assert "invitation: active (until 2026-10-19T14:00:00Z)" in line_of(last_instant, user_id)
     assert "invitation: expired (ended 2026-10-19T14:00:00Z)" in line_of(over, user_id)
 
 
-def test_an_expired_unused_invitation_is_reported_with_its_expiry_next_to_older_revoked_ones(capsys, db_url):
+def test_an_expired_unused_invitation_is_reported_with_its_expiry_next_to_older_revoked_ones(capsys, db_url, provision_db_url):
     user_id = user_without_invitation(db_url)
     insert_invitation(db_url, user_id, created=NOW - timedelta(hours=5), revoked=NOW - timedelta(hours=4))
     insert_invitation(db_url, user_id, created=NOW - timedelta(hours=4), revoked=NOW - timedelta(hours=3))
     insert_invitation(db_url, user_id, created=NOW - timedelta(hours=3))  # outstanding, over at 11:00
 
-    result = status(capsys, db_url)
+    result = status(capsys, provision_db_url)
 
     assert "invitation: expired (ended 2026-10-19T11:00:00Z)" in line_of(result, user_id)
 
 
-def test_a_used_invitation_is_reported_as_used_next_to_older_revoked_ones(capsys, db_url):
+def test_a_used_invitation_is_reported_as_used_next_to_older_revoked_ones(capsys, db_url, provision_db_url):
     user_id = user_without_invitation(db_url)
     insert_invitation(db_url, user_id, created=NOW - timedelta(hours=1), revoked=NOW)
     insert_invitation(db_url, user_id, created=NOW, consumed=NOW + timedelta(minutes=1))
 
-    result = status(capsys, db_url, now=LATER)
+    result = status(capsys, provision_db_url, now=LATER)
 
     assert "invitation: used (used 2026-10-19T12:01:00Z)" in line_of(result, user_id)
 
 
 @pytest.mark.parametrize("used_id, revoked_id", [(FIRST_ID, LAST_ID), (LAST_ID, FIRST_ID)])
 def test_equal_event_times_in_the_history_are_reported_the_same_whatever_the_ids(
-    capsys, db_url, used_id, revoked_id
+    capsys, db_url, provision_db_url, used_id, revoked_id
 ):
     user_id = user_without_invitation(db_url)
     insert_invitation(db_url, user_id, created=NOW - timedelta(hours=1), revoked=NOW, invitation_id=revoked_id)
     insert_invitation(db_url, user_id, created=NOW, consumed=NOW, invitation_id=used_id)
 
-    result = status(capsys, db_url, now=LATER)
+    result = status(capsys, provision_db_url, now=LATER)
 
     assert "invitation: used (used 2026-10-19T12:00:00Z)" in line_of(result, user_id)
 
@@ -937,8 +942,8 @@ def test_a_user_without_any_invitation_has_nothing_to_report():
 
 
 @pytest.mark.parametrize("command", ["enroll", "reissue", "revoke"])
-def test_a_mutation_reads_the_clock_only_after_the_lock_is_held(capsys, db_url, monkeypatch, command):
-    user_id, _, _ = issued_from(enroll(capsys, db_url, "Elena"))
+def test_a_mutation_reads_the_clock_only_after_the_lock_is_held(capsys, db_url, provision_db_url, monkeypatch, command):
+    user_id, _, _ = issued_from(enroll(capsys, provision_db_url, "Elena"))
     events = []
     real = provisioning._serialize
     monkeypatch.setattr(provisioning, "_serialize", lambda session: (events.append("lock"), real(session)))
@@ -953,12 +958,15 @@ def test_a_mutation_reads_the_clock_only_after_the_lock_is_held(capsys, db_url, 
         "revoke": ["revoke-invitation", "--user-id", str(user_id)],
     }[command]
 
-    result = run_admin(capsys, db_url, *argv, clock=clock)
+    result = run_admin(capsys, provision_db_url, *argv, clock=clock)
 
     assert result.code == ExitCode.OK, result.text
     assert events == ["lock", "clock"]  # once, and behind the lock: a later lock holder reads a later time
 
 
+# SQLite-scoped (write-first serialisation and file locking); the same rule on PostgreSQL is covered by tests/test_admin_enrollment_postgres.py
+@pytest.mark.sqlite
+@sqlite_only
 @pytest.mark.parametrize("round_number", range(ROUNDS))
 def test_reissues_racing_for_the_lock_are_stamped_in_the_order_they_take_it(tmp_path, migrated_template, round_number):
     url = fresh_database(tmp_path, migrated_template, "stamped.db")
@@ -990,7 +998,7 @@ def test_reissues_racing_for_the_lock_are_stamped_in_the_order_they_take_it(tmp_
 
 @pytest.mark.parametrize("active_first", [True, False])
 def test_a_user_with_an_active_and_a_revoked_telegram_entry_is_linked_whatever_the_row_order(
-    capsys, db_url, active_first
+    capsys, db_url, provision_db_url, active_first
 ):
     with write(db_url) as db:
         user = new_user(db, display_name="Both")
@@ -999,23 +1007,23 @@ def test_a_user_with_an_active_and_a_revoked_telegram_entry_is_linked_whatever_t
             allow(db, user, "telegram", subject)
         revoke(db, "telegram", "222", now=NOW)  # "111" stays active, whichever was added first
 
-    result = status(capsys, db_url)
+    result = status(capsys, provision_db_url)
 
     assert "telegram: linked" in line_of(result, user.id)
 
 
-def test_the_report_of_an_empty_database(capsys, db_url):
-    result = status(capsys, db_url)
+def test_the_report_of_an_empty_database(capsys, db_url, provision_db_url):
+    result = status(capsys, provision_db_url)
 
     assert result.code == ExitCode.OK and result.out.startswith("ok [status]: 0 user(s).")
     assert len(result.out.splitlines()) == 1
 
 
-def test_the_report_shows_no_telegram_id_digest_secret_or_email_address(capsys, db_url):
+def test_the_report_shows_no_telegram_id_digest_secret_or_email_address(capsys, db_url, provision_db_url):
     ids = build_states(db_url)
     stored_digests = [row[3] for row in invitations_of(db_url)]
 
-    result = status(capsys, db_url)
+    result = status(capsys, provision_db_url)
 
     assert result.code == ExitCode.OK
     for secret in (BSUB, FSUB, MAIL, *stored_digests):
@@ -1026,9 +1034,9 @@ def test_the_report_shows_no_telegram_id_digest_secret_or_email_address(capsys, 
     assert all(str(identifier) in result.out for identifier in ids.values())  # the ids are
 
 
-def test_the_report_never_selects_a_subject_or_a_digest(capsys, db_url):
+def test_the_report_never_selects_a_subject_or_a_digest(capsys, db_url, provision_db_url):
     build_states(db_url)
-    engine, factory = open_admin_factory(db_url)
+    engine, factory = open_admin_factory(provision_db_url)
     try:
         with statements(engine) as seen:
             report = enrollment.enrollment_status(factory, now=NOW)
@@ -1042,34 +1050,37 @@ def test_the_report_never_selects_a_subject_or_a_digest(capsys, db_url):
         assert forbidden not in joined
 
 
-def test_the_report_changes_nothing_not_even_a_file(capsys, db_url, db_path):
+# SQLite-scoped: the database FILE and its path are the subject (CI-02)
+@pytest.mark.sqlite
+@sqlite_only
+def test_the_report_changes_nothing_not_even_a_file(capsys, db_url, provision_db_url, db_path):
     build_states(db_url)
     set_journal_mode(db_path, "delete")  # reading a WAL database would create its -wal and -shm
     before = snapshot(db_path.parent)
 
-    result = status(capsys, db_url)
+    result = status(capsys, provision_db_url)
 
     assert result.code == ExitCode.OK
     assert snapshot(db_path.parent) == before
     assert journal_mode(db_path) == "delete"
 
 
-def test_the_report_covers_more_users_than_the_limit(capsys, db_url):
+def test_the_report_covers_more_users_than_the_limit(capsys, db_url, provision_db_url):
     with write(db_url) as db:
         for number in range(4):
             new_user(db, display_name=f"User {number}")
 
-    result = status(capsys, db_url)
+    result = status(capsys, provision_db_url)
 
     assert result.out.startswith("ok [status]: 4 user(s).") and len(result.out.splitlines()) == 5
 
 
-def test_a_stored_name_cannot_forge_a_line_of_the_report(capsys, db_url):
+def test_a_stored_name_cannot_forge_a_line_of_the_report(capsys, db_url, provision_db_url):
     with write(db_url) as db:
         new_user(db, display_name='x" telegram: linked; invitation: used\nuser fake name "y')
         new_user(db, display_name="bell\x07 and escape\x1b[31m")
 
-    result = status(capsys, db_url)
+    result = status(capsys, provision_db_url)
 
     lines = result.out.splitlines()
     assert len(lines) == 3  # the header and one line per user: the newline did not split one
@@ -1093,32 +1104,32 @@ def test_a_display_name_is_shown_in_a_form_the_output_stream_can_carry(monkeypat
 # --- what is left as it was -------------------------------------------------------------------------------
 
 
-def test_provision_email_still_refuses_to_make_a_second_user_after_an_enrollment(capsys, db_url):
-    enroll(capsys, db_url, "Elena")
+def test_provision_email_still_refuses_to_make_a_second_user_after_an_enrollment(capsys, db_url, provision_db_url):
+    enroll(capsys, provision_db_url, "Elena")
     before = everything(db_url)
 
-    one_user = provision(capsys, db_url, "Mama@example.com")
+    one_user = provision(capsys, provision_db_url, "Mama@example.com")
 
     assert one_user.code == ExitCode.REFUSED and one_user.err.startswith("refused [user_exists]")
-    enroll(capsys, db_url, "Мама")
+    enroll(capsys, provision_db_url, "Мама")
     before = everything(db_url)
-    two_users = provision(capsys, db_url, "Mama@example.com")
+    two_users = provision(capsys, provision_db_url, "Mama@example.com")
     assert two_users.code == ExitCode.REFUSED and two_users.err.startswith("refused [multiple_users]")
     assert everything(db_url) == before
 
 
-def test_provision_email_alone_behaves_as_before_on_the_new_schema(capsys, db_url):
-    first = provision(capsys, db_url, "Elena@example.com", "--display-name", "Elena")
-    again = provision(capsys, db_url, "Elena@example.com")
+def test_provision_email_alone_behaves_as_before_on_the_new_schema(capsys, db_url, provision_db_url):
+    first = provision(capsys, provision_db_url, "Elena@example.com", "--display-name", "Elena")
+    again = provision(capsys, provision_db_url, "Elena@example.com")
 
     assert first.code == ExitCode.OK and first.out.startswith("ok [created]: ")
     assert again.code == ExitCode.OK and again.out.startswith("ok [unchanged]: ")
     assert counts(db_url)["users"] == 1 and counts(db_url)["identity_invitations"] == 0
 
 
-def test_two_enrolled_users_have_independent_conversations(capsys, db_url):
-    first = issued_from(enroll(capsys, db_url, "Elena"))
-    second = issued_from(enroll(capsys, db_url, "Мама"))
+def test_two_enrolled_users_have_independent_conversations(capsys, db_url, provision_db_url):
+    first = issued_from(enroll(capsys, provision_db_url, "Elena"))
+    second = issued_from(enroll(capsys, provision_db_url, "Мама"))
     sessions = {
         "first": link_in(db_url, first[0], SUB),
         "second": link_in(db_url, second[0], OTHER_SUB),
@@ -1154,9 +1165,9 @@ def test_two_enrolled_users_have_independent_conversations(capsys, db_url):
     )
 
 
-def test_the_owners_telegram_account_cannot_be_linked_to_the_mothers_user(capsys, db_url):
-    first = issued_from(enroll(capsys, db_url, "Elena"))
-    second = issued_from(enroll(capsys, db_url, "Мама"))
+def test_the_owners_telegram_account_cannot_be_linked_to_the_mothers_user(capsys, db_url, provision_db_url):
+    first = issued_from(enroll(capsys, provision_db_url, "Elena"))
+    second = issued_from(enroll(capsys, provision_db_url, "Мама"))
     link_in(db_url, first[0], SUB)  # the owner links their own account
 
     engine, factory = open_factory(db_url)
@@ -1174,10 +1185,12 @@ def test_the_owners_telegram_account_cannot_be_linked_to_the_mothers_user(capsys
 # --- the first statement and the lock ---------------------------------------------------------------------
 
 
+@sqlite_only
+@pytest.mark.sqlite
 @pytest.mark.parametrize("operation", ["enroll", "reissue", "revoke"])
-def test_on_sqlite_every_mutation_begins_with_the_write_that_matches_no_row(capsys, db_url, operation):
-    user_id, _, _ = issued_from(enroll(capsys, db_url, "Elena"))
-    engine, factory = open_admin_factory(db_url)
+def test_on_sqlite_every_mutation_begins_with_the_write_that_matches_no_row(capsys, db_url, provision_db_url, operation):
+    user_id, _, _ = issued_from(enroll(capsys, provision_db_url, "Elena"))
+    engine, factory = open_admin_factory(provision_db_url)
     try:
         with statements(engine) as seen:
             if operation == "enroll":
@@ -1217,9 +1230,9 @@ def test_on_postgresql_the_lock_is_provision_emails_advisory_lock_at_read_commit
     assert list(compiled.params.values()) == [ADVISORY_LOCK_KEY] == [815883989575170308]
 
 
-def test_the_report_is_not_serialised_and_takes_no_write(capsys, db_url):
+def test_the_report_is_not_serialised_and_takes_no_write(capsys, db_url, provision_db_url):
     build_states(db_url)
-    engine, factory = open_admin_factory(db_url)
+    engine, factory = open_admin_factory(provision_db_url)
     try:
         with statements(engine) as seen:
             enrollment.enrollment_status(factory, now=NOW)
@@ -1270,6 +1283,9 @@ def fresh_database(tmp_path, migrated_template, name):
     return f"sqlite:///{path}"
 
 
+# SQLite-scoped (write-first serialisation and file locking); the same rule on PostgreSQL is covered by tests/test_admin_enrollment_postgres.py
+@pytest.mark.sqlite
+@sqlite_only
 @pytest.mark.parametrize("round_number", range(ROUNDS))
 def test_concurrent_enrollments_with_different_names_create_exactly_two_users(
     tmp_path, migrated_template, round_number
@@ -1293,6 +1309,9 @@ def test_concurrent_enrollments_with_different_names_create_exactly_two_users(
         assert [row[0] for row in outstanding(url, item.user_id)] == [item.invitation_id.hex]
 
 
+# SQLite-scoped (write-first serialisation and file locking); the same rule on PostgreSQL is covered by tests/test_admin_enrollment_postgres.py
+@pytest.mark.sqlite
+@sqlite_only
 @pytest.mark.parametrize("round_number", range(ROUNDS))
 def test_concurrent_enrollments_of_the_same_name_create_one_user(tmp_path, migrated_template, round_number):
     url = fresh_database(tmp_path, migrated_template, "same.db")
@@ -1306,6 +1325,9 @@ def test_concurrent_enrollments_of_the_same_name_create_one_user(tmp_path, migra
     assert counts(url)["users"] == 1 and counts(url)["identity_invitations"] == 1
 
 
+# SQLite-scoped (write-first serialisation and file locking); the same rule on PostgreSQL is covered by tests/test_admin_enrollment_postgres.py
+@pytest.mark.sqlite
+@sqlite_only
 @pytest.mark.parametrize("round_number", range(ROUNDS))
 def test_enrollments_racing_provision_email_never_exceed_the_limit_and_all_end_in_a_decision(
     tmp_path, migrated_template, round_number
@@ -1327,6 +1349,9 @@ def test_enrollments_racing_provision_email_never_exceed_the_limit_and_all_end_i
     assert len(results) + len(errors) == 4
 
 
+# SQLite-scoped (write-first serialisation and file locking); the same rule on PostgreSQL is covered by tests/test_admin_enrollment_postgres.py
+@pytest.mark.sqlite
+@sqlite_only
 @pytest.mark.parametrize("round_number", range(ROUNDS))
 def test_concurrent_reissues_leave_one_outstanding_invitation(tmp_path, migrated_template, round_number):
     url = fresh_database(tmp_path, migrated_template, "reissue.db")
@@ -1355,6 +1380,9 @@ def run_module(url, *argv):
     )
 
 
+# SQLite-scoped (write-first serialisation and file locking); the same rule on PostgreSQL is covered by tests/test_admin_enrollment_postgres.py
+@pytest.mark.sqlite
+@sqlite_only
 def test_separate_processes_enrolling_at_once_create_exactly_two_users(tmp_path, migrated_template):
     url = fresh_database(tmp_path, migrated_template, "processes.db")
 
@@ -1464,13 +1492,13 @@ def test_a_database_behind_the_head_is_refused_and_not_migrated(capsys, tmp_path
     assert rows(url, "SELECT name FROM sqlite_master ORDER BY name") == tables  # no table was created
 
 
-def test_a_keyboard_interrupt_is_reported_without_a_traceback_and_prints_no_secret(capsys, db_url, monkeypatch):
+def test_a_keyboard_interrupt_is_reported_without_a_traceback_and_prints_no_secret(capsys, db_url, provision_db_url, monkeypatch):
     def interrupted(*args, **kwargs):
         raise KeyboardInterrupt
 
     monkeypatch.setattr(enrollment, "enroll_user", interrupted)
 
-    result = enroll(capsys, db_url)
+    result = enroll(capsys, provision_db_url)
 
     assert result.code == INTERRUPTED and result.out == ""
     assert result.err.startswith("error [interrupted]: ") and "Traceback" not in result.err
@@ -1478,8 +1506,8 @@ def test_a_keyboard_interrupt_is_reported_without_a_traceback_and_prints_no_secr
 
 
 @pytest.mark.parametrize("command", ["enroll", "reissue", "revoke", "status"])
-def test_an_unexpected_failure_prints_its_class_and_none_of_its_text(capsys, db_url, monkeypatch, command):
-    user_id, _, _ = issued_from(enroll(capsys, db_url, "Elena"))
+def test_an_unexpected_failure_prints_its_class_and_none_of_its_text(capsys, db_url, provision_db_url, monkeypatch, command):
+    user_id, _, _ = issued_from(enroll(capsys, provision_db_url, "Elena"))
     error = sa.exc.IntegrityError(
         "INSERT INTO identity_invitations (token_hash) VALUES (?)",
         {"token_hash": SECRET},
@@ -1503,7 +1531,7 @@ def test_an_unexpected_failure_prints_its_class_and_none_of_its_text(capsys, db_
         "status": ["enrollment-status"],
     }[command]
 
-    result = run_admin(capsys, db_url, *argv)
+    result = run_admin(capsys, provision_db_url, *argv)
 
     assert result.code == ExitCode.INTERNAL and result.out == ""
     assert result.err.startswith("error [internal]: unexpected IntegrityError. ")
@@ -1511,15 +1539,18 @@ def test_an_unexpected_failure_prints_its_class_and_none_of_its_text(capsys, db_
         assert leaked not in result.text
 
 
+# SQLite-scoped: the database FILE and its path are the subject (CI-02)
+@pytest.mark.sqlite
+@sqlite_only
 @pytest.mark.parametrize("scenario", ["enrolled", "reissued", "revoked", "refused", "status"])
-def test_no_outcome_prints_the_database_location(capsys, db_url, db_path, scenario):
-    user_id, _, _ = issued_from(enroll(capsys, db_url, "Elena"))
+def test_no_outcome_prints_the_database_location(capsys, db_url, provision_db_url, db_path, scenario):
+    user_id, _, _ = issued_from(enroll(capsys, provision_db_url, "Elena"))
     result = {
-        "enrolled": lambda: enroll(capsys, db_url, "Мама"),
-        "reissued": lambda: reissue(capsys, db_url, user_id),
-        "revoked": lambda: revoke_it(capsys, db_url, user_id),
-        "refused": lambda: reissue(capsys, db_url, uuid.uuid4()),
-        "status": lambda: status(capsys, db_url),
+        "enrolled": lambda: enroll(capsys, provision_db_url, "Мама"),
+        "reissued": lambda: reissue(capsys, provision_db_url, user_id),
+        "revoked": lambda: revoke_it(capsys, provision_db_url, user_id),
+        "refused": lambda: reissue(capsys, provision_db_url, uuid.uuid4()),
+        "status": lambda: status(capsys, provision_db_url),
     }[scenario]()
 
     assert result.code in (0, 3)
@@ -1527,11 +1558,11 @@ def test_no_outcome_prints_the_database_location(capsys, db_url, db_path, scenar
         assert leaked not in result.text
 
 
-def test_the_real_clock_is_used_unless_a_test_gives_another(capsys, db_url):
+def test_the_real_clock_is_used_unless_a_test_gives_another(capsys, db_url, provision_db_url):
     from datetime import datetime, timezone
 
     before = datetime.now(timezone.utc)
-    result = run_admin(capsys, db_url, "enroll-user", "--display-name", "Elena")
+    result = run_admin(capsys, provision_db_url, "enroll-user", "--display-name", "Elena")
     after = datetime.now(timezone.utc)
 
     _, invitation_id, token = issued_from(result)
@@ -1544,8 +1575,10 @@ def test_the_real_clock_is_used_unless_a_test_gives_another(capsys, db_url):
     assert before + TWO_HOURS <= live.expires_at <= after + TWO_HOURS
 
 
-def test_the_module_entry_point_enrolls_and_reports(tmp_path, migrated_template):
-    url = fresh_database(tmp_path, migrated_template, "module.db")
+def test_the_module_entry_point_enrolls_and_reports(admin_database):
+    # R3-03: the real `python -m` entry point is generic; it runs against the configured
+    # backend's provisioning login (SQLite locally, PostgreSQL in CI).
+    url = admin_database.url_text_for("provision")
 
     process = run_module(url, "enroll-user", "--display-name", "Elena")
     out, err = process.communicate(timeout=120)
@@ -1561,14 +1594,14 @@ def test_the_module_entry_point_enrolls_and_reports(tmp_path, migrated_template)
 # --- the secret is in no log -----------------------------------------------------------------------------
 
 
-def test_the_secret_is_in_no_log_record_of_any_command_even_with_statement_logging_on(capsys, caplog, db_url):
+def test_the_secret_is_in_no_log_record_of_any_command_even_with_statement_logging_on(capsys, caplog, db_url, provision_db_url):
     caplog.set_level(logging.DEBUG, logger="sqlalchemy.engine")
     caplog.set_level(logging.DEBUG)
 
-    first = issued_from(enroll(capsys, db_url, "Elena"))
-    second = issued_from(reissue(capsys, db_url, first[0]))
-    revoke_it(capsys, db_url, first[0])
-    status(capsys, db_url)
+    first = issued_from(enroll(capsys, provision_db_url, "Elena"))
+    second = issued_from(reissue(capsys, provision_db_url, first[0]))
+    revoke_it(capsys, provision_db_url, first[0])
+    status(capsys, provision_db_url)
 
     assert "INSERT INTO identity_invitations" in caplog.text  # the logging really was on
     assert hash_secret(second[2]) in caplog.text  # ... and it shows the digest, which is stored

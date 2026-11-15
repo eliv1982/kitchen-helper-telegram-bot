@@ -7,6 +7,8 @@ an in-memory one.
 import re
 import uuid
 
+import pytest
+
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.schema import CreateIndex, CreateTable
@@ -14,6 +16,7 @@ from sqlalchemy.schema import CreateIndex, CreateTable
 import house_helper.persistence.models  # noqa: F401  (registers the tables)
 from house_helper.persistence.base import NAMING_CONVENTION, Base
 from house_helper.persistence.database import create_db_engine
+from tests.backend_support import sqlite_only
 
 TABLES = {
     "users",
@@ -420,6 +423,9 @@ def test_allowlist_entries_and_identity_links_share_one_set_of_identity_rules():
             assert texts[f"ck_allowlist_entries_{rule}"] == texts[f"ck_identity_links_{rule}"], rule
 
 
+# SQLite-scoped: an in-memory SQLite sketch of the metadata (CI-02).
+@pytest.mark.sqlite
+@sqlite_only
 def test_user_owned_tables_can_be_added_later_beside_the_foundation():
     # Preferences and favourites arrive in a later increment as ordinary
     # user-owned tables. Sketch one on a copy of the metadata to show that

@@ -15,7 +15,6 @@ from alembic import command
 from fastapi import Depends
 
 from house_helper.persistence import database as persistence_database
-from house_helper.persistence.base import Base
 from house_helper.persistence.database import (
     DATABASE_URL_ENV,
     create_db_engine,
@@ -28,6 +27,8 @@ from house_helper.web.app import create_app
 from house_helper.web.database import DatabaseClosed
 from house_helper.web.dependencies import get_database
 from house_helper.web.settings import WebConfigError, WebSettings
+from tests import backend_support
+from tests.backend_support import sqlite_only
 from tests.persistence_support import count
 from tests.web_support import (
     LifespanFailed,
@@ -36,6 +37,7 @@ from tests.web_support import (
     settings_for,
     sqlite_url,
 )
+from tests.revisions import HEAD_REVISION
 
 
 @pytest.fixture
@@ -325,40 +327,47 @@ async def test_the_database_dependency_serves_the_running_application_and_refuse
 
 
 @pytest.mark.asyncio
-async def test_a_handler_uses_the_database_through_run_and_its_work_is_committed(tmp_path):
-    url = sqlite_url(tmp_path / "handler.db")
-    engine = create_db_engine(url)
-    upgrade_database(engine)  # the operator's job, never the application's
-    app = create_app(WebSettings(database_url=url))
-
-    @app.post("/test-only/users")
-    async def create_user(database=Depends(get_database)):
-        def work(session):
-            session.add(User(display_name="Елена"))
-
-        await database.run(work)
-        return {"created": True}
-
+async def test_a_handler_uses_the_database_through_run_and_its_work_is_committed(
+    tmp_path, database_backend
+):
+    # R2-02: a generic application path uses the configured backend and its restricted
+    # application login - not an implicit SQLite file of its own.
+    database = database_backend.new_database(schema="migrations", tmp_path=tmp_path)
     try:
+        app = create_app(WebSettings(database_url=database.url_text))
+
+        @app.post("/test-only/users")
+        async def create_user(database=Depends(get_database)):
+            def work(session):
+                session.add(User(display_name="Елена"))
+
+            await database.run(work)
+            return {"created": True}
+
         async with serving(app) as client:
             assert (await client.post("/test-only/users")).json() == {"created": True}
 
-        with create_session_factory(engine)() as witness:
-            assert count(witness, User) == 1
+        engine = database.app_engine()
+        try:
+            backend_support.verify_database(engine, database)
+            with create_session_factory(engine)() as witness:
+                assert count(witness, User) == 1
+        finally:
+            engine.dispose()
     finally:
-        engine.dispose()
+        database.close()
 
 
 @pytest.mark.asyncio
-async def test_the_lifespan_logs_the_backend_and_never_the_url(tmp_path, monkeypatch, caplog):
+async def test_the_lifespan_logs_the_backend_and_never_the_url(caplog):
     secret = "hunter2-do-not-log"
-    # A PostgreSQL URL is valid settings; the engine behind it is a local SQLite
-    # file only because no PostgreSQL driver is installed here and nothing connects.
-    monkeypatch.setattr(
-        app_module, "create_db_engine", lambda url: create_db_engine(sqlite_url(tmp_path / "log.db"))
-    )
+    # R3-03: generic behavior, no SQLite on the side. The drivers are runtime
+    # dependencies now, so the engine is built from the psycopg URL itself; the lifespan
+    # opens no connection, so nothing is resolved or contacted.
     app = create_app(
-        WebSettings(database_url=f"postgresql://kitchen:{secret}@db.internal:5432/kitchen")
+        WebSettings(
+            database_url=f"postgresql+psycopg://kitchen:{secret}@db.internal:5432/kitchen"
+        )
     )
 
     with caplog.at_level(logging.DEBUG):
@@ -373,22 +382,45 @@ async def test_the_lifespan_logs_the_backend_and_never_the_url(tmp_path, monkeyp
 # --- starting changes no schema and runs no migration --------------------------------------------
 
 
-def _snapshot(path):
-    """What is in a SQLite database, independent of how the file is laid out."""
-    with sa.create_engine(f"sqlite:///{path}").connect() as connection:
-        objects = connection.exec_driver_sql(
-            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
-        ).fetchall()
-        versions = (
-            connection.exec_driver_sql("SELECT version_num FROM alembic_version").fetchall()
-            if any(name == "alembic_version" for _, name, _ in objects)
-            else None
+def _schema_snapshot(database):
+    """Tables, their columns and the `alembic_version` rows, on the configured backend.
+
+    R3-03: the behavior under test - "starting changes no schema" - is generic, so the
+    database and the snapshot are the configured ones, not a SQLite file chosen on the
+    side. The snapshot is read as the migration/owner login so an empty schema is covered
+    too."""
+    engine = database.migrate_engine()
+    backend_support.verify_database(engine, database)
+    try:
+        inspector = sa.inspect(engine)
+        tables = tuple(sorted(inspector.get_table_names()))
+        columns = tuple(
+            (
+                table,
+                tuple(
+                    (column["name"], str(column["type"]), bool(column["nullable"]))
+                    for column in inspector.get_columns(table)
+                ),
+            )
+            for table in tables
         )
-    return objects, versions
+        with engine.connect() as connection:
+            versions = (
+                tuple(sorted(row[0] for row in connection.execute(sa.text("SELECT version_num FROM alembic_version"))))
+                if "alembic_version" in tables
+                else None
+            )
+            connection.rollback()
+        return tables, columns, versions
+    finally:
+        engine.dispose()
 
 
+@pytest.mark.sqlite
+@sqlite_only
 @pytest.mark.asyncio
 async def test_starting_and_stopping_creates_no_database_file(tmp_path):
+    # SQLite-scoped: "no file is created" is a fact about the SQLite file backend (CI-02).
     target = tmp_path / "fresh.db"
     app = create_app(settings_for(target))
 
@@ -398,8 +430,11 @@ async def test_starting_and_stopping_creates_no_database_file(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.sqlite
+@sqlite_only
 @pytest.mark.asyncio
 async def test_starting_and_stopping_leaves_an_empty_database_file_empty(tmp_path):
+    # SQLite-scoped: the file's bytes, including the header SQLite writes on first use.
     target = tmp_path / "empty.db"
     target.write_bytes(b"")
     app = create_app(settings_for(target))
@@ -412,36 +447,37 @@ async def test_starting_and_stopping_leaves_an_empty_database_file_empty(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_starting_and_stopping_leaves_a_migrated_database_as_it_was(tmp_path):
-    target = tmp_path / "migrated.db"
-    engine = create_db_engine(sqlite_url(target))
-    upgrade_database(engine)
-    engine.dispose()
-    before = _snapshot(target)
-    assert before[1] == [("0014_user_measure_overrides",)]
+async def test_starting_and_stopping_leaves_a_migrated_database_as_it_was(tmp_path, database_backend):
+    database = database_backend.new_database(schema="migrations", tmp_path=tmp_path)
+    before = _schema_snapshot(database)
+    assert before[2] == (HEAD_REVISION,)
 
-    async with serving(create_app(settings_for(target))) as client:
+    async with serving(create_app(WebSettings(database_url=database.url_text))) as client:
         await client.get("/healthz")
 
-    assert _snapshot(target) == before
+    assert _schema_snapshot(database) == before
+    database.close()
 
 
 @pytest.mark.asyncio
-async def test_a_database_from_another_revision_is_not_touched_or_refused(tmp_path):
+async def test_a_database_from_another_revision_is_not_touched_or_refused(tmp_path, database_backend):
     # init_database would refuse this (see test_persistence_database.py). The web
-    # application neither migrates nor checks: it starts, and leaves the file alone.
-    target = tmp_path / "newer.db"
-    engine = create_db_engine(sqlite_url(target))
-    with engine.begin() as connection:
-        connection.exec_driver_sql("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)")
-        connection.exec_driver_sql("INSERT INTO alembic_version VALUES ('from_the_future')")
-    engine.dispose()
-    before = _snapshot(target)
+    # application neither migrates nor checks: it starts, and leaves the schema alone.
+    database = database_backend.new_database(schema="empty", tmp_path=tmp_path)
+    migration = database.migrate_engine()
+    try:
+        with migration.begin() as connection:
+            connection.exec_driver_sql("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)")
+            connection.exec_driver_sql("INSERT INTO alembic_version VALUES ('from_the_future')")
+    finally:
+        migration.dispose()
+    before = _schema_snapshot(database)
 
-    async with serving(create_app(settings_for(target))) as client:
+    async with serving(create_app(WebSettings(database_url=database.url_text))) as client:
         assert (await client.get("/healthz")).status_code == 200
 
-    assert _snapshot(target) == before
+    assert _schema_snapshot(database) == before
+    database.close()
 
 
 @pytest.mark.asyncio
@@ -458,7 +494,10 @@ async def test_no_migration_or_schema_creation_is_ever_called(tmp_path, monkeypa
         (persistence_database, "init_database"),
         (sa.MetaData, "create_all"),
         (sa.MetaData, "drop_all"),
-        (Base.metadata, "create_all"),
+        # NOT Base.metadata.create_all as well: patching the class already covers the
+        # instance, and monkeypatching the instance would capture the patched class
+        # method as its "original" and leave it installed after the test (R2-02 suite
+        # order: the next persistence fixture really does call create_all for "models").
     ]:
         monkeypatch.setattr(owner, name, forbidden)
     app = create_app(settings_for(tmp_path / "guarded.db"))

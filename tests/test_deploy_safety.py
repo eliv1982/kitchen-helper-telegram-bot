@@ -44,6 +44,7 @@ from tests.deploy_support import (
     lock_is_taken,
     make_big_database,
     make_database,
+    make_head_database,
     posix_only,
     run,
     run_tool,
@@ -70,7 +71,7 @@ def live(tmp_path, staging):
     scratch directory."""
     data = tmp_path / "data"
     data.mkdir()
-    path = make_database(data / "house_helper.db")
+    path = make_head_database(data / "house_helper.db")
     return path, env_for(path, **{STAGING_ENV: str(staging)})
 
 

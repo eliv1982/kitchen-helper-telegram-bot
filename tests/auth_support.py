@@ -22,7 +22,7 @@ import hashlib
 import hmac
 import json
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
@@ -36,11 +36,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
 from jwt.algorithms import ECAlgorithm, OKPAlgorithm, RSAAlgorithm
 
 from house_helper.persistence.allowlist import allow
-from house_helper.persistence.database import (
-    create_db_engine,
-    create_session_factory,
-    upgrade_database,
-)
+from house_helper.persistence.database import create_session_factory
 from house_helper.persistence.models import (
     AllowlistEntry,
     IdentityLink,
@@ -51,7 +47,8 @@ from house_helper.persistence.models import Session as LoginSession
 from house_helper.web.app import create_app
 from house_helper.web.settings import AuthSettings, WebSettings
 from house_helper.web.telegram_oidc import AUTHORIZATION_ENDPOINT, ISSUER, JWKS_URI, TOKEN_ENDPOINT
-from tests.web_support import TIMEOUT, running, sqlite_url
+from tests import backend_support
+from tests.web_support import TIMEOUT, running
 
 ORIGIN = "https://kitchen.example.test"
 CLIENT_ID = "1234567890"
@@ -374,6 +371,7 @@ class Harness:
     origin: str = ORIGIN
     subject: str = SUBJECT
     extra_clients: list[httpx.AsyncClient] = field(default_factory=list)
+    database: Any = None  # the backend handle (tests/backend_support.py)
 
     def new_client(self) -> httpx.AsyncClient:
         """A second browser: its own cookie jar, the same application."""
@@ -451,9 +449,10 @@ async def auth_app(
     with `bot_transport` standing in for the network to the Bot API. `structured_recipes`
     switches the recipe protocol on for the backend the application builds and for the
     shell the page reads."""
-    url = sqlite_url(tmp_path / "auth.db")
-    engine = create_db_engine(url)
-    upgrade_database(engine)
+    database = backend_support.backend().new_database(schema="migrations", tmp_path=tmp_path)
+    url = database.url_text
+    engine = database.app_engine()
+    backend_support.verify_database(engine, database)  # the effective dialect and identity (R2-02)
     factory = create_session_factory(engine)
     user_id = seed_user(factory) if seed else None
     clock = FakeClock()
@@ -480,7 +479,9 @@ async def auth_app(
             client = httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app), base_url=origin, timeout=TIMEOUT
             )
-            harness = Harness(app, client, telegram, clock, settings, factory, user_id, origin)
+            harness = Harness(
+                app, client, telegram, clock, settings, factory, user_id, origin, database=database
+            )
             try:
                 yield harness
             finally:
@@ -488,6 +489,8 @@ async def auth_app(
                     await asyncio.wait_for(opened.aclose(), TIMEOUT)
     finally:
         engine.dispose()
+        # The database is dropped by the test's teardown (tests/backend_support.py), so a
+        # test may still read it after this context has closed.
 
 
 def cookie_attributes(response: httpx.Response, name: str) -> dict[str, Any]:
@@ -505,6 +508,40 @@ def cookie_attributes(response: httpx.Response, name: str) -> dict[str, Any]:
         key, _, value = piece.partition("=")
         attributes[key.lower()] = value if value else True
     return attributes
+
+
+def fail_inserts(harness, table: str, *, name: str = None) -> None:
+    """Make every INSERT into `table` fail (a simulated database outage), on either
+    backend: SQLite's RAISE(ABORT) trigger or a PostgreSQL trigger that raises an
+    integrity error. The DDL goes through the migration/owner login."""
+    name = name or f"hh_fail_{table}"
+    if str(harness.database.url_text).startswith("sqlite"):
+        statement = (
+            f"CREATE TRIGGER {name} BEFORE INSERT ON {table} "
+            "BEGIN SELECT RAISE(ABORT, 'disk full'); END"
+        )
+    else:
+        statement = (
+            f"CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $$ "
+            "BEGIN RAISE EXCEPTION 'disk full' USING ERRCODE = '23514'; END $$; "
+            f"CREATE TRIGGER {name} BEFORE INSERT ON {table} "
+            f"FOR EACH ROW EXECUTE FUNCTION {name}()"
+        )
+    with ddl(harness) as connection:
+        connection.execute(sa.text(statement))
+
+
+@contextmanager
+def ddl(harness: "Harness"):
+    """A connection for DDL on the harness's database (rename a table to simulate an outage).
+    On PostgreSQL that is the migration/owner login; the application login cannot do DDL
+    (CI-16). On SQLite it is the same file."""
+    engine = harness.database.migrate_engine()
+    try:
+        with engine.begin() as connection:
+            yield connection
+    finally:
+        engine.dispose()
 
 
 # --- looking at the outcome ---------------------------------------------------------

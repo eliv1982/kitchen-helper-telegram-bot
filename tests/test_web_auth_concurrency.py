@@ -37,7 +37,7 @@ from tests.auth_support import (
     sign_in,
     watch_logs,
 )
-from tests.web_support import TIMEOUT, running, sqlite_url
+from tests.web_support import TIMEOUT, running
 
 SESSION_COOKIE = "__Host-hh_session"
 LOGIN_COOKIE = "__Host-hh_login"
@@ -235,7 +235,7 @@ async def test_the_database_is_the_arbiter_not_the_process(tmp_path):
         second_telegram = FakeTelegram(first.clock, first.settings)
         second_telegram.grants = first.telegram.grants  # one provider, two relying instances
         second_app = create_app(
-            WebSettings(database_url=sqlite_url(tmp_path / "auth.db"), auth=first.settings),
+            WebSettings(database_url=first.database.url_text, auth=first.settings),
             provider_transport=second_telegram.transport(),
             clock=first.clock,
         )

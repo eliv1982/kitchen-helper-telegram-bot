@@ -44,10 +44,13 @@ from tests.persistence_support import new_conversation, new_message, new_user, u
 from tests.postgres_harness import POSTGRES_URL_ENV, Scratch
 from tests.test_admin_postgres import pg_run, template  # noqa: F401  (fixtures)
 
-pytestmark = pytest.mark.skipif(
-    not os.environ.get(POSTGRES_URL_ENV),
-    reason=f"opt-in: set {POSTGRES_URL_ENV} to a local throwaway PostgreSQL (see the module docstring)",
-)
+pytestmark = [
+    pytest.mark.postgres,
+    pytest.mark.skipif(
+        not os.environ.get(POSTGRES_URL_ENV),
+        reason=f"opt-in: set {POSTGRES_URL_ENV} to a local throwaway PostgreSQL (see the module docstring)",
+    ),
+]
 
 PREVIOUS = "0011_telegram_active_selection"
 NOW = utc(2026, 11, 8, 12)
@@ -119,12 +122,29 @@ def make_list(db, user, conversation, answer, *, key="list-1", **request):
 
 
 def test_a_populated_0011_database_upgrades_and_downgrades_on_postgres(pg_run):
-    name = pg_run.create_database()
+    name = pg_run.create_database(runtime_roles=("app",))
     scratch = Scratch(pg_run, name)
-    try:
-        engine = scratch.engine()
+
+    def migrate(revision):
+        engine = scratch.migrate_engine()
         try:
-            upgrade_database(engine, PREVIOUS)
+            upgrade_database(engine, revision)
+            if revision == PREVIOUS:
+                pg_run.apply_privileges(engine)  # the ACLs and defaults the app needs next
+        finally:
+            engine.dispose()
+
+    def downgrade(revision):
+        engine = scratch.migrate_engine()
+        try:
+            downgrade_database(engine, revision)
+        finally:
+            engine.dispose()
+
+    try:
+        migrate(PREVIOUS)
+        engine = scratch.app_engine()
+        try:
             factory = create_session_factory(engine)
             with factory() as db, db.begin():
                 user = new_user(db, display_name="Elena")
@@ -147,7 +167,7 @@ def test_a_populated_0011_database_upgrades_and_downgrades_on_postgres(pg_run):
                     )
 
             before = snapshot()
-            upgrade_database(engine, "0012_shopping_lists")
+            migrate("0012_shopping_lists")
 
             with factory() as db:
                 assert db.execute(sa.text("SELECT version_num FROM alembic_version")).scalar() == (
@@ -171,7 +191,7 @@ def test_a_populated_0011_database_upgrades_and_downgrades_on_postgres(pg_run):
                     )
             assert snapshot() == before
 
-            downgrade_database(engine, PREVIOUS)
+            downgrade(PREVIOUS)
             with factory() as db:
                 assert db.execute(sa.text("SELECT version_num FROM alembic_version")).scalar() == (
                     PREVIOUS

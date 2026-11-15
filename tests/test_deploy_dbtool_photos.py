@@ -17,7 +17,7 @@ import pytest
 from house_helper.persistence import attachments
 from house_helper.persistence.database import create_db_engine, create_session_factory
 from house_helper.persistence.models import User
-from tests.deploy_support import STAGING_ENV, dbtool, env_for, make_database, run, tables
+from tests.deploy_support import STAGING_ENV, dbtool, env_for, make_database, make_head_database, run, tables
 from tests.photo_support import jpeg, png
 
 NOW = datetime(2026, 10, 28, 12, 0, tzinfo=timezone.utc)
@@ -28,7 +28,7 @@ def live(tmp_path):
     """A migrated database holding one user and two stored photos (a JPEG and a PNG)."""
     data = tmp_path / "data"
     data.mkdir()
-    path = make_database(data / "house_helper.db")
+    path = make_head_database(data / "house_helper.db")
     engine = create_db_engine(f"sqlite:///{path}")
     try:
         with create_session_factory(engine)() as session, session.begin():

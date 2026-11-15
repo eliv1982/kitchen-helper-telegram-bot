@@ -33,6 +33,7 @@ from tests.persistence_support import (  # noqa: F401  (fixtures)
     new_user,
     raw_insert,
     rejected,
+    rejected_width,
     session,
     utc,
 )
@@ -253,10 +254,15 @@ def test_an_entry_that_has_a_link_cannot_be_re_keyed_or_handed_to_another_user(s
         sa.select(AllowlistEntry.id).where(AllowlistEntry.provider == "telegram")
     ).hex
 
-    for column, value in (("subject", "7"), ("user_id", other.id.hex)):
+    for column, value in (("subject", "7"), ("user_id", other.id)):
         with rejected(session, "FOREIGN KEY"):
-            session.connection().exec_driver_sql(
-                f"UPDATE allowlist_entries SET {column} = ? WHERE id = ?", (value, entry_id)
+            # A Core UPDATE on the mapped table: the database's key rule must refuse it,
+            # before any application check. The column types are the model's, so the same
+            # statement binds correctly on SQLite and on PostgreSQL (no `?` placeholders).
+            session.execute(
+                sa.update(AllowlistEntry)
+                .where(AllowlistEntry.id == uuid.UUID(entry_id))
+                .values({column: value})
             )
 
 
@@ -354,7 +360,7 @@ def test_the_email_snapshot_has_the_width_the_column_declares(session, provision
     ok = "a" * 320
     raw_insert(session, "identity_links", **link_row(provisioned, subject=TELEGRAM_SUB, email=ok))
 
-    with rejected(session, "ck_identity_links_email_max_length"):
+    with rejected_width(session, "identity_links", "email"):
         raw_insert(
             session, "identity_links",
             **link_row(provisioned, provider="email", subject="elena@example.com", email="a" * 321),

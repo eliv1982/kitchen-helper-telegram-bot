@@ -33,10 +33,13 @@ from tests.test_admin_enrollment_postgres import monitor_rc, run_on, scratch_rc 
 from tests.test_admin_postgres import pg_run, scalar, template  # noqa: F401  (fixtures and helpers)
 from tests.test_invite_login_postgres import race
 
-pytestmark = pytest.mark.skipif(
-    not os.environ.get(POSTGRES_URL_ENV),
-    reason=f"opt-in: set {POSTGRES_URL_ENV} to a local throwaway PostgreSQL (see tests/test_admin_postgres.py)",
-)
+pytestmark = [
+    pytest.mark.postgres,
+    pytest.mark.skipif(
+        not os.environ.get(POSTGRES_URL_ENV),
+        reason=f"opt-in: set {POSTGRES_URL_ENV} to a local throwaway PostgreSQL (see tests/test_admin_postgres.py)",
+    ),
+]
 
 NOW = utc(2026, 10, 21, 12)
 LATER = NOW + timedelta(minutes=5)

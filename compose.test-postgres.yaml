@@ -1,0 +1,54 @@
+# A disposable PostgreSQL 16 server for the tests and for local development
+# (HH-DB-01 Stage 1, CI-05). It is NOT the application's database and must never be
+# the Production or n8n one.
+#
+# Isolation, by construction:
+#   * its own compose project (`name:`) and therefore its own network, which no other
+#     stack joins - in particular not the n8n cluster's network;
+#   * its own named volume, never a host path and never the application's SQLite
+#     volume;
+#   * the port is published on 127.0.0.1 only, at 55432. tests/postgres_harness.py
+#     refuses port 5432 (a long-lived installation lives there) and any non-loopback
+#     address, so this mapping is what makes the suite able to reach it at all;
+#   * the user is a member of this throwaway cluster only. The password is a made-up,
+#     documented test value, not a secret, and is never used for anything but this
+#     server.
+#
+# Start, run the suites, then remove the server AND its data:
+#
+#   docker compose -f compose.test-postgres.yaml up -d
+#   python -m tests.postgres_preflight
+#   HOUSE_HELPER_TEST_POSTGRES_URL=postgresql+psycopg://hh_test:hh_test_only_not_a_secret@127.0.0.1:55432/postgres pytest -m postgres -ra
+#   docker compose -f compose.test-postgres.yaml down -v
+#
+# The image is digest-pinned (CI-05): the tag may move, the digest is what runs here
+# and in CI. `docker compose ... pull` after editing the digest is intentional.
+
+name: house-helper-test-postgres
+
+services:
+  postgres:
+    image: postgres@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+    container_name: house-helper-test-postgres
+    # R2-06: the cluster declares itself disposable. The harness still requires the
+    # independent ownership/inventory evidence; this marker can only make it stricter
+    # (a cluster declaring something else is refused), never replace that evidence.
+    command: ["postgres", "-c", "house_helper.test_cluster=disposable"]
+    environment:
+      POSTGRES_USER: hh_test
+      # Test-only. The harness never reads it from a file and no real deployment uses it.
+      POSTGRES_PASSWORD: hh_test_only_not_a_secret
+      POSTGRES_DB: postgres
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - house-helper-test-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hh_test -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  house-helper-test-postgres-data:
+    name: house-helper-test-postgres-data
