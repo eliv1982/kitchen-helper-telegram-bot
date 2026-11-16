@@ -267,6 +267,13 @@ def test_every_character_up_to_latin_1_gets_the_same_verdict_inside_a_subject(
     assert accepted == expected
 
 
+# The documented baseline corpus has 32 values here; the PostgreSQL identity conformance
+# reuses exactly these 32. Separately, four NUL-bearing inputs are exercised by
+# `test_a_nul_inside_a_subject_is_caught_although_sqlite_text_functions_stop_at_it` below
+# ("4\x002", "4\x00", "\x00", "a\x00@example.com"): SQLite can store a NUL inside TEXT, while
+# PostgreSQL rejects such a value before storage and before any CHECK is evaluated. Those
+# four SQLite inputs are NOT established to be the four additional WP-1A adversarial values
+# (which have not been independently identified), so the two counts are never added.
 SUBJECTS = {
     "telegram: documented example": ("telegram", "1234123412341234123"),
     "telegram: letters and symbols": ("telegram", "abc_DEF-123.~!"),

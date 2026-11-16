@@ -1,13 +1,10 @@
 """The frozen role and ACL contract on a real PostgreSQL 16 server (HH-DB-01 CI-16, CI-17).
 
-PROPOSED ERRATUM - OWNER APPROVAL PENDING (R3-05): the frozen §3.6 negative test 1 says an
-unauthorized `GRANT` fails with SQLSTATE 42501. PostgreSQL 16 does not do that here: a
-`GRANT` from a role without the grant option is answered with a WARNING (SQLSTATE 01007)
-and grants nothing. This module therefore asserts the EFFECT - the complete ACL snapshot
-and every effective privilege are unchanged before and after, inside the transaction -
-and records the 01007 warning as evidence. The frozen specification is not edited, and
-this reading is not presented as accepted. If the Owner rejects the erratum, the test
-must change, not the server.
+OWNER-APPROVED AMENDMENT FE-6 (2026-11-16): frozen §3.6 negative test 1 scopes an
+unauthorized `GRANT` by `hh_app` to PostgreSQL 16's WARNING (SQLSTATE 01007), which grants
+nothing; the other seven statements of that item keep SQLSTATE 42501. This module asserts
+the EFFECT - the complete ACL snapshot and every effective privilege are unchanged before
+and after, inside the transaction - and records the 01007 warning as evidence.
 
 Every statement here runs as one of the per-run restricted identities created by
 tests/postgres_harness.py (`prepare_roles`), not as the bootstrap superuser: the
@@ -463,10 +460,10 @@ def test_the_application_can_do_no_ddl_or_temp_work(scratch):
         ):
             refused(engine, statement)
         refused(engine, "CREATE TEMP TABLE app_temp (id int)")
-        # PROPOSED ERRATUM - OWNER APPROVAL PENDING (R3-05): PostgreSQL 16 answers a GRANT
-        # from a role without the grant option with a WARNING (01007) and grants nothing,
-        # not with SQLSTATE 42501 as the frozen text says. The contract that matters is the
-        # effect - asserted completely in `test_an_application_grant_is_a_warning_...`.
+        # OWNER-APPROVED AMENDMENT FE-6: PostgreSQL 16 answers a GRANT from a role without
+        # the grant option with a WARNING (01007) and grants nothing, and frozen §3.6
+        # negative test 1 scopes that warning to this statement. The contract that matters
+        # is the effect - asserted completely in `test_an_application_grant_is_a_warning_...`.
         works(engine, "GRANT SELECT ON users TO public")
         assert run_as(engine, "SELECT has_table_privilege('public', 'users', 'SELECT')") is False
     finally:
@@ -1454,10 +1451,10 @@ def _acl_snapshot(connection, scratch):
 
 
 def test_an_application_grant_is_a_warning_that_changes_no_acl(scratch):
-    """PROPOSED ERRATUM - OWNER APPROVAL PENDING (see the module docstring).
+    """OWNER-APPROVED AMENDMENT FE-6 (see the module docstring).
 
-    The frozen §3.6 negative test 1 says SQLSTATE 42501; PostgreSQL 16 answers a GRANT
-    from a role without the grant option with a WARNING (01007) and grants nothing. The
+    Frozen §3.6 negative test 1 scopes an unauthorized GRANT by `hh_app` to PostgreSQL 16's
+    WARNING (01007), which grants nothing; the other statements of that item keep 42501. The
     EFFECT is asserted here, before any rollback could conceal a change: complete table and
     column ACLs (with grantors and grant options), `pg_default_acl`, and the effective
     privileges of PUBLIC and every project login are identical before and after the

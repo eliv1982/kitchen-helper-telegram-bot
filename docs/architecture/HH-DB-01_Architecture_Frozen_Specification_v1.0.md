@@ -1,13 +1,15 @@
 # HH-DB-01 - House Helper PostgreSQL Cutover
 ## Architecture Frozen Specification v1.0
 
-**Status:** **FROZEN SPECIFICATION v1.0 - DOCUMENTATION D2 REMEDIATED / CODEX PASS (R2.4 ARCHITECTURE, D2 DOCUMENTATION) / OWNER ACCEPT (2026-11-14) / IMPLEMENTATION NOT STARTED**
+**Status:** **FROZEN SPECIFICATION v1.0 - DOCUMENTATION D2 REMEDIATED / CODEX PASS (R2.4 ARCHITECTURE, D2 DOCUMENTATION) / OWNER ACCEPT (2026-11-14) / IMPLEMENTATION NOT STARTED at the freeze baseline**
 **Version:** 1.0
 **Date:** 2026-11-14
 **Repository:** `eliv1982/kitchen-helper-telegram-bot`
 **Verified architecture baseline:** `3fec30f` (HEAD of `main`) · Alembic migrations `0001-0014` · 20 application tables · 28 indexes
 **Consolidates:** Architecture R2 (Clean-Slate PostgreSQL Cutover), R2.1 (Targeted Remediation), R2.2 (Bootstrap, Restore and Sequence Corrections), R2.3 (State-Transition and Parser Addendum), R2.4 (Final Bootstrap Fence and Role-Check Amendment), the independent Codex Final R2.4 Delta Review **PASS**, and its four approved nonblocking documentation errata.
 **Binding Owner decision:** `HH-DB-01-DATA-RESET-01` - existing SQLite application data is abandoned; two accounts are recreated; no ETL; Production is not modified by this specification.
+
+**Current status (2026-11-16).** The status line above is the 2026-11-14 architecture freeze and its Owner acceptance; `IMPLEMENTATION NOT STARTED` describes that freeze baseline, not the current project state. HH-DB-01 Stage 1 is **CLOSED / OWNER ACCEPT**. HH-DB-01 Stage 2 WP-1B holds **TECHNICAL OWNER ACCEPT (2026-11-16)**, with the Git/CI closeout **PENDING**. HH-DB-01 Stage 2 as a whole remains **NOT CLOSED**. Production remains on SQLite: no PostgreSQL deployment exists and no cutover is authorized. FE-5 and FE-6 are registered in §14.4; the current implementation status is maintained in §14.6.
 
 ### Evidence and status legend
 
@@ -21,6 +23,8 @@
 | `[SPEC]` | A test or acceptance check that is **specified but not executed**. |
 
 ### Status of this document - read this before relying on anything below
+
+**The four statements below describe the 2026-11-14 freeze baseline**, not the current project status; the current status is recorded above and in §14.6.
 
 1. **Architecture acceptance is not implementation evidence.** The design is accepted by the reported independent Codex Final R2.4 delta review (PASS; see Evidence provenance below). **No implementation exists for this architecture at the baseline.** No role, database, container, timer, credential, archive or test in this document has been created or run.
 2. **No test was executed for this specification.** Every test, fixture and acceptance check is marked `[SPEC]`. Nothing here is a reported test result.
@@ -191,7 +195,7 @@ These are facts about the baseline, not proposals. An implementation MUST verify
 | Role | Login | Attributes | Authority | Used only by |
 |---|---|---|---|---|
 | *(bootstrap superuser)* | Local socket only (`local`/`peer`) | `SUPERUSER` | Cluster: create roles and databases, `ALTER SCHEMA public OWNER`, initial `REVOKE`. | `docker exec ... psql` from the host. Never a container credential, never the app. |
-| `hh_owner` | **NOLOGIN** | No attributes | Owns the database, schema and every object. | Target of `SET ROLE` only. |
+| `hh_owner` | **NOLOGIN** | `NOINHERIT`; no privilege attributes | Owns the database, schema and every object. | Target of `SET ROLE` only. |
 | `hh_migrate` | LOGIN | `NOSUPERUSER`, `NOCREATEDB`, `NOCREATEROLE`, `NOBYPASSRLS`; member of `hh_owner` `WITH SET TRUE, INHERIT FALSE`; `ALTER ROLE ... SET role = hh_owner` | DDL: `alembic upgrade head`; grants on existing objects. | Migration one-shot. |
 | `hh_app` | LOGIN | `NOSUPERUSER`, `NOCREATEDB`, `NOCREATEROLE`, `NOBYPASSRLS`, `NOINHERIT` | DML on all 20 application tables; `USAGE` on sequences; `SELECT` on `alembic_version`; **no** DDL, `TRUNCATE`, `REFERENCES`, `TRIGGER` or `TEMPORARY`. | Web process and its in-process Telegram poller. |
 | `hh_purge` | LOGIN | As `hh_app` | `SELECT` + `DELETE` on the ten retention tables; exact column-level `UPDATE`; `SELECT` on `alembic_version`. **No default privilege.** | Purge one-shot. |
@@ -201,7 +205,7 @@ These are facts about the baseline, not proposals. An implementation MUST verify
 
 **ROL-03.** `hh_owner` is `NOLOGIN` so that "the owner" is a privilege target, never a service identity. Only `hh_migrate` and `hh_restore` assume it, with `SET ROLE` (or the configured default role), so objects stay owned by `hh_owner` and `session_user` records the real login.
 
-**ROL-04.** The seven project roles are exactly `hh_owner`, `hh_migrate`, `hh_app`, `hh_purge`, `hh_backup`, `hh_provision`, `hh_restore`. No other project-named role is created.
+**ROL-04.** The seven project roles are exactly `hh_owner`, `hh_migrate`, `hh_app`, `hh_purge`, `hh_backup`, `hh_provision`, `hh_restore`. No other project-named role is created. Every one of the seven is created explicitly `NOINHERIT`, including the roles whose attribute cells in §3.2 do not repeat it; `CREATE ROLE` otherwise defaults to `INHERIT`. The two delegated-owner edges remain `WITH ADMIN FALSE, INHERIT FALSE, SET TRUE`. (Post-freeze amendment FE-5.)
 
 ### 3.3 Membership, `SET ROLE` and session settings
 
@@ -372,6 +376,8 @@ The application also sets `application_name` through the engine (`connect_args`)
 **Negative** - each MUST fail with SQLSTATE `42501` or a connection refusal:
 
 1. `hh_app`: `CREATE TABLE`, `DROP TABLE`, `ALTER TABLE`, `CREATE INDEX`, `TRUNCATE`, `CREATE SCHEMA`, `GRANT`, `SET ROLE hh_owner`.
+
+   **Verified exception - the `GRANT` statement only (post-freeze amendment FE-6).** On the pinned PostgreSQL 16 image an attempted `GRANT` executed by `hh_app`, which holds no grant option, is answered with WARNING SQLSTATE `01007` and grants nothing. For that statement only, this item asserts the exact warning together with complete before/after ACL and effective-privilege equality, instead of `42501`; the other seven statements above and every other negative test remain subject to `42501` or a connection refusal.
 2. `hh_app`: any `INSERT`/`UPDATE`/`DELETE` on `alembic_version` (only `SELECT` is permitted); `UPDATE` on the sequence relation.
 3. `hh_app`: connect to `postgres` or any other database; `CREATE TEMP TABLE`.
 4. `hh_app`: access the content or size of a temporary restore/smoke database it is not granted `CONNECT` on (Freeze Erratum FE-4). **This test does not require concealment of publicly accessible PostgreSQL catalog metadata** such as database names or role names in `pg_database`/`pg_roles`; it requires that content and size are inaccessible.
@@ -1747,6 +1753,13 @@ These statements appear in the source amendments and are **withdrawn**. They MUS
 | **FE-3** - Separate the initial E3 checks: after CREATE (disabled, default `PUBLIC` may exist); after ACL preparation (still disabled, `PUBLIC` revoked, `hh_migrate` `CONNECT` granted); only then enable connections and proceed with schema work. | BOOT-01 (E3-a/E3-b/E3-c), BOOT-02..BOOT-06 | §5.1 |
 | **FE-4** - The negative temporary-database access test concerns unauthorized access to content or size; it does not require concealment of publicly accessible PostgreSQL catalog metadata. | §3.6 negative test 4; RST-04 step 6; TMP-08 item 2 | §3.6, §8.8, §8.9 |
 
+**Post-freeze amendments (separate Owner approval).** The four errata above were integrated at the R2.4 PASS and remain the historical record of that freeze; they are unchanged. The two entries below are later corrections, approved separately on 2026-11-16. These amendments align the written specification with the accepted role matrix and verified PostgreSQL 16 behavior. They do not change implemented privileges, role memberships or the role set. FE-6 corrects the expected outcome of exactly one negative `GRANT` statement; all other acceptance requirements remain unchanged. They do not re-open the R2.4 PASS.
+
+| Amendment | Requirement | Where incorporated |
+|---|---|---|
+| **FE-5** - Every one of the seven project roles is created explicitly `NOINHERIT`, including the roles whose attribute cells do not repeat it; `CREATE ROLE` otherwise defaults to `INHERIT`. The `hh_owner` cell of the §3.2 matrix says so, and the two delegated-owner edges remain `WITH ADMIN FALSE, INHERIT FALSE, SET TRUE`. | ROL-04 (§3.2); the `hh_owner` attribute cell of the §3.2 matrix | §3.2 |
+| **FE-6** - The SQLSTATE `01007` warning of an unauthorized `GRANT` is scoped to the `GRANT` statement of §3.6 negative test 1, executed by `hh_app`, together with complete before/after ACL and effective-privilege equality; the other seven statements of that item and every other negative test keep `42501` or a connection refusal. | §3.6 negative test 1 | §3.6 |
+
 ### 14.5 Codex blocker disposition
 
 | Blocker | Design disposition | Implementation evidence at freeze |
@@ -1765,10 +1778,21 @@ These statements appear in the source amendments and are **withdrawn**. They MUS
 | Architecture (this document) | Consolidated; **reported Codex Final R2.4 Delta Review PASS**; four errata integrated. Architecture PASS remains valid and unchanged by D1 and D2. |
 | Documentation acceptance | **D1 findings remediated; D2 findings remediated; D2 documentation recheck PASS.** The PASS is a documentation-consistency claim only; no historical source-fidelity verification is claimed (see "Evidence provenance"). |
 | Owner acceptance | **ACCEPTED 2026-11-14** - frozen specification v1.0 is the single normative implementation baseline. Acceptance of the architecture does not approve any open Owner Decision (OD-1..OD-9, §12) and is not implementation evidence. |
-| Implementation | **NOT STARTED** - no code, migration, role, database, container or credential exists for this architecture. |
-| Implementation tests | **NONE EXECUTED** - every test in this document is `[SPEC]`. |
-| Production inventory | **NOT AUTHORIZED** - stage 7 requires a separate authorization. |
-| Production cutover | **NOT AUTHORIZED** - stage 8 requires a separate authorization. |
+| Post-freeze amendments (FE-5, FE-6) | **APPROVED 2026-11-16** (§14.4) and applied to §3.2 and §3.6. The R2.4 PASS, D1 and D2 assessed the text as consolidated and did not independently validate the amended wording; neither amendment is implementation evidence. |
+| Implementation (freeze baseline) | **NOT STARTED at the 2026-11-14 freeze** - no code, migration, role, database, container or credential existed for this architecture at that baseline. |
+| Implementation tests (freeze baseline) | **NONE EXECUTED at the freeze** - every test in this document is `[SPEC]` at that baseline. |
+| Production inventory (freeze baseline) | **NOT AUTHORIZED** - stage 7 requires a separate authorization. |
+| Production cutover (freeze baseline) | **NOT AUTHORIZED** - stage 8 requires a separate authorization. |
+
+**Current implementation status, 2026-11-16.** The rows below are the current stage status. They are separate from the freeze-baseline rows above and from the R2.4, D1 and D2 acceptance outcomes; recording them does not claim that any audit independently validated the amended text.
+
+| Stage | Status |
+|---|---|
+| HH-DB-01 Stage 1 | **CLOSED / OWNER ACCEPT.** |
+| HH-DB-01 Stage 2 WP-1B | **TECHNICAL OWNER ACCEPT (2026-11-16)** following an independent Codex PASS. |
+| Final Git/CI closeout | **PENDING** - WP-1B is not committed, pushed or closed by a CI run. |
+| HH-DB-01 Stage 2 (whole) | **NOT CLOSED.** |
+| Production | **Remains on SQLite.** The PostgreSQL cutover is not authorized. |
 
 ### 14.7 Confirmation of scope
 

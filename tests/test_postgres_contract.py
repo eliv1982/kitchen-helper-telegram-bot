@@ -165,15 +165,16 @@ def test_the_notice_callback_copies_plain_values_and_keeps_no_diagnostic():
     assert all(not hasattr(value, "sqlstate") for row in records for value in row)
 
 
-def test_the_erratum_path_is_named_as_proposed_and_pending():
-    """R3-05 item 8: the test documentation must not claim the 01007 path is accepted."""
+def test_the_erratum_path_is_recorded_as_approved():
+    """R3-05 item 8, inverted by FE-6: the marker records the approval, and no stale
+    pending marker may survive."""
     text = (
         __import__("pathlib").Path(__file__).with_name("test_postgres_roles.py").read_text(
             encoding="utf-8"
         )
     )
 
-    assert "PROPOSED ERRATUM" in text and "OWNER APPROVAL PENDING" in text
+    assert "OWNER-APPROVED AMENDMENT FE-6" in text and "PROPOSED ERRATUM" not in text
 
 
 # --- R3-05: the effect check ---------------------------------------------------------------------

@@ -176,6 +176,15 @@ ROUTING_ENV = frozenset(
 
 MARKER_PREFIX = "house_helper-test-run:"
 ISOLATION_LEVELS = ("read committed", "repeatable read", "serializable")
+# HH-DB-01 Stage 2 WP-1B: the only locale pairs a scratch database may be created with.
+# The values are literals, never derived from input. `C` is the Owner-approved setting for
+# the serving and restore databases; the other two exist so the locale acceptance gate can
+# be shown to REFUSE them (WP-1A measured C.UTF-8 folding Unicode on the pinned image).
+TEST_LOCALES = {
+    "C": ("C", "C"),
+    "C.UTF-8": ("C.UTF-8", "C.UTF-8"),
+    "en_US.utf8": ("en_US.utf8", "en_US.utf8"),
+}
 # HH-DB-01 R7: the ONE reason a scratch database may be retained instead of dropped. The
 # process that used it could not be confirmed exited, so it may still be writing its files or
 # holding its connection; nothing it used may be cleaned up. There is no other reason and no
@@ -1526,6 +1535,7 @@ class Run:
         isolation: Optional[str] = None,
         owner: Optional[str] = None,
         runtime_roles: Optional[Iterable[str]] = None,
+        locale: Optional[str] = None,
     ) -> str:
         """A new database of this run's, named by the run, marked with its token; a copy of
         `template` (one this run made) when given. Returns the name.
@@ -1536,10 +1546,26 @@ class Run:
         the disabled ACL verified, and only then enabled. The `public` schema is then
         hardened as the migration/owner login, and the four runtime logins receive their
         `CONNECT` handoff afterwards (pass `runtime_roles=()` for a template that is cloned
-        before any of them may reach it)."""
+        before any of them may reach it).
+
+        HH-DB-01 Stage 2 WP-1B: `locale` is an optionally requested, VALIDATED locale pair
+        from `TEST_LOCALES`. It implies `TEMPLATE template0` (the cluster default locale
+        cannot be changed otherwise) and adds the explicit `ENCODING 'UTF8' LC_COLLATE ...
+        LC_CTYPE ...` clause. `template="template0"` alone is also accepted. The default
+        behavior - no locale, no template, or a scratch template of this run - is unchanged,
+        so every Stage 1 test creates exactly what it created before."""
         if isolation is not None and isolation not in ISOLATION_LEVELS:
             raise ValueError("unknown isolation level")
-        if template is not None:
+        if locale is not None and locale not in TEST_LOCALES:
+            raise ValueError("unknown locale")
+        base_template = template
+        if locale is not None:
+            if template not in (None, "template0"):
+                raise ValueError("a locale database is created from template0, not from a scratch template")
+            base_template = "template0"
+        elif template == "template0":
+            base_template = "template0"  # validated literal, no user data
+        elif template is not None:
             self._state(template, "marked")
         # R3-01/R4-02: not one CREATE DATABASE before the cluster is independently
         # verified AND shown to be a dedicated disposable instance by the same eligibility
@@ -1554,7 +1580,10 @@ class Run:
         name = f"house_helper_test_{self.token}_{self._counter}"
         if not _SCRATCH_NAME.fullmatch(name):
             raise UnsafeTarget("unsafe_name", "the generated database name is not the expected form.")
-        clause = f' TEMPLATE "{template}"' if template is not None else ""
+        clause = f' TEMPLATE "{base_template}"' if base_template is not None else ""
+        if locale is not None:
+            collate, ctype = TEST_LOCALES[locale]
+            clause += f" ENCODING 'UTF8' LC_COLLATE '{collate}' LC_CTYPE '{ctype}'"
         if owner is not None:
             clause += f' OWNER "{owner}"'
         if self._roles is not None:
