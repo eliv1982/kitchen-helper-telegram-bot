@@ -58,6 +58,7 @@ from tests.persistence_support import (  # noqa: F401  (fixtures)
     factory,
     new_user,
     raw_insert,
+    refused_width,
     rejected,
     session,
     stored,
@@ -139,8 +140,24 @@ def test_the_provider_must_be_telegram(session, user):
 
 @pytest.mark.parametrize("length", [0, 63, 65, 128])
 def test_the_digest_must_be_64_characters(session, user, length):
-    with rejected(session, "ck_identity_invitations_token_hash_length"):
-        raw_insert(session, "identity_invitations", **invitation_row(user, token_hash="a" * length))
+    token_hash = "a" * length
+    if length <= 64:
+        # Within the type width: the column's own CHECK is the rule that refuses it.
+        with rejected(session, "ck_identity_invitations_token_hash_length"):
+            raw_insert(session, "identity_invitations", **invitation_row(user, token_hash=token_hash))
+        return
+
+    # Beyond the varchar's width, PostgreSQL refuses the type width before the CHECK can.
+    valid = invitation_row(user)
+    raw_insert(session, "identity_invitations", **valid)
+    refused_width(
+        session,
+        "identity_invitations",
+        "token_hash",
+        token_hash,
+        key={"id": valid["id"]},
+        check="ck_identity_invitations_token_hash_length",
+    )
 
 
 @pytest.mark.parametrize("offset", [timedelta(0), -timedelta(seconds=1)])

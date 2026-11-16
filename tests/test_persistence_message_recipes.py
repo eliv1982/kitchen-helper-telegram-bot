@@ -28,8 +28,8 @@ from tests.persistence_support import (  # noqa: F401  (fixtures)
     new_conversation,
     new_message,
     new_user,
+    refused_width,
     rejected,
-    rejected_width,
     session,
     utc,
 )
@@ -316,16 +316,28 @@ def test_the_database_refuses_a_recipe_the_protocol_could_not_have_produced(sess
         "ingredients": [{"name": "x", "amount": "1"}],
         "steps": ["s"],
         "created_at": NOW,
-        **fields,
     }
-
-    reject = (
-        rejected_width(session, "message_recipes", constraint[len("ck_message_recipes_") : -len("_max_length")])
+    column = (
+        constraint[len("ck_message_recipes_") : -len("_max_length")]
         if constraint.startswith("ck_message_recipes_") and constraint.endswith("_max_length")
-        else rejected(session, constraint)
+        else None
     )
-    with reject:
+    if column is not None:
+        # One field is out of its declared bound; everything else is a valid recipe.
+        values[column] = "ok"
         session.add(MessageRecipe(**values))
+        session.flush()
+        refused_width(
+            session,
+            "message_recipes",
+            column,
+            fields[column],
+            key={"message_id": answer.id, "position": 0},
+        )
+        return
+
+    with rejected(session, constraint):
+        session.add(MessageRecipe(**{**values, **fields}))
 
 
 def test_a_recipe_cannot_be_attached_to_a_user_message_even_by_a_direct_write(session):

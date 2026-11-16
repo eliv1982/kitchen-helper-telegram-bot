@@ -11,22 +11,35 @@ R3-04 added two more false positives to close, and their negative controls are h
     row's text (PostgreSQL's DETAIL quotes the row) - now the structured
     `diag.constraint_name` alone decides on PostgreSQL, and so does `diag.column_name`
     for NOT NULL;
-  * a width error (22001) could come from a DIFFERENT column of the same declared width -
-    now the failing statement's bound values must show the expected column, and only it,
-    over its declared width.
+  * a width error (22001) could come from a DIFFERENT column of the same declared width.
+    `rejected` now accepts no 22001 at all. `refused_width` (R4) writes the row itself:
+    one UPDATE of one existing row that assigns one bounded text column, so there is no
+    second value to confuse it with, and no SQL text to parse.
 
 The one exception kept is documented in the helper itself: psycopg refuses a NUL byte
 client-side before PostgreSQL can evaluate a printable-ASCII CHECK.
 """
 
+import uuid
 from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 import house_helper.persistence.models  # noqa: F401  (registers the tables)
-from tests.persistence_support import rejected, rejected_width
+from house_helper.persistence.base import Base
+from house_helper.persistence.database import create_session_factory
+from house_helper.persistence.models import FavoriteRecipe, User
+from tests.persistence_support import (
+    declared_width,
+    refused_width,
+    rejected,
+    require_over_width,
+    text_over_width,
+    width_probe,
+)
 
 
 class Diag:
@@ -44,7 +57,7 @@ class Orig(Exception):
 
 
 class FakeSession:
-    """The little of an ORM Session that `rejected()`/`rejected_width()` use."""
+    """The little of an ORM Session that `rejected()` uses."""
 
     def __init__(self, error, dialect="postgresql"):
         self.error = error
@@ -120,6 +133,71 @@ def test_the_generic_check_expectation_does_not_accept_another_state():
     with pytest.raises(AssertionError):
         with rejected(FakeSession(failure("23503", "foreign key violation")), "CHECK constraint failed"):
             pass
+
+
+# --- R3: exactly the two names that necessarily fire together --------------------------------
+
+
+def test_a_bounded_pair_of_check_names_accepts_either_one():
+    for name in (
+        "ck_favorite_recipes_kind_valid",
+        "ck_favorite_recipes_kind_consistent",
+    ):
+        accepts(
+            FakeSession(failure("23514", "new row violates check constraint", name)),
+            ("ck_favorite_recipes_kind_valid", "ck_favorite_recipes_kind_consistent"),
+        )
+
+
+def test_a_bounded_pair_of_check_names_refuses_a_third_rule():
+    refuses(
+        FakeSession(
+            failure(
+                "23514",
+                "new row violates check constraint",
+                "ck_favorite_recipes_version_valid",
+            )
+        ),
+        ("ck_favorite_recipes_kind_valid", "ck_favorite_recipes_kind_consistent"),
+    )
+
+
+def test_a_bounded_pair_on_sqlite_matches_either_reported_name():
+    for name in (
+        "ck_favorite_recipes_kind_valid",
+        "ck_favorite_recipes_kind_consistent",
+    ):
+        with rejected(
+            FakeSession(failure(None, f"CHECK constraint failed: {name}"), dialect="sqlite"),
+            ("ck_favorite_recipes_kind_valid", "ck_favorite_recipes_kind_consistent"),
+        ):
+            pass
+
+
+# --- R4: a type-width refusal is never proved by `rejected` ---------------------------------
+#
+# A 22001 is PostgreSQL's refusal of a value wider than a column's declared type. It does
+# not say which column, so `rejected` - which decides from the driver's diagnostics alone -
+# must never accept it. A test that means a declared width uses `refused_width`, which
+# writes the one column itself and can therefore attribute the refusal (see the end of this
+# file).
+
+
+def test_a_22001_never_satisfies_a_named_check():
+    refuses(
+        FakeSession(
+            failure(
+                "22001",
+                "value too long for type character varying(128)",
+                statement=(
+                    "INSERT INTO oidc_states (nonce, code_verifier) "
+                    "VALUES (%(nonce)s, %(code_verifier)s)"
+                ),
+                params={"nonce": "n" * 129, "code_verifier": "v" * 16},
+            )
+        ),
+        "ck_oidc_states_nonce_length",
+    )
 
 
 # --- 22001 is no longer a wildcard -----------------------------------------------------------
@@ -296,156 +374,181 @@ def test_a_column_list_needs_a_named_constraint_and_every_column():
             pass
 
 
-# --- the one place 22001 IS accepted, narrowly -----------------------------------------------
+# --- R4: a declared width, proved by a probe the helper writes itself -------------------------
+#
+# The old reader parsed the failing INSERT. It was wrong in both directions: a literal
+# before a positional parameter shifted the values onto the wrong columns, a `::JSONB` or a
+# numeric value changed the effective stored representation, and PostgreSQL's acceptance of
+# trailing spaces beyond varchar(n) made "len(value) > n" an unreliable test; meanwhile real
+# SQLAlchemy statements it did not anticipate were refused. The helper now writes the row:
+# one UPDATE of one existing row, keyed by its primary key, assigning exactly one bounded
+# text column. The statement has no literal, no cast and no second text value, so a 22001
+# can only belong to that column, and it is accepted only for the exact compiled statement.
+
+WIDTH_200 = "value too long for type character varying(200)"
+WIDTH_128 = "value too long for type character varying(128)"
 
 
-def test_rejected_width_accepts_the_exact_declared_width_of_the_column():
-    with rejected_width(
-        FakeSession(failure("22001", "value too long for type character varying(200)")),
-        "favorite_recipes",
-        "title",
-    ):
-        pass
+class FakeWidthSession:
+    """A PostgreSQL session that executes nothing: the probe's statement is compiled and a
+    driver 22001 is raised for exactly it (or for a crafted statement, in the negative
+    controls)."""
+
+    def __init__(self, *, message=WIDTH_200, state="22001", statement=None, constraint_name=None):
+        self.message = message
+        self.state = state
+        self.statement = statement
+        self.constraint_name = constraint_name
+        self.dialect = postgresql.dialect()
+        self.executed = None
+
+    @contextmanager
+    def begin_nested(self):
+        yield
+
+    def get_bind(self):
+        return SimpleNamespace(dialect=self.dialect)
+
+    def execute(self, statement):
+        self.executed = statement
+        raised = str(statement.compile(dialect=self.dialect))
+        raise sa.exc.DataError(
+            raised if self.statement is None else self.statement,
+            (),
+            Orig(self.state, self.message, self.constraint_name),
+        )
 
 
-def test_rejected_width_refuses_another_width():
-    with pytest.raises(AssertionError):
-        with rejected_width(
-            FakeSession(failure("22001", "value too long for type character varying(100)")),
-            "favorite_recipes",
-            "title",
-        ):
-            pass
-
-
-def test_rejected_width_refuses_another_state():
-    with pytest.raises(AssertionError):
-        with rejected_width(
-            FakeSession(failure("23514", "new row violates check constraint", "ck_other")),
-            "favorite_recipes",
-            "title",
-        ):
-            pass
-
-
-def test_a_width_error_from_a_same_width_column_is_refused():
-    """R3-04 negative control: oidc_states.nonce and oidc_states.code_verifier are both
-    VARCHAR(128). A 22001 caused by the OTHER one must not satisfy the nonce assertion."""
-    statement = (
-        "INSERT INTO oidc_states (state_hash, provider, nonce, code_verifier, created_at, expires_at) "
-        "VALUES (%(state_hash)s, %(provider)s, %(nonce)s, %(code_verifier)s, "
-        "%(created_at)s, %(expires_at)s)"
+@pytest.fixture
+def sqlite_session():
+    """A real SQLite database with the whole model schema, for the branch that does not
+    involve 22001 (SQLite ignores VARCHAR widths; its CHECK is the rule)."""
+    engine = sa.create_engine(
+        "sqlite://", poolclass=sa.pool.StaticPool, connect_args={"check_same_thread": False}
     )
-    params = {
-        "state_hash": "a" * 64,
-        "provider": "google",
-        "nonce": "n" * 16,  # within 128
-        "code_verifier": "v" * 129,  # the one that overflowed
-        "created_at": "2026-10-16 12:00:00.000000",
-        "expires_at": "2026-10-16 12:10:00.000000",
-    }
+    Base.metadata.create_all(engine)
+    try:
+        with create_session_factory(engine)() as session:
+            yield session
+    finally:
+        engine.dispose()
+
+
+def test_the_probe_writes_exactly_one_bounded_text_column():
+    """'Multiple potentially overflowing columns' cannot arise: the statement the helper
+    compiles assigns the target and (for favorite_recipes) only the automatic `updated_at`,
+    which is a timestamp. The target's value is a plain bind parameter, not an expression."""
+    statement = width_probe("favorite_recipes", "title", "x" * 201, {"id": uuid.uuid4()})
+
+    # `_values` is SQLAlchemy's own statement dictionary: the one explicit value. The
+    # automatic `updated_at` is added when the statement is compiled, and it has no width.
+    assert set(statement._values) == {"title"}
+    assert isinstance(statement._values["title"], sa.BindParameter)
+    assert all(
+        getattr(column.type, "length", None) is None
+        for column in Base.metadata.tables["favorite_recipes"].c
+        if column.onupdate is not None
+    )
+
+
+def test_the_probe_requires_the_primary_key_and_nothing_else():
+    with pytest.raises(AssertionError, match="primary key"):
+        width_probe("favorite_recipes", "title", "x" * 201, {"user_id": uuid.uuid4()})
+
+
+def test_a_column_without_a_declared_width_is_not_a_width_probe():
+    with pytest.raises(AssertionError, match="not a bounded text column"):
+        declared_width("favorite_recipes", "notes")  # Text: its bound is a CHECK, not a type
+    with pytest.raises(AssertionError, match="not a bounded text column"):
+        declared_width("message_recipes", "ingredients")  # JSON: a conversion, not a width
+
+
+def test_a_non_text_column_is_refused_by_the_helper():
+    session = FakeWidthSession()
+    with pytest.raises(AssertionError, match="not a text column"):
+        refused_width(
+            session,
+            "message_recipes",
+            "ingredients",
+            "{not even json}",
+            key={"message_id": 1, "position": 0},
+        )
+    assert session.executed is None
+
+
+def test_trailing_spaces_are_not_an_overflow():
+    """PostgreSQL truncates a value whose excess is only spaces instead of refusing it, so
+    `len(value) > n` is the wrong test. The probe refuses a value it cannot prove is over."""
+    assert text_over_width("x" * 200, 200) is False
+    assert text_over_width("x" * 200 + "  ", 200) is False
+    assert text_over_width("x" * 200 + " x", 200) is True
+    with pytest.raises(AssertionError, match="not provably over"):
+        require_over_width("favorite_recipes", "title", "x" * 200 + "  ", 200)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [10**100, 1.5, {"title": "x" * 201}, ["x"] * 201, b"x" * 201],
+    ids=["int", "float", "dict", "list", "bytes"],
+)
+def test_a_value_the_server_would_convert_is_refused(value):
+    """A number or a JSON document is converted by PostgreSQL before it reaches the column;
+    its stored width is not the Python length, so the helper refuses to predict it."""
+    with pytest.raises(AssertionError, match="must bind text"):
+        require_over_width("oidc_states", "nonce", value, 128)
+
+    session = FakeWidthSession(message=WIDTH_128)
+    with pytest.raises(AssertionError, match="must bind text"):
+        refused_width(session, "oidc_states", "nonce", value, key={"id": uuid.uuid4()})
+    assert session.executed is None
+
+
+def test_the_probe_statement_with_the_declared_width_is_accepted():
+    session = FakeWidthSession(message=WIDTH_200)
+    refused_width(session, "favorite_recipes", "title", "x" * 201, key={"id": uuid.uuid4()})
+    assert session.executed is not None
+
+
+def test_a_22001_for_another_statement_is_refused():
+    """The original Codex reproduction: a literal before the parameter. The old reader
+    shifted the parameter onto `title`; no crafted statement is the probe's own, so it is
+    refused before any attribution is attempted. The same rule closes a width-limiting cast,
+    a function call or a concatenation: none of them is the statement the helper compiled."""
+    session = FakeWidthSession(
+        statement="INSERT INTO favorite_recipes (title, content) VALUES ('ok', %(content)s)"
+    )
+    with pytest.raises(AssertionError, match="not raised by the single-column probe"):
+        refused_width(session, "favorite_recipes", "title", "x" * 201, key={"id": uuid.uuid4()})
+
+
+def test_a_22001_for_another_width_is_refused():
+    session = FakeWidthSession(message="value too long for type character varying(100)")
     with pytest.raises(AssertionError):
-        with rejected_width(
-            FakeSession(
-                failure(
-                    "22001",
-                    "value too long for type character varying(128)",
-                    statement=statement,
-                    params=params,
-                )
-            ),
-            "oidc_states",
-            "nonce",
-        ):
-            pass
+        refused_width(session, "favorite_recipes", "title", "x" * 201, key={"id": uuid.uuid4()})
 
 
-def test_a_width_error_with_two_overlong_columns_is_refused():
-    statement = "INSERT INTO oidc_states (nonce, code_verifier) VALUES (%(nonce)s, %(code_verifier)s)"
-    params = {"nonce": "n" * 129, "code_verifier": "v" * 129}
+def test_a_22001_with_another_state_is_refused():
+    session = FakeWidthSession(state="23514", message="new row violates check constraint")
     with pytest.raises(AssertionError):
-        with rejected_width(
-            FakeSession(
-                failure(
-                    "22001",
-                    "value too long for type character varying(128)",
-                    statement=statement,
-                    params=params,
-                )
-            ),
-            "oidc_states",
-            "nonce",
-        ):
-            pass
+        refused_width(session, "favorite_recipes", "title", "x" * 201, key={"id": uuid.uuid4()})
 
 
-def test_the_named_column_really_over_its_width_is_accepted():
-    statement = "INSERT INTO oidc_states (nonce, code_verifier) VALUES (%(nonce)s, %(code_verifier)s)"
-    params = {"nonce": "n" * 129, "code_verifier": "v" * 16}
-    with rejected_width(
-        FakeSession(
-            failure(
-                "22001",
-                "value too long for type character varying(128)",
-                statement=statement,
-                params=params,
-            )
-        ),
-        "oidc_states",
-        "nonce",
-    ):
-        pass
+def test_sqlite_still_refuses_through_the_named_check(sqlite_session):
+    user = User(display_name="owner")
+    sqlite_session.add(user)
+    sqlite_session.flush()
+    favorite = FavoriteRecipe(user_id=user.id, title="ok", content="ok", source_message_id=1)
+    sqlite_session.add(favorite)
+    sqlite_session.flush()
 
+    refused_width(sqlite_session, "favorite_recipes", "title", "x" * 201, key={"id": favorite.id})
 
-def test_a_width_error_whose_statement_cannot_be_read_is_refused():
     with pytest.raises(AssertionError):
-        with rejected_width(
-            FakeSession(
-                failure(
-                    "22001",
-                    "value too long for type character varying(200)",
-                    statement="SELECT 1",
-                    params={},
-                )
-            ),
+        refused_width(
+            sqlite_session,
             "favorite_recipes",
             "title",
-        ):
-            pass
-
-
-def test_rejected_width_on_a_text_column_requires_its_named_check():
-    with rejected_width(
-        FakeSession(
-            failure("23514", "new row violates check constraint", "ck_favorite_recipes_notes_max_length")
-        ),
-        "favorite_recipes",
-        "notes",
-    ):
-        pass
-    with pytest.raises(AssertionError):
-        with rejected_width(
-            FakeSession(failure("23514", "new row violates check constraint", "ck_other")),
-            "favorite_recipes",
-            "notes",
-        ):
-            pass
-
-
-def test_rejected_width_on_sqlite_still_requires_the_named_check():
-    with rejected_width(
-        FakeSession(
-            failure(None, "CHECK constraint failed: ck_favorite_recipes_title_max_length"),
-            dialect="sqlite",
-        ),
-        "favorite_recipes",
-        "title",
-    ):
-        pass
-    with pytest.raises(AssertionError):
-        with rejected_width(
-            FakeSession(failure(None, "CHECK constraint failed: ck_something_else"), dialect="sqlite"),
-            "favorite_recipes",
-            "title",
-        ):
-            pass
+            "x" * 201,
+            key={"id": favorite.id},
+            check="ck_something_else",
+        )

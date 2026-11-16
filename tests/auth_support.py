@@ -433,6 +433,7 @@ async def auth_app(
     *,
     origin: str = ORIGIN,
     seed: bool = True,
+    database: Optional[Any] = None,
     configure: Optional[Callable[[Any], None]] = None,
     chat_backend: Optional[Any] = None,
     provider: Optional[Any] = None,
@@ -448,8 +449,14 @@ async def auth_app(
     real OpenAI backend from it). `bot_settings` (a BotSettings) switches the Telegram bot on,
     with `bot_transport` standing in for the network to the Bot API. `structured_recipes`
     switches the recipe protocol on for the backend the application builds and for the
-    shell the page reads."""
-    database = backend_support.backend().new_database(schema="migrations", tmp_path=tmp_path)
+    shell the page reads.
+
+    `database` (a handle from a previous context's `harness.database`) reopens that SAME
+    database instead of creating a new one: a simulated restart, where nothing in memory or
+    in the schema is reset. The test's teardown still owns dropping it. Pass `seed=False`
+    when reopening - seeding is the test's choice, not a side effect of starting up."""
+    if database is None:
+        database = backend_support.backend().new_database(schema="migrations", tmp_path=tmp_path)
     url = database.url_text
     engine = database.app_engine()
     backend_support.verify_database(engine, database)  # the effective dialect and identity (R2-02)

@@ -17,8 +17,6 @@ from house_helper.admin import retention
 from house_helper.persistence import attachments as att
 from house_helper.persistence.identifiers import MAX_ATTACHMENT_BYTES
 from house_helper.persistence.models import MessageAttachment
-from house_helper.admin.target import open_target
-from house_helper.persistence.database import DATABASE_URL_ENV
 from house_helper.web import telegram_chat as tc
 from tests.chat_support import ScriptedBackend, error_of, log_text, post_headers
 from tests.photo_support import NOT_PICTURES, jpeg, png
@@ -32,7 +30,6 @@ from tests.telegram_support import (
     private_message,
     telegram_app,
 )
-from tests.web_support import sqlite_url
 
 pytestmark = pytest.mark.asyncio
 
@@ -345,7 +342,9 @@ async def test_the_expiry_job_removes_a_photo_with_its_message_and_an_unsent_upl
         await send_photo(t, data=jpeg(2000, "sent"))
         with t.chat.base.factory() as db, db.begin():
             unsent = att.store(db, t.user_id, jpeg(2000, "unsent"), now=t.chat.clock.current)
-    engine = open_target({DATABASE_URL_ENV: sqlite_url(tmp_path / "auth.db")})
+    # The same database the application used, through the restricted purge identity the
+    # retention command runs as (not a hard-coded SQLite file).
+    engine = t.chat.base.database.purge_engine()
     try:
         soon = t.chat.clock.current + att.UPLOAD_LIFETIME
         early = retention.purge_expired(engine, now=soon, pause=lambda: None)

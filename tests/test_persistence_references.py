@@ -207,11 +207,18 @@ def test_a_message_is_the_answer_of_at_most_one_request(session, world, how):
 
 @HOW
 @pytest.mark.parametrize(
-    "column, value",
-    [("user_message_role", "assistant"), ("assistant_message_role", "user")],
+    "column, value, constraint",
+    [
+        ("user_message_role", "assistant", "ck_turn_requests_user_message_role_is_user"),
+        (
+            "assistant_message_role",
+            "user",
+            "ck_turn_requests_assistant_message_role_is_assistant",
+        ),
+    ],
 )
 def test_the_role_a_link_expects_cannot_be_changed_to_match_the_wrong_message(
-    session, world, how, column, value
+    session, world, how, column, value, constraint
 ):
     # The *_role columns only exist to be part of the foreign keys. If a writer
     # could set them freely, pointing the link at a message of any role and
@@ -222,7 +229,7 @@ def test_the_role_a_link_expects_cannot_be_changed_to_match_the_wrong_message(
         fields["assistant_message_id"] = wrong.id
     user_message = wrong if column == "user_message_role" else world.mine.asked
 
-    with rejected(session, f"ck_turn_requests_{column}_is_"):
+    with rejected(session, constraint):
         insert_turn(session, how, world.mine.conversation, user_message.id, **fields)
 
 

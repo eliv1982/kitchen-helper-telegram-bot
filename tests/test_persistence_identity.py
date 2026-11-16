@@ -21,7 +21,13 @@ import warnings
 import pytest
 import sqlalchemy as sa
 
-from house_helper.persistence.allowlist import allow, allowed_user, is_allowed, revoke
+from house_helper.persistence.allowlist import (
+    MAX_SUBJECT_LENGTH,
+    allow,
+    allowed_user,
+    is_allowed,
+    revoke,
+)
 from house_helper.persistence.models import AllowlistEntry, IdentityLink, User
 from tests.persistence_support import (  # noqa: F401  (fixtures)
     count,
@@ -32,8 +38,8 @@ from tests.persistence_support import (  # noqa: F401  (fixtures)
     new_identity_link,
     new_user,
     raw_insert,
+    refused_width,
     rejected,
-    rejected_width,
     session,
     utc,
 )
@@ -302,6 +308,21 @@ def test_both_tables_refuse_the_same_malformed_identities(
     session, user, table, provider, subject, constraint
 ):
     row = entry_row(user) if table == "allowlist_entries" else link_row(user)
+    if constraint == "subject_length" and len(subject) > MAX_SUBJECT_LENGTH:
+        # Over the column's declared width: write an otherwise valid row, then target the
+        # one field (R4: the helper writes only that column, so the 22001 has one owner).
+        if table == "identity_links":  # a link is only valid for a provisioned identity
+            raw_insert(session, "allowlist_entries", **entry_row(user))
+        raw_insert(session, table, **row)
+        refused_width(
+            session,
+            table,
+            "subject",
+            subject,
+            key={"id": row["id"]},
+            check=f"ck_{table}_subject_length",
+        )
+        return
     row.update(provider=provider, subject=subject)
 
     with rejected(session, f"ck_{table}_{constraint}"):
@@ -358,13 +379,10 @@ def test_the_email_snapshot_is_printable_ascii(session, provisioned, email):
 
 def test_the_email_snapshot_has_the_width_the_column_declares(session, provisioned):
     ok = "a" * 320
-    raw_insert(session, "identity_links", **link_row(provisioned, subject=TELEGRAM_SUB, email=ok))
+    valid = link_row(provisioned, subject=TELEGRAM_SUB, email=ok)
+    raw_insert(session, "identity_links", **valid)
 
-    with rejected_width(session, "identity_links", "email"):
-        raw_insert(
-            session, "identity_links",
-            **link_row(provisioned, provider="email", subject="elena@example.com", email="a" * 321),
-        )
+    refused_width(session, "identity_links", "email", "a" * 321, key={"id": valid["id"]})
 
 
 # --- it survives the transaction ---------------------------------------------------

@@ -30,8 +30,8 @@ from tests.persistence_support import (  # noqa: F401  (fixtures)
     new_message,
     new_turn_request,
     new_user,
+    refused_width,
     rejected,
-    rejected_width,
     session,
     utc,
 )
@@ -471,22 +471,22 @@ def test_the_database_allows_one_account_per_user_and_one_user_per_account(sessi
 def test_the_database_refuses_a_group_id_or_zero(session, account):
     user = enroll(session)
 
-    with rejected(session, "telegram_user_id_positive"):
+    with rejected(session, "ck_telegram_links_telegram_user_id_positive"):
         session.add(TelegramLink(user_id=user.id, telegram_user_id=account, created_at=NOW))
 
 
 def test_the_database_bounds_the_name_and_the_code_digest(session):
     user = enroll(session)
+    link = TelegramLink(user_id=user.id, telegram_user_id=ACCOUNT, display_name="ok", created_at=NOW)
+    session.add(link)
+    session.flush()
 
-    with rejected_width(session, "telegram_links", "display_name"):
-        session.add(
-            TelegramLink(user_id=user.id, telegram_user_id=ACCOUNT, display_name="x" * 101, created_at=NOW)
-        )
-    with rejected(session, "code_hash_length"):
+    refused_width(session, "telegram_links", "display_name", "x" * 101, key={"id": link.id})
+    with rejected(session, "ck_telegram_link_codes_code_hash_length"):
         session.add(
             TelegramLinkCode(user_id=user.id, code_hash="abc", created_at=NOW, expires_at=NOW + tg.CODE_LIFETIME)
         )
-    with rejected(session, "expires_after_created"):
+    with rejected(session, "ck_telegram_link_codes_expires_after_created"):
         session.add(TelegramLinkCode(user_id=user.id, code_hash="a" * 64, created_at=NOW, expires_at=NOW))
 
 

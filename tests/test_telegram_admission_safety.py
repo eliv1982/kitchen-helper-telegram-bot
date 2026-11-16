@@ -211,7 +211,9 @@ async def test_a_restart_after_a_failed_preparation_processes_the_pending_update
     monkeypatch.setattr(tc.store, "initialize_update_admissions", real)
     after = ScriptedBackend("Ответ после перезапуска")
     before = len(bot.texts(MOTHER))
-    async with telegram_app(tmp_path, after, bot=bot, sign_in_first=False, seed=False) as second:
+    async with telegram_app(
+        tmp_path, after, bot=bot, sign_in_first=False, seed=False, database=first.database
+    ) as second:
         second.chat.clock.advance(minutes=10)
         await until(lambda: len(bot.texts(MOTHER)) > before)
         await second.settle()

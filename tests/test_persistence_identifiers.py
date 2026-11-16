@@ -45,8 +45,8 @@ from tests.persistence_support import (  # noqa: F401  (fixtures)
     new_user,
     new_turn_request,
     raw_insert,
+    refused_width,
     rejected,
-    rejected_width,
     session,
     stored,
     turn_row,
@@ -179,10 +179,27 @@ def test_keys_up_to_the_declared_width_are_accepted(session, conversation, lengt
 @pytest.mark.parametrize("length", [0, 129, 1000])
 def test_keys_beyond_the_declared_width_are_refused_by_the_database(session, conversation, length):
     asked = new_message(session, conversation)
-    row = turn_row(conversation, asked.id, idempotency_key="k" * length)
+    key = "k" * length
+    if length <= MAX_IDEMPOTENCY_KEY_LENGTH:
+        # Within the type width: the column's own CHECK is the rule that refuses it.
+        with rejected(session, "ck_turn_requests_idempotency_key_length"):
+            raw_insert(
+                session,
+                "turn_requests",
+                **turn_row(conversation, asked.id, idempotency_key=key),
+            )
+        return
 
-    with rejected(session, "ck_turn_requests_idempotency_key_length"):
-        raw_insert(session, "turn_requests", **row)
+    # Beyond the declared width: write an otherwise valid request, then target the field.
+    request = new_turn_request(session, conversation, key="valid-key")
+    refused_width(
+        session,
+        "turn_requests",
+        "idempotency_key",
+        key,
+        key={"id": request.id},
+        check="ck_turn_requests_idempotency_key_length",
+    )
 
 
 @pytest.mark.parametrize("key", [None, 5, b"key", ["key"]])
@@ -656,10 +673,14 @@ def ctx(session, user, conversation):
 @pytest.mark.parametrize("table, column, limit, build", WIDTHS, ids=[f"{t}.{c}" for t, c, *_ in WIDTHS])
 def test_a_text_column_takes_exactly_the_width_it_declares(session, ctx, table, column, limit, build):
     raw_insert(session, table, **build(ctx, "x" * limit))
-    session.rollback()
 
-    with rejected_width(session, table, column):
-        raw_insert(session, table, **build(ctx, "x" * (limit + 1)))
+
+@pytest.mark.parametrize("table, column, limit, build", WIDTHS, ids=[f"{t}.{c}" for t, c, *_ in WIDTHS])
+def test_a_text_column_refuses_one_more_character(session, ctx, table, column, limit, build):
+    valid = build(ctx, "x" * limit)
+    raw_insert(session, table, **valid)
+
+    refused_width(session, table, column, "x" * (limit + 1), key={"id": valid["id"]})
 
 
 @pytest.mark.parametrize("table, column, limit, build", WIDTHS, ids=[f"{t}.{c}" for t, c, *_ in WIDTHS])

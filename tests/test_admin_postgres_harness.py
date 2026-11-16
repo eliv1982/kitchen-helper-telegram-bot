@@ -715,6 +715,7 @@ def run(target, server):
         token=TOKEN,
         cluster=cluster_identity(),
         docker=server.docker,
+        environ={},  # R1: the synthetic Compose identity never reads the runner's environment
     )
 
 
@@ -1016,7 +1017,7 @@ def test_a_partially_prepared_role_set_cannot_escape_cleanup(target, server):
     """R2-05: the membership grant fails after two roles exist. The failure itself must run
     the ownership-verified cleanup: nothing this run created may survive it."""
     server.databases.pop("persistent", None)  # the dedicated-cluster evidence sees only this run's databases
-    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker)
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker, environ={})
     server.fail_on = 'GRANT "'
 
     with pytest.raises(RuntimeError):
@@ -1031,7 +1032,7 @@ def test_a_partially_prepared_role_set_cannot_escape_cleanup(target, server):
 
 def test_cluster_wide_role_preparation_refuses_a_server_that_is_not_dedicated(target, server):
     server.databases["house_helper"] = None  # a database this harness never created
-    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker)
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker, environ={})
 
     with pytest.raises(UnsafeTarget) as refused:
         run.prepare_roles()
@@ -1308,7 +1309,7 @@ def test_a_hand_built_identity_cannot_open_a_privileged_connection(target, serve
         port=55432,
     )
     assert identity.issued(forged) is False
-    run = Run(target, connect=server.connect, token=TOKEN, cluster=forged, docker=server.docker)
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=forged, docker=server.docker, environ={})
 
     with pytest.raises(UnsafeTarget) as refused:
         with run.control():
@@ -1330,7 +1331,7 @@ def test_a_verified_cluster_still_supports_the_permitted_operations(run, server)
 
 def test_privileged_grants_refuse_an_external_engine(target, server):
     """R4-01 item 4: an arbitrary SQLAlchemy engine is not evidence of a verified cluster."""
-    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker)
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker, environ={})
     run.prepare_roles()
     before = len(server.mutating())
     external = sa.create_engine("sqlite://")
@@ -1411,7 +1412,7 @@ def test_the_actual_engine_connection_is_what_gets_verified(target, server):
 
 
 def test_the_restore_lifecycle_creates_tracks_and_drops_a_disabled_database(target, server):
-    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker)
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker, environ={})
     run.prepare_roles()
 
     name = run.create_database_as("restore")  # created by the restore login, disabled
@@ -1497,7 +1498,7 @@ def test_dropping_roles_before_revoking_their_grants_fails_and_keeps_the_records
     """Negative control: the wrong cleanup order (DROP ROLE before REVOKE) fails the way
     PostgreSQL fails it - a role that still holds a database privilege cannot be dropped -
     and nothing is falsely recorded as cleaned."""
-    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker)
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker, environ={})
     run.prepare_roles()
 
     problems = run._drop_roles()  # the wrong order: the maintenance CONNECT grants still exist
@@ -1530,7 +1531,7 @@ def fail_on_nth(pattern, n):
 
 def test_a_failure_after_the_first_maintenance_grant_revokes_it_and_drops_the_roles(target, server):
     server.databases.pop("persistent", None)
-    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker)
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker, environ={})
     server.fail_when = fail_on_nth('GRANT CONNECT ON DATABASE "postgres"', 2)
 
     with pytest.raises(RuntimeError):
@@ -1544,7 +1545,7 @@ def test_a_failure_after_the_first_maintenance_grant_revokes_it_and_drops_the_ro
 
 def test_a_failure_after_the_second_maintenance_grant_revokes_both(target, server):
     server.databases.pop("persistent", None)
-    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker)
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker, environ={})
     server.fail_when = fail_on_nth("SELECT count(*) FROM aclexplode(", 1)  # right after both grants
 
     with pytest.raises(RuntimeError):
@@ -1557,7 +1558,7 @@ def test_a_failure_after_the_second_maintenance_grant_revokes_both(target, serve
 
 def test_a_revocation_failure_keeps_the_grant_and_the_roles_and_never_hides_the_setup_error(target, server):
     server.databases.pop("persistent", None)
-    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker)
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker, environ={})
     seen = {"grants": 0}
 
     def predicate(sql):
@@ -1586,7 +1587,7 @@ def test_a_revocation_failure_keeps_the_grant_and_the_roles_and_never_hides_the_
 
 def test_a_role_drop_failure_keeps_only_the_failed_role_record_for_the_retry(target, server):
     server.databases.pop("persistent", None)
-    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker)
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker, environ={})
     run.prepare_roles()
     server.fail_when = fail_on_nth('DROP ROLE "', 1)  # the first drop (reverse order) fails
 
@@ -1644,7 +1645,7 @@ def test_an_injected_unissued_identity_cannot_build_a_privileged_expectation(tar
         mode="compose",
         port=55432,
     )
-    run = Run(target, connect=server.connect, token=TOKEN, cluster=forged, docker=server.docker)
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=forged, docker=server.docker, environ={})
 
     with pytest.raises(UnsafeTarget) as refused:
         run._expected("postgres", None)
@@ -1662,7 +1663,7 @@ def test_an_altered_copy_of_a_verified_identity_authorizes_nothing(target, serve
 
     altered = dataclasses.replace(cluster_identity(), system_identifier=OTHER_IDENTIFIER)
     assert identity.issued(altered) is False
-    run = Run(target, connect=server.connect, token=TOKEN, cluster=altered, docker=server.docker)
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=altered, docker=server.docker, environ={})
 
     with pytest.raises(UnsafeTarget) as refused:
         with run.control():
@@ -1694,7 +1695,7 @@ def _limit_identity_inspections(server, allowed):
 
 
 def test_docker_unavailable_before_revocation_blocks_every_mutation(target, server):
-    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker)
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker, environ={})
     run.prepare_roles()
     before = len(server.mutating())
     server.docker.inspect_fails = True
@@ -1712,7 +1713,7 @@ def test_docker_unavailable_before_revocation_blocks_every_mutation(target, serv
 
 
 def test_docker_loss_between_revocation_and_role_deletion_blocks_role_drops(target, server):
-    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker)
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker, environ={})
     run.prepare_roles()
     original = _limit_identity_inspections(server, allowed=3)  # close + 2 revocations
 
@@ -1731,7 +1732,7 @@ def test_docker_loss_between_revocation_and_role_deletion_blocks_role_drops(targ
 
 
 def test_a_changed_cluster_identifier_during_cleanup_blocks_every_mutation(target, server):
-    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker)
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker, environ={})
     run.prepare_roles()
     before = len(server.mutating())
     server.docker.identifier = OTHER_IDENTIFIER  # the control file now names another cluster
@@ -1752,7 +1753,7 @@ def test_a_changed_cluster_identifier_during_cleanup_blocks_every_mutation(targe
 
 
 def _run_with_roles(target, server):
-    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker)
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker, environ={})
     run.prepare_roles()
     return run
 
@@ -1823,6 +1824,556 @@ def test_an_ambiguous_creation_that_never_took_effect_is_forgotten(target, serve
 
     assert run.pending_cleanup()["ambiguous"] == ()
     assert server.maintenance_grants == [] and server.roles == {}
+
+
+# --- R7: a held scratch database never meets cleanup ---------------------------------------------
+#
+# A test retains its database when the process that used it could not be confirmed exited
+# (tests/test_telegram_cross_owner.py). The hold is not a convenience: the database stays in
+# the tracked inventory, and both cleanup entry points refuse it -- by name at the function
+# level, and as an all-or-nothing refusal of `close()` -- before any connection is opened.
+
+
+def _opened_so_far(server):
+    """What a call could have opened: container inspections, statements, connections."""
+    return (
+        len(server.docker.inspections),
+        len(server.statements),
+        len(server.connections),
+    )
+
+
+def test_holding_a_tracked_database_is_recorded_and_opens_nothing(run, server):
+    """The hold is the one operation that must work when a process may still be alive: it
+    runs no SQL, inspects no container and opens no connection."""
+    name = run.create_database()
+    before = _opened_so_far(server)
+
+    held = run.hold_database(name, worker_pid=4321)
+
+    assert _opened_so_far(server) == before
+    assert held.name == name and held.worker_pid == 4321
+    assert held.reason == harness.HELD_UNCONFIRMED_WORKER_EXIT
+    assert held.test_run == TOKEN
+    assert name in run.pending_cleanup()["databases"]  # the inventory record stays
+    assert run.pending_cleanup()["held"] == (held,)
+
+
+def test_holding_the_same_database_twice_keeps_the_first_record(run, server):
+    name = run.create_database()
+    held = run.hold_database(name, worker_pid=4321)
+    before = _opened_so_far(server)
+
+    again = run.hold_database(name, worker_pid=9876)
+
+    assert again is held and again.worker_pid == 4321  # deterministic; nothing overwritten
+    assert _opened_so_far(server) == before
+    assert run.pending_cleanup()["held"] == (held,)
+
+
+def test_only_an_unconfirmed_worker_exit_is_a_reason_to_hold(run, server):
+    name = run.create_database()
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.hold_database(name, reason="it is convenient")
+
+    assert refused.value.code == "held_reason"
+    assert run.pending_cleanup()["held"] == ()
+    run.close()  # nothing was held: the ordinary cleanup still works
+    assert name not in server.databases
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        pytest.param(f"house_helper_test_{TOKEN}_9", id="a-name-this-run-never-created"),
+        pytest.param("persistent", id="an-application-database"),
+        pytest.param("house_helper_test_" + "f" * 32 + "_1", id="another-runs-scratch-database"),
+    ],
+)
+def test_an_unknown_database_cannot_be_held(name, run, server):
+    """A hold never protects a foreign database from the checks that govern it: only a name
+    this run has in its inventory can be recorded, and the attempt authorizes nothing."""
+    server.databases.setdefault(name, None)
+    before = _opened_so_far(server)
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.hold_database(name)
+
+    assert refused.value.code == "not_created_by_this_run"
+    assert _opened_so_far(server) == before
+    assert run.pending_cleanup()["held"] == ()
+    with pytest.raises(UnsafeTarget) as dropped:  # the attempt did not make it droppable
+        run.drop_database(name)
+    assert dropped.value.code == "not_created_by_this_run"
+
+
+def test_a_held_database_is_refused_by_drop_before_any_connection(run, server):
+    name = run.create_database()
+    run.hold_database(name, worker_pid=4321)
+    before = _opened_so_far(server)
+    databases = dict(server.databases)
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.drop_database(name)
+
+    assert refused.value.code == "held_database"
+    assert _opened_so_far(server) == before  # no Docker inspection, no connection
+    assert server.databases == databases and name in run.pending_cleanup()["databases"]
+
+
+def test_a_held_database_makes_close_refuse_every_step(run, server):
+    """The same Run instance, both cleanup paths: the direct drop refuses first, then
+    `close()` refuses before its first step -- no other database is dropped either, so the
+    ownership state around the held one is not half-cleaned."""
+    held, other = run.create_database(), run.create_database()
+    run.hold_database(held, worker_pid=4321)
+    before = _opened_so_far(server)
+    databases = dict(server.databases)
+    roles = dict(server.roles)
+    grants = list(server.maintenance_grants)
+
+    with pytest.raises(UnsafeTarget) as dropped:
+        run.drop_database(held)
+    assert dropped.value.code == "held_database"
+
+    with pytest.raises(UnsafeTarget) as closed:
+        run.close()
+    assert closed.value.code == "held_database"
+
+    assert _opened_so_far(server) == before
+    assert server.databases == databases  # neither database was dropped
+    assert server.roles == roles and server.maintenance_grants == grants
+    assert set(run.pending_cleanup()["databases"]) == {held, other}
+
+
+def test_a_held_database_keeps_the_roles_and_grants_for_recovery(target, server):
+    """The session finalizer's `close()` would drop the roles and revoke their grants; while
+    a database is held, all of it is kept -- and reported -- for a recovery."""
+    run = _run_with_roles(target, server)
+    name = run.create_database_as("restore")
+    run.hold_database(name, worker_pid=4321)
+    roles = dict(server.roles)
+    grants = list(server.maintenance_grants)
+    before = _opened_so_far(server)
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.close()
+
+    assert refused.value.code == "held_database"
+    assert server.roles == roles and server.maintenance_grants == grants  # nothing cleaned
+    assert _opened_so_far(server) == before
+    pending = run.pending_cleanup()
+    assert pending["roles"] and pending["maintenance_grants"]
+    [record] = pending["held"]
+    assert record.retained["roles"] == pending["roles"]
+    assert record.retained["maintenance_grants"] == pending["maintenance_grants"]
+    assert record.retained["databases"] == pending["databases"]
+
+
+def test_a_hold_is_never_released_by_cleanup(run, server):
+    """Nothing in teardown clears a hold: repeated cleanup attempts refuse the same record,
+    and the database is still there."""
+    name = run.create_database()
+    held = run.hold_database(name, worker_pid=4321)
+
+    for _ in range(3):
+        with pytest.raises(UnsafeTarget) as refused:
+            run.close()
+        assert refused.value.code == "held_database"
+
+    assert run.pending_cleanup()["held"] == (held,)
+    assert name in server.databases
+
+
+def test_only_the_held_database_is_refused_by_a_direct_drop(run, server):
+    """`close()` is all-or-nothing while a database is held; an explicit request to drop
+    another database of the run still goes through its usual verified path."""
+    held, other = run.create_database(), run.create_database()
+    run.hold_database(held, worker_pid=4321)
+
+    run.drop_database(other)
+
+    assert other not in server.databases and held in server.databases
+    assert other not in run.pending_cleanup()["databases"]
+    assert [record.name for record in run.pending_cleanup()["held"]] == [held]
+
+
+# --- R7: pre-armed holds -- association and the one explicit release -----------------------------------------
+
+
+def test_a_worker_that_becomes_known_is_associated_without_unholding(run, server):
+    """The pre-armed hold names no process until the spawn returns. Recording the pid
+    updates the record in place: no instant exists in which the database is not held, and no
+    SQL, Docker inspection or connection is made."""
+    name = run.create_database()
+    held = run.hold_database(name)  # armed before the worker exists: no pid yet
+    before = _opened_so_far(server)
+
+    updated = run.note_held_worker(name, worker_pid=4321)
+
+    assert _opened_so_far(server) == before
+    assert updated.worker_pid == 4321 and updated.name == name
+    assert updated.test_run == held.test_run and updated.retained == held.retained
+    assert run.pending_cleanup()["held"] == (updated,)
+    assert name in run.pending_cleanup()["databases"]  # the ownership record stays
+    with pytest.raises(UnsafeTarget) as refused:  # the protection never lapsed
+        run.drop_database(name)
+    assert refused.value.code == "held_database"
+
+
+def test_associating_a_worker_cannot_add_or_replace_a_different_process(run, server):
+    name = run.create_database()
+    held = run.hold_database(name, worker_pid=4321)
+    before = _opened_so_far(server)
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.note_held_worker(name, worker_pid=9876)
+
+    assert refused.value.code == "held_worker"
+    assert _opened_so_far(server) == before
+    assert run.pending_cleanup()["held"] == (held,)  # kept exactly as it was
+    assert run.note_held_worker(name, worker_pid=4321) is held  # idempotent, and still held
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        pytest.param(f"house_helper_test_{TOKEN}_9", id="a-name-this-run-never-created"),
+        pytest.param("persistent", id="an-application-database"),
+    ],
+)
+def test_only_a_hold_of_this_run_can_name_a_worker(name, run, server):
+    server.databases.setdefault(name, None)
+    before = _opened_so_far(server)
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.note_held_worker(name, worker_pid=4321)
+
+    assert refused.value.code == "not_held"
+    assert _opened_so_far(server) == before
+    assert run.pending_cleanup()["held"] == ()
+
+
+def _a_real_process(*, status=0):
+    """A real local process, waited for: the handle the run asks for its exit is the actual
+    object `Popen` returned, so the evidence under test is the operating system's."""
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.exit(int(sys.argv[1]))", str(status)]
+    )
+    process.wait(timeout=30)
+    return process
+
+
+def _an_exited_process(status=0):
+    return _a_real_process(status=status)
+
+
+def _a_running_process():
+    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+
+
+class _ContradictoryProcess:
+    """The handle disagrees with itself: `poll()` reports one status and `returncode`
+    another. Neither may be taken as evidence of an exit."""
+
+    pid = 4321
+
+    def __init__(self, *, polled=0, returncode=1):
+        self._polled = polled
+        self.returncode = returncode
+
+    def poll(self):
+        return self._polled
+
+
+class _UnansweringProcess:
+    """A handle that cannot say whether it exited."""
+
+    pid = 4321
+    returncode = None
+
+    def poll(self):
+        raise RuntimeError("poll failed")
+
+
+def test_a_released_hold_is_gone_from_the_inventory_of_holds_and_the_database_drops(run, server):
+    """The one explicit release, on the handle's own evidence: the hold record goes, every
+    ownership record stays, and the database is dropped only through the ordinary,
+    identity-checked path."""
+    name = run.create_database()
+    held = run.hold_database(name)
+    run.note_spawn_attempt(name)
+    process = _an_exited_process(0)
+    updated = run.note_held_process(name, process=process)
+
+    released = run.release_hold(name, reason=harness.RELEASED_WORKER_EXIT_CONFIRMED)
+
+    assert released == updated and released.worker_pid == process.pid
+    assert run.pending_cleanup()["held"] == ()
+    assert name in run.pending_cleanup()["databases"]  # the record is kept for the drop
+    run.drop_database(name)
+    assert name not in server.databases
+    assert name not in run.pending_cleanup()["databases"]
+    run.close()  # nothing left: the ordinary cleanup runs
+
+
+def test_a_release_without_positive_evidence_is_refused_and_the_hold_stays(run, server):
+    """No exit status, a wrong reason, a database that is not held: each is refused, and the
+    hold -- and the database with it -- is left exactly as it was."""
+    name = run.create_database()
+    held = run.hold_database(name, worker_pid=4321)
+    before = _opened_so_far(server)
+
+    for attempt in (
+        lambda: run.release_hold(name, reason=harness.RELEASED_WORKER_EXIT_CONFIRMED),
+        lambda: run.release_hold(name, reason="it is convenient", worker_exit=0),
+        lambda: run.release_hold(
+            name, reason=harness.RELEASED_SPAWN_NEVER_ATTEMPTED, worker_exit=0
+        ),
+        lambda: run.release_hold(
+            "house_helper_test_" + TOKEN + "_9", reason=harness.RELEASED_SPAWN_NEVER_ATTEMPTED
+        ),
+    ):
+        with pytest.raises(UnsafeTarget) as refused:
+            attempt()
+        assert refused.value.code in {"release_evidence", "release_reason", "not_held"}
+
+    assert _opened_so_far(server) == before
+    assert run.pending_cleanup()["held"] == (held,)
+    with pytest.raises(UnsafeTarget) as closed:
+        run.close()
+    assert closed.value.code == "held_database"
+    assert name in server.databases
+
+
+def test_a_spawn_that_never_happened_releases_the_hold_with_no_exit_status(run, server):
+    name = run.create_database()
+    run.hold_database(name)  # armed before `Popen`; positively no process was created
+
+    released = run.release_hold(name, reason=harness.RELEASED_SPAWN_NEVER_ATTEMPTED)
+
+    assert released.worker_pid is None
+    assert run.pending_cleanup()["held"] == ()
+    run.drop_database(name)
+    assert name not in server.databases
+
+
+# --- R7-01: the release is bound to the process the run itself holds --------------------------------------------
+
+
+def test_an_arbitrary_integer_cannot_release_a_hold(run, server):
+    """Codex R7 P1, first reproduction: the release used to trust `worker_exit`. A number is
+    not a process -- without the handle `Popen` returned there is no evidence of an exit, so
+    no integer releases anything and the database stays protected."""
+    name = run.create_database()
+    held = run.hold_database(name, worker_pid=4321)  # the reproduction's recorded worker
+    before = _opened_so_far(server)
+
+    for status in (0, 1, 137):
+        with pytest.raises(UnsafeTarget) as refused:
+            run.release_hold(
+                name, reason=harness.RELEASED_WORKER_EXIT_CONFIRMED, worker_exit=status
+            )
+        assert refused.value.code == "release_evidence"
+
+    assert _opened_so_far(server) == before
+    assert run.pending_cleanup()["held"] == (held,)
+    with pytest.raises(UnsafeTarget) as dropped:
+        run.drop_database(name)
+    assert dropped.value.code == "held_database"
+
+
+def test_a_recorded_spawn_attempt_makes_never_attempted_refusable(run, server):
+    """Codex R7 P1, second reproduction: `spawn_never_attempted` was accepted although a
+    worker PID was recorded. The attempt is recorded before `Popen`, so it survives the case
+    where `Popen` raised and no handle ever came back."""
+    name = run.create_database()
+    held = run.hold_database(name)
+    attempted = run.note_spawn_attempt(name)
+    assert attempted.spawn_attempted is True
+
+    with pytest.raises(UnsafeTarget) as never:
+        run.release_hold(name, reason=harness.RELEASED_SPAWN_NEVER_ATTEMPTED)
+    assert never.value.code == "release_evidence"
+
+    # A handleless attempt is still not an exit: neither release reason may be claimed.
+    with pytest.raises(UnsafeTarget) as exitless:
+        run.release_hold(name, reason=harness.RELEASED_WORKER_EXIT_CONFIRMED)
+    assert exitless.value.code == "release_evidence"
+
+    assert run.pending_cleanup()["held"] == (attempted,)
+    with pytest.raises(UnsafeTarget) as closed:
+        run.close()
+    assert closed.value.code == "held_database"
+
+
+def test_a_worker_pid_without_a_handle_also_blocks_the_never_attempted_release(run, server):
+    name = run.create_database()
+    held = run.hold_database(name, worker_pid=4321)
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.release_hold(name, reason=harness.RELEASED_SPAWN_NEVER_ATTEMPTED)
+
+    assert refused.value.code == "release_evidence"
+    assert run.pending_cleanup()["held"] == (held,)
+
+
+def test_a_confirmed_exit_through_the_actual_handle_releases_the_hold(run, server):
+    """The positive case, and a nonzero status too: the handle asks the operating system and
+    the status it reports is the evidence."""
+    name = run.create_database()
+    run.hold_database(name)
+    run.note_spawn_attempt(name)
+    process = _an_exited_process(1)
+
+    updated = run.note_held_process(name, process=process)
+    assert updated.worker_pid == process.pid
+
+    released = run.release_hold(name, reason=harness.RELEASED_WORKER_EXIT_CONFIRMED)
+
+    assert released.worker_pid == process.pid
+    assert run.pending_cleanup()["held"] == ()
+
+
+def test_a_supplied_status_is_only_cross_checked_against_the_handle(run, server):
+    name = run.create_database()
+    run.hold_database(name)
+    run.note_spawn_attempt(name)
+    process = _an_exited_process(0)
+    held = run.note_held_process(name, process=process)
+
+    with pytest.raises(UnsafeTarget) as contradicted:
+        run.release_hold(
+            name, reason=harness.RELEASED_WORKER_EXIT_CONFIRMED, worker_exit=1
+        )
+    assert contradicted.value.code == "release_evidence"
+    assert run.pending_cleanup()["held"] == (held,)
+
+    # The matching status is accepted, but the handle remains what proves the exit.
+    run.release_hold(name, reason=harness.RELEASED_WORKER_EXIT_CONFIRMED, worker_exit=0)
+    assert run.pending_cleanup()["held"] == ()
+
+
+def test_a_running_associated_process_cannot_release_the_hold(run, server):
+    name = run.create_database()
+    process = _a_running_process()
+    try:
+        run.hold_database(name)
+        run.note_spawn_attempt(name)
+        held = run.note_held_process(name, process=process)
+
+        with pytest.raises(UnsafeTarget) as refused:
+            run.release_hold(name, reason=harness.RELEASED_WORKER_EXIT_CONFIRMED)
+        assert refused.value.code == "release_evidence"
+        assert run.pending_cleanup()["held"] == (held,)
+    finally:
+        process.kill()
+        process.wait(timeout=30)
+
+    # Now the handle itself reports the termination; a nonzero status is valid evidence.
+    released = run.release_hold(name, reason=harness.RELEASED_WORKER_EXIT_CONFIRMED)
+    assert released.worker_pid == process.pid
+    assert run.pending_cleanup()["held"] == ()
+
+
+def test_contradictory_or_unusable_process_evidence_is_refused(run, server):
+    for process in (_ContradictoryProcess(polled=0, returncode=1), _UnansweringProcess()):
+        name = run.create_database()
+        run.hold_database(name)
+        run.note_spawn_attempt(name)
+        held = run.note_held_process(name, process=process)
+
+        with pytest.raises(UnsafeTarget) as refused:
+            run.release_hold(name, reason=harness.RELEASED_WORKER_EXIT_CONFIRMED)
+        assert refused.value.code == "release_evidence"
+        assert held in run.pending_cleanup()["held"]
+
+
+def test_a_pid_that_does_not_match_the_associated_process_is_refused(run, server):
+    """A pid recorded by another path may not override the handle: the two pieces of
+    evidence must agree, or neither is trusted."""
+    name = run.create_database()
+    run.hold_database(name)
+    run.note_spawn_attempt(name)
+    process = _an_exited_process(0)
+    held = run.note_held_process(name, process=process)
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.note_held_worker(name, worker_pid=process.pid + 1)
+
+    assert refused.value.code == "held_worker"
+    assert run.pending_cleanup()["held"] == (held,)
+    # The matching pid is idempotent, and the handle still proves the release.
+    assert run.note_held_worker(name, worker_pid=process.pid) == held
+    run.release_hold(name, reason=harness.RELEASED_WORKER_EXIT_CONFIRMED)
+    assert run.pending_cleanup()["held"] == ()
+
+
+def test_a_process_cannot_be_associated_without_a_recorded_spawn_attempt(run, server):
+    name = run.create_database()
+    held = run.hold_database(name)
+    process = _an_exited_process(0)
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.note_held_process(name, process=process)
+
+    assert refused.value.code == "held_spawn"
+    assert run.pending_cleanup()["held"] == (held,)
+
+
+def test_a_second_or_mismatched_process_cannot_replace_the_held_worker(run, server):
+    name = run.create_database()
+    run.hold_database(name, worker_pid=9876)
+    attempted = run.note_spawn_attempt(name)
+    process = _an_exited_process(0)
+
+    with pytest.raises(UnsafeTarget) as mismatched:
+        run.note_held_process(name, process=process)  # its pid is not 9876
+    assert mismatched.value.code == "held_worker"
+
+    other = run.create_database()
+    run.hold_database(other)
+    run.note_spawn_attempt(other)
+    first = run.note_held_process(other, process=_an_exited_process(0))
+    with pytest.raises(UnsafeTarget) as replaced:
+        run.note_held_process(other, process=_an_exited_process(0))
+    assert replaced.value.code == "held_worker"
+    assert run.pending_cleanup()["held"] == (attempted, first)
+
+
+def test_a_process_without_an_exit_answer_cannot_be_associated(run, server):
+    name = run.create_database()
+    run.hold_database(name)
+    attempted = run.note_spawn_attempt(name)
+
+    class _NoPoll:
+        pid = 4321
+
+    with pytest.raises(UnsafeTarget) as refused:
+        run.note_held_process(name, process=_NoPoll())
+
+    assert refused.value.code == "held_worker"
+    assert run.pending_cleanup()["held"] == (attempted,)
+
+
+def test_nothing_in_teardown_releases_a_hold(run, server):
+    """`close()`, the failed-setup cleanup and a direct drop are all refused, and no one of
+    them clears the record: only `release_hold()` does, and nothing calls it for them."""
+    name = run.create_database()
+    held = run.hold_database(name)
+
+    for cleanup in (run.close, run._cleanup_after_failed_setup):
+        with pytest.raises(UnsafeTarget) as refused:
+            cleanup()
+        assert refused.value.code == "held_database"
+        assert run.pending_cleanup()["held"] == (held,)
+
+    with pytest.raises(UnsafeTarget) as dropped:
+        run.drop_database(name)
+    assert dropped.value.code == "held_database"
+    assert run.pending_cleanup()["held"] == (held,)
+    assert name in server.databases
 
 
 # --- R5-04: volume provenance and runner evidence at the harness level -------------------------
@@ -1900,7 +2451,7 @@ def test_a_scratch_looking_foreign_database_blocks_role_preparation(target, serv
     """R5-04 item 8: the inventory check reads the actual owner and marker, not the shape
     of the name."""
     server.databases[f"house_helper_test_{'f' * 32}_1"] = None  # scratch-looking, no marker
-    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker)
+    run = Run(target, connect=server.connect, token=TOKEN, cluster=cluster_identity(), docker=server.docker, environ={})
 
     with pytest.raises(UnsafeTarget) as refused:
         run.prepare_roles()

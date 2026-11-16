@@ -220,7 +220,9 @@ async def test_a_lost_acknowledgement_leaves_the_update_pending_and_the_restart_
     bot.release_acknowledgements()
     before = len(bot.texts(MOTHER))
     after = ScriptedBackend("Этот ответ запрашивать не следовало")
-    async with telegram_app(tmp_path, after, bot=bot, sign_in_first=False, seed=False) as second:
+    async with telegram_app(
+        tmp_path, after, bot=bot, sign_in_first=False, seed=False, database=first.database
+    ) as second:
         second.chat.clock.advance(minutes=10)
         await until(lambda: len(bot.texts(MOTHER)) > before)
         await second.settle()

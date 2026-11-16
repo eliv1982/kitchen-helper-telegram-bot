@@ -34,6 +34,7 @@ from tests.persistence_support import (  # noqa: F401  (fixtures)
     new_turn_request,
     new_user,
     raw_insert,
+    refused_width,
     rejected,
     session,
     stored,
@@ -117,9 +118,21 @@ def test_a_token_hash_identifies_exactly_one_session(session):
 @pytest.mark.parametrize("token_hash", ["short", "a" * 63, "a" * 65, ""])
 def test_a_stored_token_hash_is_a_sha256_hex_digest_length(session, token_hash):
     user = new_user(session)
+    if len(token_hash) <= 64:
+        # Within the type width: the column's own CHECK is the rule that refuses it.
+        with rejected(session, "ck_sessions_token_hash_length"):
+            new_login_session(session, user, token_hash=token_hash)
+        return
 
-    with rejected(session, "ck_sessions_token_hash_length"):
-        new_login_session(session, user, token_hash=token_hash)
+    login = new_login_session(session, user)
+    refused_width(
+        session,
+        "sessions",
+        "token_hash",
+        token_hash,
+        key={"id": login.id},
+        check="ck_sessions_token_hash_length",
+    )
 
 
 def test_a_session_cannot_expire_before_it_was_created(session):
@@ -299,8 +312,21 @@ def test_an_oidc_state_is_single_use_and_short_lived(session):
 
 @pytest.mark.parametrize("state_hash", ["short", "a" * 65])
 def test_a_stored_oidc_state_is_a_sha256_hex_digest_length(session, state_hash):
-    with rejected(session, "ck_oidc_states_state_hash_length"):
-        new_oidc_state(session, state_hash=state_hash)
+    if len(state_hash) <= 64:
+        # Within the type width: the column's own CHECK is the rule that refuses it.
+        with rejected(session, "ck_oidc_states_state_hash_length"):
+            new_oidc_state(session, state_hash=state_hash)
+        return
+
+    state = new_oidc_state(session)
+    refused_width(
+        session,
+        "oidc_states",
+        "state_hash",
+        state_hash,
+        key={"id": state.id},
+        check="ck_oidc_states_state_hash_length",
+    )
 
 
 def test_an_oidc_state_cannot_expire_before_it_was_created(session):

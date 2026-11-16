@@ -173,7 +173,9 @@ async def test_the_command_works_after_a_restart(tmp_path):
         await first.pair(MOTHER)
         seed_favorites(first, 1, title="Из прошлого запуска")
 
-    async with telegram_app(tmp_path, ScriptedBackend(), sign_in_first=False, seed=False) as second:
+    async with telegram_app(
+        tmp_path, ScriptedBackend(), sign_in_first=False, seed=False, database=first.database
+    ) as second:
         await second.deliver(MOTHER, "/favorites")
 
     assert item_buttons(second.bot.sent[-1])[0]["text"] == "Из прошлого запуска"

@@ -22,7 +22,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Mapping, Optional
 
 import pytest
 import sqlalchemy as sa
@@ -122,11 +122,30 @@ def assert_expected_rejection(dialect: str, constraint: str, failure: Failure) -
 
     SQLite names its rule in the message. PostgreSQL's message may also quote row data,
     so on PostgreSQL the structured SQLSTATE and `diag.constraint_name`/`diag.column_name`
-    decide; the message is never searched for the expected name first."""
+    decide; the message is never searched for the expected name first.
+
+    `constraint` is normally one name. It may be a narrowly bounded tuple of exact
+    `ck_...` names for the one documented case where two CHECK constraints necessarily
+    fail together for a single incoherent field (R3); the structured diagnostic must then
+    name one of exactly those, never a third rule.
+
+    A PostgreSQL 22001 (a type-width refusal) is never accepted here: a test that
+    exercises a declared width asks `refused_width`, which makes the attribution itself
+    (R4)."""
+    permitted = (constraint,) if isinstance(constraint, str) else tuple(constraint)
     if dialect != "postgresql":
-        if re.search(constraint, failure.message):
-            return
+        for name in permitted:
+            if re.search(name, failure.message):
+                return
         raise AssertionError(f"the database did not name the expected rule: {failure.message}")
+    if not isinstance(constraint, str):
+        # R3: the row is incoherent in one way that two CHECKs both describe. Exactly the
+        # identified names are permitted; a generic or third constraint is not.
+        assert permitted and all(
+            isinstance(name, str) and name.startswith("ck_") for name in permitted
+        ), "a tuple expectation must list exact ck_... constraint names"
+        assert failure.state == "23514" and failure.constraint_name in permitted, failure.message
+        return
     if (
         failure.state is None
         and "printable_ascii" in constraint
@@ -165,104 +184,173 @@ def assert_expected_rejection(dialect: str, constraint: str, failure: Failure) -
         assert not missing, f"{failure.message} (DETAIL: {failure.detail})"
 
 
-_INSERT = re.compile(
-    r"^\s*INSERT\s+INTO\s+(?:[A-Za-z_][A-Za-z0-9_]*\.)?\"?([A-Za-z_][A-Za-z0-9_]*)\"?\s*"
-    r"\(([^)]*)\)\s*VALUES\s*\((.*)\)\s*(?:RETURNING\s+.*)?$",
-    re.IGNORECASE | re.DOTALL,
-)
-_NAMED_PARAM = re.compile(r"%\(([^)]+)\)s")
+# --- declared widths (R4) -----------------------------------------------------------------
+#
+# A PostgreSQL 22001 says only "value too long for type character varying(n)". Deciding
+# WHICH column caused it by reading the SQL that failed is guesswork dressed as parsing: a
+# literal before a positional parameter shifts the values, a cast changes the effective
+# type, a JSONB or numeric conversion changes the stored representation, and VARCHAR
+# accepts trailing spaces beyond n. Every attempt to make the reader cover one more real
+# statement widened the ground for a false attribution.
+#
+# So the helper does not parse the failing statement at all. It writes the row itself: an
+# UPDATE of one existing, otherwise valid row, keyed by its primary key, that assigns
+# exactly one bounded text column (plus, where the model declares one, an automatic
+# non-text onupdate column). The statement has no literal, no width-limiting cast or
+# expression around that value and no second text value, so a 22001 has exactly one possible
+# owner; and the driver's 22001 is accepted only when it reports the exact statement this
+# helper compiled, with the target's declared width in the message. The value is checked in
+# Python first (text, and provably over the width once PostgreSQL's trailing-space
+# truncation is taken into account). Anything the helper cannot account for is refused, not
+# guessed.
 
 
-def _split_top_level(text: str) -> list[str]:
-    """Split a VALUES/SET list on commas that are not inside single quotes."""
-    parts, current, quoted = [], [], False
-    for character in text:
-        if character == "'":
-            quoted = not quoted
-        if character == "," and not quoted:
-            parts.append("".join(current).strip())
-            current = []
-        else:
-            current.append(character)
-    parts.append("".join(current).strip())
-    return parts
+def declared_width(table: str, column: str) -> int:
+    """The declared width of a bounded text column, from the model (never from SQL)."""
+    column_type = Base.metadata.tables[table].c[column].type
+    limit = getattr(column_type, "length", None)
+    assert isinstance(column_type, sa.String) and limit is not None, (
+        f"{table}.{column} is not a bounded text column ({column_type!r}); a 22001 cannot "
+        "be its type refusal"
+    )
+    return limit
 
 
-def overlong_columns(statement: Optional[str], params: object, table: str) -> Optional[set[str]]:
-    """The columns of `table` whose BOUND value exceeds the column's declared width.
+def text_over_width(value: object, limit: int) -> bool:
+    """Whether PostgreSQL's `varchar(limit)` refuses `value` at that width.
 
-    R3-04: the isolated-input proof for a 22001. `None` means the statement could not be
-    read, which is a refusal (the helper must not accept a width error it cannot attribute
-    to the expected column). A different column of the same declared width is named, so a
-    same-width sibling can never satisfy the assertion."""
-    if not statement or table not in Base.metadata.tables:
-        return None
-    match = _INSERT.match(statement)
-    if match is None or match.group(1).lower() != table:
-        return None
-    columns = [part.strip().strip('"').split(".")[-1].strip('"') for part in match.group(2).split(",")]
-    values = _split_top_level(match.group(3))
-    if len(columns) != len(values):
-        return None
-    names = _NAMED_PARAM.search(match.group(3)) is not None
-    if names:
-        # One dict per row; SQLAlchemy may also hand a tuple of dicts for executemany.
-        entries: list[object] = list(params) if isinstance(params, list) else [params]
-    elif isinstance(params, list):
-        entries = list(params)
-    else:
-        entries = [params]
-    offending: set[str] = set()
-    for entry in entries:
-        for index, placeholder in enumerate(values):
-            column = columns[index]
-            declared = Base.metadata.tables[table].c.get(column)
-            limit = None if declared is None else getattr(declared.type, "length", None)
-            if limit is None:
-                continue
-            if names:
-                if not isinstance(entry, dict):
-                    continue
-                name = _NAMED_PARAM.search(placeholder)
-                if name is None:
-                    continue
-                value = entry.get(name.group(1))
-            else:
-                if not isinstance(entry, (tuple, list)):
-                    continue
-                value = entry[index] if index < len(entry) else None
-            if isinstance(value, str) and len(value) > limit:
-                offending.add(column)
-    return offending
+    PostgreSQL raises 22001 only when what remains after the trailing spaces is too long:
+    "If the excess characters are all spaces ... the string will be truncated to the
+    maximum length". A value that is not text is never over a width in a way this check can
+    predict, because the server would first convert it (a number, a JSON document)."""
+    return isinstance(value, str) and len(value.rstrip(" ")) > limit
 
 
-def assert_expected_width_rejection(table: str, column: str, failure: Failure) -> None:
-    """The one decision `rejected_width` makes for PostgreSQL, pure and testable."""
-    limit = getattr(Base.metadata.tables[table].c[column].type, "length", None)
-    constraint = f"ck_{table}_{column}_max_length"
-    if limit is None:
-        # A TEXT column: there is no type width to fire first, so the named CHECK is the
-        # rule on PostgreSQL too (and it must be that CHECK, not another one).
-        assert failure.state == "23514" and failure.constraint_name == constraint, failure.message
-        return
+def require_over_width(table: str, column: str, value: object, limit: int) -> None:
+    """`value` must be text that PostgreSQL's own rule makes over `limit`, or refuse."""
+    assert isinstance(value, str), (
+        f"a width probe for {table}.{column} must bind text; {type(value).__name__} would "
+        "be converted by the server and the stored width could not be predicted"
+    )
+    assert text_over_width(value, limit), (
+        f"{value!r} is not provably over {table}.{column}'s declared width of {limit}: "
+        "PostgreSQL truncates trailing spaces, so only the text before them counts"
+    )
+
+
+def _bound_key(column, value):
+    """A primary-key value as its column's type takes it (a UUID seeded as hex text is
+    still a UUID: SQLAlchemy's Uuid bind expects one, not a string)."""
+    if isinstance(column.type, sa.Uuid) and isinstance(value, str):
+        return uuid.UUID(value)
+    return value
+
+
+def width_probe(table: str, column: str, value: str, key: Mapping[str, object]) -> sa.Update:
+    """The one statement a 22001 may be attributed to: it writes exactly `table.column`.
+
+    `key` must be the row's primary key (and only it), and no key column may be bounded
+    text. Any automatic onupdate column may also be written, but only if it has no declared
+    width. Then the statement contains exactly one bounded text value - the caller's - with
+    no literal, no width-limiting cast and no expression around it to move the value onto
+    another column or change its effective type."""
+    model = Base.metadata.tables[table]
+    primary_key = set(model.primary_key.columns.keys())
+    assert set(key) == primary_key, (
+        f"a width probe must identify the row by its primary key {sorted(primary_key)}, "
+        f"not {sorted(key)}"
+    )
+    assert all(getattr(model.c[name].type, "length", None) is None for name in key), (
+        "a width probe's key must not include a bounded text value"
+    )
+    written = {column} | {name for name, item in model.c.items() if item.onupdate is not None}
+    assert all(
+        name == column or getattr(model.c[name].type, "length", None) is None
+        for name in written
+    ), (
+        f"the probe for {table}.{column} would also write another bounded text column: "
+        f"{sorted(written)}"
+    )
+    return (
+        sa.update(model)
+        .where(
+            *(
+                model.c[name] == _bound_key(model.c[name], expected)
+                for name, expected in key.items()
+            )
+        )
+        .values({column: value})
+        .execution_options(synchronize_session=False)
+    )
+
+
+def assert_width_refusal(table: str, column: str, failure: Failure, *, statement: str) -> None:
+    """Accept a PostgreSQL 22001 only for the probe's own statement and declared width."""
+    limit = declared_width(table, column)
     assert failure.state == "22001", failure.message
+    assert failure.statement == statement, (
+        "the width refusal was not raised by the single-column probe: expected "
+        f"{statement!r}, got {failure.statement!r}"
+    )
     assert f"character varying({limit})" in failure.message, failure.message
-    # R3-04: the width alone does not name the column; another column of the same width
-    # could have overflowed. The bound statement must show THIS column as the only one
-    # over its declared width.
-    offending = overlong_columns(failure.statement, failure.params, table)
-    assert offending is not None, (
-        "the width refusal could not be attributed to a column: the statement that "
-        f"failed was not readable ({failure.statement!r})"
+
+
+def refused_width(
+    session: OrmSession,
+    table: str,
+    column: str,
+    value: object,
+    *,
+    key: Mapping[str, object],
+    check: Optional[str] = None,
+) -> None:
+    """`table.column` refuses `value`: at its declared width on PostgreSQL, by its CHECK on
+    SQLite (which does not enforce VARCHAR(n)).
+
+    The caller has written an otherwise valid row and identifies it by primary key. This
+    helper writes only the one column, so no other value can be the false cause of a 22001;
+    `key` and `value` are both checked before the statement is issued, and the PostgreSQL
+    acceptance also requires the exact compiled statement (see `width_probe`).
+    """
+    check = check or f"ck_{table}_{column}_max_length"
+    column_type = Base.metadata.tables[table].c[column].type
+    limit = getattr(column_type, "length", None)
+    assert isinstance(column_type, sa.String), (
+        f"{table}.{column} is not a text column ({column_type!r}); a width probe binds text"
     )
-    assert offending == {column}, (
-        f"the width refusal names {sorted(offending)} and not only {column!r}"
+    assert isinstance(value, str), (
+        f"a width probe for {table}.{column} must bind text; {type(value).__name__} would "
+        "be converted by the server and the stored value could not be predicted"
     )
+    if limit is not None:
+        require_over_width(table, column, value, limit)
+    statement = width_probe(table, column, value, key)
+    compiled = str(statement.compile(dialect=session.get_bind().dialect))
+    with pytest.raises((sa.exc.IntegrityError, sa.exc.DataError)) as caught:
+        with session.begin_nested():
+            session.execute(statement)
+
+    failure = describe(caught.value)
+    if session.get_bind().dialect.name == "sqlite":
+        assert re.search(check, failure.message), failure.message
+        return
+    if limit is None:
+        # A TEXT column has no type width to fire first, so the named CHECK is the rule on
+        # PostgreSQL too (and it must be that CHECK, not another one).
+        assert failure.state == "23514" and failure.constraint_name == check, failure.message
+        return
+    assert_width_refusal(table, column, failure, statement=compiled)
 
 
 @contextmanager
-def rejected(session: OrmSession, constraint: str):
+def rejected(session: OrmSession, constraint):
     """The block (plus the flush that follows it) must violate `constraint`.
+
+    `constraint` is one rule (a named `ck_...`, a column list, or one of the generic
+    phrases) or, for the one documented case where two CHECKs necessarily fire together,
+    a tuple of the exact `ck_...` names that are permitted. A PostgreSQL type-width
+    refusal (22001) is NOT accepted here; a test that means a declared width uses
+    `refused_width`, which writes the row itself and so can attribute the refusal (R4).
 
     SQLite names a CHECK constraint, and for a UNIQUE one lists its columns. PostgreSQL
     phrases the same facts differently, so its structured diagnostics decide: the SQLSTATE
@@ -281,30 +369,6 @@ def rejected(session: OrmSession, constraint: str):
     assert_expected_rejection(
         session.get_bind().dialect.name, constraint, describe(caught.value)
     )
-
-
-@contextmanager
-def rejected_width(session: OrmSession, table: str, column: str):
-    """The block must be refused because `table.column`'s declared width is exceeded.
-
-    SQLite does not enforce `VARCHAR(n)`, so its `ck_<table>_<column>_max_length` CHECK
-    fires. PostgreSQL refuses the value at the type's width before the CHECK can run
-    (SQLSTATE 22001, "value too long for type character varying(n)"). That is accepted
-    ONLY here, with the exact column's declared limit read from the model, and - R3-04 -
-    only when the failing statement shows this column (and no other column of the same
-    declared width) as the one whose bound value is over its limit.
-    """
-    constraint = f"ck_{table}_{column}_max_length"
-    with pytest.raises((sa.exc.IntegrityError, sa.exc.DataError)) as caught:
-        with session.begin_nested():
-            yield
-            session.flush()
-
-    failure = describe(caught.value)
-    if session.get_bind().dialect.name == "sqlite":
-        assert re.search(constraint, failure.message), failure.message
-        return
-    assert_expected_width_rejection(table, column, failure)
 
 
 def new_user(session: OrmSession, **fields) -> User:

@@ -340,6 +340,12 @@ class TelegramHarness:
     def user_id(self) -> UUID:
         return self.chat.user_id
 
+    @property
+    def database(self):
+        """The fixture database this context opened; pass it to a later `telegram_app` to
+        model a restart against the SAME data (nothing is reseeded)."""
+        return self.chat.base.database
+
     def next_id(self) -> int:
         self.counter += 1
         return self.counter
@@ -420,10 +426,14 @@ async def telegram_app(
     *,
     bot: Optional[FakeBot] = None,
     sign_in_first: bool = True,
+    database: Optional[Any] = None,
     **options: Any,
 ):
     """The application with Telegram login, the chat and the bot, started; the provisioned
-    user signed in on the website unless sign_in_first=False."""
+    user signed in on the website unless sign_in_first=False.
+
+    `database` reopens a previous context's database (`harness.database`) for a simulated
+    restart; the application then sees exactly the data the earlier process left."""
     bot = bot or FakeBot()
     backend = backend if backend is not None else ScriptedBackend()
     async with auth_app(
@@ -431,6 +441,7 @@ async def telegram_app(
         chat_backend=backend,
         bot_settings=bot_settings(),
         bot_transport=bot.transport(),
+        database=database,
         **options,
     ) as base:
         if sign_in_first:

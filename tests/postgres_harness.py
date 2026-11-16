@@ -87,6 +87,31 @@ is never tracked as an owned database: only a confirmed success is (R5-05), a du
 failure is never adopted, and an unresolved attempt is preserved and reported. (4) The
 database inventory requires the actual marker and owner, not a scratch-looking name.
 
+R7 - a HELD scratch database, and the one reason for it. A test can retain a database it
+created (`hold_database`) when the process that used it could not be confirmed exited: that
+process may still write its files or hold its connection, so nothing it used may be cleaned
+up. A held database stays in the ordinary tracked inventory - its ownership record is not
+removed - but `drop_database()` refuses it before any Docker inspection or connection, and
+`close()` refuses ALL cleanup rather than partly destroying the run and leaving a
+half-cleaned ownership state. Roles, grants and the other databases of the run are kept for
+recovery; `pending_cleanup()` reports them with the database, the reason and the worker's
+PID when it is known.
+
+A hold is never released automatically: nothing in teardown, `drop_database()`,
+`close()` or a failed setup calls `release_hold()`. That one explicit operation is the only
+way a hold ends, it applies only to a hold this run recorded, and the evidence is bound to
+this run's own lifecycle state, not to a caller's assertion. A hold records, BEFORE `Popen`
+is called, that a spawn attempt is being made (`note_spawn_attempt`); the attempt is what
+makes `spawn_never_attempted` refusable later even when `Popen` raised without returning a
+handle. When `Popen` returns, the actual process handle is associated before any fallible
+post-spawn step (`note_held_process`), and a confirmed-exit release asks that handle itself
+(`poll()`, cross-checked against its `returncode`) rather than trusting a supplied number.
+A nonzero status is a valid exit; a missing handle, a failed `poll()`, a running process or
+contradictory evidence is not evidence of anything and releases nothing. An absent handle,
+a failed wrapper or a generic exception is not evidence either. A worker PID that becomes
+known after the hold was recorded is associated with `note_held_worker()`, which updates the
+record in place: the protection is never removed, not even for an instant.
+
 Messages are fixed text (`UnsafeTarget`): never the URL, never a password, never a value
 that came from the URL or the server.
 
@@ -109,7 +134,7 @@ import secrets
 import uuid
 import weakref
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterable, Iterator, Mapping, Optional
 
 import pytest
@@ -151,6 +176,20 @@ ROUTING_ENV = frozenset(
 
 MARKER_PREFIX = "house_helper-test-run:"
 ISOLATION_LEVELS = ("read committed", "repeatable read", "serializable")
+# HH-DB-01 R7: the ONE reason a scratch database may be retained instead of dropped. The
+# process that used it could not be confirmed exited, so it may still be writing its files or
+# holding its connection; nothing it used may be cleaned up. There is no other reason and no
+# automatic release: a database left this way is a resource for the operator to recover.
+HELD_UNCONFIRMED_WORKER_EXIT = "unconfirmed_worker_exit"
+HELD_REASONS = frozenset({HELD_UNCONFIRMED_WORKER_EXIT})
+# HH-DB-01 R7/R7-01: the only conditions under which a hold may be released. Each is a
+# POSITIVE establishment by this run's own lifecycle state, never a caller-supplied number:
+# the associated process handle itself reports its exit (and the status is cross-checked
+# against `returncode`), or this run recorded no spawn attempt at all. Nothing in teardown
+# releases a hold.
+RELEASED_WORKER_EXIT_CONFIRMED = "worker_exit_confirmed"
+RELEASED_SPAWN_NEVER_ATTEMPTED = "spawn_never_attempted"
+RELEASE_REASONS = frozenset({RELEASED_WORKER_EXIT_CONFIRMED, RELEASED_SPAWN_NEVER_ATTEMPTED})
 
 _MAINTENANCE_DATABASE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,62}")
 _TOKEN = re.compile(r"[0-9a-f]{32}")
@@ -678,6 +717,44 @@ def _psycopg_connect(params: Mapping[str, Any]) -> Any:
     return psycopg.connect(autocommit=True, **params)
 
 
+@dataclass(frozen=True)
+class HeldDatabase:
+    """HH-DB-01 R7: a scratch database retained because the process that used it could not
+    be confirmed exited.
+
+    The record is what a recovery needs and nothing more: WHICH database, WHY it was kept,
+    the worker's process id when the lifecycle still knew it, whether a spawn attempt was
+    recorded before `Popen`, the identity of the run that owns it, and the resources
+    (`retained`) that `close()` would otherwise have destroyed. It carries no connection, no
+    credential, no live process object and no instruction: a future cleanup must go through
+    the same ownership-, token- and identity-verified path as every other drop."""
+
+    name: str
+    reason: str
+    worker_pid: Optional[int]
+    test_run: str  # the run token: the inventory record that still owns the database
+    retained: Mapping[str, Any]  # what this run still tracks (databases, roles, grants)
+    # R7-01: recorded in the run state BEFORE `Popen` is called. It is part of the reported
+    # record because it is what makes `spawn_never_attempted` refusable even on a path where
+    # no process handle ever came back.
+    spawn_attempted: bool = False
+
+
+@dataclass
+class _HeldWorker:
+    """R7-01: the transient, in-memory half of a hold.
+
+    It lives only inside the `Run` that created the hold and is never part of
+    `HeldDatabase`: the actual process object is what proves termination, and a live
+    process is neither serializable nor meaningful outside the process that owns it.
+    `spawn_attempted` is set before `Popen`; `process` is the handle `Popen` returned,
+    associated before any fallible post-spawn step. An absent handle is not evidence that
+    no process exists."""
+
+    spawn_attempted: bool = False
+    process: Optional[Any] = None
+
+
 class Run:
     """One invocation of the PostgreSQL tests. Everything it creates carries its token;
     it creates through a connection verified to be on the validated server, and drops only
@@ -720,6 +797,14 @@ class Run:
         # R5-05: an attempted CREATE whose outcome could not be confirmed. These are
         # PRESERVED and reported, never adopted and never dropped without proof.
         self._ambiguous: dict[str, str] = {}  # name -> the owner it was attempted for
+        # R7: databases of this run that are HELD - the process that used them could not be
+        # confirmed exited. They stay in `_databases` (the ownership record is not removed);
+        # this only says that no cleanup may destroy them or anything around them.
+        self._held: dict[str, HeldDatabase] = {}
+        # R7-01: the evidence behind each hold, kept OUT of the reported record: whether a
+        # spawn was attempted and the actual process handle `Popen` returned. A handle is a
+        # live object, so it is transient state of this run and is never serialized.
+        self._held_workers: dict[str, _HeldWorker] = {}
         self._counter = 0
         self._roles: Optional[dict[str, RoleIdentity]] = None
         self._role_order: list[str] = []
@@ -802,14 +887,330 @@ class Run:
         self._docker = docker
 
     def pending_cleanup(self) -> dict[str, Any]:
-        """R3-02: what this run still has to clean (unsuccessful records are retained)."""
+        """R3-02: what this run still has to clean (unsuccessful records are retained).
+
+        R7: `held` names the databases that must NOT be cleaned - each with the reason the
+        hold exists, the worker's PID when it is known, the owning run and the resources
+        kept around it. Nothing here releases a hold; it is a record for the operator."""
         return {
             "databases": tuple(self._databases),
             "ambiguous": tuple(self._ambiguous),
             "roles": tuple(self._role_name(key) for key in self._role_order),
             "maintenance_grants": tuple(self._maintenance_grants),
             "failures": tuple(self.cleanup_failures),
+            "held": tuple(self._held.values()),
         }
+
+    def _retained_resources(self) -> Mapping[str, Any]:
+        """What this run still tracks, recorded when a database is held so that a recovery
+        does not depend on the run object outliving the failure."""
+        return {
+            "databases": tuple(self._databases),
+            "roles": tuple(self._role_name(key) for key in self._role_order),
+            "maintenance_grants": tuple(self._maintenance_grants),
+        }
+
+    def _require_held(self, name: str, what: str) -> HeldDatabase:
+        """The hold record this run created, or a refusal that changes nothing.
+
+        Only a database this run still tracks can be held or operated on, and the record's
+        token must still be this run's. Nothing is opened and nothing is altered on the
+        refusal path, so an unknown name can never be used to reach the evidence state."""
+        held = self._held.get(name)
+        if held is None:
+            raise UnsafeTarget(
+                "not_held", f"that database is not held by this run; {what}."
+            )
+        if held.test_run != self.token or name not in self._databases:
+            raise UnsafeTarget(
+                "not_held",
+                f"the hold record does not belong to this run's inventory; {what}.",
+            )
+        return held
+
+    def hold_database(
+        self,
+        name: str,
+        *,
+        reason: str = HELD_UNCONFIRMED_WORKER_EXIT,
+        worker_pid: Optional[int] = None,
+    ) -> HeldDatabase:
+        """R7: retain one of this run's scratch databases instead of ever dropping it.
+
+        The database must already be tracked (a name this run created); holding anything
+        else is refused, so this can never be used to protect a foreign database from the
+        checks that govern it. The call is idempotent and deterministic and performs NO SQL
+        and NO Docker inspection: it must work on the path where a process may still be
+        alive, exactly when those operations are unsafe or unavailable.
+
+        The ownership record is KEPT - the database stays in the inventory - and there is no
+        automatic release: only an explicit `release_hold()` with positive evidence ends a
+        hold. `drop_database()` and `close()` refuse while the hold exists."""
+        if reason not in HELD_REASONS:
+            raise UnsafeTarget(
+                "held_reason",
+                "the only retained state this harness records is an unconfirmed worker exit.",
+            )
+        # Refuses a name this run did not create (and one outside the generated form); no
+        # connection, no Docker call, nothing destroyed. An unknown name is never "held".
+        self._state(name, "created", "marked")
+        existing = self._held.get(name)
+        if existing is not None:  # idempotent: the first record stands, nothing is cleared
+            return existing
+        held = HeldDatabase(
+            name=name,
+            reason=reason,
+            worker_pid=worker_pid,
+            test_run=self.token,
+            retained=self._retained_resources(),
+        )
+        self._held[name] = held
+        return held
+
+    def note_spawn_attempt(self, name: str) -> HeldDatabase:
+        """R7-01: record, BEFORE `Popen` is called, that this run is about to attempt a spawn.
+
+        This is the evidence the release decision rests on: a `Popen` call can raise AFTER
+        the operating system has created the process, and then no handle ever comes back -
+        so "no handle" proves nothing. A recorded attempt is what makes
+        `RELEASED_SPAWN_NEVER_ATTEMPTED` refusable on that path, even though the record names
+        no worker.
+
+        The call opens nothing - no SQL, no Docker inspection, no connection - so it can be
+        made exactly where the attempt is about to happen. The record is updated in place and
+        the call is idempotent. A caller that receives an exception must not enter `Popen`:
+        the evidence is what authorizes the spawn path, not the other way round."""
+        held = self._require_held(name, "no spawn attempt is recorded")
+        worker = self._held_workers.setdefault(name, _HeldWorker())
+        if held.spawn_attempted:
+            worker.spawn_attempted = True
+            return held
+        updated = replace(held, spawn_attempted=True)
+        worker.spawn_attempted = True
+        self._held[name] = updated  # in place: no instant without the hold
+        return updated
+
+    def note_held_process(self, name: str, *, process: Any) -> HeldDatabase:
+        """R7-01: associate the ACTUAL process `Popen` returned with a hold that already
+        recorded its spawn attempt.
+
+        The handle is the only thing that can prove the worker's exit later (`poll()` or a
+        completed `wait()`): a caller-supplied integer is not. It is therefore associated as
+        soon as `Popen` returns, before any fallible post-spawn step (closing the log,
+        building a wrapper, a transfer) can lose ownership. The handle is kept only in this
+        run's transient state; the reported record stays plain data (database, reason, pid,
+        token, retained resources).
+
+        Only a hold this run recorded can be associated, and only after its spawn attempt
+        was recorded. A process without a usable integer pid or without the `poll()` evidence
+        this run relies on is refused, and a different process - or a pid that contradicts
+        the one already recorded - is refused too. Every refusal leaves the hold exactly as
+        it was."""
+        held = self._require_held(name, "no process is associated with it")
+        worker = self._held_workers.get(name)
+        if worker is None or not worker.spawn_attempted:
+            raise UnsafeTarget(
+                "held_spawn",
+                "no spawn attempt was recorded for that hold; a process cannot be associated "
+                "with a spawn this run never recorded.",
+            )
+        pid = getattr(process, "pid", None)
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            raise UnsafeTarget(
+                "held_worker", "the associated process must name a positive integer pid."
+            )
+        if not callable(getattr(process, "poll", None)):
+            raise UnsafeTarget(
+                "held_worker",
+                "the associated process must answer whether it has exited; its exit could "
+                "not otherwise be established.",
+            )
+        if worker.process is not None and worker.process is not process:
+            raise UnsafeTarget(
+                "held_worker",
+                "the hold already names a different process object; the record is kept as it is.",
+            )
+        if held.worker_pid is not None and held.worker_pid != pid:
+            raise UnsafeTarget(
+                "held_worker",
+                "the hold already names a different worker process; the record is kept as it is.",
+            )
+        if worker.process is process and held.worker_pid == pid:
+            return held  # idempotent: nothing to change, nothing removed
+        updated = replace(held, worker_pid=pid)
+        worker.process = process
+        self._held[name] = updated  # in place: no instant without the hold
+        return updated
+
+    def note_held_worker(self, name: str, *, worker_pid: int) -> HeldDatabase:
+        """R7: associate the worker's process id with a hold that ALREADY exists.
+
+        This is the pre-armed lifecycle's second half: the hold is registered before the
+        worker is started (so a spawn that cannot be confirmed never leaves the database
+        unprotected), and the process id only becomes known afterwards. The record is
+        replaced in place - there is no moment at which the database is not held - and
+        nothing is opened: no SQL, no Docker inspection, no connection.
+
+        Only a hold this run recorded can be associated. A different pid on a record that
+        already names one is refused (the protection stays exactly as it was): a record
+        that names the wrong process is worse evidence for a recovery than one that names
+        none."""
+        held = self._held.get(name)
+        if held is None:
+            raise UnsafeTarget(
+                "not_held",
+                "that database is not held by this run; no worker is associated with it.",
+            )
+        if held.test_run != self.token or name not in self._databases:
+            raise UnsafeTarget(
+                "not_held",
+                "the hold record does not belong to this run's inventory; it is not altered.",
+            )
+        if isinstance(worker_pid, bool) or not isinstance(worker_pid, int):
+            raise UnsafeTarget(
+                "held_worker", "a worker process id must be an integer."
+            )
+        if held.worker_pid is not None and held.worker_pid != worker_pid:
+            raise UnsafeTarget(
+                "held_worker",
+                "the hold already names a different worker process; the record is kept as it is.",
+            )
+        if held.worker_pid == worker_pid:
+            return held  # idempotent: nothing to change, nothing removed
+        updated = replace(held, worker_pid=worker_pid)
+        self._held[name] = updated  # in place: no instant without the hold
+        return updated
+
+    def release_hold(
+        self,
+        name: str,
+        *,
+        reason: str,
+        worker_exit: Optional[int] = None,
+    ) -> HeldDatabase:
+        """R7-01: the ONE explicit way a hold ends, and only on evidence this run holds.
+
+        `reason` is `RELEASED_WORKER_EXIT_CONFIRMED` or `RELEASED_SPAWN_NEVER_ATTEMPTED`;
+        anything else is refused. The decision is NOT the caller's assertion:
+
+        * a confirmed exit requires the process handle `note_held_process()` associated, and
+          the handle itself must report that it exited (`poll()` returns a status). A missing
+          handle, an exception from `poll()`, a process that is still running, or a status
+          that contradicts the handle is a refusal. `worker_exit`, when supplied, is only a
+          cross-check against the status the handle actually reported - a bare integer never
+          releases anything. A nonzero status is a valid exit.
+        * a spawn that never happened requires that this run recorded no spawn attempt and
+          that no worker pid or process was associated. A recorded attempt keeps the hold
+          even when no handle came back: `Popen` can raise after the operating system has
+          already created the process.
+
+        This operation opens nothing - no SQL, no Docker, no connection - so it works on the
+        path where a process may still be alive, and it does not weaken any check:
+        `drop_database()` still revalidates the container, the control file and the database's
+        marker and owner before it destroys anything. Only a database this run still tracks
+        can be released, and every refusal leaves the hold (and its transient evidence)
+        exactly as it was. Every ownership record is preserved: the database stays in the
+        inventory until it is dropped, and a release never removes a role or a grant."""
+        if reason not in RELEASE_REASONS:
+            raise UnsafeTarget(
+                "release_reason",
+                "a hold is released only for a worker exit confirmed by the operating system "
+                "or a spawn attempt positively shown never to have happened.",
+            )
+        held = self._require_held(name, "there is nothing to release")
+        worker = self._held_workers.get(name)
+
+        if reason == RELEASED_WORKER_EXIT_CONFIRMED:
+            exit_status = self._confirmed_exit_status(worker)
+            if worker_exit is not None:
+                if (
+                    isinstance(worker_exit, bool)
+                    or not isinstance(worker_exit, int)
+                    or worker_exit != exit_status
+                ):
+                    raise UnsafeTarget(
+                        "release_evidence",
+                        "the supplied exit status does not match the status the associated "
+                        "process reported; the hold is kept.",
+                    )
+        else:
+            if worker_exit is not None:
+                raise UnsafeTarget(
+                    "release_evidence",
+                    "a spawn attempt that never happened has no exit status.",
+                )
+            if held.spawn_attempted or (worker is not None and worker.spawn_attempted):
+                raise UnsafeTarget(
+                    "release_evidence",
+                    "a spawn attempt was recorded for this hold, so it cannot be shown that "
+                    "no worker exists; the hold is kept.",
+                )
+            if held.worker_pid is not None or (
+                worker is not None and worker.process is not None
+            ):
+                raise UnsafeTarget(
+                    "release_evidence",
+                    "a worker process is associated with this hold, so it cannot be shown "
+                    "that no worker exists; the hold is kept.",
+                )
+
+        del self._held[name]
+        self._held_workers.pop(name, None)
+        return held
+
+    def _confirmed_exit_status(self, worker: Optional["_HeldWorker"]) -> int:
+        """The status the ACTUAL associated process reported, or a refusal.
+
+        The evidence is the process's own answer, never a number the caller supplied: an
+        absent handle cannot prove an exit (the process could exist without one), `poll()`
+        is the operating-system-backed question, and a status that contradicts the handle's
+        `returncode` is not evidence either. Nothing is changed on the refusal path."""
+        if worker is None or worker.process is None:
+            raise UnsafeTarget(
+                "release_evidence",
+                "no process handle is associated with this hold; its exit cannot be "
+                "established and the hold is kept.",
+            )
+        process = worker.process
+        try:
+            observed = process.poll()
+        except BaseException:
+            raise UnsafeTarget(
+                "release_evidence",
+                "the associated process did not report whether it has exited; the hold is kept.",
+            ) from None
+        if observed is None:
+            raise UnsafeTarget(
+                "release_evidence",
+                "the associated process is still running; the hold is kept.",
+            )
+        if isinstance(observed, bool) or not isinstance(observed, int):
+            raise UnsafeTarget(
+                "release_evidence",
+                "the associated process reported no usable exit status; the hold is kept.",
+            )
+        reported = getattr(process, "returncode", observed)
+        if reported is not None and reported != observed:
+            raise UnsafeTarget(
+                "release_evidence",
+                "the associated process reported contradictory exit evidence; the hold is kept.",
+            )
+        return observed
+
+    def _require_no_holds(self) -> None:
+        """R7: cleanup may not run at all while a database is held.
+
+        A held database keeps the roles, the maintenance grants and the other databases that
+        belong to it; destroying any of those would leave the ownership state of this run
+        half-cleaned around a database that must survive. Refusing BEFORE the first step is
+        the fail-closed choice: no role is dropped, no grant is revoked, nothing is opened."""
+        if self._held:
+            raise UnsafeTarget(
+                "held_database",
+                "cleanup was asked to run while a scratch database is held after an "
+                "unconfirmed worker exit; nothing is dropped, no role is dropped and no "
+                "grant is revoked.",
+            )
 
     def _expected(
         self,
@@ -950,6 +1351,7 @@ class Run:
         then only the roles this run created. Failed records are kept."""
         if not self._has_state():
             return
+        self._require_no_holds()  # R7: the same all-or-nothing refusal `close()` makes
         self._require_cleanup_identity()
         problems = self._resolve_ambiguous_creations()
         if problems:
@@ -1420,6 +1822,14 @@ class Run:
 
 
     def drop_database(self, name: str) -> None:
+        # R7: a held database is refused by name BEFORE any Docker inspection or connection
+        # (both of which `_require_cleanup_identity` and `control()` would make), and before
+        # any statement. Its tracking record is never cleared.
+        if name in self._held:
+            raise UnsafeTarget(
+                "held_database",
+                "that database is held after an unconfirmed worker exit; nothing is dropped.",
+            )
         state = self._state(name, "created", "marked")
         # R4-03: every cleanup entry point revalidates the container, its storage and the
         # control file's identifier against the identity established at setup - not against
@@ -1452,7 +1862,13 @@ class Run:
         the roles own), then the maintenance grants it handed out, then its roles (R3-02).
         Every step is attempted in order; the first problem is raised once the later steps
         that are still safe have been tried, and every unsuccessful record is kept for a
-        retry or for the operator."""
+        retry or for the operator.
+
+        R7: if any database is held (an unconfirmed worker exit), this refuses before its
+        first step instead of cleaning around it: the roles and grants that belong to the
+        held database must survive with it, and a partially cleaned run is worse than a
+        retained one."""
+        self._require_no_holds()  # R7: before the identity check and before any step
         self._require_cleanup_identity()  # nothing destroyed if this refuses
         if not self._has_state():
             return

@@ -27,8 +27,8 @@ from tests.persistence_support import (  # noqa: F401  (fixtures)
     new_conversation,
     new_message,
     new_user,
+    refused_width,
     rejected,
-    rejected_width,
     session,
     utc,
 )
@@ -398,15 +398,22 @@ def test_the_database_refuses_a_second_favorite_of_the_same_answer(session):
 )
 def test_the_database_refuses_an_empty_title_a_long_title_and_an_empty_text(session, fields, constraint):
     user = new_user(session)
-    values = {"title": "ok", "content": "ok", "source_message_id": 1, "created_at": NOW, **fields}
+    values = {"title": "ok", "content": "ok", "source_message_id": 1, "created_at": NOW}
+    if constraint == "ck_favorite_recipes_title_max_length":
+        favorite = FavoriteRecipe(user_id=user.id, **values)
+        session.add(favorite)
+        session.flush()
+        refused_width(
+            session,
+            "favorite_recipes",
+            "title",
+            fields["title"],
+            key={"id": favorite.id},
+        )
+        return
 
-    reject = (
-        rejected_width(session, "favorite_recipes", "title")
-        if constraint == "ck_favorite_recipes_title_max_length"
-        else rejected(session, constraint)
-    )
-    with reject:
-        session.add(FavoriteRecipe(user_id=user.id, **values))
+    with rejected(session, constraint):
+        session.add(FavoriteRecipe(user_id=user.id, **{**values, **fields}))
 
 
 def test_a_favorite_needs_an_owner_that_exists(session):

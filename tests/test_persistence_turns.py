@@ -25,6 +25,7 @@ from tests.persistence_support import (  # noqa: F401  (fixtures)
     new_message,
     new_turn_request,
     new_user,
+    refused_width,
     rejected,
     session,
     utc,
@@ -104,8 +105,21 @@ def test_an_empty_idempotency_key_is_rejected_by_the_database(session, conversat
 
 @pytest.mark.parametrize("fingerprint", ["", "abc", "a" * 63, "a" * 65])
 def test_the_request_fingerprint_is_a_sha256_hex_digest_length(session, conversation, fingerprint):
-    with rejected(session, "ck_turn_requests_fingerprint_length"):
-        new_turn_request(session, conversation, request_fingerprint=fingerprint)
+    if len(fingerprint) <= 64:
+        # Within the type width: the column's own CHECK is the rule that refuses it.
+        with rejected(session, "ck_turn_requests_fingerprint_length"):
+            new_turn_request(session, conversation, request_fingerprint=fingerprint)
+        return
+
+    request = new_turn_request(session, conversation, key="valid-key")
+    refused_width(
+        session,
+        "turn_requests",
+        "request_fingerprint",
+        fingerprint,
+        key={"id": request.id},
+        check="ck_turn_requests_fingerprint_length",
+    )
 
 
 @pytest.mark.parametrize("how", ["orm", "sql"])
@@ -160,11 +174,28 @@ def test_the_database_itself_supplies_the_pending_status_and_zero_attempts(sessi
 
 
 @pytest.mark.parametrize(
-    "status", ["done", "PENDING", "", "canceled", "running", "failed_generation", "reconciling"]
+    "status", ["done", "PENDING", "", "canceled", "running", "reconciling"]
 )
 def test_an_unknown_status_is_rejected(session, conversation, status):
     with rejected(session, "ck_turn_requests_status_valid"):
         new_turn_request(session, conversation, status=status)
+
+
+def test_a_status_past_the_column_width_is_refused_by_the_width_not_the_check(
+    session, conversation
+):
+    # 17 characters in a VARCHAR(16): PostgreSQL refuses the value (22001) before
+    # the status CHECK can see it, so the refusal belongs to the declared width.
+    # SQLite ignores the width and still refuses it by the status CHECK.
+    turn = new_turn_request(session, conversation, key="valid-key")
+    refused_width(
+        session,
+        "turn_requests",
+        "status",
+        "failed_generation",
+        key={"id": turn.id},
+        check="ck_turn_requests_status_valid",
+    )
 
 
 def test_a_negative_attempt_count_is_rejected(session, conversation):

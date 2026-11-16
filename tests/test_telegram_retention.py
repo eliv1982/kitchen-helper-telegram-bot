@@ -4,16 +4,38 @@ with its message.
 
 The rules for the rest of the history are tests/test_admin_retention.py; the photo storage is
 tests/test_persistence_attachments.py.
+
+Backend and identity note (R8): `db_url` is the backend-parameterized APPLICATION login, on
+which the scenario is seeded and read; `purge_db_url` is the restricted PURGE login, and the
+retention run itself is executed with it (the same split as
+tests/test_admin_retention_postgres.py). On PostgreSQL this therefore exercises the purge
+identity's narrower grants (ROL-11: SELECT/DELETE on only the retention tables plus the
+purge-locked columns), not the application login's broader privileges; on SQLite both URLs are
+the same file. The purge role is granted nothing extra here.
 """
 
+import uuid
 from datetime import timedelta
 
 from house_helper.persistence.authn import hash_secret
 from house_helper.persistence.models import MessageAttachment, TelegramLink, TelegramLinkCode
-from tests.admin_support import db_path, db_url, migrated_template  # noqa: F401  (fixtures)
+from tests.admin_support import (  # noqa: F401  (fixtures; admin_database is db_url's dependency)
+    admin_database,
+    db_path,
+    db_url,
+    migrated_template,
+    purge_db_url,
+)
 from tests.photo_support import jpeg
 from tests.retention_support import MICROSECOND, NOW, ago, count, read, seeded
 from tests.test_admin_retention import present, purge
+
+
+def as_uuid(identifier):
+    """A row id as a UUID, whichever form the backend returned: psycopg gives UUID objects
+    on PostgreSQL, while the SQLite driver gives the stored 32-character hex text. Rows are
+    seeded as UUIDs (from the ORM), so the read side is normalised to compare with them."""
+    return identifier if isinstance(identifier, uuid.UUID) else uuid.UUID(identifier)
 
 
 def code(user, name, *, created, expires, consumed_at=None):
@@ -40,7 +62,7 @@ def photo(user, *, message_id, created, expires, tag="x"):
     )
 
 
-def test_a_pairing_code_goes_at_its_own_deadline_used_or_not_and_a_link_stays(db_url):
+def test_a_pairing_code_goes_at_its_own_deadline_used_or_not_and_a_link_stays(db_url, purge_db_url):
     def fill(s):
         user = s.user()
         link = TelegramLink(user_id=user.id, telegram_user_id=555000111, display_name="@mama", created_at=ago(days=400))
@@ -57,20 +79,20 @@ def test_a_pairing_code_goes_at_its_own_deadline_used_or_not_and_a_link_stays(db
         ]
         s.session.add_all(gone + kept)
         s.session.flush()
-        return [row.id.hex for row in gone], [row.id.hex for row in kept]
+        return [row.id for row in gone], [row.id for row in kept]
 
     gone, kept = seeded(db_url, fill)
 
-    dry = purge(db_url, dry_run=True)
-    report = purge(db_url)
+    dry = purge(purge_db_url, dry_run=True)
+    report = purge(purge_db_url)
 
     assert dry.deleted["telegram_link_codes"] == report.deleted["telegram_link_codes"] == 3
-    left = present(db_url, "telegram_link_codes")
+    left = {as_uuid(value) for value in present(db_url, "telegram_link_codes")}
     assert not set(gone) & left and set(kept) <= left and len(left) == 3
     assert count(db_url, "telegram_links") == 1  # a link has no deadline
 
 
-def test_a_photo_goes_with_its_message_and_not_before_and_an_upload_that_was_never_sent_goes_after_its_hour(db_url):
+def test_a_photo_goes_with_its_message_and_not_before_and_an_upload_that_was_never_sent_goes_after_its_hour(db_url, purge_db_url):
     def fill(s):
         user = s.user()
         conversation = s.conversation(user, created=ago(days=500), updated=ago(days=1))
@@ -84,23 +106,23 @@ def test_a_photo_goes_with_its_message_and_not_before_and_an_upload_that_was_nev
         }
         s.session.add_all(rows.values())
         s.session.flush()
-        return {name: row.id.hex for name, row in rows.items()}
+        return {name: row.id for name, row in rows.items()}
 
     ids = seeded(db_url, fill)
 
-    report = purge(db_url)
+    report = purge(purge_db_url)
 
-    left = present(db_url, "message_attachments")
+    left = {as_uuid(value) for value in present(db_url, "message_attachments")}
     assert left == {ids["with a recent message"], ids["never sent, hour left"]}
     assert report.deleted["message_attachments"] == 2
     assert report.deleted["messages"] == 1  # the old message went too, and its photo had gone first
     assert len(read(db_url, "SELECT id FROM messages")) == 1
 
 
-def test_the_second_run_finds_nothing_more_to_do(db_url):
+def test_the_second_run_finds_nothing_more_to_do(db_url, purge_db_url):
     seeded(db_url, lambda s: s.session.add(code(s.user(), "old", created=ago(hours=1), expires=ago(minutes=50))))
 
-    first = purge(db_url)
-    second = purge(db_url)
+    first = purge(purge_db_url)
+    second = purge(purge_db_url)
 
     assert first.deleted["telegram_link_codes"] == 1 and second.total == 0

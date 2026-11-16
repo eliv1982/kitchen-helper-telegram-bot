@@ -36,8 +36,8 @@ from tests.persistence_support import (  # noqa: F401  (fixtures)
     new_conversation,
     new_message,
     new_user,
+    refused_width,
     rejected,
-    rejected_width,
     session,
     utc,
 )
@@ -698,8 +698,23 @@ def test_the_limit_counts_both_kinds_together(factory, user_id, monkeypatch):
 @pytest.mark.parametrize(
     ("fields", "constraint"),
     [
-        ({"kind": "other"}, "ck_favorite_recipes_kind_valid"),
-        ({"source_recipe_index": 5}, "ck_favorite_recipes_source_recipe_index_valid"),
+        # An unknown kind is incoherent in one way that two CHECKs both describe: the
+        # enumerated kind list and the per-kind shape. Exactly those two are permitted.
+        (
+            {"kind": "other"},
+            ("ck_favorite_recipes_kind_valid", "ck_favorite_recipes_kind_consistent"),
+        ),
+        # A structured row with every other structured field valid, so the ONLY fault is
+        # the out-of-range index (the range CHECK), not the kind consistency CHECK too.
+        (
+            {
+                "kind": "structured",
+                "source_recipe_index": 5,
+                "ingredients": [{"name": "x", "amount": "1"}],
+                "steps": ["s"],
+            },
+            "ck_favorite_recipes_source_recipe_index_valid",
+        ),
         ({"version": 0}, "ck_favorite_recipes_version_valid"),
         ({"notes": "x" * 2001}, "ck_favorite_recipes_notes_max_length"),
         (
@@ -737,17 +752,30 @@ def test_the_database_refuses_an_inconsistent_favorite(session, fields, constrai
         "updated_at": NOW,
         **fields,
     }
-
-    reject = (
-        rejected_width(
+    column = (
+        constraint[len("ck_favorite_recipes_") : -len("_max_length")]
+        if isinstance(constraint, str)
+        and constraint.startswith("ck_favorite_recipes_")
+        and constraint.endswith("_max_length")
+        else None
+    )
+    if column is not None:
+        # The fault is one field's declared bound. Write an otherwise valid row first and
+        # let the helper write only that field (R4: the 22001 has exactly one owner).
+        values[column] = "ok"
+        favorite = FavoriteRecipe(**values)
+        session.add(favorite)
+        session.flush()
+        refused_width(
             session,
             "favorite_recipes",
-            constraint[len("ck_favorite_recipes_") : -len("_max_length")],
+            column,
+            fields[column],
+            key={"id": favorite.id},
         )
-        if constraint.startswith("ck_favorite_recipes_") and constraint.endswith("_max_length")
-        else rejected(session, constraint)
-    )
-    with reject:
+        return
+
+    with rejected(session, constraint):
         session.add(FavoriteRecipe(**values))
 
 

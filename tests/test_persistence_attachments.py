@@ -364,13 +364,16 @@ def test_the_database_refuses_a_row_that_breaks_its_own_rules(session):
                 data=b"\xff\xd8\xff\xe0", created_at=NOW, expires_at=NOW + timedelta(hours=1))
 
     for change, constraint in [
-        (dict(content_type="image/gif"), "content_type_valid"),
-        (dict(content_type="text/html"), "content_type_valid"),
-        (dict(size_bytes=0, data=b""), "size_bytes_valid"),
-        (dict(size_bytes=MAX_ATTACHMENT_BYTES + 1, data=b"x" * (MAX_ATTACHMENT_BYTES + 1)), "size_bytes_valid"),
-        (dict(size_bytes=5), "data_matches_size"),
-        (dict(sha256="abc"), "sha256_length"),
-        (dict(expires_at=NOW), "expires_after_created"),
+        (dict(content_type="image/gif"), "ck_message_attachments_content_type_valid"),
+        (dict(content_type="text/html"), "ck_message_attachments_content_type_valid"),
+        (dict(size_bytes=0, data=b""), "ck_message_attachments_size_bytes_valid"),
+        (
+            dict(size_bytes=MAX_ATTACHMENT_BYTES + 1, data=b"x" * (MAX_ATTACHMENT_BYTES + 1)),
+            "ck_message_attachments_size_bytes_valid",
+        ),
+        (dict(size_bytes=5), "ck_message_attachments_data_matches_size"),
+        (dict(sha256="abc"), "ck_message_attachments_sha256_length"),
+        (dict(expires_at=NOW), "ck_message_attachments_expires_after_created"),
     ]:
         with rejected(session, constraint):
             session.add(MessageAttachment(**{**good, **change}))

@@ -156,7 +156,9 @@ async def test_a_crash_after_the_attempt_began_then_a_restart_and_the_same_updat
 
     # A new process: nothing in memory, the same database. Telegram brings the update again.
     after = ScriptedBackend("Ответ на новое сообщение")
-    async with telegram_app(tmp_path, after, sign_in_first=False, seed=False) as second:
+    async with telegram_app(
+        tmp_path, after, sign_in_first=False, seed=False, database=first.database
+    ) as second:
         second.chat.clock.advance(minutes=10)
         await second.deliver_update(update)
         told = second.bot.texts(MOTHER)[-1]

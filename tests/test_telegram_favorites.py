@@ -435,7 +435,7 @@ async def test_a_button_still_works_after_the_bot_restarts(tmp_path):
 
     # A new process: nothing in memory, the same database and the same Telegram message.
     async with telegram_app(
-        tmp_path, ScriptedBackend(), sign_in_first=False, seed=False
+        tmp_path, ScriptedBackend(), sign_in_first=False, seed=False, database=first.database
     ) as second:
         second.chat.clock.advance(minutes=10)
         await second.click(MOTHER, data)
