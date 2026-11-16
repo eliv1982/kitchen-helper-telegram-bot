@@ -12,6 +12,10 @@ pre-existing role or database, and every fixture drops what it created. Test-onl
 credentials are generated per process for the six logins AFTER roles.sql; no credential is
 in the artifacts and none is printed.
 
+One negative test needs an UNRELATED default-ACL recipient. It creates a disposable
+NOLOGIN role under a unique generated name and drops it again, so the suite never depends
+on a role (the bootstrap user included) happening to exist on the cluster.
+
 The setup-failure lifecycle tests (which need a cluster with NO project resources, so they
 cannot share this module's module-scoped `project` fixture) live in
 `tests/test_postgres_sql_setup_failures.py` and import this module's provisioning helpers.
@@ -26,6 +30,7 @@ Opt-in, like the Stage 1 suites:
 import os
 import re
 import secrets
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
@@ -94,6 +99,13 @@ _CREATED_BY_THIS_MODULE: set = set()
 # a claimed name that a clean rollback never created is a no-op.
 _CREATED_ROLE_NAMES: set = set()
 _MAINTENANCE_GRANTS: list = []  # (role, database) pairs granted CONNECT by this process
+# CI-FAIL-01: the disposable NOLOGIN roles this process created as an UNRELATED default-ACL
+# recipient. Each name is registered BEFORE its CREATE ROLE, so a failure after the
+# statement (or an ambiguous acknowledgement) still drops it if it exists. The test that
+# creates one drops it again; a drop that fails stays registered and the module teardown
+# retries it once the databases holding the dependency are gone.
+_CREATED_UNRELATED_ROLES: set = set()
+UNRELATED_ROLE = re.compile(r"hh_unrelated_[0-9a-f]{16}")
 
 
 # --- fixtures ---------------------------------------------------------------------------------
@@ -261,6 +273,72 @@ def _drop_leftover_databases(run) -> None:
             _CREATED_BY_THIS_MODULE.discard(name)
 
 
+def _require_unrelated_role_absent(run, name: str) -> None:
+    """Refuse a generated name that already exists, BEFORE it is claimed or mutated: a
+    pre-existing role is never adopted, and no cleanup path may ever drop it."""
+    with run.control() as control:
+        if control.execute(
+            "SELECT 1 FROM pg_roles WHERE rolname = %s", (name,)
+        ).fetchone() is not None:
+            pytest.fail(f"generated role {name!r} already exists; refusing to adopt it")
+
+
+def _create_unrelated_role(run, name: str) -> None:
+    """Create one uniquely named disposable NOLOGIN role through the run's verified
+    privileged boundary (the only way to a cluster-wide statement)."""
+    with run.control() as control:
+        control.execute(f'CREATE ROLE "{name}" NOLOGIN NOINHERIT')
+
+
+def _drop_unrelated_role(run, name: str) -> None:
+    """Drop one disposable role by its generated name. `IF EXISTS` makes a clean rollback
+    that never created it a no-op; a drop that still fails (a default ACL left behind in a
+    database that has not been dropped yet) raises and leaves the name registered."""
+    with run.control() as control:
+        control.execute(f'DROP ROLE IF EXISTS "{name}"')
+    _CREATED_UNRELATED_ROLES.discard(name)
+
+
+def _drop_leftover_unrelated_roles(run) -> None:
+    """Last resort at module teardown: retry any disposable role a failed per-test drop
+    left registered. The function-scoped databases that could hold a blocking default ACL
+    are gone by then, so the retry can succeed."""
+    for name in sorted(_CREATED_UNRELATED_ROLES):
+        _drop_unrelated_role(run, name)
+
+
+@contextmanager
+def _unrelated_default_recipient(run, recipient: str):
+    """The default-ACL recipient of the negative test: `PUBLIC`, or a disposable role.
+
+    `PUBLIC` is built in. The role case creates a UNIQUELY named NOLOGIN role on the
+    verified disposable cluster - never a role that merely happens to exist there - and
+    drops it after the test, whether the test passed or failed. The absence check runs
+    first, then the name is claimed BEFORE the CREATE; a cleanup failure is reported with
+    the test/setup failure, never instead of it.
+
+    The caller removes the default ACL it granted to the role before this context exits:
+    an existing default ACL would block DROP ROLE."""
+    if recipient == "PUBLIC":
+        yield recipient
+        return
+    name = "hh_unrelated_" + secrets.token_hex(8)
+    assert UNRELATED_ROLE.fullmatch(name)
+    _require_unrelated_role_absent(run, name)
+    _CREATED_UNRELATED_ROLES.add(name)
+    try:
+        _create_unrelated_role(run, name)
+        yield name
+    except BaseException as test_error:
+        try:
+            _drop_unrelated_role(run, name)
+        except BaseException as cleanup_error:
+            raise test_error from cleanup_error
+        raise
+    else:
+        _drop_unrelated_role(run, name)
+
+
 @pytest.fixture(scope="module")
 def project(project_run):
     """Create the seven literal roles ONCE, with test-only credentials.
@@ -273,6 +351,7 @@ def project(project_run):
         yield project
     finally:
         _deprovision_project(project_run)
+        _drop_leftover_unrelated_roles(project_run)
 
 
 def _bootstrap(
@@ -955,26 +1034,33 @@ def test_global_and_grant_option_default_drift_is_converged(serving):
     _assert_acl_matrix(serving)
 
 
-@pytest.mark.parametrize("recipient", ["PUBLIC", "hh_test"], ids=repr)
+@pytest.mark.parametrize(
+    "recipient", ["PUBLIC", "unrelated"], ids=["PUBLIC", "unrelated-role"]
+)
 def test_an_unauthorized_default_privilege_is_rejected(serving, recipient):
     """R1-01: a default grant to PUBLIC or to an unrelated role cannot be revoked without
-    naming it, so a re-invocation refuses instead of silently accepting it; nothing changes."""
+    naming it, so a re-invocation refuses instead of silently accepting it; nothing changes.
+
+    The unrelated recipient is a disposable NOLOGIN role this test creates on the verified
+    test cluster under a unique name, so the test does not depend on any role (such as the
+    bootstrap user) happening to exist there, and it leaves no role behind."""
     project = serving.project
-    with artifacts.project_connection(
-        project.run, serving.name, "hh_migrate", project.passwords["hh_migrate"]
-    ) as connection:
-        connection.execute(
-            f"ALTER DEFAULT PRIVILEGES FOR ROLE hh_owner GRANT SELECT ON TABLES TO {recipient}")
-        try:
-            before = artifacts.acl_dump(connection)
-            with pytest.raises(artifacts.ArtifactError) as refused:
-                artifacts.PrivilegesScript().apply(connection, database=serving.name)
-            assert refused.value.code == "privilege_contract"
-            assert artifacts.acl_dump(connection) == before  # nothing was accepted
-        finally:
+    with _unrelated_default_recipient(project.run, recipient) as grantee:
+        with artifacts.project_connection(
+            project.run, serving.name, "hh_migrate", project.passwords["hh_migrate"]
+        ) as connection:
             connection.execute(
-                f"ALTER DEFAULT PRIVILEGES FOR ROLE hh_owner REVOKE ALL ON TABLES FROM {recipient}")
-        artifacts.PrivilegesScript().apply(connection, database=serving.name)  # clean state accepted
+                f"ALTER DEFAULT PRIVILEGES FOR ROLE hh_owner GRANT SELECT ON TABLES TO {grantee}")
+            try:
+                before = artifacts.acl_dump(connection)
+                with pytest.raises(artifacts.ArtifactError) as refused:
+                    artifacts.PrivilegesScript().apply(connection, database=serving.name)
+                assert refused.value.code == "privilege_contract"
+                assert artifacts.acl_dump(connection) == before  # nothing was accepted
+            finally:
+                connection.execute(
+                    f"ALTER DEFAULT PRIVILEGES FOR ROLE hh_owner REVOKE ALL ON TABLES FROM {grantee}")
+            artifacts.PrivilegesScript().apply(connection, database=serving.name)  # clean state accepted
     _assert_acl_matrix(serving)
 
 
