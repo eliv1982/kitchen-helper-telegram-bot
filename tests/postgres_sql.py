@@ -1,7 +1,8 @@
-"""The validated renderer and runner for the WP-1B SQL artifacts (HH-DB-01 Stage 2).
+"""The validated renderer and runner for the WP-1B/WP-1C-A SQL artifacts (HH-DB-01 Stage 2).
 
-`db/roles.sql`, `db/bootstrap.sql` and `db/privileges.sql` are the checked-in artifacts of
-the frozen role/ACL contract. This module is the ONLY thing that renders or executes them:
+`db/roles.sql`, `db/bootstrap.sql`, `db/schema.sql` and `db/privileges.sql` are the
+checked-in artifacts of the frozen role/schema/ACL contract. This module is the ONLY thing
+that renders or executes them:
 
   * every substituted value is validated against a fixed allowlist BEFORE any SQL text is
     built (`validate_database_name`, `validate_grantee`, `validate_role_name`,
@@ -11,8 +12,11 @@ the frozen role/ACL contract. This module is the ONLY thing that renders or exec
     is sent alone on an autocommit connection (PostgreSQL refuses it in a transaction,
     SQLSTATE 25001); the E3-a and E3-b catalog checks run before E3-c may enable
     connections, and a failed check never reaches the ALTER;
-  * `db/roles.sql` and `db/privileges.sql` each run in ONE transaction supplied here (the
-    files contain no BEGIN/COMMIT);
+  * `db/roles.sql`, `db/schema.sql` and `db/privileges.sql` each run in ONE transaction
+    supplied here (the files contain no BEGIN/COMMIT). The ROL-06 session settings
+    (`search_path`, `application_name`, `statement_timeout`) are set by `db/schema.sql`
+    itself, transaction-locally, and read back afterwards; this module never has to trust
+    whatever the caller's session looked like;
   * every connection to a project database is built from the harness's validated `Target`
     and verified with the harness's own `Expected`/`verify_connection` (peer, port,
     database, owner, identity and the independently established system identifier).
@@ -114,6 +118,24 @@ EXPECTED_EDGES: Mapping[tuple[str, str], tuple[bool, bool, bool]] = {
     ("hh_migrate", "hh_owner"): (False, False, True),
     ("hh_restore", "hh_owner"): (False, False, True),
 }
+
+# BOOT-04/ROL-09: the exact exploded `public` schema ACL - the owner holds USAGE and
+# CREATE, each of the six LOGIN roles holds USAGE, and no entry carries a grant option.
+EXPECTED_SCHEMA_ACL: frozenset[tuple[str, str, bool]] = frozenset(
+    {("hh_owner", "USAGE", False), ("hh_owner", "CREATE", False)}
+    | {(login, "USAGE", False) for login in LOGIN_ROLE_NAMES}
+)
+
+# ROL-14: the complete, exploded default-ACL set of `hh_owner` (global + schema-specific).
+EXPECTED_SCHEMA_DEFAULTS: frozenset[tuple[str, str, str, str, bool]] = frozenset({
+    ("public", "S", "hh_app", "USAGE", False),
+    ("public", "S", "hh_backup", "SELECT", False),
+    ("public", "r", "hh_app", "DELETE", False),
+    ("public", "r", "hh_app", "INSERT", False),
+    ("public", "r", "hh_app", "SELECT", False),
+    ("public", "r", "hh_app", "UPDATE", False),
+    ("public", "r", "hh_backup", "SELECT", False),
+})
 
 SERVING_DATABASE = "house_helper"
 _RESTORE_DATABASE = re.compile(r"house_helper_restore_[a-z0-9]{1,32}")
@@ -275,6 +297,20 @@ def render_privileges(database: object, *, sql: Optional[str] = None) -> str:
     rendered = text.replace("{{database}}", name)
     if "{{" in rendered:
         raise ArtifactError("placeholder", "the privileges placeholder was not substituted")
+    return rendered
+
+
+def render_schema(database: object, *, sql: Optional[str] = None) -> str:
+    """`db/schema.sql` with the validated database name in its string-literal guard.
+
+    The placeholder is inside `'...'` (a value compared with current_database()), so it
+    receives the raw validated name; the allowlist admits only [a-z0-9_], so the literal
+    cannot be broken out of. There is no identifier placeholder in this artifact."""
+    name = validate_database_name(database)
+    text = _load("schema.sql") if sql is None else sql
+    rendered = text.replace("{{database}}", name)
+    if "{{" in rendered:
+        raise ArtifactError("placeholder", "a schema placeholder was not substituted")
     return rendered
 
 
@@ -704,14 +740,29 @@ def _is_duplicate(error: BaseException) -> bool:
 
 
 class SchemaContract:
-    """The §5.1 BOOT-04 schema state needed before `db/privileges.sql` can run.
+    """`db/schema.sql`, applied in one transaction and verified against BOOT-04.
 
-    It is not part of E3 (which ends at E3-c) and it is not the privilege contract: it
-    makes `public` belong to `hh_owner` with no PUBLIC entry and exactly USAGE for the six
-    logins. It runs on the TARGET database as `hh_migrate`/`hh_restore` with
-    `current_user = hh_owner`."""
+    It is not part of E3 (which ends at E3-c) and it is not the object privilege contract:
+    it makes `public` belong to `hh_owner` with no PUBLIC entry, exactly USAGE for the six
+    logins and no CREATE, and installs the four ROL-14 default ACLs for future objects.
+    It runs on the TARGET database as `hh_migrate`/`hh_restore` with
+    `current_user = hh_owner`, BEFORE `alembic upgrade head`, so it does not require
+    `alembic_version`. It also establishes the full ROL-06 session contract itself
+    (`search_path`, `application_name`, `statement_timeout`) transaction-locally and
+    re-verifies the effective values, so a caller that skips its own preamble cannot bypass
+    the mandatory preparation; `verify` reads the same settings back independently.
 
-    def apply(self, connection: Any) -> None:
+    The file is the single authoritative implementation of the schema contract: this
+    runner renders and executes it, and only verifies the catalog state it produced. It
+    does not restate the statements."""
+
+    def __init__(self, sql: Optional[str] = None) -> None:
+        self.sql = _load("schema.sql") if sql is None else sql
+
+    def apply(self, connection: Any, *, database: object) -> Mapping[str, Any]:
+        """Apply and verify in ONE transaction, so a refusal leaves nothing behind."""
+        name = validate_database_name(database)
+        _require_autocommit(connection)
         session, current = identity(connection)
         if session not in ("hh_migrate", "hh_restore") or current != "hh_owner":
             raise ArtifactError(
@@ -719,36 +770,74 @@ class SchemaContract:
                 "the schema contract needs hh_migrate/hh_restore with current_user hh_owner",
                 f"{session}/{current}",
             )
-        with connection.transaction():
-            connection.execute("SET LOCAL search_path = public")
-            connection.execute("ALTER SCHEMA public OWNER TO hh_owner")
-            connection.execute("REVOKE ALL ON SCHEMA public FROM PUBLIC")
-            connection.execute(
-                "GRANT USAGE ON SCHEMA public TO "
-                "hh_app, hh_purge, hh_backup, hh_provision, hh_migrate, hh_restore"
+        if _current_database(connection) != name:
+            raise ArtifactError(
+                "wrong_database", "the connection is not to the parameterized database",
+                _current_database(connection),
             )
-        self.verify(connection)
+        rendered = render_schema(name, sql=self.sql)
+        try:
+            with connection.transaction():  # ONE transaction; the file has no BEGIN/COMMIT
+                connection.execute(rendered)
+                evidence = self.verify(connection)  # still inside: no post-COMMIT gap
+        except BaseException as error:
+            if getattr(error, "sqlstate", None) == "P0001":
+                raise ArtifactError(
+                    "schema_contract",
+                    "schema.sql refused the current state; nothing was changed",
+                ) from None
+            raise
+        return evidence
 
     def verify(self, connection: Any) -> Mapping[str, Any]:
+        """The BOOT-04 acceptance state. This is a verification, not an implementation."""
+        # ROL-06: the effective session contract, read back rather than assumed. The artifact
+        # establishes it transaction-locally (so it is in force here, inside the caller's
+        # transaction) and its own acceptance block checks it too; this is the independent
+        # second reading the rest of the suite relies on.
+        session, application_name, statement_timeout, search_path = connection.execute(
+            "SELECT session_user, current_setting('application_name'), "
+            "current_setting('statement_timeout'), current_setting('search_path')"
+        ).fetchone()
+        if application_name != session:
+            raise ArtifactError(
+                "session_contract",
+                "application_name is not the phase identity",
+                f"{application_name}/{session}",
+            )
+        if statement_timeout != "0":
+            raise ArtifactError(
+                "session_contract",
+                "statement_timeout is not the ROL-06 value",
+                statement_timeout,
+            )
+        if search_path != "public":
+            raise ArtifactError(
+                "session_contract", "search_path is not exactly public", search_path
+            )
         owner, public_entries = connection.execute(
             "SELECT n.nspowner::regrole::text, "
             "(SELECT count(*) FROM aclexplode(n.nspacl) a WHERE a.grantee = 0) "
             "FROM pg_namespace n WHERE n.nspname = 'public'"
         ).fetchone()
         if owner != "hh_owner" or public_entries != 0:
-            raise ArtifactError("schema_contract", "the public schema is not hardened as required")
-        matrix = {
-            role: (
-                connection.execute(
-                    "SELECT has_schema_privilege(%s, 'public', 'USAGE')", (role,)
-                ).fetchone()[0],
-                connection.execute(
-                    "SELECT has_schema_privilege(%s, 'public', 'CREATE')", (role,)
-                ).fetchone()[0],
+            raise ArtifactError(
+                "schema_contract", "the public schema is not hardened as required", owner
             )
-            for role in PROJECT_ROLE_NAMES
-        }
-        for role, (usage, create) in matrix.items():
+        entries = schema_acl_entries(connection)
+        if entries != EXPECTED_SCHEMA_ACL:
+            raise ArtifactError(
+                "schema_contract", "the public schema ACL is not the frozen contract",
+                "; ".join(f"{grantee}:{privilege}:{grantable}" for grantee, privilege, grantable in sorted(entries)),
+            )
+        matrix = {}
+        for role in PROJECT_ROLE_NAMES:
+            usage, create = connection.execute(
+                "SELECT has_schema_privilege(%s, 'public', 'USAGE'), "
+                "has_schema_privilege(%s, 'public', 'CREATE')",
+                (role, role),
+            ).fetchone()
+            matrix[role] = (usage, create)
             if role == "hh_owner":
                 # The schema owner holds every schema privilege inherently; the contract
                 # grants USAGE to the six LOGINS and no CREATE to any of them.
@@ -756,19 +845,45 @@ class SchemaContract:
                     raise ArtifactError("schema_contract", "the schema owner lost a privilege", role)
             elif usage is not True or create is not False:
                 raise ArtifactError("schema_contract", "schema privileges are not exactly USAGE", role)
-        return {"owner": owner, "public_entries": public_entries, "matrix": matrix}
+        defaults = frozenset(
+            entry for entry in default_acl_entries(connection) if entry[2] != "hh_owner"
+        )
+        if defaults != EXPECTED_SCHEMA_DEFAULTS:
+            raise ArtifactError(
+                "schema_contract", "the hh_owner default ACL set is not the frozen matrix"
+            )
+        return {
+            "owner": owner,
+            "public_entries": public_entries,
+            "entries": entries,
+            "matrix": matrix,
+            "defaults": defaults,
+            "session": {
+                "session_user": session,
+                "application_name": application_name,
+                "statement_timeout": statement_timeout,
+                "search_path": search_path,
+            },
+        }
 
 
 # --- privileges.sql --------------------------------------------------------------------------
 
 
 class PrivilegesScript:
-    """`db/privileges.sql` rendered for ONE validated database and executed in ONE transaction."""
+    """`db/privileges.sql` rendered for ONE validated database and executed in ONE transaction.
+
+    The file establishes the complete ROL-06 session contract itself, transaction-locally
+    (`search_path`, `application_name` = the phase identity, `statement_timeout = 0`), and a
+    transaction guard refuses a transactionless invocation before any protected operation.
+    `apply` re-reads the EFFECTIVE values inside the same transaction, so the correction is
+    observed rather than inferred from the file's own DO block, and at COMMIT the caller's
+    session returns to exactly what it had."""
 
     def __init__(self, sql: Optional[str] = None) -> None:
         self.sql = _load("privileges.sql") if sql is None else sql
 
-    def apply(self, connection: Any, *, database: object) -> None:
+    def apply(self, connection: Any, *, database: object) -> Mapping[str, Any]:
         name = validate_database_name(database)
         _require_autocommit(connection)
         session, current = identity(connection)
@@ -790,12 +905,43 @@ class PrivilegesScript:
         try:
             with connection.transaction():  # ONE transaction; SET LOCAL lives inside the file
                 connection.execute(rendered)
+                evidence = self.verify(connection)  # still inside: the callers' values return at COMMIT
         except BaseException as error:
             if getattr(error, "sqlstate", None) == "P0001":
                 raise ArtifactError(
                     "privilege_contract", "privileges.sql refused the current ACL state; nothing was changed"
                 ) from None
             raise
+        return evidence
+
+    def verify(self, connection: Any) -> Mapping[str, Any]:
+        """The ROL-06 state the artifact must have left in force inside the caller's transaction."""
+        session, application_name, statement_timeout, search_path = connection.execute(
+            "SELECT session_user, current_setting('application_name'), "
+            "current_setting('statement_timeout'), current_setting('search_path')"
+        ).fetchone()
+        if application_name != session:
+            raise ArtifactError(
+                "session_contract",
+                "application_name is not the phase identity",
+                f"{application_name}/{session}",
+            )
+        if statement_timeout != "0":
+            raise ArtifactError(
+                "session_contract",
+                "statement_timeout is not the ROL-06 value",
+                statement_timeout,
+            )
+        if search_path != "public":
+            raise ArtifactError(
+                "session_contract", "search_path is not exactly public", search_path
+            )
+        return {
+            "session_user": session,
+            "application_name": application_name,
+            "statement_timeout": statement_timeout,
+            "search_path": search_path,
+        }
 
 
 # --- connections to the project database ----------------------------------------------------
@@ -909,6 +1055,42 @@ def migration_engine(run: Run, database: str, login: str, password: Optional[str
 
 
 # --- catalog evidence used by the tests ----------------------------------------------------
+
+
+def schema_acl_entries(connection: Any) -> frozenset[tuple[str, str, bool]]:
+    """The exploded `public` schema ACL as `(grantee, privilege, grantable)` tuples.
+
+    `PUBLIC` is reported as the literal name. An absent ACL (`nspacl IS NULL`, the
+    PostgreSQL default) explodes to an empty set, so the caller compares sets rather than
+    assuming the ACL was materialized."""
+    rows = connection.execute(
+        "SELECT COALESCE(g.rolname, 'PUBLIC'), a.privilege_type, a.is_grantable "
+        "FROM pg_namespace n CROSS JOIN LATERAL aclexplode(n.nspacl) a "
+        "LEFT JOIN pg_roles g ON g.oid = a.grantee WHERE n.nspname = 'public'"
+    ).fetchall()
+    return frozenset((row[0], row[1], row[2]) for row in rows)
+
+
+def schema_snapshot(connection: Any) -> Mapping[str, Any]:
+    """Everything `db/schema.sql` can change, in a comparable form.
+
+    It is readable in the pre-hardening state too (owner `pg_database_owner`, the PUBLIC
+    entry present), so a failed run can be compared with the state that preceded it."""
+    owner, acl = connection.execute(
+        "SELECT n.nspowner::regrole::text, n.nspacl::text "
+        "FROM pg_namespace n WHERE n.nspname = 'public'"
+    ).fetchone()
+    schemas = connection.execute(
+        r"SELECT nspname FROM pg_namespace WHERE nspname <> 'public' "
+        r"AND nspname <> 'information_schema' AND nspname NOT LIKE 'pg\_%' ORDER BY nspname"
+    ).fetchall()
+    return {
+        "owner": owner,
+        "acl": acl,
+        "entries": schema_acl_entries(connection),
+        "defaults": default_acl_entries(connection),
+        "foreign_schemas": tuple(row[0] for row in schemas),
+    }
 
 
 def acl_dump(connection: Any) -> Mapping[str, Any]:

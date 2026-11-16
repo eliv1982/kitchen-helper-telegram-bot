@@ -3,14 +3,22 @@
 -- Frozen source: §3.4 (ROL-09..ROL-18), §3.6 (positive/negative ACL tests), §3.8
 -- (MEM-01..MEM-09), §8.8 RST-04/RST-07.
 --
+-- WP-1C-A R2 narrow integration correction: the transaction guard and the complete ROL-06
+-- session preparation/verification were added under the R2 authorization. No ACL, grant,
+-- default-privilege or catalog-verification statement below changed.
+--
 -- Authority and boundary
 --   * Invoked ONLY as `hh_migrate` (serving database) or `hh_restore` (restore database)
 --     with `current_user = hh_owner`. The runner in tests/postgres_sql.py connects the
 --     login, has it assume the owner, and supplies ONE transaction; this file contains no
---     BEGIN/COMMIT.
+--     BEGIN/COMMIT. A caller that owns the transaction must BEGIN before the file; a caller
+--     that does not is refused by the transaction guard before any protected operation.
 --   * `current_database()` must be the database named by the validated `{{database}}`
---     parameter, and `search_path` must be exactly `public` (ROL-06). The script sets it
---     locally and verifies it before any unqualified statement.
+--     parameter. ROL-06 is established by the script itself, transaction-locally:
+--     `search_path = public`, `application_name` = the phase identity (`session_user`,
+--     checked against the two permitted logins) and `statement_timeout = 0`. The effective
+--     values are verified before the first unqualified statement, never assumed from the
+--     caller's session.
 --   * `public.alembic_version` MUST exist: this is applied after a migration or a
 --     restore, never to an uninitialised schema.
 --
@@ -24,9 +32,27 @@
 --     commit: table, column, sequence, schema and default ACLs for every role.
 
 -- The unqualified statements below are resolved in `public` only (ROL-06).
-SET LOCAL search_path = public;
 
--- 1. Phase identity, database and schema guard.
+-- 0. TRANSACTION GUARD - the FIRST executable statement, before the session preparation and
+--    before any protected operation. ROL-06 is transaction-local, so a caller that prealigns
+--    the three settings at SESSION level could satisfy the guard's value checks while running
+--    outside a transaction; each statement would commit on its own and a later refusal would
+--    leave partially applied ACL/default-ACL changes. PostgreSQL accepts a SAVEPOINT only
+--    inside a transaction block (SQLSTATE 25P01 otherwise), so this pair refuses a
+--    transactionless invocation before anything is prepared or changed. The savepoint is
+--    released at once and never left behind; BEGIN/COMMIT/ROLLBACK remain the caller's.
+SAVEPOINT hh_privileges_tx_guard;
+RELEASE SAVEPOINT hh_privileges_tx_guard;
+
+-- 0b. ROL-06 session contract, established before any unqualified statement. All three
+--     settings are transaction-local: at COMMIT/ROLLBACK the session returns to whatever the
+--     caller had. `application_name` is the phase identity (`session_user`), which the guard
+--     below pins to the two permitted phases.
+SET LOCAL search_path = public;
+SELECT set_config('application_name', session_user, true);
+SELECT set_config('statement_timeout', '0', true);
+
+-- 1. Phase identity, database, ROL-06 and schema guard.
 DO $hh_guard$
 DECLARE
     session text := session_user;
@@ -42,9 +68,19 @@ BEGIN
         RAISE EXCEPTION 'privileges.sql was pointed at the wrong database (current_database=%)',
             current_database();
     END IF;
+    -- ROL-06: all three settings must be in force, and `application_name` must name the
+    -- phase. A caller that could not set them (no transaction block) fails closed here.
     IF current_setting('search_path') <> 'public' THEN
         RAISE EXCEPTION 'search_path is not exactly public (search_path=%)',
             current_setting('search_path');
+    END IF;
+    IF current_setting('application_name') <> session THEN
+        RAISE EXCEPTION 'application_name is not the phase identity (application_name=%, session_user=%)',
+            current_setting('application_name'), session;
+    END IF;
+    IF current_setting('statement_timeout') <> '0' THEN
+        RAISE EXCEPTION 'statement_timeout is not 0 (statement_timeout=%)',
+            current_setting('statement_timeout');
     END IF;
     IF NOT EXISTS (
         SELECT 1 FROM pg_tables

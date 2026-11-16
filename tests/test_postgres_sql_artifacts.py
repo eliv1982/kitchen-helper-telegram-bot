@@ -1,7 +1,7 @@
-"""HH-DB-01 Stage 2 WP-1B - the SQL artifacts on a real PostgreSQL 16 (opt-in).
+"""HH-DB-01 Stage 2 (WP-1B, WP-1C-A) - the SQL artifacts on a real PostgreSQL 16 (opt-in).
 
-Scope: `db/roles.sql`, `db/bootstrap.sql`, `db/privileges.sql` and the validated runner in
-`tests/postgres_sql.py`, against the SAME disposable cluster of
+Scope: `db/roles.sql`, `db/bootstrap.sql`, `db/schema.sql`, `db/privileges.sql` and the
+validated runner in `tests/postgres_sql.py`, against the SAME disposable cluster of
 compose.test-postgres.yaml that Stage 1 uses, through the same independent identity and
 safety boundary (`tests/postgres_harness.py`). Nothing here is deployed, and no Production,
 n8n or ETL service is contacted.
@@ -30,6 +30,7 @@ Opt-in, like the Stage 1 suites:
 import os
 import re
 import secrets
+import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -90,6 +91,11 @@ EXPECTED_DEFAULTS = frozenset({
     ("public", "r", "hh_app", "UPDATE", False),
     ("public", "r", "hh_backup", "SELECT", False),
 })
+# BOOT-04/ROL-09: the independent golden expectation of the exploded `public` schema ACL.
+EXPECTED_SCHEMA_ACL = frozenset(
+    {("hh_owner", "USAGE", False), ("hh_owner", "CREATE", False)}
+    | {(login, "USAGE", False) for login in artifacts.LOGIN_ROLE_NAMES}
+)
 # Every database THIS process created for these tests. The last-resort teardown drops
 # only these; a pre-existing database is refused at setup, never adopted or dropped.
 _CREATED_BY_THIS_MODULE: set = set()
@@ -381,7 +387,7 @@ def _serving_database(project: Project) -> SimpleNamespace:
         with artifacts.project_connection(
             project.run, artifacts.SERVING_DATABASE, "hh_migrate", project.passwords["hh_migrate"]
         ) as connection:
-            artifacts.SchemaContract().apply(connection)
+            artifacts.SchemaContract().apply(connection, database=artifacts.SERVING_DATABASE)
         engine = artifacts.migration_engine(
             project.run, artifacts.SERVING_DATABASE, "hh_migrate", project.passwords["hh_migrate"]
         )
@@ -410,7 +416,7 @@ def _restore_database(project: Project) -> SimpleNamespace:
             expected_current_user="hh_restore",
         ) as connection:
             artifacts.assume_owner(connection)
-            artifacts.SchemaContract().apply(connection)
+            artifacts.SchemaContract().apply(connection, database=name)
         engine = artifacts.migration_engine(
             project.run, name, "hh_restore", project.passwords["hh_restore"]
         )
@@ -452,6 +458,23 @@ def restore(project):
         with project.run.control() as control:
             if database.name in database.bootstrap.created:
                 database.bootstrap.drop(control, database.name)
+
+
+@pytest.fixture
+def schema_only(project):
+    """A bootstrapped database that has NOT been migrated or privilege-seeded.
+
+    `db/schema.sql` runs before `alembic upgrade head`, so the schema-contract tests need
+    exactly the E3-c end state: connections enabled, only the phase login allowed, no
+    application object and no `alembic_version`."""
+    name = "house_helper_restore_" + secrets.token_hex(8)
+    bootstrap = _bootstrap(project, name, "hh_restore")
+    try:
+        yield SimpleNamespace(name=name, project=project, bootstrap=bootstrap)
+    finally:
+        with project.run.control() as control:
+            if name in bootstrap.created:
+                bootstrap.drop(control, name)
 
 
 @pytest.fixture
@@ -773,7 +796,7 @@ def test_roles_sql_requires_autocommit(project):
 
 
 def test_the_artifacts_do_not_manage_transactions_themselves():
-    for filename in ("roles.sql", "privileges.sql"):
+    for filename in ("roles.sql", "schema.sql", "privileges.sql"):
         text = (artifacts.SQL_DIR / filename).read_text(encoding="utf-8")
         without_comments = "\n".join(
             line for line in text.splitlines() if not line.strip().startswith("--")
@@ -962,6 +985,494 @@ def test_bootstrap_verifies_ownership_locale_and_connect_privileges(serving):
         assert all(matrix[role] is False for role in (
             "hh_app", "hh_purge", "hh_backup", "hh_provision", "hh_restore"))
         assert _temporary(control, serving.name, "hh_migrate") is False
+
+
+# --- B2. schema.sql (BOOT-04) ----------------------------------------------------------------
+
+
+@contextmanager
+def _schema_owner(project: Project, database: str, login: str):
+    """A verified phase connection with `current_user = hh_owner`.
+
+    `hh_migrate` arrives as the owner through its `ALTER ROLE ... SET role` default; the
+    restore login performs the explicit RST-01/BOOT-03 transition."""
+    if login == "hh_restore":
+        with artifacts.project_connection(
+            project.run, database, login, project.passwords[login],
+            expected_current_user="hh_restore",
+        ) as connection:
+            artifacts.assume_owner(connection)
+            yield connection
+    else:
+        with artifacts.project_connection(
+            project.run, database, login, project.passwords[login]
+        ) as connection:
+            yield connection
+
+
+def test_the_schema_contract_applies_in_the_serving_phase(serving):
+    """BOOT-04 serving phase: `hh_migrate` arrives as `hh_owner`, and the artifact is
+    idempotent on the already-migrated serving database."""
+    project = serving.project
+    with _schema_owner(project, serving.name, "hh_migrate") as connection:
+        assert artifacts.identity(connection) == ("hh_migrate", "hh_owner")
+        evidence = artifacts.SchemaContract().apply(connection, database=serving.name)
+    assert evidence["owner"] == "hh_owner"
+    assert evidence["public_entries"] == 0
+    assert evidence["entries"] == EXPECTED_SCHEMA_ACL
+    assert evidence["defaults"] == EXPECTED_DEFAULTS
+
+
+def test_the_schema_contract_applies_in_the_restore_phase(schema_only):
+    """BOOT-04 restore phase: `hh_restore` connects as itself, then assumes `hh_owner`."""
+    project = schema_only.project
+    with artifacts.project_connection(
+        project.run, schema_only.name, "hh_restore", project.passwords["hh_restore"],
+        expected_current_user="hh_restore",
+    ) as connection:
+        assert artifacts.identity(connection) == ("hh_restore", "hh_restore")
+        artifacts.assume_owner(connection)
+        assert artifacts.identity(connection) == ("hh_restore", "hh_owner")
+        evidence = artifacts.SchemaContract().apply(connection, database=schema_only.name)
+    assert evidence["owner"] == "hh_owner"
+    assert evidence["entries"] == EXPECTED_SCHEMA_ACL
+    assert evidence["defaults"] == EXPECTED_DEFAULTS
+
+
+def test_the_public_schema_contract_is_exact(schema_only):
+    """The resulting catalog state: ownership, the exact ACL, the effective matrix and the
+    default-ACL set. The fresh pre-state (owned by `pg_database_owner`, PUBLIC USAGE) is
+    recorded first so the change is measured, not assumed."""
+    project = schema_only.project
+    with _schema_owner(project, schema_only.name, "hh_restore") as connection:
+        before = artifacts.schema_snapshot(connection)
+        assert before["owner"] == "pg_database_owner"
+        assert ("PUBLIC", "USAGE", False) in before["entries"]
+        assert before["defaults"] == ()
+        artifacts.SchemaContract().apply(connection, database=schema_only.name)
+        after = artifacts.schema_snapshot(connection)
+        assert after["foreign_schemas"] == ()
+        assert after["owner"] == "hh_owner"
+        assert after["entries"] == EXPECTED_SCHEMA_ACL
+        assert frozenset(
+            entry for entry in after["defaults"] if entry[2] != "hh_owner"
+        ) == EXPECTED_DEFAULTS
+        for role in artifacts.PROJECT_ROLE_NAMES:
+            usage, create = connection.execute(
+                "SELECT has_schema_privilege(%s, 'public', 'USAGE'), "
+                "has_schema_privilege(%s, 'public', 'CREATE')",
+                (role, role),
+            ).fetchone()
+            expected = (True, True) if role == "hh_owner" else (True, False)
+            assert (usage, create) == expected, role
+        assert connection.execute(
+            "SELECT has_schema_privilege('public', 'public', 'USAGE')"
+        ).fetchone()[0] is False
+        assert connection.execute(
+            "SELECT has_schema_privilege('public', 'public', 'CREATE')"
+        ).fetchone()[0] is False
+
+
+def test_a_pre_existing_public_grant_is_converged(schema_only):
+    """BOOT-04 explicitly revokes PUBLIC: a PUBLIC entry present on the fresh database is
+    removed, not refused."""
+    project = schema_only.project
+    with _schema_owner(project, schema_only.name, "hh_restore") as connection:
+        connection.execute("GRANT USAGE, CREATE ON SCHEMA public TO PUBLIC")
+        assert ("PUBLIC", "CREATE", False) in artifacts.schema_acl_entries(connection)
+        artifacts.SchemaContract().apply(connection, database=schema_only.name)
+        assert artifacts.schema_acl_entries(connection) == EXPECTED_SCHEMA_ACL
+
+
+def test_an_unauthorized_schema_grant_is_refused_not_silently_kept(schema_only):
+    """A grant to a recipient the artifact cannot revoke (a project role's CREATE) is
+    security drift: the verification refuses it and the transaction changes nothing."""
+    project = schema_only.project
+    with _schema_owner(project, schema_only.name, "hh_restore") as connection:
+        connection.execute("GRANT CREATE ON SCHEMA public TO hh_app")
+        before = artifacts.schema_snapshot(connection)
+        with pytest.raises(artifacts.ArtifactError) as refused:
+            artifacts.SchemaContract().apply(connection, database=schema_only.name)
+        assert refused.value.code == "schema_contract"
+        assert artifacts.schema_snapshot(connection) == before
+        connection.execute("REVOKE CREATE ON SCHEMA public FROM hh_app")
+        artifacts.SchemaContract().apply(connection, database=schema_only.name)
+
+
+def test_the_schema_contract_is_idempotent(schema_only):
+    project = schema_only.project
+    with _schema_owner(project, schema_only.name, "hh_restore") as connection:
+        artifacts.SchemaContract().apply(connection, database=schema_only.name)
+        first = artifacts.schema_snapshot(connection)
+        artifacts.SchemaContract().apply(connection, database=schema_only.name)
+        second = artifacts.schema_snapshot(connection)
+        artifacts.SchemaContract().apply(connection, database=schema_only.name)
+        assert artifacts.schema_snapshot(connection) == second == first
+
+
+def test_the_schema_contract_refuses_wrong_phase_identities(schema_only):
+    project = schema_only.project
+    stranger = psycopg.connect(
+        autocommit=True, **project.run.target.connect_params(schema_only.name)
+    )
+    try:
+        before = artifacts.schema_snapshot(stranger)
+        with pytest.raises(artifacts.ArtifactError) as refused:
+            artifacts.SchemaContract().apply(stranger, database=schema_only.name)
+        assert refused.value.code == "wrong_phase_identity"
+        assert artifacts.schema_snapshot(stranger) == before
+    finally:
+        stranger.close()
+    with _schema_owner(project, schema_only.name, "hh_restore") as connection:
+        connection.execute('SET ROLE "hh_restore"')
+        try:
+            before = artifacts.schema_snapshot(connection)
+            with pytest.raises(artifacts.ArtifactError) as refused:
+                artifacts.SchemaContract().apply(connection, database=schema_only.name)
+            assert refused.value.code == "wrong_phase_identity"
+            assert artifacts.schema_snapshot(connection) == before
+        finally:
+            connection.execute('SET ROLE "hh_owner"')
+
+
+def test_the_schema_contract_refuses_the_wrong_database(schema_only):
+    """Both the runner guard and the file's own DO block refuse a database mismatch, and
+    neither changes anything."""
+    project = schema_only.project
+    with _schema_owner(project, schema_only.name, "hh_restore") as connection:
+        before = artifacts.schema_snapshot(connection)
+        with pytest.raises(artifacts.ArtifactError) as refused:
+            artifacts.SchemaContract().apply(
+                connection, database=artifacts.SERVING_DATABASE
+            )
+        assert refused.value.code == "wrong_database"
+        assert artifacts.schema_snapshot(connection) == before
+        # The authoritative second layer: the rendered file itself, run as the owner.
+        rendered = artifacts.render_schema(artifacts.SERVING_DATABASE)
+        with pytest.raises(psycopg.errors.RaiseException):
+            with connection.transaction():
+                connection.execute(rendered)
+        assert artifacts.schema_snapshot(connection) == before
+
+
+def test_a_failed_schema_contract_run_rolls_back_everything(schema_only):
+    """The runner supplies ONE transaction. A failure after the contract statements have
+    run leaves the pre-hardening catalog exactly as it was."""
+    project = schema_only.project
+    text = (artifacts.SQL_DIR / "schema.sql").read_text(encoding="utf-8")
+    doctored = text + "\nSELECT 1 / 0;\n"
+    with _schema_owner(project, schema_only.name, "hh_restore") as connection:
+        before = artifacts.schema_snapshot(connection)
+        assert before["owner"] == "pg_database_owner"
+        assert ("PUBLIC", "USAGE", False) in before["entries"]
+        with pytest.raises(psycopg.errors.DivisionByZero):
+            artifacts.SchemaContract(sql=doctored).apply(
+                connection, database=schema_only.name
+            )
+        assert artifacts.schema_snapshot(connection) == before
+
+
+def test_the_schema_contract_preserves_unrelated_objects(schema_only):
+    """A pre-existing object is untouched: no DROP, no adoption, and the default ACLs
+    installed by the artifact apply to FUTURE objects only."""
+    project = schema_only.project
+    with _schema_owner(project, schema_only.name, "hh_restore") as connection:
+        connection.execute("CREATE TABLE public.wp1c_keep (id integer)")
+        connection.execute("INSERT INTO public.wp1c_keep (id) VALUES (1)")
+        artifacts.SchemaContract().apply(connection, database=schema_only.name)
+        assert connection.execute("SELECT id FROM public.wp1c_keep").fetchall() == [(1,)]
+        assert connection.execute(
+            "SELECT relacl::text, relowner::regrole::text FROM pg_class "
+            "WHERE oid = 'public.wp1c_keep'::regclass"
+        ).fetchone() == (None, "hh_owner")
+
+
+# --- B3. ROL-06 session contract ------------------------------------------------------------
+# The frozen requirement (§3.3 ROL-06) is that the session sets and then VERIFIES
+# `search_path`, `application_name` and `statement_timeout` before any unqualified SQL after
+# assuming `hh_owner`. The values are `public`, the phase identity ('hh_migrate' serving /
+# 'hh_restore' restore) and `0`. The artifact establishes them itself, transaction-locally, so
+# a caller that supplies WRONG values is converged rather than believed, and the file's own
+# guard refuses any state in which the settings are not actually in force.
+
+
+DEFAULT_SEARCH_PATH = '"$user", public'
+
+
+def test_the_rol06_contract_is_established_in_the_serving_phase(serving):
+    """`hh_migrate`/`hh_owner`: a wrong `application_name` and `statement_timeout` supplied by
+    the caller are replaced by the frozen values, the runner reads the effective state back,
+    and the change is transaction-local (the caller's own values return at COMMIT)."""
+    project = serving.project
+    with _schema_owner(project, serving.name, "hh_migrate") as connection:
+        assert artifacts.identity(connection) == ("hh_migrate", "hh_owner")
+        connection.execute("SET application_name = 'not_hh'")
+        connection.execute("SET statement_timeout = '7s'")
+        assert connection.execute(
+            "SELECT current_setting('application_name'), current_setting('statement_timeout'), "
+            "current_setting('search_path')"
+        ).fetchone() == ("not_hh", "7s", DEFAULT_SEARCH_PATH)
+        evidence = artifacts.SchemaContract().apply(connection, database=serving.name)
+        assert evidence["session"] == {
+            "session_user": "hh_migrate",
+            "application_name": "hh_migrate",
+            "statement_timeout": "0",
+            "search_path": "public",
+        }
+        # Transaction-local: COMMIT restored the caller's session exactly. Nothing was
+        # written to `rolconfig`/`pg_db_role_setting` and no other session was touched.
+        assert connection.execute(
+            "SELECT current_setting('application_name'), current_setting('statement_timeout'), "
+            "current_setting('search_path')"
+        ).fetchone() == ("not_hh", "7s", DEFAULT_SEARCH_PATH)
+    assert _role_settings(project, "hh_migrate") == ("application_name=hh_migrate", "role=hh_owner")
+
+
+def test_the_rol06_contract_is_established_in_the_restore_phase(schema_only):
+    """`hh_restore`/`hh_owner`: the restore phase obeys the same contract, with the restore
+    identity as `application_name`, and the settings do not outlive the transaction."""
+    project = schema_only.project
+    with artifacts.project_connection(
+        project.run, schema_only.name, "hh_restore", project.passwords["hh_restore"],
+        expected_current_user="hh_restore",
+    ) as connection:
+        artifacts.assume_owner(connection)
+        assert artifacts.identity(connection) == ("hh_restore", "hh_owner")
+        connection.execute("SET application_name = 'not_hh'")
+        connection.execute("SET statement_timeout = '7s'")
+        evidence = artifacts.SchemaContract().apply(connection, database=schema_only.name)
+        assert evidence["session"] == {
+            "session_user": "hh_restore",
+            "application_name": "hh_restore",
+            "statement_timeout": "0",
+            "search_path": "public",
+        }
+        assert connection.execute(
+            "SELECT current_setting('application_name'), current_setting('statement_timeout')"
+        ).fetchone() == ("not_hh", "7s")
+    assert _role_settings(project, "hh_restore") == ()
+
+
+def test_the_guard_enforces_each_rol06_setting(schema_only):
+    """The anti-bypass layer, stated as a property of the artifact itself: each of the three
+    ROL-06 settings is VERIFIED by the file's own guard, not merely set. With the matching
+    preparation statement removed and a wrong value supplied instead, the file refuses.
+
+    (A caller cannot normally strip the preparation - it is in the artifact - so the doctored
+    text here is the way to observe the guard that a statement-by-statement caller, where
+    `SET LOCAL` would silently not apply, would hit.)"""
+    project = schema_only.project
+    text = (artifacts.SQL_DIR / "schema.sql").read_text(encoding="utf-8")
+    cases = (
+        ("SET LOCAL search_path = public;", "SET search_path = 'pg_catalog'",
+         "search_path is not exactly public"),
+        ("SELECT set_config('application_name', session_user, true);",
+         "SET application_name = 'not_hh'", "application_name is not the phase identity"),
+        ("SELECT set_config('statement_timeout', '0', true);",
+         "SET statement_timeout = '7s'", "statement_timeout is not 0"),
+    )
+    with _schema_owner(project, schema_only.name, "hh_restore") as connection:
+        before = artifacts.schema_snapshot(connection)
+        for preparation, wrong_value, message in cases:
+            assert preparation in text  # the preparation really is in the deployable artifact
+            doctored = artifacts.render_schema(
+                schema_only.name, sql=text.replace(preparation, "-- removed by the test")
+            )
+            with pytest.raises(psycopg.errors.RaiseException) as raised:
+                with connection.transaction():
+                    connection.execute(wrong_value)
+                    connection.execute(doctored)
+            assert message in str(raised.value)
+            assert artifacts.schema_snapshot(connection) == before
+
+
+def _role_settings(project: Project, role: str):
+    with project.run.control() as control:
+        row = control.execute(
+            "SELECT rolconfig FROM pg_roles WHERE rolname = %s", (role,)
+        ).fetchone()
+    return tuple(sorted(row[0] or ()))
+
+
+# --- B4. permanent negative coverage of the schema contract ----------------------------------
+
+
+def test_a_conflicting_public_schema_owner_is_refused(schema_only):
+    """BOOT-07: `public` owned by anything but `pg_database_owner` (fresh) or `hh_owner`
+    (re-run) is a conflicting-ownership state, never adopted. The refusal leaves the catalog
+    - ownership and ACL - exactly as it was."""
+    project = schema_only.project
+    with psycopg.connect(
+        autocommit=True, **project.run.target.connect_params(schema_only.name)
+    ) as superuser:
+        superuser.execute("ALTER SCHEMA public OWNER TO hh_app")
+        assert superuser.execute(
+            "SELECT n.nspowner::regrole::text FROM pg_namespace n WHERE n.nspname = 'public'"
+        ).fetchone()[0] == "hh_app"
+    with _schema_owner(project, schema_only.name, "hh_restore") as connection:
+        before = artifacts.schema_snapshot(connection)
+        assert before["owner"] == "hh_app"
+        with pytest.raises(artifacts.ArtifactError) as refused:
+            artifacts.SchemaContract().apply(connection, database=schema_only.name)
+        assert refused.value.code == "schema_contract"
+        assert artifacts.schema_snapshot(connection) == before
+        # The authoritative second layer refuses the same state.
+        with pytest.raises(psycopg.errors.RaiseException) as raised:
+            with connection.transaction():
+                connection.execute(artifacts.render_schema(schema_only.name))
+        assert "unexpected role" in str(raised.value)
+        assert artifacts.schema_snapshot(connection) == before
+
+
+def test_an_unauthorized_schema_recipient_is_refused(schema_only):
+    """ROL-09: exactly the six logins hold `USAGE` and nobody else. A grant to a recipient the
+    artifact would have to NAME cannot be converged, so it is refused with the whole
+    transaction rolled back - the stray grant is still there afterwards, unchanged."""
+    project = schema_only.project
+    with _unrelated_default_recipient(project.run, "unrelated") as grantee:
+        with _schema_owner(project, schema_only.name, "hh_restore") as connection:
+            connection.execute(f'GRANT USAGE ON SCHEMA public TO "{grantee}"')
+            try:
+                before = artifacts.schema_snapshot(connection)
+                assert (grantee, "USAGE", False) in before["entries"]
+                with pytest.raises(artifacts.ArtifactError) as refused:
+                    artifacts.SchemaContract().apply(connection, database=schema_only.name)
+                assert refused.value.code == "schema_contract"
+                assert artifacts.schema_snapshot(connection) == before
+            finally:
+                # The role cannot be dropped while the scratch database holds a grant on it.
+                connection.execute(f'REVOKE USAGE ON SCHEMA public FROM "{grantee}"')
+            artifacts.SchemaContract().apply(connection, database=schema_only.name)
+            assert artifacts.schema_acl_entries(connection) == EXPECTED_SCHEMA_ACL
+
+
+def test_a_schema_grant_option_is_refused(schema_only):
+    """A grant option on the schema ACL is drift the artifact cannot remove by re-granting
+    `USAGE`; the exact-ACL check refuses it and nothing is changed."""
+    project = schema_only.project
+    with _schema_owner(project, schema_only.name, "hh_restore") as connection:
+        connection.execute("GRANT USAGE ON SCHEMA public TO hh_backup WITH GRANT OPTION")
+        before = artifacts.schema_snapshot(connection)
+        assert ("hh_backup", "USAGE", True) in before["entries"]
+        with pytest.raises(artifacts.ArtifactError) as refused:
+            artifacts.SchemaContract().apply(connection, database=schema_only.name)
+        assert refused.value.code == "schema_contract"
+        assert artifacts.schema_snapshot(connection) == before
+        connection.execute("REVOKE USAGE ON SCHEMA public FROM hh_backup")
+        artifacts.SchemaContract().apply(connection, database=schema_only.name)
+        assert artifacts.schema_acl_entries(connection) == EXPECTED_SCHEMA_ACL
+
+
+def test_a_schema_specific_default_acl_drift_is_refused(schema_only):
+    """ROL-14 is an exact matrix. An extra schema-specific default grant to a legitimate role
+    is not in it, and the artifact only grants - so the state is refused, not half-fixed."""
+    project = schema_only.project
+    with _schema_owner(project, schema_only.name, "hh_restore") as connection:
+        connection.execute(
+            "ALTER DEFAULT PRIVILEGES FOR ROLE hh_owner IN SCHEMA public "
+            "GRANT SELECT ON TABLES TO hh_purge"
+        )
+        before = artifacts.schema_snapshot(connection)
+        assert ("public", "r", "hh_purge", "SELECT", False) in before["defaults"]
+        with pytest.raises(artifacts.ArtifactError) as refused:
+            artifacts.SchemaContract().apply(connection, database=schema_only.name)
+        assert refused.value.code == "schema_contract"
+        assert artifacts.schema_snapshot(connection) == before
+        connection.execute(
+            "ALTER DEFAULT PRIVILEGES FOR ROLE hh_owner IN SCHEMA public "
+            "REVOKE ALL ON TABLES FROM hh_purge"
+        )
+        artifacts.SchemaContract().apply(connection, database=schema_only.name)
+        assert frozenset(
+            entry
+            for entry in artifacts.default_acl_entries(connection)
+            if entry[2] != "hh_owner"
+        ) == EXPECTED_DEFAULTS
+
+
+def _exploded_relation_acl(connection, relation: str) -> frozenset:
+    rows = connection.execute(
+        "SELECT COALESCE(g.rolname, 'PUBLIC'), a.privilege_type "
+        "FROM pg_class c CROSS JOIN LATERAL aclexplode(c.relacl) a "
+        "LEFT JOIN pg_roles g ON g.oid = a.grantee "
+        "WHERE c.oid = 'public." + relation + "'::regclass"
+    ).fetchall()
+    return frozenset((row[0], row[1]) for row in rows)
+
+
+def test_future_objects_get_the_frozen_privileges_before_privileges_sql(schema_only):
+    """BOOT-09 step 1 -> step 2: `db/schema.sql` alone (no migration, no `db/privileges.sql`)
+    gives a table and a sequence created by the owner the exact ROL-14 privileges. The probe
+    objects are created in an explicitly rolled-back block, so nothing is left behind."""
+    project = schema_only.project
+    table_privileges = ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER")
+    with _schema_owner(project, schema_only.name, "hh_restore") as connection:
+        artifacts.SchemaContract().apply(connection, database=schema_only.name)
+        # Precondition: an uninitialised schema. There is no application object at all.
+        assert connection.execute(
+            "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = 'public'"
+        ).fetchone()[0] == 0
+        connection.execute("BEGIN")  # autocommit connection: explicit block
+        try:
+            connection.execute(
+                "CREATE TABLE public.wp1c_future_probe (id integer, content text)"
+            )
+            connection.execute("CREATE SEQUENCE public.wp1c_future_probe_seq")
+            assert connection.execute(
+                "SELECT pg_get_userbyid(relowner) FROM pg_class "
+                "WHERE oid = 'public.wp1c_future_probe'::regclass"
+            ).fetchone()[0] == "hh_owner"
+            # The exact materialized ACL: PostgreSQL writes the owner's own entries next to
+            # the two default-ACL recipients, and nothing else.
+            owner_table = {("hh_owner", privilege) for privilege in table_privileges}
+            assert _exploded_relation_acl(connection, "wp1c_future_probe") == owner_table | {
+                ("hh_app", "SELECT"), ("hh_app", "INSERT"),
+                ("hh_app", "UPDATE"), ("hh_app", "DELETE"),
+                ("hh_backup", "SELECT"),
+            }
+            assert _exploded_relation_acl(connection, "wp1c_future_probe_seq") == {
+                ("hh_owner", "SELECT"), ("hh_owner", "UPDATE"), ("hh_owner", "USAGE"),
+                ("hh_app", "USAGE"), ("hh_backup", "SELECT"),
+            }
+            # The effective matrix, for every role, in the catalog's own words.
+            table_expected = {"hh_app": {"SELECT", "INSERT", "UPDATE", "DELETE"},
+                              "hh_backup": {"SELECT"}}
+            for role in ("hh_owner", "hh_migrate", "hh_app", "hh_backup", "hh_purge",
+                         "hh_provision", "hh_restore", "public"):
+                expected = table_expected.get(role, set())
+                if role == "hh_owner":
+                    expected = set(table_privileges)  # the owner holds them inherently
+                for privilege in table_privileges:
+                    assert connection.execute(
+                        "SELECT has_table_privilege(%s, 'public.wp1c_future_probe', %s)",
+                        (role, privilege),
+                    ).fetchone()[0] is (privilege in expected), (role, privilege)
+            sequence_expected = {"hh_app": {"USAGE"}, "hh_backup": {"SELECT"},
+                                 "hh_owner": {"USAGE", "SELECT", "UPDATE"}}
+            for role in ("hh_owner", "hh_migrate", "hh_app", "hh_backup", "hh_purge",
+                         "hh_provision", "hh_restore", "public"):
+                expected = sequence_expected.get(role, set())
+                for privilege in ("USAGE", "SELECT", "UPDATE"):
+                    assert connection.execute(
+                        "SELECT has_sequence_privilege(%s, 'public.wp1c_future_probe_seq', %s)",
+                        (role, privilege),
+                    ).fetchone()[0] is (privilege in expected), (role, privilege)
+            # A column-level grant would evade `has_table_privilege`; ask the column question.
+            for role in ("hh_purge", "hh_provision", "hh_restore", "public"):
+                assert connection.execute(
+                    "SELECT has_column_privilege(%s, 'public.wp1c_future_probe', 'content', 'SELECT')",
+                    (role,),
+                ).fetchone()[0] is False
+        finally:
+            connection.execute("ROLLBACK")
+        # The rollback restored the uninitialised, already-hardened schema.
+        assert connection.execute(
+            "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = 'public'"
+        ).fetchone()[0] == 0
+        assert artifacts.schema_acl_entries(connection) == EXPECTED_SCHEMA_ACL
+
 
 
 # --- C. privileges.sql -----------------------------------------------------------------------
@@ -1332,6 +1843,8 @@ def test_adversarial_database_names_are_refused_before_render(name):
         artifacts.render_bootstrap(name, "hh_migrate")
     with pytest.raises(artifacts.ArtifactError):
         artifacts.render_privileges(name)
+    with pytest.raises(artifacts.ArtifactError):
+        artifacts.render_schema(name)
 
 
 def test_the_allowed_database_shapes_are_exact():
@@ -1344,6 +1857,9 @@ def test_the_allowed_database_shapes_are_exact():
     assert 'TO "hh_restore"' in rendered["harden"]
     assert "{{" not in rendered["create"] + rendered["harden"] + rendered["enable"]
     assert "'house_helper'" in artifacts.render_privileges("house_helper")
+    assert "'house_helper'" in artifacts.render_schema("house_helper")
+    assert "'" + longest + "'" in artifacts.render_schema(longest)
+    assert "{{database}}" not in artifacts.render_schema(longest)
 
 
 def test_a_database_grantee_mismatch_is_refused_before_rendering_or_sql():
@@ -1408,6 +1924,8 @@ def test_invalid_input_never_reaches_a_connection():
         )
     with pytest.raises(artifacts.ArtifactError):
         artifacts.PrivilegesScript().apply(rejecting, database="house_helper;drop")
+    with pytest.raises(artifacts.ArtifactError):
+        artifacts.SchemaContract().apply(rejecting, database="house_helper;drop")
 
 
 # --- E. locale conformance -------------------------------------------------------------------
@@ -1514,3 +2032,286 @@ def test_locale_option_is_validated_before_any_connection(project_run):
         project_run.create_database(locale="en_US.utf8;DROP")
     with pytest.raises(ValueError):
         project_run.create_database(locale="C", template="not_a_scratch_database")
+
+
+# --- G. transaction and session contract (WP-1C-A R2) ---------------------------------------
+# Codex's R1 counterexample: correct SESSION-level settings do not prove execution inside an
+# explicit transaction. Direct `psql -f` processes one statement at a time, so without BEGIN
+# every catalog change commits on its own and a late verification failure leaves partially
+# committed schema ownership / default ACLs behind. Both artifacts therefore begin with a
+# SAVEPOINT (legal only inside a transaction block) before the ROL-06 preparation, and
+# `db/privileges.sql` now establishes the complete ROL-06 contract itself.
+
+_PSQL_CONTAINER_ID = re.compile(r"[0-9a-f]{12,64}")
+
+
+def _run_psql(run, *, database, login, script) -> subprocess.CompletedProcess:
+    """Execute SQL through real `psql -X -v ON_ERROR_STOP=1` INSIDE the verified container.
+
+    No host psql is required and the host's port 5432 is never contacted: psql connects over
+    the container's own Unix socket (`local ... trust`) in the container whose id, digest-
+    pinned image and `system_identifier` the harness independently established. The SQL is
+    handed to psql on stdin (`-f -`), which processes it statement by statement - exactly the
+    statement-at-a-time path where a missing transaction block is observable."""
+    name = artifacts.validate_database_name(database)
+    role = artifacts.validate_login_role(login)
+    cluster = run.verified_cluster()
+    assert _PSQL_CONTAINER_ID.fullmatch(cluster.container_id)
+    return subprocess.run(
+        [
+            "docker", "exec", "-i", cluster.container_id,
+            "psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", role, "-d", name, "-f", "-",
+        ],
+        input=script,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+def _transactionless_script(rendered, *, application_name, prealigned):
+    """A one-statement-per-query script (NO BEGIN) with a caller-supplied session contract.
+
+    `prealigned` supplies exactly the frozen ROL-06 values at SESSION level - the case the
+    value checks alone accepted - while its absence supplies deliberately wrong values. A
+    restore-phase caller must also assume the owner, which is session state in this mode."""
+    lines = []
+    if application_name == "hh_restore":
+        lines.append("SET ROLE hh_owner;")  # RST-01/BOOT-03 transition, session-level
+    if prealigned:
+        lines.append("SET search_path = public;")
+        lines.append(f"SET application_name = '{application_name}';")
+        lines.append("SET statement_timeout = 0;")
+    else:
+        lines.append("SET search_path = 'pg_catalog';")
+        lines.append("SET application_name = 'not_hh';")
+        lines.append("SET statement_timeout = '7s';")
+    return "\n".join(lines) + "\n" + rendered
+
+
+def _fresh_phase_database(project: Project, phase: str) -> SimpleNamespace:
+    """A bootstrapped, NOT yet hardened database in the named phase.
+
+    `house_helper` is free for the serving case because no other fixture is alive in the same
+    test: every database fixture is function-scoped, so `serving` never overlaps this one."""
+    if phase == "serving":
+        name, login = artifacts.SERVING_DATABASE, "hh_migrate"
+    else:
+        name, login = "house_helper_restore_" + secrets.token_hex(8), "hh_restore"
+    bootstrap = _bootstrap(project, name, login)
+    return SimpleNamespace(
+        name=name, login=login, phase=phase, project=project, bootstrap=bootstrap
+    )
+
+
+def _drop_phase_database(database: SimpleNamespace) -> None:
+    with database.project.run.control() as control:
+        if database.name in database.bootstrap.created:
+            database.bootstrap.drop(control, database.name)
+
+
+@pytest.fixture(params=["serving", "restore"])
+def phase_schema_only(request, project):
+    database = _fresh_phase_database(project, request.param)
+    try:
+        yield database
+    finally:
+        _drop_phase_database(database)
+
+
+def test_the_transaction_guard_is_the_first_executable_statement():
+    """Structural contract: no comment, no `SET`, no catalog statement may precede the guard."""
+    expected = {
+        "schema.sql": "hh_schema_tx_guard",
+        "privileges.sql": "hh_privileges_tx_guard",
+    }
+    for filename, savepoint in expected.items():
+        text = (artifacts.SQL_DIR / filename).read_text(encoding="utf-8")
+        executable = [
+            line.strip()
+            for line in text.splitlines()
+            if line.strip() and not line.strip().startswith("--")
+        ]
+        assert executable[0] == f"SAVEPOINT {savepoint};", filename
+        assert executable[1] == f"RELEASE SAVEPOINT {savepoint};", filename
+
+
+@pytest.mark.parametrize("settings", ["incorrect", "prealigned"])
+def test_direct_psql_without_a_transaction_is_refused_in_both_phases(
+    phase_schema_only, settings
+):
+    """Codex R1, reproduced: real `psql -f` with NO BEGIN, in both phases.
+
+    `prealigned` sets exactly the frozen search_path/application_name/statement_timeout at
+    session level, so the old value checks would have passed and the catalog mutations would
+    have committed one by one. The transaction guard refuses the very first statement; the
+    complete catalog snapshot - ownership, exploded ACL, default ACLs - is unchanged."""
+    database = phase_schema_only
+    rendered = artifacts.render_schema(database.name)
+    with _schema_owner(database.project, database.name, database.login) as connection:
+        before = artifacts.schema_snapshot(connection)
+        assert before["owner"] == "pg_database_owner"
+        assert ("PUBLIC", "USAGE", False) in before["entries"]
+        assert before["defaults"] == ()
+
+    result = _run_psql(
+        database.project.run,
+        database=database.name,
+        login=database.login,
+        script=_transactionless_script(
+            rendered,
+            application_name=database.login,
+            prealigned=(settings == "prealigned"),
+        ),
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "SAVEPOINT can only be used in transaction blocks" in result.stderr
+
+    with _schema_owner(database.project, database.name, database.login) as connection:
+        after = artifacts.schema_snapshot(connection)
+    assert after == before
+    assert after["owner"] == "pg_database_owner"
+    assert after["defaults"] == ()
+
+
+def test_a_preexisting_unauthorized_grant_is_unchanged_by_a_transactionless_run(
+    phase_schema_only,
+):
+    """The named counterexample: `GRANT CREATE ON SCHEMA public TO hh_app` is refused only by
+    the artifact's FINAL verification (step 4b). Without a transaction the ownership change
+    and all four default ACLs would already be committed by then. The guard refuses first, so
+    ownership, the ACL and the default-ACL set are byte-identical after the attempt."""
+    database = phase_schema_only
+    with _schema_owner(database.project, database.name, database.login) as connection:
+        connection.execute("GRANT CREATE ON SCHEMA public TO hh_app")
+        before = artifacts.schema_snapshot(connection)
+        assert ("hh_app", "CREATE", False) in before["entries"]
+    try:
+        result = _run_psql(
+            database.project.run,
+            database=database.name,
+            login=database.login,
+            script=_transactionless_script(
+                artifacts.render_schema(database.name),
+                application_name=database.login,
+                prealigned=True,
+            ),
+        )
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert "SAVEPOINT can only be used in transaction blocks" in result.stderr
+        with _schema_owner(database.project, database.name, database.login) as connection:
+            after = artifacts.schema_snapshot(connection)
+        assert after == before
+        assert after["owner"] == "pg_database_owner"
+        assert after["defaults"] == ()
+        assert ("hh_app", "CREATE", False) in after["entries"]
+    finally:
+        with _schema_owner(database.project, database.name, database.login) as connection:
+            connection.execute("REVOKE CREATE ON SCHEMA public FROM hh_app")
+
+
+def test_direct_psql_in_an_explicit_transaction_applies_in_both_phases(phase_schema_only):
+    """The positive control: the same psql path with the caller owning BEGIN/COMMIT (and, in
+    the restore phase, the explicit owner transition) installs the complete BOOT-04 state."""
+    database = phase_schema_only
+    preamble = "BEGIN;\n"
+    if database.phase == "restore":
+        preamble += "SET ROLE hh_owner;\n"
+    script = preamble + artifacts.render_schema(database.name) + "\nCOMMIT;\n"
+    result = _run_psql(
+        database.project.run, database=database.name, login=database.login, script=script
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    with _schema_owner(database.project, database.name, database.login) as connection:
+        after = artifacts.schema_snapshot(connection)
+    assert after["owner"] == "hh_owner"
+    assert after["entries"] == EXPECTED_SCHEMA_ACL
+    assert after["foreign_schemas"] == ()
+    assert frozenset(
+        entry for entry in after["defaults"] if entry[2] != "hh_owner"
+    ) == EXPECTED_DEFAULTS
+
+
+def _assert_privileges_session_contract(database: SimpleNamespace, *, login: str) -> None:
+    project = database.project
+    with artifacts.project_connection(
+        project.run, database.name, login, project.passwords[login],
+        expected_current_user="hh_restore" if login == "hh_restore" else None,
+    ) as connection:
+        if login == "hh_restore":
+            artifacts.assume_owner(connection)
+        connection.execute("SET application_name = 'not_hh'")
+        connection.execute("SET statement_timeout = '7s'")
+        evidence = artifacts.PrivilegesScript().apply(connection, database=database.name)
+        # Read INSIDE the transaction the artifact ran in: the frozen values, not the caller's.
+        assert evidence == {
+            "session_user": login,
+            "application_name": login,
+            "statement_timeout": "0",
+            "search_path": "public",
+        }
+        # Transaction-local: at COMMIT the caller's own (wrong) values are back.
+        assert connection.execute(
+            "SELECT current_setting('application_name'), current_setting('statement_timeout')"
+        ).fetchone() == ("not_hh", "7s")
+
+
+def test_privileges_sql_corrects_and_restores_the_session_contract_while_serving(serving):
+    _assert_privileges_session_contract(serving, login="hh_migrate")
+
+
+def test_privileges_sql_corrects_and_restores_the_session_contract_while_restoring(restore):
+    _assert_privileges_session_contract(restore, login="hh_restore")
+
+
+def test_direct_psql_privileges_without_a_transaction_changes_no_acl(serving):
+    """Real `psql -f` as `hh_migrate` with prealigned settings and no BEGIN: the first
+    statement is refused, and the complete ACL/default-ACL dump is unchanged."""
+    project = serving.project
+    rendered = artifacts.render_privileges(serving.name)
+    with artifacts.project_connection(
+        project.run, serving.name, "hh_migrate", project.passwords["hh_migrate"]
+    ) as connection:
+        before = artifacts.acl_dump(connection)
+    script = (
+        "SET search_path = public;\n"
+        "SET application_name = 'hh_migrate';\n"
+        "SET statement_timeout = 0;\n" + rendered
+    )
+    result = _run_psql(
+        project.run, database=serving.name, login="hh_migrate", script=script
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "SAVEPOINT can only be used in transaction blocks" in result.stderr
+    with artifacts.project_connection(
+        project.run, serving.name, "hh_migrate", project.passwords["hh_migrate"]
+    ) as connection:
+        after = artifacts.acl_dump(connection)
+    assert after == before
+
+
+def test_a_late_privileges_failure_rolls_back_every_acl_change(serving):
+    """The caller owns the transaction: the artifact converges injected drift and then a late
+    failure aborts. The database (not the error text) is the evidence: the injected drift is
+    exactly what remains, and a clean re-run converges it."""
+    project = serving.project
+    text = (artifacts.SQL_DIR / "privileges.sql").read_text(encoding="utf-8")
+    doctored = text + "\nSELECT 1 / 0;\n"
+    with artifacts.project_connection(
+        project.run, serving.name, "hh_migrate", project.passwords["hh_migrate"]
+    ) as connection:
+        connection.execute("GRANT SELECT ON users TO hh_purge")  # drift the artifact WOULD fix
+        before = artifacts.acl_dump(connection)
+        assert connection.execute(
+            "SELECT has_table_privilege('hh_purge', 'users', 'SELECT')"
+        ).fetchone()[0] is True
+        with pytest.raises(psycopg.errors.DivisionByZero):
+            artifacts.PrivilegesScript(sql=doctored).apply(
+                connection, database=serving.name
+            )
+        assert artifacts.acl_dump(connection) == before
+        assert connection.execute(
+            "SELECT has_table_privilege('hh_purge', 'users', 'SELECT')"
+        ).fetchone()[0] is True
+        artifacts.PrivilegesScript().apply(connection, database=serving.name)
+    _assert_acl_matrix(serving)
