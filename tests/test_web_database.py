@@ -342,6 +342,7 @@ def test_the_postgresql_pool_is_configured_explicitly_below_the_unit_limit():
         engine.dispose()
 
 
+@pytest.mark.sqlite  # builds a SQLite engine on the side (R3-03)
 def test_the_application_name_reaches_postgresql_only_as_a_connect_argument(monkeypatch):
     # HH-DB-01 ROL-17: the web session carries application_name 'hh_web' through the engine
     # (connect_args), never in the DSN, so the URL keeps no query parameters; SQLite ignores
