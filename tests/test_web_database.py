@@ -342,6 +342,27 @@ def test_the_postgresql_pool_is_configured_explicitly_below_the_unit_limit():
         engine.dispose()
 
 
+def test_the_application_name_reaches_postgresql_only_as_a_connect_argument(monkeypatch):
+    # HH-DB-01 ROL-17: the web session carries application_name 'hh_web' through the engine
+    # (connect_args), never in the DSN, so the URL keeps no query parameters; SQLite ignores
+    # the argument. Tests/test_deploy_dbtool_postgres.py proves the value on a live session.
+    seen = {}
+    real = sa.create_engine
+
+    def spy(url, **kwargs):
+        seen[url] = kwargs
+        return real(url, **kwargs)
+
+    monkeypatch.setattr(sa, "create_engine", spy)
+    postgres = "postgresql+psycopg://hh_app@db.example/house_helper"
+    create_db_engine(postgres, application_name="hh_web").dispose()
+    assert seen[postgres]["connect_args"] == {"application_name": "hh_web"}
+    create_db_engine(postgres).dispose()
+    assert "connect_args" not in seen[postgres]
+    create_db_engine("sqlite://", application_name="hh_web").dispose()
+    assert "connect_args" not in seen["sqlite://"]
+
+
 @pytest.mark.asyncio
 async def test_at_most_the_limit_runs_at_once_and_every_connection_comes_back(tmp_path):
     limit, total = 3, 12

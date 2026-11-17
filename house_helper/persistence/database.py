@@ -36,6 +36,13 @@ DEFAULT_DATABASE_URL = "sqlite:///house_helper.db"
 POSTGRES_POOL_SIZE = 5
 POSTGRES_MAX_OVERFLOW = 12
 
+# HH-DB-01 ROL-17: the application_name the application's sessions carry. It is NOT a
+# role: the runtime login is `hh_app` (§3.2), and 'hh_web' is what pg_stat_activity shows
+# for that login's web process (C4, §7.6). The web layer sets it through the engine
+# (connect_args), not in the DSN, so the URL stays clean and carries no parameters. The
+# role's own default is also 'hh_web' (db/roles.sql); the start gate verifies the value.
+APPLICATION_NAME = "hh_web"
+
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 
 
@@ -86,17 +93,22 @@ def _begin_sqlite_transaction(connection: sa.Connection) -> None:
     connection.exec_driver_sql("BEGIN")
 
 
-def create_db_engine(url: Optional[str] = None) -> Engine:
-    """An engine for `url` (default: the environment, then a local SQLite file)."""
+def create_db_engine(url: Optional[str] = None, *, application_name: Optional[str] = None) -> Engine:
+    """An engine for `url` (default: the environment, then a local SQLite file).
+
+    `application_name` is applied as a psycopg connect argument on PostgreSQL only (never
+    in the URL, so a DSN stays free of query parameters); SQLite ignores it.
+    """
     text = url or database_url_from_environment()
+    parsed = make_url(text)
     # The pool sizes are explicit for PostgreSQL only: SQLite keeps the pool SQLAlchemy
     # chooses for the file, which the existing tests pin.
-    pool_options = (
-        {"pool_size": POSTGRES_POOL_SIZE, "max_overflow": POSTGRES_MAX_OVERFLOW}
-        if make_url(text).get_backend_name() == "postgresql"
-        else {}
-    )
-    engine = sa.create_engine(text, **pool_options)
+    options = {}
+    if parsed.get_backend_name() == "postgresql":
+        options.update({"pool_size": POSTGRES_POOL_SIZE, "max_overflow": POSTGRES_MAX_OVERFLOW})
+        if application_name is not None:
+            options["connect_args"] = {"application_name": application_name}
+    engine = sa.create_engine(text, **options)
     if engine.dialect.name == "sqlite":
         sa.event.listen(engine, "connect", _configure_sqlite_connection)
         sa.event.listen(engine, "begin", _begin_sqlite_transaction)

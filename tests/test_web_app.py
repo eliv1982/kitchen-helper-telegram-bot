@@ -53,8 +53,8 @@ def engines(monkeypatch):
     real_create = app_module.create_db_engine
     real_dispose = sa.engine.Engine.dispose
 
-    def recording_create(url):
-        engine = real_create(url)
+    def recording_create(url, **kwargs):
+        engine = real_create(url, **kwargs)
         created.append(engine)
         return engine
 
@@ -272,7 +272,7 @@ async def test_shutdown_disposes_the_engine_even_when_the_run_ended_in_an_error(
 async def test_a_failed_startup_leaves_nothing_to_clean_up(tmp_path, monkeypatch, engines):
     created, disposed = engines
 
-    def refuse(url):
+    def refuse(url, **kwargs):
         raise ModuleNotFoundError("No module named 'psycopg2'")
 
     monkeypatch.setattr(app_module, "create_db_engine", refuse)

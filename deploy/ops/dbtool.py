@@ -22,6 +22,31 @@ web service.
   restore        install a verified backup as the database, never over an existing one
                  unless told to, and never alongside the old one's -wal/-shm files
 
+Two backends, two lock locations (HH-DB-01 ARC-07, LCK-01/LCK-02, STG-02):
+
+  * SQLite: the file HOUSE_HELPER_DATABASE_URL names. `check-config`, `check-schema`,
+    `serve`, `exec` and `check-idle` behave exactly as they always have, and the lock
+    stays `<data directory>/.house-helper.lock`. `backup`, `restore`, `verify` and
+    `sanitize` are unchanged.
+  * PostgreSQL: a `postgresql+psycopg://` URL. `check-config`, `check-schema`, `serve`,
+    `exec` and `check-idle` work; `backup` and `restore` are refused explicitly until
+    WP-2D (they would otherwise act on a SQLite file that is not there). The lock lives
+    on the STATE VOLUME, `HOUSE_HELPER_STATE_DIR/.house-helper.lock`, never beside a
+    SQLite file: a PostgreSQL deployment has no such file, and the state volume is what
+    a container restart does not discard. The variable must be set for those commands.
+
+The PostgreSQL start gate (`serve`, and `check-schema` for an operator preflight) reads
+the effective session back the way AUTH-05 requires, not from the DSN: session_user,
+current_user, current_database(), inet_server_addr/port and the session settings. It
+refuses, fail-closed, any session whose role is not `hh_app` (the runtime login; `hh_web`
+is only the application_name, ROL-17/§7.6), whose database is not the one the URL names,
+whose search_path/statement_timeout/lock_timeout/idle_in_transaction_session_timeout/
+application_name are not the ROL-17 defaults, or whose effective privileges differ from
+the frozen contract (DML on the application tables, SELECT-only on alembic_version,
+USAGE-only on sequences, and no DDL - CREATE on the database or in schema public, or on a
+table - no TRUNCATE, TEMPORARY or sequence write). The schema
+revision is checked through the administrative target (house_helper.admin.target).
+
 What it is not: it applies no migration, creates no schema, and never reads or prints the
 content of a user's data. The tables it reports are counted, not read. The database URL is
 read from HOUSE_HELPER_DATABASE_URL, like the application; this tool additionally requires
@@ -36,7 +61,8 @@ a self-contained single file (rollback-journal mode) and checked before it is re
 The same applies in reverse: restoring a file next to a stale -wal/-shm pair makes SQLite
 replay the old log onto the new file, so a restore moves the old trio aside as a unit.
 
-The maintenance lock. `<data directory>/.house-helper.lock` is locked with flock(2):
+The maintenance lock. For SQLite, `<data directory>/.house-helper.lock` is locked with
+flock(2); for PostgreSQL it is `<state volume>/.house-helper.lock` (see above). In both:
   * the web service holds it SHARED for as long as uvicorn runs (`serve` takes it and then
     exec()s uvicorn, which inherits the descriptor; the kernel drops it when the process
     ends, so it is never stale);
@@ -128,6 +154,14 @@ except ImportError:  # Windows: developers run the tests there; this tool runs i
 
 DATABASE_URL_ENV = "HOUSE_HELPER_DATABASE_URL"
 STAGING_ENV = "HOUSE_HELPER_STAGING_DIR"
+# HH-DB-01 LCK-01: the flock lives on a state volume, not in PGDATA and not beside a
+# SQLite file a PostgreSQL deployment does not have.
+STATE_ENV = "HOUSE_HELPER_STATE_DIR"
+
+# The runtime login and the session name it carries (HH-DB-01 §3.2, ROL-17). The role is
+# `hh_app`; `hh_web` is the application_name pg_stat_activity shows for its web process
+# (C4), never a role. `check-schema`/`serve` refuse a session whose role is not APP_ROLE.
+APP_ROLE = "hh_app"
 
 SQLITE_MAGIC = b"SQLite format 3\x00"
 
@@ -191,9 +225,9 @@ def _mib(value: int) -> str:
 # --- the configured database --------------------------------------------------------------
 
 
-def database_path(environ: Mapping[str, str]) -> Path:
-    """The SQLite file HOUSE_HELPER_DATABASE_URL names, or ToolError. The URL itself is
-    never part of a message."""
+def database_url(environ: Mapping[str, str]):
+    """The configured database URL (a SQLAlchemy URL object), or ToolError. Its text is
+    never part of a message: it can hold a password."""
     raw = (environ.get(DATABASE_URL_ENV) or "").strip()
     if not raw:
         raise _unusable(
@@ -204,13 +238,31 @@ def database_path(environ: Mapping[str, str]) -> Path:
     from sqlalchemy.engine import make_url
 
     try:
-        url = make_url(raw)
+        return make_url(raw)
     except Exception:  # the parser's message can quote what it was given
         raise _unusable(
             "invalid_url", f"{DATABASE_URL_ENV} is not a valid database URL (its value is not shown)."
         ) from None
-    if url.get_backend_name() != "sqlite":
-        raise _refused("unsupported_backend", "this tool works on SQLite databases only.")
+
+
+def database_path(environ: Mapping[str, str]) -> Path:
+    """The SQLite file HOUSE_HELPER_DATABASE_URL names, or ToolError. Used by the commands
+    that act on a SQLite file only; a PostgreSQL URL is refused explicitly, never treated
+    as a file (WP-2D implements the PostgreSQL backup and restore)."""
+    url = database_url(environ)
+    backend = url.get_backend_name()
+    if backend == "postgresql":
+        raise _refused(
+            "postgresql_not_implemented",
+            "this build has no PostgreSQL backup or restore (WP-2D). The command is refused "
+            "rather than acting on a SQLite file that a PostgreSQL deployment does not have.",
+        )
+    if backend != "sqlite":
+        raise _refused(
+            "unsupported_backend",
+            "this command works on SQLite databases only; PostgreSQL is supported for "
+            "check-config, check-schema, serve, exec and check-idle.",
+        )
     database = url.database
     if not database or database == ":memory:" or database.startswith("file:"):
         raise _refused(
@@ -249,6 +301,8 @@ def _check_directory(path: Path) -> None:
 
 def check_config(environ: Mapping[str, str]) -> str:
     """The message describing a usable configuration, or ToolError."""
+    if database_url(environ).get_backend_name() == "postgresql":
+        return _check_postgres_config(environ)
     path = database_path(environ)
     _check_directory(path)
     if path.exists() and path.stat().st_size > 0:
@@ -261,7 +315,11 @@ def check_config(environ: Mapping[str, str]) -> str:
 
 
 def check_schema(environ: Mapping[str, str]) -> str:
-    """The message saying the schema is at the head, or ToolError. Reads only."""
+    """The message saying the schema is at the head, or ToolError. Reads only. On
+    PostgreSQL it is the whole start gate: the session read back, its settings, the
+    revision through the administrative target, and the application privileges."""
+    if database_url(environ).get_backend_name() == "postgresql":
+        return _postgres_start_gate(environ)
     database_path(environ)  # the rules of this tool first: absolute SQLite path
     from house_helper.admin.target import TargetError, open_target, repository_head
 
@@ -283,6 +341,393 @@ _HINTS = {
     "it needs the image that matches it, or a backup taken with this image's version "
     "(deploy/RUNBOOK.md, Rollback). Never migrate down to fit the image.",
 }
+
+
+# --- the PostgreSQL runtime ---------------------------------------------------------------
+
+# The state volume that keeps the maintenance lock (HH-DB-01 LCK-01): /state in the planned
+# deployment. Required for every PostgreSQL command that takes the lock: there is no SQLite
+# file to derive a directory from, and a lock invented from the current directory would let
+# two containers disagree about where it is.
+_STATE_ENV_HINT = (
+    f"the {STATE_ENV} variable must name the state volume (for example /state) that the web "
+    "and ops containers both mount"
+)
+
+_UNAVAILABLE = (
+    "could not use the database: it does not exist, is not reachable, refused the credentials, "
+    "or is not a database. The driver's details are withheld because they can name hosts, "
+    "users and parameters."
+)
+
+
+def state_directory(environ: Mapping[str, str]) -> Path:
+    """The state volume the PostgreSQL lock lives on, or ToolError."""
+    raw = (environ.get(STATE_ENV) or "").strip()
+    if not raw:
+        raise _refused(
+            "state_dir_not_configured",
+            f"{STATE_ENV} is not set: {_STATE_ENV_HINT}. A PostgreSQL deployment keeps the "
+            f"maintenance lock on that volume ({LOCK_FILE_NAME}), never beside a SQLite file.",
+        )
+    path = Path(raw)
+    if not path.is_absolute():
+        raise _refused("state_dir_unusable", f"{STATE_ENV} must be an absolute path.")
+    if path.is_symlink() or not path.is_dir() or not os.access(path, os.W_OK | os.X_OK):
+        raise _refused(
+            "state_dir_unusable",
+            f"the state directory {path} is missing, is a symlink, or is not writable by this "
+            f"user. ({_STATE_ENV_HINT}, and it is a volume of its own.)",
+        )
+    return path
+
+
+def _url_text(environ: Mapping[str, str]) -> str:
+    return (environ.get(DATABASE_URL_ENV) or "").strip()
+
+
+def _postgres_url(environ: Mapping[str, str]):
+    """The PostgreSQL URL, validated before anything is opened, or ToolError. The value
+    itself is never printed. psycopg 3 is the only driver this image pins, and the URL must
+    name the login and the host explicitly: libpq would otherwise take them from the
+    ambient environment (§7.7 ST-02, AUTH-03)."""
+    url = database_url(environ)
+    if url.get_backend_name() != "postgresql":
+        raise _refused(
+            "unsupported_backend", "this command needs a PostgreSQL URL (postgresql+psycopg://...)."
+        )
+    if url.get_driver_name() != "psycopg":
+        raise _refused(
+            "driver_missing",
+            f"{DATABASE_URL_ENV} must name the psycopg 3 driver (postgresql+psycopg://...); "
+            "its value is not shown.",
+        )
+    if not url.username:
+        raise _refused(
+            "invalid_url",
+            f"{DATABASE_URL_ENV} must name the application login in the URL; this tool never "
+            "lets libpq take it from the environment (its value is not shown).",
+        )
+    if not url.host:
+        raise _refused(
+            "invalid_url",
+            f"{DATABASE_URL_ENV} must name the database host in the URL; this tool never lets "
+            "libpq take it from the environment (its value is not shown).",
+        )
+    if not url.database:
+        raise _refused(
+            "invalid_url", f"{DATABASE_URL_ENV} must name the database (its value is not shown)."
+        )
+    try:
+        import psycopg  # noqa: F401
+    except ImportError:
+        raise _refused(
+            "driver_missing", "the PostgreSQL driver (psycopg 3) is not installed in this image."
+        ) from None
+    return url
+
+
+def _check_postgres_config(environ: Mapping[str, str]) -> str:
+    """`check-config` for PostgreSQL: the URL, its driver and the state volume. It opens no
+    connection; `check-schema` reads the effective session back."""
+    url = _postgres_url(environ)
+    state = state_directory(environ)
+    return (
+        f"database {_plain(url.database)} as {_plain(url.username)}: the psycopg 3 URL is "
+        f"usable and the state directory {state} is writable. check-schema verifies the "
+        "effective role, its session settings, the schema revision and its privileges."
+    )
+
+
+# ROL-17: set by `ALTER ROLE hh_app SET ...` in db/roles.sql and read back here, never
+# assumed from the DSN. The timeouts are compared as the millisecond values PostgreSQL
+# stores ('60s' is reported as '1min' by current_setting, so the spelling is not the value).
+_TIMEOUTS_MS = {
+    "statement_timeout": 30_000,
+    "lock_timeout": 5_000,
+    "idle_in_transaction_session_timeout": 60_000,
+}
+
+
+def _required_session_settings() -> tuple:
+    from house_helper.persistence.database import APPLICATION_NAME
+
+    return (("search_path", "public"), ("application_name", APPLICATION_NAME))
+
+
+def _session_facts(connection) -> Mapping[str, object]:
+    """The effective session, read from the server (AUTH-05)."""
+    import sqlalchemy as sa
+
+    row = connection.execute(
+        sa.text(
+            "SELECT session_user, current_user, current_database() AS database, "
+            "current_setting('search_path') AS search_path, "
+            "current_setting('application_name') AS application_name, "
+            "inet_server_addr()::text AS server_address, inet_server_port() AS server_port "
+            "FROM pg_roles WHERE rolname = current_user"
+        )
+    ).mappings().one_or_none()
+    if row is None:  # cannot happen for a connected role; fail closed if it ever does
+        raise _refused("app_role", "the connected role is not in pg_roles.")
+    facts = dict(row)
+    facts["timeouts_ms"] = {
+        setting["name"]: int(setting["setting"])
+        for setting in connection.execute(
+            sa.text(
+                "SELECT name, setting FROM pg_settings WHERE name IN "
+                "('statement_timeout', 'lock_timeout', 'idle_in_transaction_session_timeout')"
+            )
+        ).mappings()
+    }
+    return facts
+
+
+def _require_app_identity(facts: Mapping[str, object], url, expected_role: str) -> None:
+    """The role and database read back from the session, not from the file (§7.6 C4,
+    AUTH-05). `hh_web` is the application_name, never the role."""
+    session_user, current_user = facts["session_user"], facts["current_user"]
+    if current_user != expected_role or session_user != expected_role:
+        raise _refused(
+            "app_role",
+            f"the session is {_plain(session_user)}/{_plain(current_user)} "
+            f"(session_user/current_user), not the application login {_plain(expected_role)}. "
+            "The start gate refuses a session that assumed another role (hh_migrate assumes "
+            "hh_owner) or a URL that names one.",
+        )
+    if session_user != url.username:
+        raise _refused(
+            "app_role",
+            "the session user is not the login the URL names (its value is not shown).",
+        )
+    if facts["database"] != url.database:
+        raise _refused(
+            "app_database",
+            f"the session is in database {_plain(facts['database'])}, not the one the URL names. "
+            "The URL's database is what this image was configured to serve.",
+        )
+
+
+def _require_app_session(facts: Mapping[str, object]) -> None:
+    for name, wanted in _required_session_settings():
+        found = facts[name]
+        if found != wanted:
+            raise _refused(
+                "app_session_settings",
+                f"the session setting {name} is {_plain(found)}, not {wanted}: the application "
+                "login's session defaults (ROL-17) are not in force. Correct the role with "
+                "db/roles.sql; do not widen this check.",
+            )
+    for name, wanted_ms in _TIMEOUTS_MS.items():
+        found_ms = facts["timeouts_ms"].get(name)
+        if found_ms != wanted_ms:
+            raise _refused(
+                "app_session_settings",
+                f"the session setting {name} is {found_ms} ms, not {wanted_ms} ms: the "
+                "application login's session defaults (ROL-17) are not in force. Correct the "
+                "role with db/roles.sql; do not widen this check.",
+            )
+
+
+def _app_privilege_problems(connection) -> List[str]:
+    """What differs from the frozen contract, as short sentences (ROL-10, §3.6). Read-only:
+    every answer comes from PostgreSQL's own privilege functions."""
+    import sqlalchemy as sa
+
+    from house_helper.persistence import models  # noqa: F401  (registers every model)
+    from house_helper.persistence.base import Base
+
+    expected = set(Base.metadata.tables) | {_REVISION_TABLE}
+    problems: List[str] = []
+    tables = connection.execute(
+        sa.text(
+            "SELECT c.relname AS name, "
+            "has_table_privilege(c.oid, 'SELECT') AS can_select, "
+            "has_table_privilege(c.oid, 'INSERT') AS can_insert, "
+            "has_table_privilege(c.oid, 'UPDATE') AS can_update, "
+            "has_table_privilege(c.oid, 'DELETE') AS can_delete, "
+            "has_table_privilege(c.oid, 'TRUNCATE') AS can_truncate, "
+            "has_table_privilege(c.oid, 'REFERENCES') AS can_reference, "
+            "has_table_privilege(c.oid, 'TRIGGER') AS can_trigger "
+            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')"
+        )
+    ).mappings().all()
+    present = {row["name"] for row in tables}
+    for name in sorted(expected - present):
+        problems.append(f"table {_plain(name)} is missing")
+    for name in sorted(present - expected):
+        problems.append(f"table {_plain(name)} is unexpected")
+    for row in tables:
+        name = _plain(row["name"])
+        if row["name"] == _REVISION_TABLE:
+            wanted = {
+                "can_select": True, "can_insert": False, "can_update": False, "can_delete": False,
+                "can_truncate": False, "can_reference": False, "can_trigger": False,
+            }
+        else:
+            wanted = {
+                "can_select": True, "can_insert": True, "can_update": True, "can_delete": True,
+                "can_truncate": False, "can_reference": False, "can_trigger": False,
+            }
+        for key, value in wanted.items():
+            if bool(row[key]) != value:
+                problems.append(f"{name} {key.replace('can_', '')} is {bool(row[key])}")
+    sequences = connection.execute(
+        sa.text(
+            "SELECT c.relname AS name, "
+            "has_sequence_privilege(c.oid, 'USAGE') AS can_usage, "
+            "has_sequence_privilege(c.oid, 'SELECT') AS can_select, "
+            "has_sequence_privilege(c.oid, 'UPDATE') AS can_update "
+            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = 'public' AND c.relkind = 'S'"
+        )
+    ).mappings().all()
+    if not sequences:
+        problems.append("the messages sequence is missing")
+    for row in sequences:
+        name = _plain(row["name"])
+        if not row["can_usage"]:
+            problems.append(f"sequence {name} USAGE is missing")
+        if row["can_select"] or row["can_update"]:
+            problems.append(f"sequence {name} carries a write or SELECT privilege (USAGE only)")
+    attributes = connection.execute(
+        sa.text(
+            "SELECT rolsuper, rolbypassrls, rolcreaterole, rolcreatedb, rolcanlogin, rolinherit "
+            "FROM pg_roles WHERE rolname = current_user"
+        )
+    ).mappings().one()
+    for column in ("rolsuper", "rolbypassrls", "rolcreaterole", "rolcreatedb", "rolinherit"):
+        if attributes[column]:
+            problems.append(f"the role is {column} (it must not be)")
+    if not attributes["rolcanlogin"]:
+        problems.append("the role cannot log in")
+    database_and_schema = connection.execute(
+        sa.text(
+            "SELECT has_database_privilege(current_user, current_database(), 'CONNECT') AS connect, "
+            "has_database_privilege(current_user, current_database(), 'TEMP') AS temp, "
+            "has_database_privilege(current_user, current_database(), 'CREATE') AS database_create, "
+            "has_schema_privilege(current_user, 'public', 'USAGE') AS schema_usage, "
+            "has_schema_privilege(current_user, 'public', 'CREATE') AS schema_create"
+        )
+    ).mappings().one()
+    if not database_and_schema["connect"]:
+        problems.append("the role cannot connect to the database")
+    if database_and_schema["temp"]:
+        problems.append("the role may create temporary objects (TEMPORARY must be revoked)")
+    # CREATE on the DATABASE is schema-creation authority on its own: a login that lacks
+    # CREATE on schema public can still create one when it holds this. The function is the
+    # effective check, so a grant to PUBLIC or through role membership counts (§3.2/§3.6).
+    if database_and_schema["database_create"]:
+        problems.append(
+            "the role may create schemas in this database (CREATE on the database must be revoked)"
+        )
+    if not database_and_schema["schema_usage"]:
+        problems.append("the role has no USAGE on schema public")
+    if database_and_schema["schema_create"]:
+        problems.append("the role may create objects in schema public (DDL must be impossible)")
+    return problems
+
+
+def _postgres_start_gate(environ: Mapping[str, str]) -> str:
+    """The mandatory PostgreSQL start checks, in one read-only session: the effective
+    session (role, database, settings), the revision through the administrative target, and
+    the application's privileges. Every mismatch is a refusal (exit 3); an unreachable
+    database is exit 4. Nothing here changes anything.
+
+    The session is checked before the schema so that a mis-provisioned login is reported as
+    such, not as an unreachable database."""
+    role = APP_ROLE
+    url = _postgres_url(environ)
+    from house_helper.admin.target import TargetError, check_schema_at_head, repository_head
+    from house_helper.persistence.database import create_db_engine
+    import sqlalchemy as sa
+
+    try:
+        # No application_name here, on purpose: this session must show the login's OWN
+        # configured defaults (ROL-17). The application engine also pins 'hh_web' through
+        # connect_args, so a missing role default would be hidden if this engine did too.
+        engine = create_db_engine(_url_text(environ))
+    except ImportError:
+        raise _refused(
+            "driver_missing", "the PostgreSQL driver (psycopg 3) is not installed in this image."
+        ) from None
+    try:
+        try:
+            with engine.connect() as connection:
+                facts = _session_facts(connection)
+                _require_app_identity(facts, url, role)
+                _require_app_session(facts)
+                try:
+                    check_schema_at_head(connection)
+                except TargetError as error:
+                    raise _unusable(
+                        error.code, f"{error.message} {_HINTS.get(error.code, '')}".strip()
+                    ) from None
+                problems = _app_privilege_problems(connection)
+        except sa.exc.DBAPIError:
+            raise _unusable("database_unavailable", _UNAVAILABLE) from None
+    finally:
+        engine.dispose()
+    head = repository_head()
+    if problems:
+        shown = "; ".join(problems[:6]) + (f"; and {len(problems) - 6} more" if len(problems) > 6 else "")
+        raise _refused(
+            "app_privileges",
+            f"the application login does not have the frozen privilege contract ({shown}). "
+            "Apply db/privileges.sql as the migration login; do not widen a grant to make the "
+            "start pass.",
+        )
+    server = (
+        f"{facts['server_address']}:{facts['server_port']}"
+        if facts["server_address"]
+        else "local socket"
+    )
+    return (
+        f"connected as {_plain(facts['current_user'])} to database {_plain(facts['database'])} "
+        f"at {server} (application_name {facts['application_name']}, search_path "
+        f"{facts['search_path']}); the schema is at revision {head}, which this image expects; "
+        "the session settings are the ROL-17 defaults; the login holds DML on the application "
+        "tables and USAGE on the sequence, with no DDL, TRUNCATE, TEMPORARY or sequence write."
+    )
+
+
+def _postgres_idle(environ: Mapping[str, str]) -> str:
+    """`check-idle` for PostgreSQL: no dbtool-managed command holds the state volume, and no
+    other client session is connected to this database. Read-only."""
+    url = _postgres_url(environ)
+    lock = maintenance_lock(environ, url, exclusive=True, purpose="the idle check")
+    lock.acquire()
+    try:
+        from house_helper.persistence.database import create_db_engine
+        import sqlalchemy as sa
+
+        engine = create_db_engine(_url_text(environ))
+        try:
+            with engine.connect() as connection:
+                others = connection.execute(
+                    sa.text(
+                        "SELECT count(*) FROM pg_stat_activity "
+                        "WHERE datname = current_database() AND pid <> pg_backend_pid() "
+                        "AND backend_type = 'client backend'"
+                    )
+                ).scalar_one()
+        except sa.exc.DBAPIError:
+            raise _unusable("database_unavailable", _UNAVAILABLE) from None
+        finally:
+            engine.dispose()
+    finally:
+        lock.release()
+    if others:
+        raise _refused(
+            "database_in_use",
+            f"{others} other client session(s) are connected to the database: something is "
+            "still using it. Stop the web service and every other command first.",
+        )
+    return (
+        "no web service or other database command holds the state volume, and no other client "
+        "session is connected to the database."
+    )
 
 
 # --- the maintenance lock -------------------------------------------------------------------
@@ -309,17 +754,21 @@ def _try_lock(descriptor: int, exclusive: bool) -> bool:
     return True
 
 
-class DataDirLock:
-    """The lock on the data directory (see the module docstring). Taken without waiting: a
-    holder that conflicts is a refusal now, not a command that hangs for a restore."""
+class MaintenanceLock:
+    """The lock on a lock file (see the module docstring). Taken without waiting: a holder
+    that conflicts is a refusal now, not a command that hangs for a restore. `location`
+    names where the file is, for the refusal only."""
 
-    def __init__(self, database: Path, *, exclusive: bool, purpose: str) -> None:
-        self.path = database.with_name(LOCK_FILE_NAME)
+    def __init__(
+        self, path: Path, *, exclusive: bool, purpose: str, location: str = "data directory"
+    ) -> None:
+        self.path = path
         self.exclusive = exclusive
         self.purpose = purpose
+        self.location = location
         self.descriptor: Optional[int] = None
 
-    def __enter__(self) -> "DataDirLock":
+    def __enter__(self) -> "MaintenanceLock":
         self.acquire()
         return self
 
@@ -333,8 +782,8 @@ class DataDirLock:
             except OSError:
                 raise _refused(
                     "data_dir_not_writable",
-                    f"cannot open the lock file {self.path}: the data directory must exist and be "
-                    "writable by this user.",
+                    f"cannot open the lock file {self.path}: the {self.location} must exist and "
+                    "be writable by this user.",
                 ) from None
             if not _try_lock(descriptor, self.exclusive):
                 os.close(descriptor)
@@ -367,16 +816,40 @@ class DataDirLock:
         if self.exclusive:
             return _refused(
                 "maintenance_lock_busy",
-                f"{self.purpose} needs the data directory to itself, but the web service or another "
-                "database command is running (it holds the lock "
-                f"{LOCK_FILE_NAME}). Stop the web service (docker compose stop house-helper), "
-                "confirm it is stopped, wait for any other command to finish, then try again.",
+                f"{self.purpose} needs the {self.location} to itself, but the web service or "
+                f"another database command is running (it holds the lock {LOCK_FILE_NAME}). "
+                "Stop the web service (docker compose stop house-helper), confirm it is "
+                "stopped, wait for any other command to finish, then try again.",
             )
         return _refused(
             "maintenance_lock_busy",
-            f"{self.purpose} cannot start: a restore or a migration holds the data directory "
+            f"{self.purpose} cannot start: a restore or a migration holds the {self.location} "
             f"exclusively (the lock {LOCK_FILE_NAME}). Wait for it to finish.",
         )
+
+
+class DataDirLock(MaintenanceLock):
+    """The SQLite lock: `<data directory>/.house-helper.lock`, derived from the database
+    file, exactly as before HH-DB-01. PostgreSQL uses MaintenanceLock on the state volume."""
+
+    def __init__(self, database: Path, *, exclusive: bool, purpose: str) -> None:
+        super().__init__(database.with_name(LOCK_FILE_NAME), exclusive=exclusive, purpose=purpose)
+
+
+def maintenance_lock(
+    environ: Mapping[str, str], url, *, exclusive: bool, purpose: str
+) -> MaintenanceLock:
+    """The lock for this deployment: the SQLite data directory as before, or the state
+    volume for PostgreSQL (LCK-01/LCK-02). The state volume is validated before a holder
+    can start, so a PostgreSQL command without one refuses before it opens anything."""
+    if url.get_backend_name() == "postgresql":
+        return MaintenanceLock(
+            state_directory(environ) / LOCK_FILE_NAME,
+            exclusive=exclusive,
+            purpose=purpose,
+            location="state volume",
+        )
+    return DataDirLock(database_path(environ), exclusive=exclusive, purpose=purpose)
 
 
 def _wal_mode(path: Path) -> bool:
@@ -1134,7 +1607,10 @@ def verify(environ: Mapping[str, str], source: str, stdin: BinaryIO, *, require_
 
 def check_idle(environ: Mapping[str, str]) -> str:
     """Whether a restore may begin: nothing holds the data directory's lock and the database
-    is not in use. Changes nothing but what opening a crashed WAL database recovers."""
+    is not in use. Changes nothing but what opening a crashed WAL database recovers. On
+    PostgreSQL: the state volume is free and no other client session is connected."""
+    if database_url(environ).get_backend_name() == "postgresql":
+        return _postgres_idle(environ)
     target = database_path(environ)
     _check_directory(target)
     with DataDirLock(target, exclusive=True, purpose="the idle check"):
@@ -1274,7 +1750,7 @@ def _exec(command: Sequence[str]) -> None:
     os.execvp(command[0], list(command))
 
 
-def _run_under(lock: DataDirLock, command: Sequence[str]) -> None:
+def _run_under(lock: MaintenanceLock, command: Sequence[str]) -> None:
     lock.keep_across_exec()
     try:
         _exec(command)
@@ -1286,10 +1762,15 @@ def _run_under(lock: DataDirLock, command: Sequence[str]) -> None:
 
 def serve(environ: Mapping[str, str], command: Sequence[str]) -> None:
     """The web service's start. Takes the shared lock first, so that a restore cannot begin
-    (and a running restore keeps this out), checks the schema, then becomes `command`, which
-    holds the lock until it ends. Returns only by raising."""
-    target = database_path(environ)
-    lock = DataDirLock(target, exclusive=False, purpose="the web service")
+    (and a running restore keeps this out), checks the schema (and, on PostgreSQL, the
+    effective role, database, settings and privileges), then becomes `command`, which holds
+    the lock until it ends. Returns only by raising."""
+    lock = maintenance_lock(
+        environ,
+        database_url(environ),
+        exclusive=False,
+        purpose="the web service",
+    )
     lock.acquire()
     try:
         message = check_schema(environ)
@@ -1300,11 +1781,12 @@ def serve(environ: Mapping[str, str], command: Sequence[str]) -> None:
 
 
 def exec_locked(environ: Mapping[str, str], command: Sequence[str], *, exclusive: bool) -> None:
-    """Run `command` (a migration, an enrollment) holding the data directory's lock."""
-    target = database_path(environ)
-    _check_directory(target)
+    """Run `command` (a migration, an enrollment) holding the database's lock."""
+    url = database_url(environ)
+    if url.get_backend_name() != "postgresql":
+        _check_directory(database_path(environ))
     purpose = "a migration or other exclusive command" if exclusive else "a database command"
-    lock = DataDirLock(target, exclusive=exclusive, purpose=purpose)
+    lock = maintenance_lock(environ, url, exclusive=exclusive, purpose=purpose)
     lock.acquire()
     try:
         _run_under(lock, command)

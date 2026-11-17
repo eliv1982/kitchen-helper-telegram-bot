@@ -62,7 +62,7 @@ from fastapi import FastAPI
 from house_helper.core.backend import ChatBackend
 from house_helper.core.openai_chat import StandaloneOpenAIBackend
 from house_helper.persistence.base import utcnow
-from house_helper.persistence.database import create_db_engine
+from house_helper.persistence.database import APPLICATION_NAME, create_db_engine
 from house_helper.web import (
     auth,
     chat_api,
@@ -97,7 +97,9 @@ PROVIDER_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 async def _lifespan(app: FastAPI):
     settings: WebSettings = app.state.settings
     install_access_log_redaction()
-    database = WebDatabase(create_db_engine(settings.database_url))
+    database = WebDatabase(
+        create_db_engine(settings.database_url, application_name=APPLICATION_NAME)
+    )
     app.state.database = database
     http: Optional[httpx.AsyncClient] = None
     bot_http: Optional[httpx.AsyncClient] = None

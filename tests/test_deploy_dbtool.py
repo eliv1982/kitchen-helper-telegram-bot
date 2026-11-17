@@ -83,7 +83,7 @@ def good_backup(live, tmp_path, capsys):
         ("sqlite://", "sqlite_not_a_file"),
         ("sqlite:///:memory:", "sqlite_not_a_file"),
         ("sqlite:///house_helper.db", "path_not_absolute"),
-        ("postgresql+psycopg://user:hunter2-password@db.example/house", "unsupported_backend"),
+        ("mysql+pymysql://user:hunter2-password@db.example/house", "unsupported_backend"),
         ("not a url at all hunter2-password", "invalid_url"),
     ],
 )
