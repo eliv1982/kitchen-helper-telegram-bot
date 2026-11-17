@@ -978,6 +978,32 @@ _HANDOVER_CHILD = (
 _REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 
 
+def _publish_the_pid(pidfile, pid) -> None:
+    """Publish the backend pid atomically, so the observing test can never read the pidfile
+    while it is still empty.
+
+    `Path.write_text` creates (or truncates) the file first and writes into it second; an
+    observer that looks for the file between those two steps can see it while it is still
+    empty and parse an empty string (the observed CI flake). A sibling temporary file
+    renamed into place publishes the name and the complete contents together: the pidfile
+    exists only once it holds the full pid."""
+    pidfile = Path(pidfile)
+    partial = pidfile.with_name(pidfile.name + ".partial")
+    partial.write_text(str(pid), encoding="ascii")
+    os.replace(partial, pidfile)
+
+
+def _published_pid(pidfile):
+    """The worker's backend pid once its publication is complete, or None while it is not:
+    the file may be absent, or (on Windows) briefly unopenable while the rename into place
+    is still in flight. A pidfile that exists but does not carry a complete pid is not a
+    publication, so the observer waits for this value instead of for the file's existence."""
+    try:
+        return int(Path(pidfile).read_text(encoding="ascii"))
+    except (OSError, ValueError):
+        return None
+
+
 def _hand_over_the_account(configuration) -> None:
     """The worker's own process: the transaction the test used to run in a thread -- the
     DELETE that waits on A's share lock, the new link, the commit -- on an engine guarded
@@ -987,7 +1013,7 @@ def _hand_over_the_account(configuration) -> None:
     try:
         with create_session_factory(engine)() as db, db.begin():
             pid = db.connection().exec_driver_sql("SELECT pg_backend_pid()").scalar()
-            Path(configuration["pidfile"]).write_text(str(pid), encoding="ascii")
+            _publish_the_pid(configuration["pidfile"], pid)
             # Budgets of this transaction, below the observation and result deadlines.
             db.execute(sa.text(f"SET LOCAL lock_timeout = '{HANDOVER_LOCK_TIMEOUT}'"))
             db.execute(
@@ -1692,14 +1718,14 @@ def test_the_binding_handover_waits_for_an_open_admission_and_the_marker_refuses
 
     def observe(child):
         _wait_until(
-            lambda: child.pidfile.exists() or child.exited(),
+            lambda: _published_pid(child.pidfile) is not None or child.exited(),
             timeout=HANDOVER_WITHIN,
             what="the handover's transaction to open on its own connection",
         )
-        assert child.pidfile.exists(), (
+        pid = _published_pid(child.pidfile)
+        assert pid is not None, (
             "the handover process ended before its transaction opened:\n" + child.output()
         )
-        pid = int(child.pidfile.read_text())
         _wait_until(
             lambda: _waiting_on_a_lock(monitor_rc, pid) or child.exited(),
             timeout=OBSERVE_WITHIN,
