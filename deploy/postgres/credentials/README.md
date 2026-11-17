@@ -1,4 +1,4 @@
-# PostgreSQL credential directory (HH-DB-01 WP-2B)
+# PostgreSQL credential directory (HH-DB-01 WP-2B / WP-2C-A)
 
 This directory is the default host location for the per-role libpq passfiles selected by the
 WP-2B OD-8 decision. **No real credential is stored in this repository and no credential is
@@ -41,6 +41,8 @@ group or other, or carries another login's line. It never prints a file's conten
 
 * The SQLite deployment's environment file. This directory holds only PostgreSQL credentials.
 * The bootstrap superuser password past WP-2C enrollment. Its later lifecycle (rotation or
-  retirement) is a WP-2C credential operation under OD-8, not part of WP-2B.
+  retirement) is a WP-2C credential operation under OD-8, not part of WP-2B. WP-2C-A
+  designs the retirement as a printed plan (`python deploy/postgres/enroll.py
+  plan-bootstrap-retirement`) and does not execute it.
 * Any credential for `hh_owner`: that role is `NOLOGIN` and is assumed by `hh_migrate` or
   `hh_restore` with `SET ROLE`.

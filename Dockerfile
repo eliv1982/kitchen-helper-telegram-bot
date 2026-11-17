@@ -60,6 +60,10 @@ COPY --from=build /opt/venv /opt/venv
 WORKDIR /app
 COPY house_helper ./house_helper
 COPY alembic.ini ./alembic.ini
+# The frozen role/schema/privilege artifacts. WP-2C-A's in-container migrate executor
+# loads and hashes them from /app/db; they are the same checked-in files the host tool
+# hashes into the Mode B authorization, so a worker image cannot run against other SQL.
+COPY db ./db
 COPY deploy/ops /opt/house-helper/ops
 COPY deploy/logging.json /opt/house-helper/logging.json
 

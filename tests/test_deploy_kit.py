@@ -144,7 +144,7 @@ def test_the_image_runs_as_a_numeric_non_root_user_set_after_the_files_are_copie
 
 
 def test_the_dockerfile_copies_only_named_sources_and_never_adds_or_copies_everything():
-    allowed = {"requirements.txt", "house_helper", "alembic.ini", "deploy/ops", "deploy/logging.json"}
+    allowed = {"requirements.txt", "house_helper", "alembic.ini", "db", "deploy/ops", "deploy/logging.json"}
     for name, args in dockerfile_instructions():
         assert name != "ADD"
         if name != "COPY":

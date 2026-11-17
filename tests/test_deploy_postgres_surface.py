@@ -460,8 +460,8 @@ def oneshot_environment(role: str) -> dict:
     return environment
 
 
-@pytest.mark.parametrize("role", sorted(ONE_SHOTS))
-def test_every_one_shot_refuses_before_it_connects(role, capsys):
+@pytest.mark.parametrize("role", sorted(set(ONE_SHOTS) - {"migrate"}))
+def test_every_unimplemented_one_shot_refuses_before_it_connects(role, capsys):
     code = oneshot.main([role], oneshot_environment(role))
     captured = capsys.readouterr()
     assert code == 78
@@ -533,14 +533,23 @@ def run_oneshot_cli(role: str, **override) -> subprocess.CompletedProcess:
     )
 
 
-@pytest.mark.parametrize("role", sorted(ONE_SHOTS))
-def test_every_real_one_shot_cli_enters_its_validation_path(role):
+@pytest.mark.parametrize("role", sorted(set(ONE_SHOTS) - {"migrate"}))
+def test_every_unimplemented_real_one_shot_cli_enters_its_validation_path(role):
     # Real invocation with `environ is None`, which is the path that used to raise
     # AttributeError on the nonexistent `sys.environ`.
     done = run_oneshot_cli(role)
     assert done.returncode == 78, done.stderr
     assert "oneshot_not_implemented" in done.stderr
     assert role in done.stderr
+    assert "Traceback" not in done.stderr
+
+
+def test_the_real_migrate_cli_refuses_without_the_authorization_channel():
+    # WP-2C-A implements migrate, but only through the host tool's explicit stdin
+    # channel. A direct `docker compose run migrate` exits 3 before it reads or connects.
+    done = run_oneshot_cli("migrate")
+    assert done.returncode == 3, done.stderr
+    assert "authorization_channel" in done.stderr
     assert "Traceback" not in done.stderr
 
 

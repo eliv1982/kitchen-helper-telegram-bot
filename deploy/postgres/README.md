@@ -1,11 +1,16 @@
-# PostgreSQL deploy surface (HH-DB-01 Stage 2 WP-2B)
+# PostgreSQL deploy surface (HH-DB-01 Stage 2 WP-2B / WP-2C-A)
 
 **Status: repository surface only. Nothing here is deployed.** No PostgreSQL cluster has been
 initialized, no role or database has been created, no credential has been generated or
 populated, no container, network or volume has been created for this surface, and the
-Production deployment remains SQLite. **WP-2B does not authorize a cutover.** The Clean-Slate
-PostgreSQL Cutover is governed by
+Production deployment remains SQLite. **Neither WP-2B nor WP-2C-A authorizes a cutover.**
+The Clean-Slate PostgreSQL Cutover is governed by
 `docs/architecture/HH-DB-01_Architecture_Frozen_Specification_v1.0.md`.
+
+WP-2C-A adds the host-side enrollment/verification tool and the in-container `migrate`
+executor. The executor is reachable only through a Mode B authorization; the deployment
+surface and the four other one-shots are unchanged. The authority flow is recorded in
+`docs/architecture/HH-DB-01_WP-2C-A_Authority_Flow.md`.
 
 This document records what WP-2B built, what it deliberately did not build, and the decisions
 the Owner approved for this work package.
@@ -37,8 +42,9 @@ These decisions do **not** close any other open Owner choice:
 | `deploy/postgres/pg_hba.conf` | AUTH-01 host-based authentication, with explicit first-match ordering and remote-superuser rejection. |
 | `deploy/postgres/postgresql.conf` | The minimal server configuration: listener, scram-sha-256, the explicit HBA file and the socket directory. |
 | `deploy/postgres/preflight.py` | The read-only deployment preflight. It creates nothing and runs only `docker compose ... config`, `docker network ls` and `docker network inspect`. |
+| `deploy/postgres/enroll.py` | WP-2C-A host tool: Mode A enrollment (including the ENR-04 schema/default-ACL step before the marker), authoritative Mode B verification, the bounded migrate authorization, worker-lifecycle reconciliation evidence, credential checks and the bootstrap-retirement plan. Root + Docker socket; never copied into the image. |
 | `deploy/postgres/credentials/README.md` | The credential layout. Real files are git-ignored and are not generated here. |
-| `deploy/ops/pg_oneshot.py` | The fail-closed entrypoint of the five one-shots. It exits `78` before connecting or writing. |
+| `deploy/ops/pg_oneshot.py` | The fail-closed entrypoint of the five one-shots. `migrate` and the enrollment-time `schema` step are implemented in WP-2C-A; `provision`, `purge`, `backup` and `restore` still exit `78` before connecting or writing. `schema` is run through the `migrate` service, so the Compose topology is unchanged. |
 
 `deploy/compose.yaml`, `deploy/backup.sh`, `deploy/upgrade.sh`, the existing systemd units,
 `db/*.sql` and the WP-2A start gate are unchanged.
@@ -148,11 +154,11 @@ The candidate subnet check is the reason `10.213.79.0/24` is a candidate: it has
 validated against the Production host. Do not copy it into the enrollment record before the
 Stage 7 inventory and this preflight both pass.
 
-## 7. One-shot boundaries (not implemented)
+## 7. One-shot boundaries
 
-| Service | Login | Status in WP-2B |
+| Service | Login | Status |
 |---|---|---|
-| `migrate` | `hh_migrate` | Refuses. WP-2C must run the ordered initializer and **re-apply `db/privileges.sql` after every migration**; no WP-2B path runs `alembic upgrade head`. |
+| `migrate` | `hh_migrate` | **Implemented in WP-2C-A**, reachable only through `enroll.py migrate`. It re-verifies the live cluster, runs the ordered fresh initializer or a verified upgrade, and **re-applies `db/privileges.sql` after every migration**. |
 | `provision` | `hh_provision` | Refuses. Production enrollment is WP-2C/WP-2E. |
 | `purge` | `hh_purge` | Refuses. Scheduled execution and timer re-arm are WP-2F. |
 | `backup` | `hh_backup` | Refuses. PostgreSQL backup is WP-2D. |
@@ -161,33 +167,55 @@ Stage 7 inventory and this preflight both pass.
 Each service has exactly one login, one read-only passfile, the database network only and the
 `/state` lock volume. `backup` and `restore` also have an anonymous `/staging` volume, as the
 SQLite operator tool does. `pg_oneshot.py` first requires the exact activation value, then
-validates its own wiring, and exits with `EX_CONFIG` (78). It never opens a connection and
-never writes.
+validates its own wiring; the four unimplemented roles exit with `EX_CONFIG` (78).
 
-## 8. What WP-2B did not do
+The `migrate` one-shot additionally requires the host tool's stdin channel
+(`HOUSE_HELPER_PG_AUTHORIZATION_STDIN=1`) and a bounded Mode B record. A bare environment
+flag is not enough: the executor validates the record, re-reads the live marker and
+inventory, compares the artifact manifest with its own image's `db/*.sql`, and only then
+takes the exclusive state-volume lock. A direct `docker compose run migrate` is refused.
 
-* No cluster initialization, role creation, database creation, schema migration or privilege
-  application.
-* No credential generation, population, rotation or disclosure.
+The enrollment-time `schema` step uses the same stdin channel and a distinct bounded
+schema authorization. The one-shot executes only `db/schema.sql`; the step itself consumes
+the decoded record and compares its authorized deployment/database target with the live
+E3-c catalog (no marker, no application relation, expected owner/encoding/locale, exact
+database and role inventory, exact database ACL fence) before and after the artifact runs.
+
+**Retained worker evidence (F10).** The migration worker is launched with a deterministic
+name (`house-helper-pg-migrate-run-<run_id>`) and **without** `docker compose run --rm`.
+A client timeout therefore leaves lifecycle evidence the reconciler can inspect
+(`docker ps -a` plus `docker inspect`). Evidence is bound to the pending intent's run id;
+the Compose project/service, exact name, full container id, terminal state and exit code
+are all re-checked by the resolver. A confirmed terminal worker is removed with exactly
+`docker rm <container-id>` only after the migrate outcome is durably journaled (or the
+reconciliation record appended). Running, UNKNOWN, unrecognized or identity-mismatched
+containers are never removed, and no prune/global cleanup/`--remove-orphans` is used. A
+cleanup failure is reported as `warning [migrate-cleanup]`: the recorded migration outcome
+is not reclassified as UNKNOWN. A refused or failed worker is retained for investigation;
+an operator removes it only after confirming the exact run-specific name and an
+`exited`/`dead` state.
+
+## 8. What WP-2C-A did not do
+
+* No live cluster was initialized, no role/database was created, no schema was migrated and
+  no privilege was applied. The executor was validated offline against controlled fixtures.
+* No credential was generated, populated, rotated or disclosed. The bootstrap password
+  retirement is a printed plan; it was not executed.
 * No PostgreSQL backup/restore, offsite archive v2 or restore rehearsal (WP-2D/WP-2E).
-* No enrollment journal, maintenance journal, lock handoff, DSN switch, timer re-arm or
-  systemd change (WP-2F).
-* No Production access, cutover or deployment. No Docker resource was created, removed or
-  modified while building this surface.
-* No change to `deploy/compose.yaml`, the SQLite scripts, the existing systemd units,
+* No timer re-arm, systemd change, DSN switch, container identity update (ENR-18) or
+  Production access (WP-2F).
+* No change to `deploy/compose.postgres.yaml`, the SQLite stack, the existing systemd units,
   `db/*.sql`, `deploy/ops/dbtool.py`, `.claude/` or `deploy/monitoring/`.
 
-## 9. Next package
+## 9. Next packages
 
-WP-2C owns the production initializer/executor and the OD-8 credential population. Its
-minimum obligations before any `migrate` one-shot becomes runnable:
+* **WP-2D** - PostgreSQL backup/restore, archive v2, isolated restore and the sequence
+  contract.
+* **WP-2E** - isolated rehearsal and the remaining failure-injection matrix.
+* **WP-2F** - scheduled operations, timer re-arm, DSN switch, container identity updates and
+  the Production cutover.
 
-1. Positively identify the cluster (container name, image digest, PGDATA volume,
-   `system_identifier`) and write the Mode A intent outside PGDATA.
-2. Package and execute `db/roles.sql`, `db/bootstrap.sql`, the Alembic chain and
-   `db/privileges.sql` in the frozen order, with the E3/E4 connection fence.
-3. Re-apply `db/privileges.sql` after every migration, in the same controlled path.
-4. Populate each role's verifier under OD-8, then remove the bootstrap credential from the
-   running surface.
-5. Prove the refusal paths: a missing state volume, a wrong login, a wrong database, a
-   pre-handoff connection and a migration without the privilege re-application all fail closed.
+The executor's live obligations still need the separately approved isolated PostgreSQL
+environment: a real `hh_migrate` login and passfile, `alembic upgrade head` through
+SQLAlchemy/psycopg, `db/schema.sql`/`db/privileges.sql` execution and `alembic check`, the
+state-volume lock, and the full §5 fence/ACL assertions.
