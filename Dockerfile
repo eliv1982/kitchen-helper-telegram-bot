@@ -38,17 +38,19 @@ ENV PATH=/opt/venv/bin:$PATH \
     PYTHONPATH=/app \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    HOUSE_HELPER_STAGING_DIR=/staging
+    HOUSE_HELPER_STAGING_DIR=/staging \
+    HOUSE_HELPER_STATE_DIR=/state
 
 # A fixed numeric user, so that the ownership of a volume does not depend on names. /data is
-# the only directory the application writes; it is created owned by that user, and a new
-# named volume mounted there inherits that ownership. /staging is the same for the operator
-# tool's scratch copies of the database (backup, verify, restore): a disk-backed volume the
-# compose file mounts for the ops service only, because a database can be larger than /tmp.
+# the SQLite database directory and /state the PostgreSQL maintenance-lock volume (HH-DB-01
+# LCK-01); both are created owned by that user, and a new named volume mounted there inherits
+# that ownership. /staging is the same for the operator tool's scratch copies of the database
+# (backup, verify, restore): a disk-backed volume the compose file mounts for the ops service
+# only, because a database can be larger than /tmp.
 RUN groupadd --system --gid 10001 app \
  && useradd --system --uid 10001 --gid app --no-create-home --home-dir /nonexistent \
         --shell /usr/sbin/nologin app \
- && install --directory --owner app --group app --mode 0700 /data /staging
+ && install --directory --owner app --group app --mode 0700 /data /staging /state
 
 COPY --from=build /opt/venv /opt/venv
 

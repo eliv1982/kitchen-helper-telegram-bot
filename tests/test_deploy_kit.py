@@ -91,8 +91,9 @@ def known_variable_names() -> set:
     return names
 
 
-# Read by the operator tool (deploy/ops/dbtool.py), not by the application.
-TOOL_VARIABLES = {"HOUSE_HELPER_STAGING_DIR"}
+# Read by the operator tool (deploy/ops/dbtool.py), not by the application. The state volume
+# is the PostgreSQL maintenance-lock directory (HH-DB-01 LCK-01, WP-2A).
+TOOL_VARIABLES = {"HOUSE_HELPER_STAGING_DIR", "HOUSE_HELPER_STATE_DIR"}
 
 # Read by the cleanup's systemd service (deploy/systemd/, R4C-D2) from its environment file, not by
 # the application, the operator tool or Compose itself.
@@ -112,6 +113,10 @@ COMPOSE_ONLY_VARIABLES = {
     "HOUSE_HELPER_IMAGE_TAG",
     "HOUSE_HELPER_GIT_SHA",
     "HOUSE_HELPER_HSTS_SECONDS",
+    # HH-DB-01 WP-2B: the PostgreSQL surface's deliberate-activation guard and the host
+    # directory holding its per-role passfiles (deploy/postgres/README.md).
+    "HOUSE_HELPER_PG_ACTIVATE",
+    "HOUSE_HELPER_PG_CREDENTIALS_DIR",
 }
 
 
@@ -177,11 +182,16 @@ def test_the_start_command_takes_the_lock_and_checks_the_schema_but_never_migrat
     assert "house_helper.web.asgi:app" in command
 
 
-def test_the_staging_directory_for_the_operator_tool_exists_owned_by_the_application_user():
+def test_the_staging_and_state_directories_exist_owned_by_the_application_user():
     text = read(DOCKERFILE)
-    assert re.search(r"install --directory --owner app --group app --mode 0700 /data /staging", text)
+    assert re.search(
+        r"install --directory --owner app --group app --mode 0700 /data /staging /state", text
+    )
     env = " ".join(args for name, args in dockerfile_instructions() if name == "ENV")
     assert "HOUSE_HELPER_STAGING_DIR=/staging" in env
+    # HH-DB-01 LCK-01: the PostgreSQL maintenance lock lives on the state volume. Creating the
+    # directory in the image is what gives a new named volume the application's ownership.
+    assert "HOUSE_HELPER_STATE_DIR=/state" in env
 
 
 def test_the_healthcheck_asks_the_liveness_endpoint_and_nothing_else_is_exposed():

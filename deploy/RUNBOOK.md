@@ -45,6 +45,7 @@ VPS or domain is introduced, and the shared Traefik and the other applications a
 | `deploy/.gitattributes` | keeps the scripts' and units' line endings LF on a Windows checkout |
 | `deploy/systemd/house-helper-purge.service`, `.timer`, `.env.example` | **R4C-D2, opt-in, installed by nothing:** the systemd oneshot service and daily timer that run the cleanup (section 14) |
 | `deploy/ops/dbtool.py sanitize`, `deploy/offsite_backup.py`, `deploy/systemd/house-helper-offsite-backup.service`, `.timer`, `house-helper-offsite.env.example` | **opt-in, installed by nothing:** the encrypted off-host backup (section 15): a snapshot rewritten without deleted rows, packed, encrypted with `age` for a public key, uploaded with `rclone`, read back, and rotated (7 daily + 4 weekly) |
+| `deploy/compose.postgres.yaml`, `deploy/postgres/README.md` | **HH-DB-01 WP-2B, repository-only, not deployed:** the PostgreSQL deployment surface and its read-only preflight. Nothing in this kit's SQLite procedures uses it; see section 17. |
 | `deploy/RUNBOOK.md` | this document |
 
 ## 2. Design
@@ -2495,3 +2496,13 @@ database, PostgreSQL, and Python 3.10 at run time on the development machine (CI
 **What to tell the users.** While no conversation has been chosen in Telegram, the bot answers in the latest one and copies every Web conversation there. After `/dialogs` or `/new`, it answers in the chosen one and copies only that one. If the chosen conversation is deleted on the website, the Telegram side says so and the next message starts a new conversation rather than continuing another one. A message Telegram delivers again after its conversation was deleted is answered with a request-to-resend sentence and is never run elsewhere; the same is true of a message older than Telegram's 24-hour delivery window. Unlinking Telegram ends the copies and forgets the choice; a new link starts in the latest-conversation mode. The Russian `/help` and the link panel say this.
 
 **Not verified.** The real Telegram rendering of the four-command menu and the list, a real device tap, Codex, CI and real PostgreSQL. The list reaches every conversation (eight per page, no fixed page ceiling); a title too long for a button is shortened but the time and its Moscow label are kept.
+
+## 17. PostgreSQL deployment surface (HH-DB-01 WP-2B, not deployed)
+
+This section is a pointer, not a procedure. `deploy/compose.postgres.yaml` and
+`deploy/postgres/README.md` define the PostgreSQL 16 deployment surface prepared under
+HH-DB-01 Stage 2 WP-2B. Nothing in it is running: no cluster is initialized, no role or
+database is created, no credential is populated and no cutover is authorized. The SQLite
+procedures in sections 1-16 remain the operating instructions. Do not start the PostgreSQL
+surface from this runbook, and do not treat its one-shot services as implemented: they refuse
+every execution until WP-2C (executor/enrollment) and WP-2D (backup/restore) are accepted.
