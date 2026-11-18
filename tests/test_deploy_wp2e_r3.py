@@ -267,7 +267,7 @@ def test_a_compose_path_with_an_embedded_newline_and_a_fake_record_creates_nothi
     world, _ = v2_world(tmp_path)
     fake = 'offsite-status/v1 {"contract":"house-helper-maintenance-status/1"}\n'
     compose = tmp_path / f"x{fake}underlying [isolated_verification]" / "compose.yaml"
-    compose.parent.mkdir()
+    compose.parent.mkdir(parents=True)
     compose.write_text("services: {}\n")
     _unconfirmed(world, code="docker_infrastructure")
     world.fake.restore_stderr = f"refused [rehearsal_cleanup] {compose}\n".encode()
