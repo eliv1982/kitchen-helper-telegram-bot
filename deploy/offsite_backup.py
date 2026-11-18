@@ -11,6 +11,20 @@ The restore rehearsal (download, decrypt with a private identity, restore into a
 is deploy/offsite_rehearsal.py, a separate program for the owner's own machine: this one never holds,
 reads or asks for a private key.
 
+A second, OPT-IN source exists for the PostgreSQL cutover (HH-DB-01 WP-2E, Frozen Specification
+BAK-15..BAK-16). It is selected only by `--database postgresql`; without that flag this program is the
+SQLite tool it has always been, byte for byte. The v2 path does not take its own backup at all: it
+runs the accepted WP-2D host tool (`deploy/postgres/maintenance.py backup`) for a snapshot-consistent,
+format-v2 archive, copies that file once into a private exclusively created snapshot, re-validates that
+snapshot with the same tool's `verify-archive` and again in this process with the accepted contract
+module (`house_helper.persistence.pg_backup`), and only then encrypts it with `age` through one open
+descriptor of the snapshot (never its path), verifying the bytes again before and after `age`. There is
+no `dbtool sanitize` step: a logical dump contains only live rows, so deleted rows leave no trace
+inherently (BAK-15). From the encrypted file onward the upload, read-back, rename, commit record,
+retention, `.partial` handling, clock rules and exit codes are the SAME code as v1. The PostgreSQL path
+is disabled in practice: no systemd unit passes `--database postgresql`, and production remains SQLite
+until an explicit Owner approval (WP-2F).
+
 `run` is the whole job and what the opt-in systemd service starts (deploy/systemd/house-helper-offsite-
 backup.*, RUNBOOK section 15). It uses what already exists and rewrites none of it:
 
@@ -167,11 +181,24 @@ except ImportError:  # Windows: the tests run there; this tool runs on the Linux
 EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_REFUSED, EXIT_RETENTION, EXIT_UNCONFIRMED = 0, 1, 2, 3, 6, 7
 
 FORMAT = "house-helper-recovery-point/1"
+FORMAT_V2 = "house-helper-recovery-point/2"
 SNAPSHOT_NAME = "snapshot.db"
 CHECKSUM_NAME = "snapshot.db.sha256"
 MANIFEST_NAME = "MANIFEST.json"
 TAR_MEMBERS = (MANIFEST_NAME, CHECKSUM_NAME, SNAPSHOT_NAME)  # the order they are written in
 AGE_HEADER = b"age-encryption.org/v1\n"
+
+# The two sources of a recovery point. The default is the SQLite tool this file has always been; the
+# PostgreSQL path is explicit (`--database postgresql`) and is never inferred from a file, a host or a
+# failure (BAK-15). The v2 archive is produced and validated by the accepted WP-2D host tool only.
+DATABASE_SQLITE = "sqlite"
+DATABASE_POSTGRESQL = "postgresql"
+DATABASES = (DATABASE_SQLITE, DATABASE_POSTGRESQL)
+POSTGRES_DATABASE_KIND = "postgresql"
+MAINTENANCE_SCRIPT = "postgres/maintenance.py"
+POSTGRES_BACKUP_TIMEOUT = 5400
+POSTGRES_VERIFY_TIMEOUT = 3600
+MAX_MANIFEST_BYTES = 1 << 16  # bounds the dispatch peek; the v1 reader keeps its own 4096-byte rule
 
 KEEP_DAILY = 7
 KEEP_WEEKLY = 4
@@ -337,6 +364,29 @@ def digests_of(path: Path) -> Digests:
     return Digests(size, sha256.hexdigest(), sha1.hexdigest(), md5.hexdigest())
 
 
+@dataclasses.dataclass(frozen=True)
+class Snapshot:
+    """A private copy of the bytes a subprocess produced, identified only by the bytes themselves
+    (F1): the size and SHA-256 of exactly what was copied. No path, no inode and no timestamp is
+    part of this identity."""
+
+    path: Path
+    size: int
+    sha256: str
+
+
+def hash_handle(handle: BinaryIO) -> tuple:
+    """(size, sha256) of everything a binary handle holds, read from the start. Consumes the handle;
+    the caller rewinds if it needs the bytes again. Content, not metadata, is the evidence."""
+    handle.seek(0)
+    hasher = hashlib.sha256()
+    size = 0
+    for chunk in iter(lambda: handle.read(CHUNK), b""):
+        size += len(chunk)
+        hasher.update(chunk)
+    return size, hasher.hexdigest()
+
+
 def sha256_of(path: Path) -> str:
     return digests_of(path).sha256
 
@@ -376,18 +426,26 @@ class Runner:
         *,
         timeout: float,
         stdin_path: Optional[Path] = None,
+        stdin_handle: Optional[BinaryIO] = None,
         stdout_path: Optional[Path] = None,
         capture: bool = False,
         env_extra: Optional[Mapping[str, str]] = None,
     ) -> Result:
-        """Run `argv` without a shell. stdin comes from `stdin_path` (or nothing); stdout goes to the
+        """Run `argv` without a shell. stdin comes from `stdin_handle` (an already-open binary file,
+        used as is and closed by its owner, so the command reads the very descriptor the caller
+        validated), or from `stdin_path` (a path opened here), or from nothing; stdout goes to the
         NEW file `stdout_path`, or is returned if `capture`, or is dropped. stderr is returned,
         bounded. On a timeout, or when an exception such as Interrupted passes through, the command is
         asked to stop (SIGTERM, which `docker run` forwards to its container) and then killed."""
         environment = {k: v for k, v in os.environ.items() if not k.startswith("RCLONE_")}
         environment.update(env_extra or {})
         with contextlib.ExitStack() as stack:
-            stdin = stack.enter_context(open(stdin_path, "rb")) if stdin_path is not None else subprocess.DEVNULL
+            if stdin_handle is not None:
+                stdin = stdin_handle
+            elif stdin_path is not None:
+                stdin = stack.enter_context(open(stdin_path, "rb"))
+            else:
+                stdin = subprocess.DEVNULL
             if stdout_path is not None:
                 stdout = stack.enter_context(open_exclusive(stdout_path))
             else:
@@ -987,6 +1045,29 @@ def _check_manifest(raw: bytes) -> dict:
     return manifest
 
 
+def read_point_manifest(path: Path) -> dict:
+    """The MANIFEST.json of a recovery-point tar and nothing else, so that a reader can dispatch on the
+    format the archive itself declares. The file name is never evidence of a format (WP-2E), and only the
+    manifest member is read: bounded, never extracted. Raises Failed when the tar or the manifest cannot be
+    read, so a damaged archive fails closed before any format-specific code runs."""
+    try:
+        with tarfile.open(path, mode="r:") as archive:
+            info = archive.getmember(MANIFEST_NAME)
+            if not info.isfile() or info.size > MAX_MANIFEST_BYTES:
+                raise Failed("the manifest in the tar is not a small regular file.")
+            handle = archive.extractfile(info)
+            raw = b"" if handle is None else handle.read()
+    except (tarfile.TarError, OSError, KeyError):
+        raise Failed("this is not a recovery-point tar.") from None
+    try:
+        manifest = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise Failed("the manifest is not JSON.") from None
+    if not isinstance(manifest, dict):
+        raise Failed("the manifest is not one this tool writes.")
+    return manifest
+
+
 # --- configuration -----------------------------------------------------------------------------
 
 
@@ -1247,6 +1328,13 @@ class Config:
     max_deletions: int = DEFAULT_MAX_DELETIONS
     access_mode: str = ACCESS_APP_FOLDER
     trust: ConfigTrust = DEFAULT_TRUST
+    database: str = DATABASE_SQLITE
+    # Passed to deploy/postgres/maintenance.py only when given; its own defaults are the installed
+    # layout (the checkout, /var/lib/house-helper/cutover, deploy/postgres/credentials, the fixture).
+    postgres_compose_file: Optional[Path] = None
+    postgres_journal_dir: Optional[Path] = None
+    postgres_credentials_dir: Optional[Path] = None
+    postgres_object_contract: Optional[Path] = None
 
 
 # --- the job -----------------------------------------------------------------------------------
@@ -1264,6 +1352,7 @@ class Job:
     ) -> None:
         self.config, self.runner, self.deploy_dir = config, runner, deploy_dir
         self.clock, self.token, self.log = clock, token, log
+        self.maintenance_script = deploy_dir / MAINTENANCE_SCRIPT
         self.tools: Dict[str, str] = {}
         self.remote: Optional[Remote] = None
         self.run_dir: Optional[Path] = None
@@ -1278,19 +1367,35 @@ class Job:
     def preflight(self) -> None:
         config = self.config
         authorize_remote(config.rclone_config, config.remote, config.access_mode, config.trust)
-        if not TAG_RE.fullmatch(config.tag):
+        if config.database not in DATABASES:
+            raise Refused("--database is not one this tool knows.")
+        if config.database == DATABASE_SQLITE and not TAG_RE.fullmatch(config.tag):
             raise Refused("--tag is not an image tag.")
         read_recipients(config.recipients_file)
         work = config.work_dir
         if work is None or not work.is_absolute() or work.is_symlink() or not work.is_dir() or not os.access(work, os.W_OK | os.X_OK):
             raise Refused("--work-dir must be an existing absolute directory (not a link) that this user can write.")
-        for name in ("bash", "docker", "age", "rclone"):
+        # The v2 path has no backup.sh and no dbtool sanitize: the accepted WP-2D tool needs Docker and
+        # this checkout. The v1 path is unchanged, down to the tools it insists on.
+        needed = ("bash", "docker", "age", "rclone") if config.database == DATABASE_SQLITE else ("docker", "age", "rclone")
+        for name in needed:
             found = self.runner.which(name)
             if not found:
                 raise Refused(f"{name} is not installed on this host (RUNBOOK section 15 lists what is needed).")
             self.tools[name] = found
-        if not is_plain_file(self.deploy_dir / "backup.sh"):
-            raise Refused("deploy/backup.sh is not next to this script.")
+        if config.database == DATABASE_SQLITE:
+            if not is_plain_file(self.deploy_dir / "backup.sh"):
+                raise Refused("deploy/backup.sh is not next to this script.")
+        else:
+            if not is_plain_file(self.maintenance_script):
+                raise Refused(
+                    f"the PostgreSQL host tool ({MAINTENANCE_SCRIPT}) is not next to this script: the v2 path uses only "
+                    "the accepted WP-2D tool and refuses to look for another."
+                )
+            if config.postgres_compose_file is not None and not is_plain_file(config.postgres_compose_file):
+                raise Refused("--postgres-compose-file must be an existing regular file (not a link).")
+            if config.postgres_object_contract is not None and not is_plain_file(config.postgres_object_contract):
+                raise Refused("--postgres-object-contract must be an existing regular file (not a link).")
         self.remote, has_app_folder = open_remote(
             self.runner, self.tools["rclone"], config.rclone_config, config.remote, config.access_mode
         )
@@ -1359,7 +1464,18 @@ class Job:
     def make_recovery_point(self) -> None:
         run_dir = self.run_dir
         created = self.created = self.clock().astimezone(timezone.utc).replace(microsecond=0)
+        if self.config.database == DATABASE_POSTGRESQL:
+            sealed = self.make_postgresql_point(run_dir)
+        else:
+            sealed = self.make_sqlite_point(run_dir, created)
 
+        name = f"house-helper-{created.strftime(STAMP_FORMAT)}-{self.token()}.tar.age"
+        if not POINT_RE.fullmatch(name):
+            raise Failed("internal error: the recovery point name is not of the tool's own shape.")
+        self.upload_and_commit(sealed, name)
+
+    def make_sqlite_point(self, run_dir: Path, created: datetime) -> Path:
+        """The accepted v1 source: backup.sh, the sanitize rewrite, then one v1 tar. Unchanged."""
         pair = self.take_backup(run_dir / "pair")
         size = pair.stat().st_size
         free = free_bytes(run_dir)
@@ -1378,11 +1494,178 @@ class Job:
 
         sealed = self.encrypt(tar_path, run_dir / "recovery-point.tar.age")
         self.discard(tar_path)
+        return sealed
 
-        name = f"house-helper-{created.strftime(STAMP_FORMAT)}-{self.token()}.tar.age"
-        if not POINT_RE.fullmatch(name):
-            raise Failed("internal error: the recovery point name is not of the tool's own shape.")
-        self.upload_and_commit(sealed, name)
+    def make_postgresql_point(self, run_dir: Path) -> Path:
+        """The opt-in v2 source (BAK-15): the accepted WP-2D tool creates and validates a format-v2
+        archive from one exported snapshot; this process validates the same bytes again under the frozen
+        contract; then age encrypts it. There is no sanitize step: a logical dump holds live rows only.
+        Only the encrypted file leaves this method; every failure raises before anything is uploaded.
+
+        The tool writes a file whose PATH is never trusted again (F1). Immediately after it is written,
+        its bytes are copied into a private, exclusively created snapshot and hashed as they are copied;
+        both validators read that snapshot, and `age` is handed an already-open descriptor of it, not a
+        path it could reopen. The snapshot is hashed again through that same descriptor before and after
+        `age`; any difference from the copied digest fails the run before anything is uploaded."""
+        archive = run_dir / "recovery-point.tar"
+        self.log(f"step 1/5: PostgreSQL format-v2 recovery point (deploy/{MAINTENANCE_SCRIPT} backup) ...")
+        done = self.runner.run(
+            self.maintenance_argv("backup", "--output", str(archive), work_dir=run_dir / "pg-work"),
+            timeout=POSTGRES_BACKUP_TIMEOUT, capture=True,
+        )
+        self.forward(done.stdout)
+        self.forward(done.stderr)
+        if done.returncode != 0:
+            raise Failed(f"deploy/{MAINTENANCE_SCRIPT} backup failed (exit {done.returncode}); no recovery point was made.")
+        if not is_plain_file(archive):
+            raise Failed("the PostgreSQL tool left no regular recovery-point file; nothing was uploaded.")
+
+        # ONE protected byte snapshot from here on. The tool's own path is removed once its bytes are
+        # copied, so there is exactly one plaintext archive in the run directory, and it is the one
+        # validated and encrypted.
+        snapshot = self.seal_snapshot(archive, run_dir / "recovery-point.snapshot.tar")
+        self.discard(archive)
+
+        # The snapshot is validated twice, both before encryption: by the accepted tool (TOC, the one
+        # SEQUENCE SET payload, the object contract) and by the frozen contract in this process (the
+        # members, the canonical manifest and the dump's own checksum). A zero exit status alone is
+        # never taken for a validated archive.
+        self.log("step 2/5: validating it as a format-v2 recovery point (maintenance.py verify-archive) ...")
+        checked = self.runner.run(
+            self.maintenance_argv("verify-archive", str(snapshot.path), work_dir=run_dir / "pg-work"),
+            timeout=POSTGRES_VERIFY_TIMEOUT, capture=True,
+        )
+        self.forward(checked.stdout)
+        self.forward(checked.stderr)
+        if checked.returncode != 0:
+            raise Failed(
+                f"the PostgreSQL archive did not pass verify-archive (exit {checked.returncode}); nothing was uploaded."
+            )
+        self.check_postgresql_archive(snapshot.path)
+
+        free = free_bytes(run_dir)
+        if free < snapshot.size + SPACE_HEADROOM:
+            raise Failed(
+                f"not enough room in the work directory: {free >> 20} MiB free, "
+                f"{(snapshot.size + SPACE_HEADROOM) >> 20} MiB needed."
+            )
+        sealed = self.encrypt_validated(
+            snapshot, run_dir / "recovery-point.tar.age",
+            step="step 3/5: encrypting the validated archive for the recipients' public keys (age) ...",
+        )
+        self.discard(snapshot.path)
+        return sealed
+
+    def seal_snapshot(self, source: Path, destination: Path) -> Snapshot:
+        """Copy a subprocess's output into a NEW private (0600) file and hash exactly the bytes copied.
+        The copy is streamed: no archive is held in memory. A source that is not a regular file, or an
+        empty one, fails before anything else happens."""
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(source, flags)
+        except OSError:
+            raise Failed("the PostgreSQL recovery-point archive cannot be read; nothing was uploaded.") from None
+        hasher = hashlib.sha256()
+        size = 0
+        try:
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise Failed("the PostgreSQL recovery point is not a regular file; nothing was uploaded.")
+            except OSError:
+                raise Failed("the PostgreSQL recovery point cannot be inspected; nothing was uploaded.") from None
+            try:
+                with open_exclusive(destination) as copied:
+                    for chunk in iter(lambda: os.read(descriptor, CHUNK), b""):
+                        size += len(chunk)
+                        hasher.update(chunk)
+                        copied.write(chunk)
+                    copied.flush()
+                    os.fsync(copied.fileno())
+            except OSError:
+                raise Failed("the private snapshot of the PostgreSQL recovery point cannot be written; nothing was uploaded.") from None
+        finally:
+            os.close(descriptor)
+        if size <= 0:
+            raise Failed("the PostgreSQL recovery point is empty; nothing was uploaded.")
+        return Snapshot(destination, size, hasher.hexdigest())
+
+    def encrypt_validated(self, snapshot: Snapshot, destination: Path, *, step: str) -> Path:
+        """Encrypt a validated snapshot through ONE open descriptor. `age` never receives the snapshot's
+        path, so it cannot reopen a name that was replaced after validation. The descriptor is hashed
+        immediately before `age` (it must still be the copied bytes) and again after `age` returns (the
+        bytes must not have changed while it ran); either mismatch is a failure and the ciphertext is
+        removed, so unvalidated bytes can never be uploaded. A zero `age` exit is not validity."""
+        self.log(step)
+        try:
+            handle = open(snapshot.path, "rb")
+        except OSError:
+            raise Failed("the validated PostgreSQL snapshot cannot be reopened; nothing was uploaded.") from None
+        with handle:
+            if hash_handle(handle) != (snapshot.size, snapshot.sha256):
+                raise Failed("the PostgreSQL snapshot changed after it was validated; nothing was uploaded.")
+            handle.seek(0)
+            done = self.runner.run(
+                self.age_argv(),
+                timeout=AGE_TIMEOUT, stdin_handle=handle, stdout_path=destination,
+            )
+            if done.returncode != 0:
+                raise Failed(f"age failed (exit {done.returncode}); nothing was uploaded.")
+            if hash_handle(handle) != (snapshot.size, snapshot.sha256):
+                self.discard(destination)
+                raise Failed("the PostgreSQL snapshot changed while it was being encrypted; nothing was uploaded.")
+        with open(destination, "rb") as sealed:
+            header = sealed.read(len(AGE_HEADER))
+        if header != AGE_HEADER or destination.stat().st_size <= snapshot.size:
+            raise Failed("the encrypted file is not an age file; nothing was uploaded.")
+        return destination
+
+    def maintenance_argv(self, command: str, *operands: str, work_dir: Optional[Path] = None) -> List[str]:
+        """One command of the accepted WP-2D host tool. Its global options come before the subcommand,
+        and only options the operator gave are passed: its own defaults are the installed layout. Its
+        temporary plaintext is put under this run's private work directory, never in /tmp."""
+        argv = [sys.executable, str(self.maintenance_script)]
+        for option, value in (
+            ("--compose-file", self.config.postgres_compose_file),
+            ("--journal-dir", self.config.postgres_journal_dir),
+            ("--credentials-dir", self.config.postgres_credentials_dir),
+            ("--object-contract", self.config.postgres_object_contract),
+            ("--work-dir", work_dir),
+        ):
+            if value is not None:
+                argv += [option, str(value)]
+        argv += [command, *operands]
+        return argv
+
+    def check_postgresql_archive(self, archive: Path) -> dict:
+        """Validate the EXACT file that is about to be encrypted under the frozen v2 contract, in this
+        process, so the bytes validated are the bytes encrypted (an exit status of a subprocess is not
+        that evidence). The contract module lives in this checkout next to deploy/, as the host tool's
+        own imports do; a missing checkout is a refusal, never a skipped check."""
+        root = self.deploy_dir.resolve().parent
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+        try:
+            from house_helper.persistence import pg_backup  # noqa: PLC0415 (the v2 path only)
+        except ImportError:
+            raise Failed(
+                "the format-v2 contract module (house_helper.persistence.pg_backup) is not importable from this "
+                "checkout; the archive cannot be validated, so nothing was uploaded."
+            ) from None
+        try:
+            point = pg_backup.read_archive(archive)
+        except pg_backup.BackupError as failure:
+            raise Failed(
+                f"the PostgreSQL archive is not a valid format-v2 recovery point ({failure.code}); nothing was uploaded."
+            ) from None
+        manifest = dict(point.manifest)
+        if manifest.get("format") != FORMAT_V2 or manifest.get("database") != POSTGRES_DATABASE_KIND:
+            raise Failed("the archive does not declare the PostgreSQL format-v2 contract; nothing was uploaded.")
+        self.log(
+            "the archive passed the frozen v2 contract: "
+            f"revision {manifest['alembic_revision']}, {len(manifest['tables'])} tables, "
+            f"dump {manifest['snapshot']['bytes']} bytes."
+        )
+        return manifest
 
     def take_backup(self, directory: Path) -> Path:
         self.log("step 1/6: backup (deploy/backup.sh) ...")
@@ -1444,10 +1727,14 @@ class Job:
         return [self.tools["docker"], *DOCKER_ISOLATION, f"house-helper:{self.config.tag}",
                 "python", DBTOOL, *dbtool_args]
 
-    def encrypt(self, plaintext: Path, destination: Path) -> Path:
-        self.log("step 4/6: encrypting for the recipients' public keys (age) ...")
+    def age_argv(self) -> List[str]:
+        """The one age invocation of this tool: public recipients only, never a private identity."""
+        return [self.tools["age"], "-R", str(self.config.recipients_file)]
+
+    def encrypt(self, plaintext: Path, destination: Path, *, step: str = "step 4/6: encrypting for the recipients' public keys (age) ...") -> Path:
+        self.log(step)
         done = self.runner.run(
-            [self.tools["age"], "-R", str(self.config.recipients_file)],
+            self.age_argv(),
             timeout=AGE_TIMEOUT, stdin_path=plaintext, stdout_path=destination,
         )
         if done.returncode != 0:
@@ -1888,7 +2175,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = _Parser(prog="offsite_backup.py", description="Encrypted off-host backup of the House Helper database.", allow_abbrev=False)
     commands = parser.add_subparsers(dest="command", required=True, metavar="command")
     run = commands.add_parser("run", help="take, rewrite, pack, encrypt, upload, verify and rotate")
-    run.add_argument("--tag", required=True, help="the image that matches the database (the one RUNNING)")
+    run.add_argument(
+        "--database", choices=DATABASES, default=DATABASE_SQLITE,
+        help=f"{DATABASE_SQLITE} (default): the SQLite recovery point this tool has always made. {DATABASE_POSTGRESQL}: the "
+             "OPT-IN format-v2 path of HH-DB-01 WP-2E, built by deploy/postgres/maintenance.py from the enrolled cluster; "
+             "never selected by anything else and not activated by any unit (deploy/postgres/offsite_v2.md)",
+    )
+    run.add_argument("--tag", default=None, help="the image that matches the database (the one RUNNING); required for --database sqlite")
+    run.add_argument("--postgres-compose-file", type=Path, default=None, help="passed to maintenance.py (default: its own)")
+    run.add_argument("--postgres-journal-dir", type=Path, default=None, help="passed to maintenance.py (default: its own)")
+    run.add_argument("--postgres-credentials-dir", type=Path, default=None, help="passed to maintenance.py (default: its own)")
+    run.add_argument("--postgres-object-contract", type=Path, default=None, help="passed to maintenance.py (default: its own)")
     run.add_argument("--recipients-file", required=True, type=Path, help="age PUBLIC keys, one per line")
     run.add_argument("--rclone-config", required=True, type=Path, help="the rclone config file of the remote (mode 0600)")
     run.add_argument("--remote", required=True, help="NAME:FOLDER, the dedicated folder on the rclone remote")
@@ -1947,10 +2244,32 @@ def main(
             return list_points(remote, log, clock)
         if args.max_deletions < 0:
             raise Refused("--max-deletions cannot be negative.")
+        if args.database == DATABASE_SQLITE and args.tag is None:
+            # The v1 command always required --tag; an OMITTED one stays a usage error (2), as before. An
+            # explicitly given but malformed tag (including an empty one) is still refused (3) by the
+            # preflight, as it always was.
+            log("usage: --tag is required with --database sqlite.")
+            return EXIT_USAGE
+        if args.database != DATABASE_POSTGRESQL:
+            given = [
+                option for option, value in (
+                    ("--postgres-compose-file", args.postgres_compose_file),
+                    ("--postgres-journal-dir", args.postgres_journal_dir),
+                    ("--postgres-credentials-dir", args.postgres_credentials_dir),
+                    ("--postgres-object-contract", args.postgres_object_contract),
+                ) if value is not None
+            ]
+            if given:
+                raise Refused(
+                    f"{', '.join(given)} belong to --database {DATABASE_POSTGRESQL}: the SQLite path has no PostgreSQL tool. "
+                    "Nothing was done."
+                )
         config = Config(
-            remote=args.remote, rclone_config=args.rclone_config, tag=args.tag,
+            remote=args.remote, rclone_config=args.rclone_config, tag=args.tag or "",
             recipients_file=args.recipients_file, work_dir=args.work_dir, max_deletions=args.max_deletions,
-            access_mode=args.access_mode, trust=config_trust,
+            access_mode=args.access_mode, trust=config_trust, database=args.database,
+            postgres_compose_file=args.postgres_compose_file, postgres_journal_dir=args.postgres_journal_dir,
+            postgres_credentials_dir=args.postgres_credentials_dir, postgres_object_contract=args.postgres_object_contract,
         )
         Job(
             config, runner, deploy_dir or Path(__file__).resolve().parent,

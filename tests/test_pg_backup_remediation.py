@@ -71,6 +71,7 @@ class _ArchiveTools:
         self.toc = toc
         self.extraction = extraction
         self.requests = []
+        self.removed = []
 
     def pg_restore_list(self, work):
         return self.toc
@@ -78,6 +79,10 @@ class _ArchiveTools:
     def sequence_extraction(self, work, list_text):
         self.requests.append(list_text)
         return self.extraction
+
+    def remove_verified(self, name, *, image=None):
+        self.removed.append((name, image))
+        return True
 
 
 def _work(tmp_path):
@@ -353,8 +358,8 @@ def test_the_standalone_rehearse_command_completes_dispatch(monkeypatch, tmp_pat
     tools = _ArchiveTools(_toc(manifest), _extraction())
     calls = []
 
-    def fake_rehearse(tools, *, point, work, fixture, app_image, keep=False):
-        calls.append(point.manifest["alembic_revision"])
+    def fake_rehearse(tools, *, point, work, fixture, app_image, run_id, keep=False):
+        calls.append((point.manifest["alembic_revision"], run_id))
         return {
             "system_identifier": "1",
             "database": "house_helper_restore_x",
@@ -373,7 +378,11 @@ def test_the_standalone_rehearse_command_completes_dispatch(monkeypatch, tmp_pat
     monkeypatch.setattr(maintenance, "rehearse", fake_rehearse)
     monkeypatch.setattr(backup, "toc_contract_failures", lambda entries, fixture: ())
     assert maintenance.main(["rehearse", str(path)]) == maintenance.EX_OK
-    assert calls == [manifest["alembic_revision"]]
+    ((revision, run_id),) = calls
+    assert revision == manifest["alembic_revision"]
+    # F2: the run id names the one disposable container, and removal is by that exact name only.
+    assert maintenance.RUN_ID_RE.fullmatch(run_id)
+    assert tools.removed == [(maintenance.REHEARSAL_CONTAINER_PREFIX + run_id, _PINNED_IMAGE)]
 
 
 # --- F5: the backup mutex covers the whole logical backup and publication ------------------
@@ -1280,18 +1289,37 @@ def test_an_internal_failure_releases_the_mutex_without_exposing_an_archive(
 
 
 class _ProofTools:
-    def __init__(self, stdout, returncode=0):
-        self.stdout = stdout
+    """A stand-in for the proof container.
+
+    It frames the record with the per-run token the host put in the container environment, exactly
+    as the real program does (R5); a caller that needs arbitrary stdout passes it explicitly.
+    """
+
+    def __init__(self, record=None, *, returncode=0, stdout=None):
+        self.record = record
         self.returncode = returncode
+        self.stdout = stdout
 
     def run(self, program, **kwargs):
+        stdout = self.stdout
+        if stdout is None:
+            nonce = next(
+                entry.split("=", 1)[1]
+                for entry in kwargs["environment"]
+                if entry.startswith(maintenance._ATTACHMENT_PROOF_NONCE_ENV + "=")
+            )
+            stdout = (
+                f"{maintenance._ATTACHMENT_PROOF_PREFIX} {nonce} "
+                f"{json.dumps(self.record, sort_keys=True)}\n"
+            ).encode()
         return subprocess.CompletedProcess(
-            program, self.returncode, stdout=self.stdout, stderr=b"loader refused"
+            program, self.returncode, stdout=stdout, stderr=b"loader refused"
         )
 
 
 def _proof(value):
-    return json.dumps(value, sort_keys=True).encode() + b"\n"
+    # R4-F3/R5: a framed, status-agreeing verdict is the program's only intentional outcome.
+    return {"verdict": "ok", **value}
 
 
 def _run_proof(tools):
@@ -1352,13 +1380,28 @@ def test_an_empty_attachment_proof_is_explicit_about_the_empty_set():
         },
     ],
 )
-def test_an_inconsistent_attachment_proof_is_refused(value):
+def test_an_inconsistent_attachment_proof_record_is_environment_not_artifact(value):
+    """R5: a record that contradicts itself is unreliable evidence, not an archive defect."""
     with pytest.raises(maintenance.MaintenanceError) as refused:
         _run_proof(_ProofTools(_proof(value)))
-    assert refused.value.code == "attachment_proof"
+    assert refused.value.code == "attachment_proof_environment"
 
 
-def test_a_failed_attachment_loader_proof_is_refused():
+def test_a_failed_attachment_loader_proof_without_a_verdict_is_environment_not_artifact():
+    """R4-F3: exit 1 alone is not proof of an artifact defect.
+
+    An uncaught Python/SQLAlchemy/connection/import/environment exception inside the proof also
+    exits 1 and prints no verdict. It must be infrastructure (exit 4), never `attachment_proof`,
+    which is reserved for a refusal the program explicitly established."""
     with pytest.raises(maintenance.MaintenanceError) as refused:
-        _run_proof(_ProofTools(b"", returncode=1))
+        _run_proof(_ProofTools(returncode=1, stdout=b""))
+    assert refused.value.code == "attachment_proof_environment"
+    assert refused.value.message == "the attachment proof did not reach a verdict"
+
+
+def test_a_deliberate_attachment_refusal_keeps_its_artifact_classification():
+    record = {"verdict": "refused", "reason": "loader_mismatch"}
+    with pytest.raises(maintenance.MaintenanceError) as refused:
+        _run_proof(_ProofTools(record, returncode=3))
     assert refused.value.code == "attachment_proof"
+    assert refused.value.detail == "loader_mismatch"

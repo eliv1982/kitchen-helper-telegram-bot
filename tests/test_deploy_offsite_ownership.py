@@ -61,7 +61,7 @@ class Scripted(offsite.Runner):
         self.code = code
         self.calls = []
 
-    def run(self, argv, *, timeout, stdin_path=None, stdout_path=None, capture=False, env_extra=None):
+    def run(self, argv, *, timeout, stdin_path=None, stdin_handle=None, stdout_path=None, capture=False, env_extra=None):
         self.calls.append([str(a) for a in argv])
         return offsite.Result(self.code)
 

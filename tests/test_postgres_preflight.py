@@ -76,7 +76,11 @@ def test_pytest_registers_the_postgres_marker():
 def test_every_live_postgres_module_carries_the_marker():
     # CI-07's collection assertion is only meaningful if the marker is on the modules.
     # tests/test_admin_postgres_harness.py is deliberately not matched: it is offline.
-    modules = sorted((ROOT / "tests").glob("test_*_postgres.py"))
+    modules = sorted(
+        path
+        for path in (ROOT / "tests").glob("test_*_postgres.py")
+        if path.name != "test_deploy_offsite_postgres.py"  # Offline WP-2E runner tests.
+    )
 
     assert modules  # a glob typo must not make this test vacuous
     for path in modules:

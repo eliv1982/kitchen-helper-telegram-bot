@@ -608,13 +608,18 @@ def test_rclone_messages_full_of_secrets_are_not_printed(tmp_path, kind, capsys)
 # --- what the program is, and what the production script is not ---------------------------------------------------------------------
 
 
-def test_the_rehearsal_never_calls_anything_that_writes_to_the_remote_or_runs_a_container_or_a_shell():
+def test_the_rehearsal_never_calls_anything_that_writes_to_the_remote_or_runs_a_shell():
     source = (DEPLOY / "offsite_rehearsal.py").read_text()
     assert set(re.findall(r"remote\.(\w+)\(", source)) == {"listing", "read_record", "download"}
     for forbidden in ("upload", "delete", "move(", "ensure_folder", "mkdir\"", "deletefile", "moveto", "docker", "bash", "shell=True",
                       "os.system", "Popen(", "restore(", "dbtool", "backup.sh", "--yandex-hard-delete"):
         assert forbidden not in re.sub(r'""".*?"""', "", source, flags=re.S), forbidden       # the docstring explains; the code does not do
-    assert source.count("self.runner.run(") == 1                                             # one command: age -d -i
+    # Three commands, both by absolute path with no shell and no Docker of its own: `age -d -i` (v1
+    # and v2), the accepted WP-2D host tool that starts the disposable PostgreSQL for a v2 point
+    # (BAK-16), and - only after a signal, a timeout or a kill - the accepted tool's own
+    # `cleanup-rehearsal` fallback (WP-2E F2), which removes exactly one run id's container.
+    assert source.count("self.runner.run(") == 3
+    assert 'str(self.maintenance_script)' in source and '"rehearse"' in source
 
 
 def test_the_production_script_and_the_units_know_nothing_of_the_rehearsal_or_an_identity():

@@ -163,6 +163,18 @@ token = {"access_token":"test"}
 '''
 
 
+class _OpenStdin:
+    """The open descriptor a production v2 run hands to `age`, presented with the one accessor the
+    fake tools use. Reading it reads the descriptor, so a replaced path is not followed (F1)."""
+
+    def __init__(self, handle) -> None:
+        self.handle = handle
+        self.name = getattr(handle, "name", "")
+
+    def read_bytes(self) -> bytes:
+        return self.handle.read()
+
+
 class FakeSystem(offsite.Runner):
     """bash/docker/age/rclone, as far as the orchestrator uses them. `faults` maps (kind, nth) to an
     action; nth 0 means every call of that kind. Kinds: backup, sanitize, verify, age, mkdir, lsjson,
@@ -257,10 +269,14 @@ class FakeSystem(offsite.Runner):
 
     # the runner ------------------------------------------------------------------------------
 
-    def run(self, argv, *, timeout, stdin_path=None, stdout_path=None, capture=False, env_extra=None):
+    def run(self, argv, *, timeout, stdin_path=None, stdin_handle=None, stdout_path=None, capture=False, env_extra=None):
         self.calls.append([str(a) for a in argv])
         self.env_extras.append(dict(env_extra or {}))
         tool = Path(argv[0]).name
+        if stdin_handle is not None:
+            # The production v2 path passes an already-open descriptor, never a path. Read the very
+            # descriptor it would have handed `age`, so a path replaced after validation changes nothing.
+            stdin_path = _OpenStdin(stdin_handle)
         return getattr(self, "_" + tool)([str(a) for a in argv], stdin_path, stdout_path, dict(env_extra or {}))
 
     # bash deploy/backup.sh ------------------------------------------------------------------

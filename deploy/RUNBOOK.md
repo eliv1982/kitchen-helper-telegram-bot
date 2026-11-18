@@ -2226,28 +2226,73 @@ python3 deploy/offsite_rehearsal.py --rclone-config "$HOME/keys/house-helper/rcl
 identity, host and scratch checks, all before any command runs; (2) lists the folder and chooses a **committed** point (the newest,
 or `--point`): an `UNRESOLVED` object or one that is not in the folder is refused; (3) downloads that one object into a fresh `0700`
 directory under `--work-dir` and requires its size, SHA-256, SHA-1 and MD5 to equal its commit record; (4) decrypts with `age -d -i
-IDENTITY` (the identity is passed as a path and never printed); (5) unpacks with the backup tool's own reader (exactly three files, the
-manifest's shape, the snapshot equal to its size and SHA-256) and checks that the manifest's time is the time in the point's name; (6)
-opens the snapshot **read only** and checks SQLite's integrity, foreign keys, no free page, exactly one plain Alembic revision, and every
-`--expect-rows TABLE=N` (the table exists and has at least N rows; at least one is required, so "expected contents" is something you
-state); (7) removes the scratch directory on every exit path, signals included. A directory that cannot be removed is a failure.
+IDENTITY` (the identity is passed as a path and never printed); (5) reads the `MANIFEST.json` inside the decrypted archive and
+**dispatches on the format it declares**, never on the object's name (both formats use the same name shape): a
+`house-helper-recovery-point/1` point takes the SQLite path below, a `house-helper-recovery-point/2` + `database: postgresql` point is
+handed to the accepted WP-2D isolated restore, and any other or contradictory format is refused with no fallback (15.14); (6) for a
+v1 point, unpacks with the backup tool's own reader (exactly three files, the manifest's shape, the snapshot equal to its size and
+SHA-256), checks that the manifest's time is the time in the point's name, then opens the snapshot **read only** and checks SQLite's
+integrity, foreign keys, no free page, exactly one plain Alembic revision, and every `--expect-rows TABLE=N`; for a v2 point it checks
+the frozen manifest and every `--expect-rows` against the manifest's own counts, then runs a disposable `--network none` PostgreSQL 16
+restore that verifies schema revision, counts, digests, object contract, the sequence pair, ownership/ACLs, the attachment loader and a
+real `hh_app` smoke (only the decrypted archive path reaches that tool: the identity reaches no argument of it); (7) removes the
+scratch directory on every exit path, signals included. A directory that cannot be removed is a failure.
 
 **What it never does:** write to the remote (it lists, reads one commit record and downloads one object; the commands that create,
 move or delete are not in the file), write anywhere but the new directory under `--work-dir`, open an existing file for writing,
-use Docker, `backup.sh` or `restore`, or print a key, a token, a path of the config, a row or an rclone/age message.
+run a shell or name Docker itself (for a v2 point it runs the accepted WP-2D tool by an absolute path, and that tool's disposable
+containers are the only containers involved), use `backup.sh` or `restore`, or print a key, a token, a path of the config, a row or
+an rclone/age message.
 
 | Exit | Meaning |
 |---|---|
 | 0 | retrieved, matched its record, decrypted, unpacked and verified; the scratch directory is gone. **The only status that says the point can be restored.** |
-| 1 | failed before a verdict: rclone or the disk failed, a signal, or the scratch directory could not be removed (a failure of `age` is **not** here: it is exit 4) |
+| 1 | failed before a verdict: rclone or the disk failed, `age` or the accepted host tool could not be run, Docker or its pinned image was unavailable, an internal error, a signal, a clean-up that could not be confirmed, or the scratch directory could not be removed (a *decryption* failure of `age` is **not** here: it is exit 4) |
 | 2 | usage |
 | 3 | refused before anything was done: configuration, identity, host, scratch place, no committed point, a `--point` that is not one |
-| 4 | **not restorable**: the bytes differ from the record, `age` fails to decrypt it (any non-zero exit of `age -d`: not a recipient of this point, or the object is damaged), the archive or the database is not sound, or an expectation is not met |
+| 4 | **not restorable**: the bytes differ from the record, `age` fails to decrypt it (any non-zero exit of `age -d`: not a recipient of this point, or the object is damaged), the archive, the database or the isolated restore is not sound, or an expectation is not met. For a v2 point this needs the accepted tool's own structured refusal code about the artifact; a Docker/tooling/internal failure is exit 1, never exit 4 |
 
-**What it does not replace.** It does not check the schema against the application's migrations or restore into the application. For
-that, after a pass, do 15.6 and section 10 with the image of the manifest's tag onto a **scratch volume** (never the live one), and
-run the cleanup afterwards (14.6). Record in 15.9: the date, the point's name, its encrypted SHA-256 (the verdict prints it), the
-mode, the machine, and the result. Plaintext existed on that machine for the length of the run: it is unlink, not erasure (15.2).
+A v2 rehearsal owns exactly one disposable container, named by a run id it generates. Killing the rehearsal does **not** remove a
+detached container, so a signal, a timeout or a kill is followed by a fallback: the accepted tool's `cleanup-rehearsal --run-id <id>`
+removes that one exact name and confirms it is gone. The same fallback runs when the accepted tool reports that its own verified
+clean-up could not be confirmed: that clean-up failure takes precedence over the rehearsal outcome, and only after the fallback
+confirms the removal may the tool's own artifact refusal stand. If the removal cannot be confirmed the status is 1 and the container's
+exact name and safe recovery command are printed as recovery evidence; that is never a pass and never exit 4. Do not remove a
+container by a prefix match, and never touch `house-helper-db`.
+
+**What it does not replace.** For a v1 point it does not check the schema against the application's migrations or restore into the
+application. For that, after a pass, do 15.6 and section 10 with the image of the manifest's tag onto a **scratch volume** (never the
+live one), and run the cleanup afterwards (14.6). A v2 point's isolated restore already runs `alembic check` and the `hh_app` smoke, but
+it still does not start the application against a serving database: that remains WP-2F. Record in 15.9: the date, the point's name, its
+encrypted SHA-256 (the verdict prints it), the mode, the machine, and the result. Plaintext existed on that machine for the length of the
+run: it is unlink, not erasure (15.2).
+
+### 15.14 PostgreSQL format-v2 points (HH-DB-01 WP-2E, not activated) **[OWNER]**
+
+**Status: the repository side only. Nothing is installed, scheduled or deployed, and no PostgreSQL point has been made or uploaded.**
+Production stays on SQLite and on the unchanged v1 schedule. `deploy/postgres/offsite_v2.md` is the operator procedure; this section is
+the pointer and the gate list.
+
+The v2 source is selected **only** by `--database postgresql`; without the flag `deploy/offsite_backup.py` is the same SQLite tool as
+before. The v2 path does not take its own backup: it runs the accepted WP-2D tool `deploy/postgres/maintenance.py backup`, then copies
+that file **once** into a private, exclusively created snapshot and hashes exactly the bytes it copied. Both validators
+(`verify-archive` and the in-process frozen v2 contract) read that snapshot, and `age` is handed an already-open descriptor of it - never
+a path it could reopen - with the bytes hashed again through the same descriptor before and after `age`. Any difference fails the run
+before anything is uploaded, so the bytes validated are the bytes encrypted. Encryption is for the same public recipients, and from the
+encrypted file onward the upload, read-back, rename, commit record, retention, `.partial`, clock and exit-code code are v1's. There is
+no `dbtool sanitize` step: a logical dump holds live rows only, so the rewrite is removed, not weakened (BAK-15).
+
+```bash
+sudo python3 deploy/offsite_backup.py run --database postgresql --recipients-file /etc/house-helper/age-recipients.txt --rclone-config /etc/house-helper/rclone.conf --remote NAME:house-helper --work-dir /run/house-helper-offsite
+```
+
+The rehearsal of 15.13 rehearses a v2 point with the same command: the archive's manifest decides the path. A v2 point is restored in a
+disposable `--network none` PostgreSQL 16 container by the accepted WP-2D tool; the private age identity never reaches it.
+
+**Gates (none closed here):** the Owner's explicit approval to run the one real external round trip with **synthetic** PostgreSQL test
+data in an isolated test prefix; the Owner's approval to activate the v2 path at all (no unit passes `--database postgresql`); every
+WP-2D prerequisite (enrollment, OD-2, per-role passfiles, the pinned client image); PostgreSQL provisioning, cutover, DSN and production
+credentials, which remain WP-2F. Monitoring and alerting are unchanged (BAK-17): the existing exit codes are the interface.
 
 ## 16. The Telegram bot and photos (shared conversations) **[OWNER]**
 
