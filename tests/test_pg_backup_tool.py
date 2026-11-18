@@ -9,12 +9,14 @@ disposable-container argv (no credential material on a command line).
 from __future__ import annotations
 
 import json
+import stat
 from pathlib import Path
 
 import pytest
 
 from house_helper.persistence import pg_backup as backup
 from house_helper.persistence import pg_contract
+from house_helper.persistence import pg_credentials
 from tests.test_pg_backup import _manifest
 
 from deploy.postgres import maintenance
@@ -301,13 +303,42 @@ def test_the_tool_refuses_a_client_image_that_is_not_the_pinned_digest():
     )
 
 
-def test_a_passfile_is_validated_before_it_is_mounted(tmp_path):
+class _RuntimeOwnedStat:
+    """A passfile stat for the identity that consumes the mount (10001:10001, 0600)."""
+
+    st_mode = stat.S_IFREG | pg_credentials.PASSFILE_MODE
+    st_uid = pg_credentials.RUNTIME_UID
+    st_gid = pg_credentials.RUNTIME_GID
+    st_size = 64
+
+
+def _report_runtime_ownership(monkeypatch, *paths):
+    """Make `paths` look runtime-owned without a privileged chown and without a skip.
+
+    The host tool validates a passfile against the container identity that will read
+    it, but CI's `tmp_path` belongs to the runner. Only the named files report the
+    production identity; every other `lstat` is the real one, so the POSIX ownership
+    and mode comparisons still run exactly as production does.
+    """
+    reported = set(paths)
+    real_lstat = pg_credentials.Path.lstat
+
+    def lstat(self):
+        if self in reported:
+            return _RuntimeOwnedStat()
+        return real_lstat(self)
+
+    monkeypatch.setattr(pg_credentials.Path, "lstat", lstat)
+
+
+def test_a_passfile_is_validated_before_it_is_mounted(tmp_path, monkeypatch):
     path = tmp_path / "hh_restore.pgpass"
     path.write_text("house-helper-db:5432:*:hh_restore:pw\n", encoding="utf-8")
-    value = maintenance.passfile(tmp_path, "hh_restore", database="*")
-    assert value.role == "hh_restore"
     bad = tmp_path / "hh_backup.pgpass"
     bad.write_text("house-helper-db:5432:*:hh_restore:pw\n", encoding="utf-8")
+    _report_runtime_ownership(monkeypatch, path, bad)
+    value = maintenance.passfile(tmp_path, "hh_restore", database="*")
+    assert value.role == "hh_restore"
     with pytest.raises(maintenance.MaintenanceError):
         maintenance.passfile(tmp_path, "hh_backup", database="house_helper")
 
