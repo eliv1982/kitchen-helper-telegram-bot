@@ -2504,5 +2504,12 @@ This section is a pointer, not a procedure. `deploy/compose.postgres.yaml` and
 HH-DB-01 Stage 2 WP-2B. Nothing in it is running: no cluster is initialized, no role or
 database is created, no credential is populated and no cutover is authorized. The SQLite
 procedures in sections 1-16 remain the operating instructions. Do not start the PostgreSQL
-surface from this runbook, and do not treat its one-shot services as implemented: they refuse
-every execution until WP-2C (executor/enrollment) and WP-2D (backup/restore) are accepted.
+surface from this runbook.
+
+WP-2C (executor/enrollment) is accepted for its isolated evidence; WP-2D (backup/restore)
+is implemented in the repository only and has not been deployed. Its operating procedure,
+prerequisites (including the still-open OD-2 maintenance-database choice), verification
+steps, failure matrix and explicit non-claims are in
+`deploy/postgres/backup_restore.md`. The Compose `backup`/`restore` one-shots intentionally
+remain fail-closed app-image boundaries; the WP-2D tool runs the pinned `postgres:16.x`
+client containers. Scheduled backup, timer re-arm and the Production cutover remain WP-2F.

@@ -1175,9 +1175,23 @@ def mode_b(records: Iterable[Record], observation: Observation) -> ModeBVerdict:
         ]
         if recorded_effective != live_effective:
             mismatches.append("effective_membership")
-    for name in sorted(
-        set(observation.databases) - set(contract.BASE_DATABASES) - {contract.SERVING_DATABASE}
-    ):
+    # TMP-01: the expected inventory is the enrolled base plus the exact databases
+    # authorized by active (non-retired) temporary-database operation records. A name
+    # prefix is never evidence; only an exact record broadens the inventory, and a
+    # record for another cluster's system_identifier authorizes nothing.
+    from house_helper.persistence import pg_backup
+
+    authorized = pg_backup.active_temporary_databases(records)
+    valid_temp: set[str] = set()
+    for name, temp_payload in sorted(authorized.items()):
+        if temp_payload.get("system_identifier") != observation.identity.system_identifier:
+            mismatches.append(f"temp_database_identity:{name}")
+        else:
+            valid_temp.add(name)
+    allowed_databases = (
+        set(contract.BASE_DATABASES) | {contract.SERVING_DATABASE} | valid_temp
+    )
+    for name in sorted(set(observation.databases) - allowed_databases):
         mismatches.append(f"unexpected_database:{name}")
     if contract.SERVING_DATABASE not in observation.databases:
         mismatches.append("database:missing")

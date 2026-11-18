@@ -292,3 +292,65 @@ def test_the_mismatch_record_names_items_not_values(tmp_path):
     assert record.payload["items"] == ["container:id"]
     assert "e" * 64 not in serialized
     assert "726485930221" not in serialized
+
+
+def test_an_active_temporary_database_record_authorizes_its_exact_name(tmp_path):
+    cluster, journal_file = _enrolled(tmp_path)
+    name = "house_helper_restore_abcd1234"
+    journal_file.append(
+        "temp_db",
+        {
+            "action": "authorized",
+            "operation_id": "a" * 32,
+            "token": "abcd1234",
+            "database": name,
+            "purpose": "restore_verification",
+            "system_identifier": cluster.system_identifier,
+        },
+    )
+    cluster.databases.add(name)
+    verdict = enrollment.mode_b(
+        journal_file.read().records, cluster.observe(read_target=True)
+    )
+    assert verdict.ok is True, verdict.mismatches
+
+
+def test_a_temporary_database_record_for_another_cluster_authorizes_nothing(tmp_path):
+    cluster, journal_file = _enrolled(tmp_path)
+    name = "house_helper_restore_abcd1234"
+    journal_file.append(
+        "temp_db",
+        {
+            "action": "authorized",
+            "operation_id": "a" * 32,
+            "token": "abcd1234",
+            "database": name,
+            "purpose": "restore_verification",
+            "system_identifier": "1",
+        },
+    )
+    cluster.databases.add(name)
+    verdict = enrollment.mode_b(
+        journal_file.read().records, cluster.observe(read_target=True)
+    )
+    assert verdict.ok is False
+    assert f"temp_database_identity:{name}" in verdict.mismatches
+    assert f"unexpected_database:{name}" in verdict.mismatches
+
+
+def test_a_retired_temporary_database_record_authorizes_nothing(tmp_path):
+    cluster, journal_file = _enrolled(tmp_path)
+    name = "house_helper_restore_abcd1234"
+    journal_file.append(
+        "temp_db",
+        {
+            "action": "retired",
+            "database": name,
+            "system_identifier": cluster.system_identifier,
+        },
+    )
+    cluster.databases.add(name)
+    verdict = enrollment.mode_b(
+        journal_file.read().records, cluster.observe(read_target=True)
+    )
+    assert f"unexpected_database:{name}" in verdict.mismatches

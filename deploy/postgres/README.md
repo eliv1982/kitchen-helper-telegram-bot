@@ -1,9 +1,10 @@
-# PostgreSQL deploy surface (HH-DB-01 Stage 2 WP-2B / WP-2C-A)
+# PostgreSQL deploy surface (HH-DB-01 Stage 2 WP-2B / WP-2C-A / WP-2D)
 
 **Status: repository surface only. Nothing here is deployed.** No PostgreSQL cluster has been
 initialized, no role or database has been created, no credential has been generated or
 populated, no container, network or volume has been created for this surface, and the
-Production deployment remains SQLite. **Neither WP-2B nor WP-2C-A authorizes a cutover.**
+Production deployment remains SQLite. **WP-2B, WP-2C-A and WP-2D do not authorize a
+cutover.**
 The Clean-Slate PostgreSQL Cutover is governed by
 `docs/architecture/HH-DB-01_Architecture_Frozen_Specification_v1.0.md`.
 
@@ -11,6 +12,14 @@ WP-2C-A adds the host-side enrollment/verification tool and the in-container `mi
 executor. The executor is reachable only through a Mode B authorization; the deployment
 surface and the four other one-shots are unchanged. The authority flow is recorded in
 `docs/architecture/HH-DB-01_WP-2C-A_Authority_Flow.md`.
+
+WP-2D adds PostgreSQL backup and restore through `deploy/postgres/maintenance.py` and the
+pure format-v2 contract in `house_helper/persistence/pg_backup.py`. The operating
+procedure, prerequisites, failure matrix and explicit non-claims are in
+[`backup_restore.md`](backup_restore.md). WP-2D was exercised against the isolated
+WP-2C-B PostgreSQL 16.15 environment with a real backup, a target-cluster restore, a
+disposable `--network none` restore, an `hh_app` smoke and `alembic check`; it was not
+deployed and no Production database was touched.
 
 This document records what WP-2B built, what it deliberately did not build, and the decisions
 the Owner approved for this work package.
@@ -43,6 +52,8 @@ These decisions do **not** close any other open Owner choice:
 | `deploy/postgres/postgresql.conf` | The minimal server configuration: listener, scram-sha-256, the explicit HBA file and the socket directory. |
 | `deploy/postgres/preflight.py` | The read-only deployment preflight. It creates nothing and runs only `docker compose ... config`, `docker network ls` and `docker network inspect`. |
 | `deploy/postgres/enroll.py` | WP-2C-A host tool: Mode A enrollment (including the ENR-04 schema/default-ACL step before the marker), authoritative Mode B verification, the bounded migrate authorization, worker-lifecycle reconciliation evidence, credential checks and the bootstrap-retirement plan. Root + Docker socket; never copied into the image. |
+| `deploy/postgres/maintenance.py` | WP-2D host tool: Mode B verification, format-v2 backup, archive verification, target-cluster restore with temporary-database records and isolated `--network none` rehearsal. Root + Docker socket; never copied into the image. |
+| `deploy/postgres/backup_restore.md` | The WP-2D operating procedure, prerequisites, failure matrix and explicit non-claims. |
 | `deploy/postgres/credentials/README.md` | The credential layout. Real files are git-ignored and are not generated here. |
 | `deploy/ops/pg_oneshot.py` | The fail-closed entrypoint of the five one-shots. `migrate` and the enrollment-time `schema` step are implemented in WP-2C-A; `provision`, `purge`, `backup` and `restore` still exit `78` before connecting or writing. `schema` is run through the `migrate` service, so the Compose topology is unchanged. |
 
@@ -161,8 +172,8 @@ Stage 7 inventory and this preflight both pass.
 | `migrate` | `hh_migrate` | **Implemented in WP-2C-A**, reachable only through `enroll.py migrate`. It re-verifies the live cluster, runs the ordered fresh initializer or a verified upgrade, and **re-applies `db/privileges.sql` after every migration**. |
 | `provision` | `hh_provision` | Refuses. Production enrollment is WP-2C/WP-2E. |
 | `purge` | `hh_purge` | Refuses. Scheduled execution and timer re-arm are WP-2F. |
-| `backup` | `hh_backup` | Refuses. PostgreSQL backup is WP-2D. |
-| `restore` | `hh_restore` | Refuses. PostgreSQL restore is WP-2D; the OD-2 maintenance database is not selected. |
+| `backup` | `hh_backup` | Refuses. The application image has no client binaries (BAK-13); WP-2D runs `pg_dump` in a disposable pinned `postgres:16.x` client container from `maintenance.py`. |
+| `restore` | `hh_restore` | Refuses for the same reason. WP-2D runs the ordered restore and isolated rehearsal from `maintenance.py`; the OD-2 maintenance database is an explicit required argument. |
 
 Each service has exactly one login, one read-only passfile, the database network only and the
 `/state` lock volume. `backup` and `restore` also have an anonymous `/staging` volume, as the
@@ -201,7 +212,9 @@ an operator removes it only after confirming the exact run-specific name and an
   no privilege was applied. The executor was validated offline against controlled fixtures.
 * No credential was generated, populated, rotated or disclosed. The bootstrap password
   retirement is a printed plan; it was not executed.
-* No PostgreSQL backup/restore, offsite archive v2 or restore rehearsal (WP-2D/WP-2E).
+* No PostgreSQL backup/restore in WP-2C-A; WP-2D now implements the core backup,
+  target-cluster restore, isolated rehearsal and format-v2 archive. The offsite
+  `age`/`rclone` wrapper and the v1/v2 rehearsal dispatcher remain WP-2E.
 * No timer re-arm, systemd change, DSN switch, container identity update (ENR-18) or
   Production access (WP-2F).
 * No change to `deploy/compose.postgres.yaml`, the SQLite stack, the existing systemd units,
@@ -209,9 +222,10 @@ an operator removes it only after confirming the exact run-specific name and an
 
 ## 9. Next packages
 
-* **WP-2D** - PostgreSQL backup/restore, archive v2, isolated restore and the sequence
-  contract.
-* **WP-2E** - isolated rehearsal and the remaining failure-injection matrix.
+* **WP-2D (implemented, repository only)** - PostgreSQL backup/restore, archive v2,
+  isolated restore and the sequence contract. See [`backup_restore.md`](backup_restore.md).
+* **WP-2E** - the offsite `age`/`rclone` v2 path, the v1/v2 rehearsal dispatcher and the
+  remaining failure-injection matrix.
 * **WP-2F** - scheduled operations, timer re-arm, DSN switch, container identity updates and
   the Production cutover.
 

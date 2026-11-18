@@ -15,8 +15,11 @@ enrollment-time **schema** step (F8):
     never run Alembic or arbitrary SQL.
 
 `provision`, `purge`, `backup` and `restore` remain boundaries that refuse with
-EX_CONFIG (78). PostgreSQL backup/restore are WP-2D; production account enrollment is
-WP-2C/WP-2E; the systemd re-arm is WP-2F.
+EX_CONFIG (78). The application image intentionally has no `pg_dump`/`pg_restore`
+(BAK-13), so the backup/restore roles are executed by the host tool
+`deploy/postgres/maintenance.py` in disposable pinned `postgres:16.x` client containers,
+not by these app-image one-shots. Production account enrollment is WP-2C/WP-2E; the
+systemd re-arm is WP-2F.
 
 The authority channel
 ---------------------

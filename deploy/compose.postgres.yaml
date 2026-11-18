@@ -35,8 +35,10 @@
 # Their entrypoint refuses every execution until WP-2C packages the executor; this is
 # deliberate, because a migration path that runs `alembic upgrade head` without the mandatory
 # post-migration re-application of db/privileges.sql would be worse than no path at all.
-# PostgreSQL backup/restore are WP-2D; production enrollment is WP-2C/WP-2E. See
-# deploy/postgres/README.md.
+# PostgreSQL backup/restore are WP-2D and run in disposable pinned postgres client
+# containers launched by deploy/postgres/maintenance.py (BAK-13), not in these app-image
+# one-shots; production enrollment is WP-2C/WP-2E. See deploy/postgres/README.md and
+# deploy/postgres/backup_restore.md.
 #
 # Variables read by Compose itself:
 #   HOUSE_HELPER_PG_ACTIVATE          REQUIRED. Set it to exactly 1 only for a deliberate
