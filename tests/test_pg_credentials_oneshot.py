@@ -448,7 +448,9 @@ def test_the_schema_one_shot_uses_the_migrate_login_only(capsys):
 
 
 def test_the_unimplemented_one_shots_keep_their_refusal(capsys):
-    for role in ("provision", "purge", "backup", "restore"):
+    # `provision` is implemented by P0-2; it is refused for a different reason when it
+    # has no supported administrative command (tested in test_deploy_provision_oneshot.py).
+    for role in ("purge", "backup", "restore"):
         code = oneshot.main([role], _environment(role))
         captured = capsys.readouterr()
         assert code == 78

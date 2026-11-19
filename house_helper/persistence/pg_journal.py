@@ -60,11 +60,29 @@ LOCK_FILE = "journal.lock"
 HEAD_FILE = "journal.head"
 # A host-side operation lock, distinct from the journal append lock and from the
 # worker's state-volume maintenance lock (LCK-01/LCK-06). It serializes host-side
-# identity-changing operations (Mode A, migrate, reconciliation) across the Mode B
-# verification -> worker execution interval without ever taking the same non-reentrant
+# identity-changing operations (Mode A, migrate, reconciliation, handoff, and the
+# maintenance backup/restore) across the Mode B verification -> worker execution interval
+# without ever taking the same non-reentrant
 # flock on both sides of the host/worker boundary. Journal appends still take
 # `journal.lock` inside this interval; the two lock files are never nested in reverse.
 OPERATION_LOCK_FILE = "operation.lock"
+# The one environment variable every host entry point reads for the default journal
+# directory. `enroll.py` and `maintenance.py` both default here, and the offsite tool
+# forwards its own `--postgres-journal-dir` to `maintenance.py`. The operation interval is
+# the flock on `<journal-dir>/operation.lock`, so two processes exclude each other only
+# when that resolves to the SAME underlying file. `reject_conflicting_journal_directories`
+# refuses an explicit `--journal-dir` that names a different directory than the
+# environment, rather than silently operating on two disjoint locks.
+JOURNAL_DIRECTORY_ENV = "HOUSE_HELPER_PG_JOURNAL_DIR"
+# Lock acquisition order for the whole host tooling - one direction, never reversed:
+#   1. `operation.lock` (host operation interval: mode-a, migrate, reconcile-migration,
+#      handoff, and maintenance backup/restore);
+#   2. `journal.lock`   (one append, taken inside the interval);
+#   3. the state-volume flocks (shared `/state/.house-helper.lock`, exclusive
+#      `/state/.house-helper.backup.lock`), taken only by disposable containers, which
+#      never take 1 or 2.
+# Layers 1-2 belong to the host, layer 3 to a container, so no wait-for cycle exists.
+# Every acquisition is non-blocking: a conflict is refused immediately, never waited on.
 
 # Every record kind the WP-2C-A tooling can write or read. A journal line whose kind is
 # not in this set is treated as corruption, not as a future extension to be ignored.
@@ -143,6 +161,49 @@ class JournalError(Exception):
         self.code = code
         self.message = message
         self.detail = detail
+
+
+def same_directory(first: object, second: object) -> bool:
+    """Whether two directory names denote the same underlying filesystem object.
+
+    When both exist this compares `(st_dev, st_ino)` - a hard link, a bind mount or a
+    symlink to the same directory compares equal even when the names differ. When one
+    does not exist yet it falls back to the canonical, case-normalized real path. This
+    never assumes that an identical textual path means the same object, nor that two
+    different spellings mean different ones.
+    """
+    left, right = Path(first), Path(second)
+    try:
+        a, b = os.stat(left), os.stat(right)
+    except OSError:
+        return os.path.normcase(os.path.realpath(left)) == os.path.normcase(
+            os.path.realpath(right)
+        )
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
+def reject_conflicting_journal_directories(
+    cli_value: object, *, environ: Optional[Mapping[str, str]] = None
+) -> None:
+    """Refuse when `--journal-dir` and `HOUSE_HELPER_PG_JOURNAL_DIR` name different dirs.
+
+    Every cluster-advancing host operation excludes the others through the flock on
+    `<journal-dir>/operation.lock`. If an operator passes one directory explicitly while
+    the environment names another, the two silently take different locks. Failing closed
+    here is the only way to keep one operation interval across `enroll.py`,
+    `maintenance.py` and the offsite tool that forwards the value.
+    """
+    values = os.environ if environ is None else environ
+    configured = values.get(JOURNAL_DIRECTORY_ENV)
+    if not configured:
+        return
+    if not same_directory(cli_value, configured):
+        raise JournalError(
+            "journal_mismatch",
+            "the explicit --journal-dir and HOUSE_HELPER_PG_JOURNAL_DIR name different "
+            "directories; they would take different operation locks",
+            f"{JOURNAL_DIRECTORY_ENV}={configured}",
+        )
 
 
 # --- canonical encoding ----------------------------------------------------------------------
@@ -365,6 +426,22 @@ class Journal:
             busy_code="operation_busy",
             busy_message="another host enrollment or migration operation is in progress",
         )
+
+    def canonical_directory(self) -> Path:
+        """The journal directory's real path (symlinks and `..` resolved)."""
+        return Path(os.path.realpath(self.directory))
+
+    def operation_lock_identity(self) -> tuple[int, int]:
+        """The `(st_dev, st_ino)` of the one operation-lock file this directory names.
+
+        Two processes exclude each other exactly when this identity is equal. It is
+        exposed so a rehearsal can prove that `enroll.py`, `maintenance.py` and the
+        offsite tool resolve to the same underlying lock file, not merely the same
+        textual path.
+        """
+        self.prepare()
+        info = os.stat(self.operation_path)
+        return (info.st_dev, info.st_ino)
 
     def read(self) -> JournalView:
         # A read-only verification of a host that has never enrolled must not create the

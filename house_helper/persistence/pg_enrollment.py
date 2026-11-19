@@ -260,6 +260,705 @@ def _completed_records(records: Iterable[Record]) -> tuple[Record, ...]:
     )
 
 
+# --- §7.3 permission handoffs -----------------------------------------------------------------
+#
+# HOF-01/ROL-16 make each runtime CONNECT grant a separately authorized handoff, with an
+# intent and an observed outcome in the journal. The P0 cutover window authorizes exactly
+# three grantees: the serving app (H1), enrollment (H2) and the scheduled backup login
+# (H3). `hh_purge` is deliberately not part of this surface: its timer is re-armed later.
+HANDOFF_ROLES = ("hh_app", "hh_provision", "hh_backup")
+HANDOFF_EVENTS = {
+    "hh_app": "app",
+    "hh_provision": "provision",
+    "hh_backup": "scheduled",
+}
+# An outcome is a *decision*. `unknown` is deliberately not a value: an unresolved
+# operation has no outcome at all (LCK-08), so it cannot be mistaken for a resolution.
+HANDOFF_OUTCOMES = frozenset({"observed", "failed", "reconciled"})
+_HANDOFF_RUN_ID = re.compile(r"[0-9a-f]{32}")
+_HANDOFF_APPLICATION_PREFIX = "hh-handoff-"
+_HANDOFF_INTENT_KEYS = frozenset(
+    {
+        "state",
+        "action",
+        "handoff",
+        "role",
+        "database",
+        "operator",
+        "run_id",
+        "application_name",
+        "before",
+    }
+)
+_HANDOFF_OUTCOME_KEYS = frozenset(
+    {
+        "state",
+        "action",
+        "handoff",
+        "role",
+        "database",
+        "run_id",
+        "operator",
+        "outcome",
+        "evidence",
+    }
+)
+
+# The complete database-level privilege vocabulary. `CREATE`/`TEMPORARY` are never
+# authorized by a handoff; they exist here so a collateral grant is detected rather than
+# ignored.
+DATABASE_PRIVILEGES = contract.DATABASE_PRIVILEGES
+# The enrolled baseline already authorizes exactly these roles to CONNECT: the NOLOGIN
+# owner (inherent rights) and the pre-handoff maintenance login (db/bootstrap.sql). Every
+# other login's CONNECT must have provenance: a journaled successful handoff.
+PRE_HANDOFF_CONNECT_ROLES = frozenset({contract.OWNER_ROLE, "hh_migrate"})
+
+# psql exit codes. With `ON_ERROR_STOP=1` and a script whose only statement is the GRANT,
+# 3 is a definitive server-side refusal of that statement; 0 is a completed execution.
+# Everything else (connection loss 2, BusyBox `timeout` 143, client/docker failures,
+# signals) is
+# ambiguous and must never be recorded as "failed".
+GRANT_SUCCEEDED = 0
+GRANT_SERVER_REFUSED = 3
+
+
+def handoff_application_name(run_id: str) -> str:
+    """The one `application_name` a handoff operation's psql session carries.
+
+    It is derived from the bounded run id, so the journal, the session evidence and the
+    container-side markers all name the same operation without storing a secret.
+    """
+    if not isinstance(run_id, str) or not _HANDOFF_RUN_ID.fullmatch(run_id):
+        raise EnrollmentError("handoff_journal", "the handoff run id is malformed")
+    return _HANDOFF_APPLICATION_PREFIX + run_id
+
+
+@dataclass(frozen=True)
+class DatabaseAclState:
+    """The complete serving-database ACL, exactly as observed.
+
+    `entries` are the explicit `datacl` items as `(grantee, privilege, grantable)`;
+    `effective` is the full `has_database_privilege` matrix for the seven project roles
+    across the three database privileges. Both the pre-state recorded in an intent and the
+    post-state read after an attempt use this one shape, so the comparison is total.
+    """
+
+    acl_materialized: bool
+    entries: tuple[tuple[str, str, bool], ...] = ()
+    effective: tuple[tuple[str, str, bool], ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "entries", tuple(sorted(self.entries)))
+        object.__setattr__(self, "effective", tuple(sorted(self.effective)))
+
+    def privilege(self, role: str, privilege: str) -> Optional[bool]:
+        for observed_role, observed_privilege, value in self.effective:
+            if observed_role == role and observed_privilege == privilege:
+                return value
+        return None
+
+    def entries_for(self, grantee: str) -> tuple[tuple[str, str, bool], ...]:
+        return tuple(entry for entry in self.entries if entry[0] == grantee)
+
+    def as_journal(self) -> Mapping[str, Any]:
+        return {
+            "acl_materialized": self.acl_materialized,
+            "entries": [list(entry) for entry in self.entries],
+            "effective": [list(entry) for entry in self.effective],
+        }
+
+    @classmethod
+    def from_journal(
+        cls, value: Any, *, where: str = ""
+    ) -> "DatabaseAclState":
+        suffix = f" ({where})" if where else ""
+        if not isinstance(value, Mapping) or set(value) != {
+            "acl_materialized",
+            "entries",
+            "effective",
+        }:
+            raise EnrollmentError(
+                "handoff_journal", "the handoff pre-state is malformed" + suffix
+            )
+        if not isinstance(value["acl_materialized"], bool):
+            raise EnrollmentError(
+                "handoff_journal", "the handoff pre-state is malformed" + suffix
+            )
+        for key in ("entries", "effective"):
+            if not isinstance(value[key], list):
+                raise EnrollmentError(
+                    "handoff_journal", "the handoff pre-state is malformed" + suffix
+                )
+        entries: list[tuple[str, str, bool]] = []
+        for item in value["entries"]:
+            if (
+                not isinstance(item, (list, tuple))
+                or len(item) != 3
+                or not isinstance(item[0], str)
+                or not item[0]
+                or len(item[0]) > 128
+                or item[1] not in DATABASE_PRIVILEGES
+                or not isinstance(item[2], bool)
+            ):
+                raise EnrollmentError(
+                    "handoff_journal", "the handoff pre-state is malformed" + suffix
+                )
+            entries.append((item[0], item[1], item[2]))
+        effective: list[tuple[str, str, bool]] = []
+        for item in value["effective"]:
+            if (
+                not isinstance(item, (list, tuple))
+                or len(item) != 3
+                or item[0] not in contract.PROJECT_ROLE_NAMES
+                or item[1] not in DATABASE_PRIVILEGES
+                or not isinstance(item[2], bool)
+            ):
+                raise EnrollmentError(
+                    "handoff_journal", "the handoff pre-state is malformed" + suffix
+                )
+            effective.append((item[0], item[1], item[2]))
+        pairs = {(role, privilege) for role, privilege, _ in effective}
+        expected_pairs = len(contract.PROJECT_ROLE_NAMES) * len(DATABASE_PRIVILEGES)
+        if len(effective) != expected_pairs or len(pairs) != expected_pairs:
+            raise EnrollmentError(
+                "handoff_journal",
+                "the handoff pre-state does not cover the full privilege matrix" + suffix,
+            )
+        return cls(
+            acl_materialized=value["acl_materialized"],
+            entries=tuple(entries),
+            effective=tuple(effective),
+        )
+
+
+_HANDOFF_EVIDENCE_BOOLEANS = (
+    "has_database_privilege",
+    "has_temporary",
+    "has_create",
+    "changed",
+    "reconciled",
+    "applied",
+    "privileges_unchanged",
+)
+
+
+def _validate_handoff_evidence(
+    payload: Mapping[str, Any], intent: Mapping[str, Any], *, where: str
+) -> None:
+    """The evidence of one outcome must be structurally and semantically consistent.
+
+    A structurally valid outcome that never had a matching intent, or whose evidence
+    contradicts its own recorded pre-state, is journal corruption. Provenance is derived
+    only from a validated history: an orphan or self-contradictory `observed` line can
+    never authorize a CONNECT.
+    """
+    evidence = payload.get("evidence")
+    if not isinstance(evidence, Mapping):
+        raise EnrollmentError(
+            "handoff_journal", "a handoff outcome has no evidence", where
+        )
+    for key in _HANDOFF_EVIDENCE_BOOLEANS:
+        if key in evidence and not isinstance(evidence[key], bool):
+            raise EnrollmentError(
+                "handoff_journal", "a handoff outcome evidence field is malformed", where
+            )
+    if "psql_exit" in evidence:
+        value = evidence["psql_exit"]
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool)
+        ):
+            raise EnrollmentError(
+                "handoff_journal", "a handoff psql status is malformed", where
+            )
+    if "items" in evidence and (
+        not isinstance(evidence["items"], list)
+        or not all(isinstance(item, str) for item in evidence["items"])
+    ):
+        raise EnrollmentError(
+            "handoff_journal", "a handoff evidence item list is malformed", where
+        )
+    if "code" in evidence and not isinstance(evidence["code"], str):
+        raise EnrollmentError(
+            "handoff_journal", "a handoff evidence code is malformed", where
+        )
+    if "transport" in evidence and not isinstance(evidence["transport"], str):
+        raise EnrollmentError(
+            "handoff_journal", "a handoff transport label is malformed", where
+        )
+
+    role = payload["role"]
+    outcome = payload["outcome"]
+    before = DatabaseAclState.from_journal(intent.get("before"), where=where)
+    already_connected = before.privilege(role, "CONNECT") is True
+
+    if "changed" in evidence:
+        if evidence["changed"] is True and already_connected:
+            raise EnrollmentError(
+                "handoff_journal",
+                "a handoff outcome claims a change that its pre-state already contained",
+                where,
+            )
+        if evidence["changed"] is False and not already_connected:
+            raise EnrollmentError(
+                "handoff_journal",
+                "a handoff outcome claims no change from an absent privilege",
+                where,
+            )
+
+    if outcome == "failed":
+        if evidence.get("has_database_privilege") is True:
+            raise EnrollmentError(
+                "handoff_journal",
+                "a failed handoff outcome cannot establish database privilege",
+                where,
+            )
+        if not isinstance(evidence.get("code"), str) and not isinstance(
+            evidence.get("items"), list
+        ):
+            raise EnrollmentError(
+                "handoff_journal",
+                "a failed handoff outcome names neither a code nor its failing items",
+                where,
+            )
+    elif outcome == "observed":
+        if "changed" not in evidence or evidence.get("has_database_privilege") is not True:
+            raise EnrollmentError(
+                "handoff_journal",
+                "an observed handoff outcome does not record the observed privilege",
+                where,
+            )
+    elif outcome == "reconciled":
+        if evidence.get("reconciled") is not True:
+            raise EnrollmentError(
+                "handoff_journal",
+                "a reconciled handoff outcome is missing its reconciliation evidence",
+                where,
+            )
+        applied = evidence.get("applied") is True
+        unchanged = evidence.get("privileges_unchanged") is True
+        if applied == unchanged:
+            raise EnrollmentError(
+                "handoff_journal",
+                "a reconciled handoff outcome is neither applied nor unchanged",
+                where,
+            )
+        if applied and already_connected:
+            raise EnrollmentError(
+                "handoff_journal",
+                "a reconciled handoff outcome claims an application over an existing grant",
+                where,
+            )
+        # "Unchanged" means the recorded pre-state survived. For a no-op intent (the role
+        # already held CONNECT) that is still True; for a real attempt it is False.
+        expected_privilege = True if applied else already_connected
+        if evidence.get("has_database_privilege") is not expected_privilege:
+            raise EnrollmentError(
+                "handoff_journal",
+                "a reconciled handoff outcome contradicts its observed privilege",
+                where,
+            )
+
+
+def handoff_events(records: Iterable[Record]) -> tuple[Record, ...]:
+    """The valid `handoff` records, in journal order, as one paired history.
+
+    Every outcome must follow exactly one intent with the same run id, role, action,
+    handoff event and database. Duplicate intents, duplicate outcomes, orphan outcomes and
+    cross-role pairings are journal corruption, never a future extension to ignore: an
+    outcome that does not pair with a prior intent could otherwise authorize a CONNECT
+    that this tool never recorded making.
+    """
+    found = tuple(record for record in records if record.kind == "handoff")
+    intents: dict[str, Record] = {}
+    outcomes: dict[str, Record] = {}
+    for record in found:
+        payload = record.payload
+        where = f"seq {record.seq}"
+        state = payload.get("state")
+        role = payload.get("role")
+        if state not in ("intent", "outcome"):
+            raise EnrollmentError(
+                "handoff_journal", "a handoff record has an unknown state", where
+            )
+        expected_keys = (
+            _HANDOFF_INTENT_KEYS if state == "intent" else _HANDOFF_OUTCOME_KEYS
+        )
+        if set(payload) != expected_keys:
+            raise EnrollmentError(
+                "handoff_journal", "a handoff record has unexpected fields", where
+            )
+        if role not in HANDOFF_ROLES:
+            raise EnrollmentError(
+                "handoff_journal", "a handoff record names an unauthorized role", where
+            )
+        if payload.get("database") != contract.SERVING_DATABASE:
+            raise EnrollmentError(
+                "handoff_journal", "a handoff record names a foreign database", where
+            )
+        if payload.get("action") != f"grant_connect:{role}":
+            raise EnrollmentError(
+                "handoff_journal", "a handoff record names a foreign action", where
+            )
+        if payload.get("handoff") != HANDOFF_EVENTS[role]:
+            raise EnrollmentError(
+                "handoff_journal", "a handoff record names a foreign event", where
+            )
+        run_id = payload.get("run_id")
+        if not isinstance(run_id, str) or not _HANDOFF_RUN_ID.fullmatch(run_id):
+            raise EnrollmentError(
+                "handoff_journal", "a handoff record has no run id", where
+            )
+        operator = payload.get("operator")
+        if not isinstance(operator, str) or not operator:
+            raise EnrollmentError(
+                "handoff_journal", "a handoff record has no operator", where
+            )
+        if state == "intent":
+            if run_id in intents or run_id in outcomes:
+                raise EnrollmentError(
+                    "handoff_journal",
+                    "a handoff operation id appears more than once",
+                    where,
+                )
+            if payload.get("application_name") != handoff_application_name(run_id):
+                raise EnrollmentError(
+                    "handoff_journal",
+                    "a handoff intent does not name its operation session",
+                    where,
+                )
+            DatabaseAclState.from_journal(payload.get("before"), where=where)
+            intents[run_id] = record
+            continue
+
+        # The type gate comes BEFORE the membership test: `HANDOFF_OUTCOMES` is a set, so
+        # an unhashable value (a list, a dict) would raise TypeError from the lookup itself
+        # and escape as an internal error instead of the controlled `handoff_journal`
+        # refusal. Only a known string token is ever an outcome; everything else - a list,
+        # a mapping, null, a number, a boolean or an unrecognized string - is corruption,
+        # and never CONNECT provenance.
+        outcome = payload.get("outcome")
+        if not isinstance(outcome, str) or outcome not in HANDOFF_OUTCOMES:
+            raise EnrollmentError(
+                "handoff_journal",
+                "a handoff outcome is not recognized",
+                f"{where}, {type(outcome).__name__}",
+            )
+        intent = intents.get(run_id)
+        if intent is None:
+            raise EnrollmentError(
+                "handoff_journal",
+                "a handoff outcome has no matching prior intent",
+                where,
+            )
+        if run_id in outcomes:
+            raise EnrollmentError(
+                "handoff_journal",
+                "a handoff operation has more than one outcome",
+                where,
+            )
+        for key in ("role", "action", "handoff", "database"):
+            if payload.get(key) != intent.payload.get(key):
+                raise EnrollmentError(
+                    "handoff_journal",
+                    "a handoff outcome does not match its intent",
+                    where,
+                )
+        _validate_handoff_evidence(payload, intent.payload, where=where)
+        outcomes[run_id] = record
+    return found
+
+
+def pending_handoff_intents(records: Iterable[Record]) -> tuple[Record, ...]:
+    """LCK-08: handoff intents with no outcome record for the same run id, oldest first.
+
+    An intent without an outcome is UNKNOWN. It is never treated as "did not happen"; the
+    next handoff invocation must (1) prove the original operation terminated and (2) compare
+    the complete ACL with the intent's recorded pre-state before it may append a resolving
+    outcome. Until then no other handoff transition is attempted.
+    """
+    events = handoff_events(records)
+    resolved = {
+        (record.payload["run_id"], record.payload["role"])
+        for record in events
+        if record.payload["state"] == "outcome"
+    }
+    return tuple(
+        record
+        for record in events
+        if record.payload["state"] == "intent"
+        and (record.payload["run_id"], record.payload["role"]) not in resolved
+    )
+
+
+def successful_handoff_roles(records: Iterable[Record]) -> frozenset[str]:
+    """The roles whose CONNECT has journaled provenance.
+
+    Only an `observed` outcome that *made* the change, or a `reconciled` outcome that
+    observed it applied, is proof. A `failed` outcome, a reconciled "not applied", or the
+    mere presence of a grant in the catalog is not. A no-op outcome (the role already held
+    CONNECT) only confirms provenance created earlier in the same history; a no-op that has
+    no such predecessor is semantically inconsistent and is refused rather than allowed to
+    launder an unjournaled CONNECT.
+    """
+    roles: set[str] = set()
+    for record in handoff_events(records):
+        payload = record.payload
+        if payload["state"] != "outcome":
+            continue
+        evidence = payload["evidence"]
+        if evidence.get("has_database_privilege") is not True:
+            continue
+        if evidence.get("changed") is True or evidence.get("applied") is True:
+            roles.add(payload["role"])
+            continue
+        if payload["role"] not in roles:
+            raise EnrollmentError(
+                "handoff_journal",
+                "a no-op handoff outcome precedes any successful handoff for its role",
+                f"seq {record.seq}",
+            )
+    return frozenset(roles)
+
+
+def acl_state_equal(left: DatabaseAclState, right: DatabaseAclState) -> bool:
+    """Total equality: materialization, every explicit entry and every effective value."""
+    return (
+        left.acl_materialized == right.acl_materialized
+        and left.entries == right.entries
+        and left.effective == right.effective
+    )
+
+
+def database_acl_failures(
+    state: DatabaseAclState,
+    *,
+    records: Iterable[Record],
+    authorized_roles: Iterable[str] = (),
+) -> tuple[str, ...]:
+    """The complete ACL security invariant for the serving database.
+
+    It is checked both before any handoff (the fence must already be intact) and after a
+    transition. Every failure is a stable, non-secret label:
+
+    * the ACL must be materialized; PUBLIC must hold nothing;
+    * no grant option may appear on a login role;
+    * `CREATE` and `TEMPORARY` are forbidden to every login role;
+    * a login role may hold CONNECT only when it is `hh_migrate` (pre-handoff) or has a
+      journaled successful handoff (`authorized_roles` lets the caller add the role that the
+      outcome currently being judged is about);
+    * a role that may hold CONNECT must hold it, exactly once, non-grantable, with no other
+      explicit entry; a role that may not hold it must hold no explicit entry at all;
+    * no explicit entry may name a role outside the project inventory.
+    """
+    provenance = set(successful_handoff_roles(records)) | set(authorized_roles)
+    allowed_connect = set(PRE_HANDOFF_CONNECT_ROLES) | provenance
+    failures: list[str] = []
+    if not state.acl_materialized:
+        failures.append("acl_not_materialized")
+    for grantee, privilege, grantable in state.entries:
+        if grantee == "PUBLIC":
+            failures.append("public_database_privilege")
+            continue
+        if grantee not in contract.PROJECT_ROLE_NAMES:
+            failures.append(f"foreign_grantee:{grantee}")
+            continue
+        if grantable and grantee != contract.OWNER_ROLE:
+            failures.append(f"grant_option:{grantee}:{privilege}")
+    for role in contract.PROJECT_ROLE_NAMES:
+        for privilege in DATABASE_PRIVILEGES:
+            if state.privilege(role, privilege) is None:
+                failures.append("acl_unrecognized_observation")
+                return tuple(dict.fromkeys(failures))
+        if role == contract.OWNER_ROLE:
+            # The NOLOGIN owner's rights are inherent; its explicit representation may
+            # legitimately be absent or complete. Collateral changes to it are still
+            # caught by the total pre/post comparison.
+            continue
+        connect = state.privilege(role, "CONNECT")
+        if role in allowed_connect:
+            if connect is not True:
+                failures.append(f"connect_missing:{role}")
+        elif connect is not False:
+            failures.append(f"unrecorded_connect:{role}")
+        if state.privilege(role, "CREATE") is not False:
+            failures.append(f"create:{role}")
+        if state.privilege(role, "TEMPORARY") is not False:
+            failures.append(f"temporary:{role}")
+        role_entries = state.entries_for(role)
+        connect_entries = [entry for entry in role_entries if entry[1] == "CONNECT"]
+        for _grantee, privilege, _grantable in role_entries:
+            if privilege != "CONNECT":
+                failures.append(f"unexpected_privilege:{role}:{privilege}")
+        if role in allowed_connect:
+            if len(connect_entries) != 1:
+                failures.append(f"connect_entry_count:{role}")
+            elif connect_entries[0][2] is not False:
+                failures.append(f"grant_option:{role}:CONNECT")
+        elif connect_entries:
+            failures.append(f"unexpected_entry:{role}:CONNECT")
+    return tuple(dict.fromkeys(failures))
+
+
+def expected_after_handoff(before: DatabaseAclState, role: str) -> DatabaseAclState:
+    """The exact post-state a successful `GRANT CONNECT` to `role` may produce.
+
+    A role that already holds CONNECT is a no-op, so the expected state is the pre-state
+    itself.
+    """
+    if before.privilege(role, "CONNECT") is True:
+        return before
+    entries = tuple(sorted(before.entries + ((role, "CONNECT", False),)))
+    effective = tuple(
+        sorted(
+            (
+                observed_role,
+                privilege,
+                True
+                if (observed_role, privilege) == (role, "CONNECT")
+                else value,
+            )
+            for observed_role, privilege, value in before.effective
+        )
+    )
+    return DatabaseAclState(
+        acl_materialized=before.acl_materialized,
+        entries=entries,
+        effective=effective,
+    )
+
+
+def _multiset_difference(
+    expected: Sequence[tuple[str, str, bool]],
+    observed: Sequence[tuple[str, str, bool]],
+) -> tuple[tuple[str, str, bool], ...]:
+    remaining = list(observed)
+    missing: list[tuple[str, str, bool]] = []
+    for item in expected:
+        if item in remaining:
+            remaining.remove(item)
+        else:
+            missing.append(item)
+    return tuple(missing) + tuple(remaining)
+
+
+def acl_transition_failures(
+    before: DatabaseAclState,
+    after: DatabaseAclState,
+    role: str,
+    *,
+    records: Iterable[Record],
+) -> tuple[str, ...]:
+    """The observed post-state must equal the pre-state plus exactly one CONNECT.
+
+    This is the Finding-3 correction: only selected fields were checked before, so a
+    grant option, a collateral `CREATE`, or an unjournaled CONNECT on another role could
+    pass. The comparison here is total, and the invariant is then re-checked on the
+    resulting state with the current role's provenance admitted.
+    """
+    expected = expected_after_handoff(before, role)
+    failures: list[str] = []
+    if after.acl_materialized != expected.acl_materialized:
+        failures.append(
+            "acl_materialization_changed:"
+            + ("materialized" if after.acl_materialized else "unmaterialized")
+        )
+    if after.entries != expected.entries:
+        for grantee, privilege, grantable in _multiset_difference(
+            expected.entries, after.entries
+        ):
+            failures.append(f"acl_entry:{grantee}:{privilege}:{int(grantable)}")
+    if after.effective != expected.effective:
+        expected_map = {
+            (observed_role, privilege): value
+            for observed_role, privilege, value in expected.effective
+        }
+        for observed_role, privilege, value in after.effective:
+            if expected_map.get((observed_role, privilege)) != value:
+                failures.append(
+                    f"privilege_changed:{observed_role}:{privilege}:{int(value)}"
+                )
+    # The role's provenance is admitted only when this transition is what creates its
+    # CONNECT. A pre-existing CONNECT must already have a journaled handoff; otherwise the
+    # baseline below reports `unrecorded_connect:<role>` instead of blessing it.
+    adds_connect = before.privilege(role, "CONNECT") is not True
+    failures.extend(
+        database_acl_failures(
+            after,
+            records=records,
+            authorized_roles=(role,) if adds_connect else (),
+        )
+    )
+    return tuple(dict.fromkeys(failures))
+
+
+def reconcile_acl_decision(
+    before: DatabaseAclState,
+    after: DatabaseAclState,
+    role: str,
+    *,
+    records: Iterable[Record],
+) -> tuple[str, tuple[str, ...]]:
+    """Decide an UNKNOWN operation's outcome from the complete ACL state alone.
+
+    * `not_applied`: the state is exactly the recorded pre-state and the fence is intact;
+      the GRANT did not commit.
+    * `applied`: the state is exactly the pre-state plus this role's single CONNECT and the
+      fence is intact with the role's provenance admitted.
+    * `unsafe`: anything else. It is never reconciled; the caller must retain UNKNOWN.
+    """
+    if acl_state_equal(before, after):
+        failures = database_acl_failures(after, records=records)
+        return ("unsafe", failures) if failures else ("not_applied", ())
+    failures = acl_transition_failures(before, after, role, records=records)
+    return ("unsafe", failures) if failures else ("applied", ())
+
+
+# --- handoff transport termination (Finding 1) ----------------------------------------------
+
+
+@dataclass(frozen=True)
+class HandoffTransportEvidence:
+    """The container-side completion and liveness evidence of ONE handoff operation.
+
+    It is evidence only. `observed=False` means the probe itself failed and is never
+    interpreted as termination. `psql_exit` is the status the container-side wrapper
+    recorded after psql returned; its presence proves the client terminated. `client_alive`
+    and `session_alive` are positive evidence that it has not.
+    """
+
+    run_id: str = ""
+    observed: bool = False
+    started: bool = False
+    stopped: bool = False
+    psql_exit: Optional[int] = None
+    client_alive: bool = False
+    session_alive: bool = False
+
+
+def handoff_termination_failures(
+    evidence: HandoffTransportEvidence,
+) -> tuple[str, ...]:
+    """Why the original operation's termination is not positively established.
+
+    An instantaneous privilege snapshot is never enough (Finding 1): a delayed GRANT may
+    still execute. Termination is established only when the tagged session/client is gone
+    AND either its recorded completion status exists or the wrapper was observed to have
+    started. A wrapper that never started cannot be distinguished from one that is about to
+    start, so it stays UNKNOWN.
+    """
+    if not evidence.observed:
+        return ("transport:unobserved",)
+    if evidence.client_alive:
+        return ("transport:client_alive",)
+    if evidence.session_alive:
+        return ("transport:session_alive",)
+    if evidence.psql_exit is not None:
+        return ()
+    if evidence.started:
+        return ()
+    return ("transport:never_started",)
+
+
 # --- the E0-E7 dispatch ----------------------------------------------------------------------
 
 

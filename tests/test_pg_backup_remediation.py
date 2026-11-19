@@ -22,6 +22,7 @@ import pytest
 
 from house_helper.persistence import pg_backup as backup
 from house_helper.persistence import pg_contract
+from house_helper.persistence import pg_enrollment as enrollment
 from house_helper.persistence import pg_journal as journal
 from tests.test_pg_backup import PINNED_EXTRACTION, _manifest
 
@@ -404,9 +405,11 @@ def _backup_facts():
 class _BackupTool:
     """The Docker boundary plus an in-process stand-in for the lock holder.
 
-    The stand-in keeps the mutex for the same span as the real holder: acquisition
-    through publication and read-back until the holder is removed. Publication options
-    let a test terminate the holder immediately before or during the publication call.
+    The stand-in keeps the state-volume mutex for the same span as the real holder:
+    acquisition through publication and read-back until the holder is removed. It cannot
+    publish: publication is performed by the host (`maintenance._host_publish`). The
+    `die_before_publish` and `die_before_confirm` options terminate the holder at the
+    first (pre-publication) and second (post-read-back) ownership probe respectively.
     """
 
     def __init__(
@@ -414,24 +417,17 @@ class _BackupTool:
         lock=None,
         *,
         die_before_publish=False,
-        die_during_publish=False,
         die_before_confirm=False,
     ):
         self.lock = lock or threading.Lock()
         self.die_before_publish = die_before_publish
-        self.die_during_publish = die_during_publish
         self.die_before_confirm = die_before_confirm
         self.acquired = 0
         self.released = 0
         self.holders = {}
-        self.cleanup_holders = []
         self.holder_control_dirs = []
-        self.cleanup_control_dirs = []
-        self.publications = []
         self.confirmations = []
-        self.cleanups = []
         self.dump_bytes = DUMP_BYTES
-        self.before_failure = None
         self.toc = "1; 0 0 SEQUENCE SET public messages_id_seq hh_owner\n"
         self.extraction = _extraction()
 
@@ -441,103 +437,27 @@ class _BackupTool:
     def inspect_volume(self, name):
         return {}
 
-    def start_lock_holder(self, *, name, control_dir, output_dir, timeout=30.0):
+    def start_lock_holder(self, *, name, control_dir, timeout=30.0):
         if not self.lock.acquire(timeout=timeout):
             raise maintenance.MaintenanceError("backup_lock", "busy")
         self.acquired += 1
         container = f"holder-{self.acquired}"
-        self.holders[container] = (Path(control_dir), Path(output_dir))
+        self.holders[container] = Path(control_dir)
         self.holder_control_dirs.append(Path(control_dir))
         return container
 
-    def start_cleanup_holder(self, *, name, control_dir, output_dir, timeout=30.0):
-        """The cleanup-only recovery holder: same mutex, no publication path.
-
-        It is a distinct start method so the production recovery path must ask for the
-        cleanup-only holder explicitly. A control directory that still contains a
-        publication request is never passed here by `_recover_cleanup`.
-        """
-        if not self.lock.acquire(timeout=timeout):
-            raise maintenance.MaintenanceError("backup_lock", "busy")
-        self.acquired += 1
-        container = f"holder-{self.acquired}"
-        self.holders[container] = (Path(control_dir), Path(output_dir))
-        self.cleanup_holders.append(container)
-        self.cleanup_control_dirs.append(Path(control_dir))
-        return container
-
-    def publish_in_holder(
-        self, container, *, control_dir, staging_name, output_name, replace=False, timeout=120.0
-    ):
-        if container not in self.holders:
-            raise maintenance.MaintenanceError("backup_lock", "holder terminated")
-        if container in self.cleanup_holders:
-            # A recovery holder is structurally unable to publish; the stand-in keeps
-            # the same rule so a regression cannot pass through it.
-            raise maintenance.MaintenanceError(
-                "backup_lock", "the recovery holder cannot publish"
-            )
-        _, output_dir = self.holders[container]
-        staging = output_dir / staging_name
-        final = output_dir / output_name
-        self.publications.append((container, self.lock.locked(), self.released))
-        if self.die_before_publish:
-            self._terminate(container)
-            if self.before_failure is not None:
-                self.before_failure()
-            raise maintenance.MaintenanceError("backup_lock", "holder terminated")
-        # The holder reports the staged inode, which is the inode a link or rename
-        # publishes (the real holder does the same with `stat -c '%d %i'`).
-        recorded = staging.stat()
-        identity = f"{recorded.st_dev} {recorded.st_ino}"
-        if self.die_during_publish:
-            if replace:
-                os.replace(staging, final)
-            else:
-                os.link(staging, final)
-            self._terminate(container)
-            if self.before_failure is not None:
-                self.before_failure()
-            raise maintenance.MaintenanceError(
-                "backup_lock", "holder terminated during publication"
-            )
-        if replace:
-            os.replace(staging, final)
-            return f"ok {identity}"
-        try:
-            os.link(staging, final)
-        except FileExistsError:
-            return "exists"
-        staging.unlink()
-        return f"ok {identity}"
-
-    def cleanup_in_holder(
-        self, container, *, control_dir, output_name, identity, timeout=60.0
-    ):
-        """The stand-in for the holder's mutex-held identity check and unlink."""
-        if container not in self.holders:
-            raise maintenance.MaintenanceError("backup_lock", "holder terminated")
-        _, output_dir = self.holders[container]
-        final = output_dir / output_name
-        held = self.lock.locked()
-        if not held:
-            self.cleanups.append((container, held, self.released, "refused"))
-            raise maintenance.MaintenanceError("backup_lock", "the mutex is not held")
-        if final.is_symlink():
-            outcome = "error"
-        elif not final.exists():
-            outcome = "absent"
-        elif (final.stat().st_dev, final.stat().st_ino) != tuple(identity):
-            outcome = "retained"
-        else:
-            final.unlink()
-            outcome = "removed"
-        self.cleanups.append((container, held, self.released, outcome))
-        return outcome
-
     def confirm_lock_holder(self, container, *, control_dir, timeout=60.0):
+        """The ownership probe. There is no publication channel to stand in for."""
+        if container not in self.holders:
+            raise maintenance.MaintenanceError("backup_lock", "holder terminated")
+        probe = len(self.confirmations) + 1
         self.confirmations.append((container, self.lock.locked(), self.released))
-        if self.die_before_confirm:
+        if probe == 1 and self.die_before_publish:
+            self._terminate(container)
+            raise maintenance.MaintenanceError(
+                "backup_lock", "holder terminated before publication"
+            )
+        if probe == 2 and self.die_before_confirm:
             self._terminate(container)
             raise maintenance.MaintenanceError(
                 "backup_lock", "holder terminated before success was acknowledged"
@@ -595,6 +515,15 @@ def _install_target_fakes(monkeypatch, tmp_path):
             system_identifier=SYSTEM_IDENTIFIER,
         ),
     )
+    # P0: `backup_command`/`restore_command` take the host operation interval before the
+    # target check, so they open the journal themselves. The test runs unprivileged; the
+    # lock is real, only its root-ownership requirement is relaxed.
+    real_journal = journal.Journal
+
+    def portable_journal(directory, require_root=False):
+        return real_journal(directory, require_root=False)
+
+    monkeypatch.setattr(maintenance.journal, "Journal", portable_journal)
     monkeypatch.setattr(
         maintenance,
         "passfile",
@@ -610,15 +539,24 @@ def _install_backup_fakes(monkeypatch, tmp_path, tools):
 
 
 def test_two_concurrent_backups_create_at_most_one_archive(monkeypatch, tmp_path):
+    """F5: two backups that both reach the mutex create at most one archive.
+
+    The host operation interval is the outer layer and would refuse the second caller
+    before this point (see tests/test_pg_operation_interval.py). This test drives the
+    inner layer it was written for - the exclusive backup mutex that covers the dump,
+    output-path checks and publication - by entering the backup body with the target the
+    interval would have produced.
+    """
     tools = _BackupTool()
     _install_backup_fakes(monkeypatch, tmp_path, tools)
     output = tmp_path / "point.tar"
     args = _backup_args(tmp_path, output)
+    target = maintenance.verify_target(args.compose_file, args.journal_dir)
     results = []
 
     def attempt():
         try:
-            results.append(maintenance.backup_command(args))
+            results.append(maintenance._backup_command_locked(args, target))
         except maintenance.MaintenanceError as error:
             results.append(error.code)
 
@@ -691,24 +629,24 @@ def test_an_explicitly_authorized_overwrite_still_replaces_the_archive(tmp_path)
     assert point.dump == DUMP_BYTES
 
 
-def test_the_lock_holder_script_takes_both_locks_signals_readiness_and_publishes():
+def test_the_lock_holder_script_takes_both_locks_and_cannot_publish():
     script = maintenance._lock_holder_script()
     assert maintenance.STATE_LOCK in script
     assert maintenance.BACKUP_MUTEX in script
     assert "flock -s -n 9" in script and "flock -x -n 8" in script
     assert f"touch {maintenance.LOCK_CONTROL_TARGET}/{maintenance.LOCK_READY_NAME}" in script
-    # F5-B: no unconditional lifetime. The holder expires only when the host-refreshed
-    # deadline is stale, and it performs the publication itself.
+    # P0: no unconditional lifetime; the host-refreshed deadline is the only expiry.
     assert "exec sleep" not in script
     assert maintenance.LOCK_DEADLINE_NAME in script
-    assert 'ln "' in script and 'mv -f "' in script
+    # P0: the holder only answers the ownership probe. It has no publication, success or
+    # cleanup branch, and it never references the output directory at all.
     assert maintenance.LOCK_CONFIRM_NAME in script and "alive" in script
-    # F5-B: publication reports the published inode, and the same holder performs the
-    # identity-checked failure cleanup under the mutex it already owns.
-    assert 'stat -c "%d %i"' in script and "ok $identity" in script
-    assert maintenance.LOCK_CLEANUP_NAME in script
-    assert "outcome=removed" in script and "outcome=retained" in script
-    assert '"$identity" = "$device $inode"' in script
+    assert 'ln "' not in script
+    assert 'mv -f "' not in script
+    assert "replace" not in script
+    assert "LOCK_CLEANUP" not in script
+    assert "output_dir" not in script
+    assert "/out" not in script
 
 
 def test_a_holder_that_terminates_before_publication_publishes_nothing(
@@ -722,34 +660,10 @@ def test_a_holder_that_terminates_before_publication_publishes_nothing(
     assert refused.value.code == "backup_lock"
     assert not output.exists()
     assert list(tmp_path.glob(".point.tar.partial-*")) == []
-    # F5-B: the recovery holder re-acquires the released mutex to check that nothing
-    # was published, then exits; the operation still reports failure.
-    assert tools.acquired == 2 and tools.released == 2
-    assert len(tools.cleanups) == 1
-    assert tools.cleanups[0][1] is True and tools.cleanups[0][3] == "absent"
-    # R4: recovery is a cleanup-only holder on a fresh control directory.
-    assert tools.cleanup_holders
-    assert tools.cleanup_control_dirs[0] != tools.holder_control_dirs[0]
-
-
-def test_a_holder_that_terminates_during_publication_removes_its_unreported_archive(
-    monkeypatch, tmp_path
-):
-    tools = _BackupTool(die_during_publish=True)
-    _install_backup_fakes(monkeypatch, tmp_path, tools)
-    output = tmp_path / "point.tar"
-    with pytest.raises(maintenance.MaintenanceError) as refused:
-        maintenance.backup_command(_backup_args(tmp_path, output))
-    assert refused.value.code == "backup_lock"
-    # The link completed in the instant before the holder died; publication was never
-    # reported, so the recovery holder removes the exact inode that was staged.
-    assert not output.exists()
-    assert list(tmp_path.glob(".point.tar.partial-*")) == []
-    assert len(tools.cleanups) == 1
-    assert tools.cleanups[0][1] is True and tools.cleanups[0][3] == "removed"
-    # R4: the removing holder is the cleanup-only one, not a replaying publisher.
-    assert tools.cleanup_holders
-    assert tools.cleanup_control_dirs[0] != tools.holder_control_dirs[0]
+    # The holder is asked once, before publication; it cannot answer, so the host never
+    # publishes and no recovery holder is needed (the host holds the operation interval).
+    assert tools.acquired == 1 and tools.released == 1
+    assert len(tools.confirmations) == 1
 
 
 def test_a_dead_holders_operation_cannot_publish_after_a_second_acquires_the_mutex(
@@ -765,19 +679,17 @@ def test_a_dead_holders_operation_cannot_publish_after_a_second_acquires_the_mut
     tools.die_before_publish = False
     assert maintenance.backup_command(_backup_args(tmp_path, output)) == maintenance.EX_OK
     assert output.is_file()
-    # The first operation's failure cleanup ran through one recovery holder.
-    assert tools.acquired == 3 and tools.released == 3
+    assert tools.acquired == 2 and tools.released == 2
 
 
 def test_a_failed_acknowledgement_never_removes_a_successors_archive(
     monkeypatch, tmp_path
 ):
-    """R3/F5-B: the exact A/B sequence — A's cleanup runs after B replaced the archive.
+    """The exact A/B sequence: A's identity-checked cleanup runs after B replaced it.
 
-    A publishes and reads back, then its holder dies before the acknowledgement. B then
-    acquires the released mutex and publishes a replacement with overwrite=true through
-    the real publication functions. A's failure cleanup must run under that same mutex
-    and leave B's completed archive exactly where it is.
+    A publishes and reads back, then its holder dies before the post-read-back ownership
+    probe. B then acquires the released mutex and publishes a replacement with
+    overwrite=true. A's host-side failure cleanup must leave B's archive untouched.
     """
     output = tmp_path / "point.tar"
     failed = _BackupTool()
@@ -788,16 +700,20 @@ def test_a_failed_acknowledgement_never_removes_a_successors_archive(
     monkeypatch.setattr(maintenance, "ToolContainers", lambda image: current["tools"])
     outcomes = []
     completed = []
+    calls = {"n": 0}
 
     def lose_holder_then_let_a_successor_publish(container, *, control_dir, timeout=60.0):
+        calls["n"] += 1
         failed.confirmations.append((container, failed.lock.locked(), failed.released))
-        # A published and read back successfully; its lock holder now dies before it
-        # can acknowledge, releasing the mutex.
+        if calls["n"] == 1:
+            return  # the pre-publication ownership probe succeeds
+        # A published and read back successfully; its holder now dies before it can
+        # acknowledge, releasing the mutex.
         failed._terminate(container)
         current["tools"] = successor
         try:
             outcomes.append(
-                maintenance.backup_command(_backup_args(tmp_path, output, overwrite=True))
+                maintenance._backup_command_locked(successor_args, target)
             )
             completed.append(output.read_bytes())
         finally:
@@ -807,67 +723,22 @@ def test_a_failed_acknowledgement_never_removes_a_successors_archive(
         )
 
     failed.confirm_lock_holder = lose_holder_then_let_a_successor_publish
+    args = _backup_args(tmp_path, output)
+    successor_args = _backup_args(tmp_path, output, overwrite=True)
+    target = maintenance.verify_target(args.compose_file, args.journal_dir)
     with pytest.raises(maintenance.MaintenanceError) as refused:
-        maintenance.backup_command(_backup_args(tmp_path, output))
+        maintenance._backup_command_locked(args, target)
 
-    # 2: A reports failure, never success.
+    # A reports failure, never success.
     assert refused.value.code == "backup_lock"
-    # 1: B's archive is present and byte-identical.
+    # B's archive is present and byte-identical; A's cleanup found a different inode.
     assert outcomes == [maintenance.EX_OK]
     assert completed and output.read_bytes() == completed[0]
     assert backup.read_archive(output).dump == successor.dump_bytes
-    # 3/4: A's cleanup ran with the mutex held and did not remove B's output. The dead
-    # original holder could not clean up, so one recovery holder re-acquired the mutex.
-    assert len(failed.cleanups) == 1
-    _, held, released, outcome = failed.cleanups[0]
-    assert held is True and released == 1 and outcome == "retained"
-    assert backup.read_archive(output).dump == successor.dump_bytes
-
-
-def test_a_failed_publication_never_removes_a_successors_archive(monkeypatch, tmp_path):
-    """R3/F5-B: the same rule on the second failure-cleanup path.
-
-    A's holder links the archive and dies before reporting it. B then publishes a
-    replacement under the recovered mutex. A's unreported-output cleanup must find a
-    different inode and leave B's completed archive untouched.
-    """
-    output = tmp_path / "point.tar"
-    failed = _BackupTool(die_during_publish=True)
-    successor = _BackupTool(lock=failed.lock)
-    successor.dump_bytes = b"the successor archive for the failed-publication branch"
-    current = {"tools": failed}
-    _install_target_fakes(monkeypatch, tmp_path)
-    monkeypatch.setattr(maintenance, "ToolContainers", lambda image: current["tools"])
-    outcomes = []
-
-    completed = []
-
-    def let_a_successor_publish():
-        failed.before_failure = None
-        current["tools"] = successor
-        try:
-            outcomes.append(
-                maintenance.backup_command(_backup_args(tmp_path, output, overwrite=True))
-            )
-            completed.append(output.read_bytes())
-        finally:
-            current["tools"] = failed
-
-    failed.before_failure = let_a_successor_publish
-    with pytest.raises(maintenance.MaintenanceError) as refused:
-        maintenance.backup_command(_backup_args(tmp_path, output))
-
-    assert refused.value.code == "backup_lock"
-    assert outcomes == [maintenance.EX_OK]
-    assert completed and output.read_bytes() == completed[0]
-    assert backup.read_archive(output).dump == successor.dump_bytes
-    assert len(failed.cleanups) == 1
-    _, held, released, outcome = failed.cleanups[0]
-    assert held is True and released == 1 and outcome == "retained"
 
 
 def test_a_live_holder_cleanup_removes_only_the_published_inode(monkeypatch, tmp_path):
-    """R3/F5-B: even with the holder alive, a replaced inode is never removed."""
+    """A replaced inode is never removed, even while the holder is still alive."""
     tools = _BackupTool()
     _install_backup_fakes(monkeypatch, tmp_path, tools)
     output = tmp_path / "point.tar"
@@ -889,8 +760,6 @@ def test_a_live_holder_cleanup_removes_only_the_published_inode(monkeypatch, tmp
         maintenance.backup_command(_backup_args(tmp_path, output))
     assert refused.value.code == "output_verify"
     assert output.read_bytes() == replacement
-    assert tools.cleanups and tools.cleanups[0][1] is True
-    assert tools.cleanups[0][3] == "retained"
 
 
 def test_normal_backup_holds_the_mutex_through_publication_and_readback(
@@ -900,33 +769,44 @@ def test_normal_backup_holds_the_mutex_through_publication_and_readback(
     _install_backup_fakes(monkeypatch, tmp_path, tools)
     output = tmp_path / "point.tar"
     reads = []
+    publishes = []
     real_read = backup.read_archive
+    real_publish = maintenance._host_publish
 
     def recording_read(path):
         if Path(path).name == output.name:
             reads.append((tools.lock.locked(), tools.released))
         return real_read(path)
 
+    def recording_publish(staging, output_path, replace):
+        publishes.append((tools.lock.locked(), tools.released))
+        return real_publish(staging, output_path, replace)
+
     monkeypatch.setattr(backup, "read_archive", recording_read)
+    monkeypatch.setattr(maintenance, "_host_publish", recording_publish)
     assert maintenance.backup_command(_backup_args(tmp_path, output)) == maintenance.EX_OK
-    assert tools.publications and all(
-        held and released == 0 for _, held, released in tools.publications
-    )
-    # The read-back of the published path happens while the mutex is still held and the
-    # holder is still alive; it is released only in the final cleanup.
+    # The host publication happens while the state-volume mutex is still held and the
+    # holder is still alive.
+    assert publishes and all(held and released == 0 for held, released in publishes)
+    # The read-back of the published path happens under the same condition.
     assert reads and all(held and released == 0 for held, released in reads)
-    assert tools.confirmations and all(
-        held and released == 0 for _, held, released in tools.confirmations
-    )
+    # The ownership probe ran before publication and again after the read-back.
+    assert len(tools.confirmations) == 2
+    assert all(held and released == 0 for _, held, released in tools.confirmations)
     assert tools.released == 1
 
 
-# --- R4/F5-B: recovery must never replay a stale publication --------------------------------
+# --- P0: the holder owns the locks but cannot publish ----------------------------------------
 #
-# These tests run the production holder scripts under a real POSIX shell with the real
-# `flock` binary — locally on a POSIX host, or through WSL on Windows. The host-side
-# request/result files use the production protocol helpers, so nothing here is an
-# in-memory stand-in for the mutex or the holder loop.
+# These tests run the production holder script under a real POSIX shell with the real
+# `flock` binary — locally on a POSIX host, or through WSL on Windows. The holder is the
+# only detached process in the backup protocol, so this is where its (absent) publication
+# capability is proved: it has no output-directory access and no publication branch, and
+# the host process performs the atomic publication while it holds `operation.lock`.
+
+# The publication channel the pre-P0 holder served. It is deliberately kept as a literal
+# here so the regression test can show that a queued message from that protocol is inert.
+_LEGACY_PUBLISH_REQUEST = ".house-helper.publish.request"
 
 
 def _linux_shell_command() -> list[str]:
@@ -958,73 +838,52 @@ def _linux_path(path) -> str:
     return "/mnt/" + drive.lower() + value.as_posix()[2:]
 
 
-def _linux_identity(path) -> tuple[int, int]:
-    """The identity as the holder itself sees it (`stat -c '%d %i'`)."""
-    done = _linux_run(f'stat -c "%d %i" "{_linux_path(path)}"')
-    if done.returncode != 0:
-        raise AssertionError(done.stderr.decode("utf-8", "replace"))
-    device, inode = done.stdout.split()
-    return int(device), int(inode)
-
-
 class _LocalLinuxHolders:
     """The ToolContainers boundary backed by a real POSIX shell and real `flock`.
 
     Instead of Docker, the production holder script text runs under the local Linux
-    shell. Requests and results travel through the same production control files, and
-    the mutex is a real kernel `flock`, so a stale request is replayed (or not) exactly
-    as it would be in the deployed holder container.
+    shell. The ownership probe travels through the same production control file, and the
+    mutex is a real kernel `flock`. The holder has no output-directory access and no
+    publication branch, so a queued publication message can only ever be inert.
     """
 
     def __init__(self, state_dir):
         self.state_dir = Path(state_dir)
         self.processes = {}
-        self.publish_holder_dirs = []
-        self.cleanup_holder_dirs = []
-        self.cleanup_requests_at_start = []
-        self.mutex_held_while_cleanup = []
+        self.holder_dirs = []
         self._count = 0
         probe = _linux_run("command -v flock")
         if probe.returncode != 0:
             pytest.skip("real Linux flock is unavailable")
 
-    def _paths(self, control_dir, output_dir):
-        for value in (self.state_dir, Path(control_dir), Path(output_dir)):
+    def _paths(self, control_dir):
+        for value in (self.state_dir, Path(control_dir)):
             if re.search(r"[^A-Za-z0-9._/\\:-]", str(value)):
                 pytest.skip("the Linux reproduction needs shell-safe paths")
         return {
             "control_dir": _linux_path(control_dir),
-            "output_dir": _linux_path(output_dir),
             "state_lock": _linux_path(self.state_dir / "maintenance.lock"),
             "backup_mutex": _linux_path(self.state_dir / "backup.lock"),
         }
 
-    def start_lock_holder(self, *, name, control_dir, output_dir, timeout=30.0):
-        script = maintenance._lock_holder_script(**self._paths(control_dir, output_dir))
+    def start_lock_holder(self, *, name, control_dir, timeout=30.0):
+        script = maintenance._lock_holder_script(**self._paths(control_dir))
         container = self._start(script, Path(control_dir), timeout)
-        self.publish_holder_dirs.append(Path(control_dir))
+        self.holder_dirs.append(Path(control_dir))
         return container
 
-    def start_cleanup_holder(self, *, name, control_dir, output_dir, timeout=30.0):
-        script = maintenance._cleanup_holder_script(
-            **self._paths(control_dir, output_dir)
-        )
+    def confirm_lock_holder(self, container, *, control_dir, timeout=60.0):
         control = Path(control_dir)
-        self.cleanup_requests_at_start.append(
-            (control / maintenance.LOCK_REQUEST_NAME).exists()
+        maintenance._write_control_request(
+            control, maintenance.LOCK_CONFIRM_NAME, "confirm\n"
         )
-        container = self._start(script, control, timeout)
-        self.cleanup_holder_dirs.append(control)
-        self.mutex_held_while_cleanup.append(self._mutex_is_held())
-        return container
-
-    def _mutex_is_held(self) -> bool:
-        """A competing exclusive `flock` must fail while the holder runs."""
-        done = _linux_run(
-            f'flock -x -n 8 8>"{_linux_path(self.state_dir / "backup.lock")}"'
-            " && echo free || echo held"
+        outcome = self._wait_result(
+            container, control / maintenance.LOCK_CONFIRM_RESULT_NAME, timeout
         )
-        return done.stdout.strip() == b"held"
+        if outcome != "alive":
+            raise maintenance.MaintenanceError(
+                "backup_lock", "the real holder did not acknowledge ownership"
+            )
 
     def _start(self, script, control_dir, timeout):
         process = subprocess.Popen(
@@ -1046,40 +905,6 @@ class _LocalLinuxHolders:
         process.kill()
         process.wait(timeout=10)
         raise AssertionError("the real holder did not signal readiness")
-
-    def publish_in_holder(
-        self,
-        container,
-        *,
-        control_dir,
-        staging_name,
-        output_name,
-        replace=False,
-        timeout=120.0,
-    ):
-        control = Path(control_dir)
-        maintenance._write_control_request(
-            control,
-            maintenance.LOCK_REQUEST_NAME,
-            maintenance._publish_request_body(staging_name, output_name, replace),
-        )
-        return self._wait_result(
-            container, control / maintenance.LOCK_RESULT_NAME, timeout
-        )
-
-    def cleanup_in_holder(
-        self, container, *, control_dir, output_name, identity, timeout=60.0
-    ):
-        control = Path(control_dir)
-        device, inode = int(identity[0]), int(identity[1])
-        maintenance._write_control_request(
-            control,
-            maintenance.LOCK_CLEANUP_NAME,
-            maintenance._cleanup_request_body(output_name, device, inode),
-        )
-        return self._wait_result(
-            container, control / maintenance.LOCK_CLEANUP_RESULT_NAME, timeout
-        )
 
     def _wait_result(self, container, result, timeout):
         process = self.processes[container]
@@ -1114,134 +939,183 @@ class _LocalLinuxHolders:
 def _scenario_dirs(tmp_path):
     output = tmp_path / "out"
     state = tmp_path / "state"
-    control_a = tmp_path / "ctl-a"
-    for directory in (output, state, control_a):
+    control = tmp_path / "ctl"
+    for directory in (output, state, control):
         directory.mkdir()
-    return output, state, control_a
+    return output, state, control
 
 
-def _write_stale_overwrite_request(control_a):
-    """A's publication request, written before A's holder dies and never consumed."""
-    maintenance._write_control_request(
-        control_a,
-        maintenance.LOCK_REQUEST_NAME,
-        maintenance._publish_request_body("A_staging.tar", "point.tar", True),
+def test_the_real_holder_answers_the_ownership_probe(tmp_path):
+    """A real `alive` answer from the real shell loop, under the real flock."""
+    output, state, control = _scenario_dirs(tmp_path)
+    tools = _LocalLinuxHolders(state)
+    lock = maintenance._BackupLock(
+        tools, name="probe", control_dir=control, output_dir=output
     )
+    lock.acquire()
+    try:
+        lock.assert_owned()
+    finally:
+        lock.release()
+    assert not (control / maintenance.LOCK_CONFIRM_NAME).exists()
 
 
-def test_the_recovery_holder_script_has_no_publication_path():
-    """Structural proof: the recovery script cannot publish, even a stale message."""
-    script = maintenance._cleanup_holder_script()
-    assert maintenance.LOCK_CLEANUP_NAME in script
-    assert maintenance.LOCK_CLEANUP_RESULT_NAME in script
-    assert maintenance.LOCK_READY_NAME in script
-    assert maintenance.LOCK_DEADLINE_NAME in script
-    # No publication request, no confirmation, and no archive link/rename at all.
-    assert maintenance.LOCK_REQUEST_NAME not in script
-    assert maintenance.LOCK_CONFIRM_NAME not in script
-    assert 'ln "' not in script
-    assert "replace" not in script
-    # The same two locks as the publishing holder — not a second locking mechanism.
-    assert maintenance.STATE_LOCK in script and maintenance.BACKUP_MUTEX in script
-    assert "flock -s -n 9" in script and "flock -x -n 8" in script
+def test_an_abandoned_real_holder_expires_and_releases_the_locks(tmp_path):
+    """Interruption recovery: a host killed by SIGKILL leaves a holder that expires.
 
-
-def test_recovery_never_replays_a_stale_publication_and_keeps_the_successor(tmp_path):
-    """The exact Codex sequence, with the real production recovery script and flock.
-
-    A's holder staged an archive and died with an unconsumed overwrite request. B then
-    acquired the mutex and published its own archive. A's recovery must leave both the
-    stale request and B's completed archive untouched.
+    The unrefreshed heartbeat deadline is the only expiry. The holder exits with 7 and
+    the kernel releases both state-volume flocks, so a later backup is not blocked and
+    nothing was published.
     """
-    output, state, control_a = _scenario_dirs(tmp_path)
-    successor = b"B's completed recovery point, byte for byte"
-    (output / "point.tar").write_bytes(successor)
-    staging = output / "A_staging.tar"
-    a_bytes = b"A's archive, which must never be published by recovery"
-    staging.write_bytes(a_bytes)
-    identity = _linux_identity(staging)
-    _write_stale_overwrite_request(control_a)
-
-    tools = _LocalLinuxHolders(state)
-    lock = maintenance._BackupLock(
-        tools, name="recover", control_dir=control_a, output_dir=output
+    output, state, control = _scenario_dirs(tmp_path)
+    (control / maintenance.LOCK_DEADLINE_NAME).write_text(
+        str(int(time.time()) - 5), encoding="utf-8"
     )
-    # 1/2/4/5: recovery does not execute A's publication, reports "not ours" and
-    # deletes nothing; A's own inode is not the successor's.
-    assert lock._recover_cleanup("point.tar", identity) is False
-
-    assert (output / "point.tar").read_bytes() == successor
-    assert staging.read_bytes() == a_bytes
-    assert (control_a / maintenance.LOCK_REQUEST_NAME).exists()
-    # The recovery holder was the cleanup-only script, mounted on a fresh private
-    # directory that never contained a publication request, holding the real mutex.
-    assert tools.cleanup_holder_dirs
-    assert all(directory != control_a for directory in tools.cleanup_holder_dirs)
-    assert tools.cleanup_requests_at_start == [False]
-    assert tools.mutex_held_while_cleanup == [True]
-
-
-def test_recovery_still_removes_its_own_unreported_inode_under_the_mutex(tmp_path):
-    """6: normal recovery still removes exactly the failed operation's own archive."""
-    output, state, control_a = _scenario_dirs(tmp_path)
-    staging = output / "A_staging.tar"
-    a_bytes = b"A's unreported archive inode"
-    staging.write_bytes(a_bytes)
-    # The holder had linked the staged inode before it died and never reported it.
-    os.link(staging, output / "point.tar")
-    identity = _linux_identity(staging)
-
     tools = _LocalLinuxHolders(state)
-    lock = maintenance._BackupLock(
-        tools, name="recover", control_dir=control_a, output_dir=output
+    script = maintenance._lock_holder_script(**tools._paths(control))
+    process = subprocess.Popen(
+        _linux_shell_command() + [script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
-    assert lock._recover_cleanup("point.tar", identity) is True
+    assert process.wait(timeout=30) == 7
+    free = _linux_run(
+        f'flock -x -n 8 8>"{_linux_path(state / "backup.lock")}"'
+        " && echo free || echo held"
+    )
+    assert free.stdout.strip() == b"free"
     assert not (output / "point.tar").exists()
-    assert staging.exists() and staging.read_bytes() == a_bytes
-    assert tools.mutex_held_while_cleanup == [True]
 
 
-def test_the_removed_recovery_strategy_replays_the_stale_publication(tmp_path):
-    """The defect, reproduced against the exact call the previous code made.
+def test_a_stale_publication_request_is_inert_under_the_real_holder(tmp_path):
+    """A legacy publication message written into the control directory does nothing.
 
-    The previous `_recover_cleanup` started the *publishing* holder on the failed
-    operation's control directory. That holder consumes the stale request, replaces
-    B's completed archive with A's staging, and the following identity-checked cleanup
-    then deletes it. The current recovery path never makes this call.
+    The holder has no publication branch and never sees the output directory, so the
+    payload of the message cannot become an archive even while the holder is alive.
     """
-    output, state, control_a = _scenario_dirs(tmp_path)
-    successor = b"B's completed recovery point, byte for byte"
-    (output / "point.tar").write_bytes(successor)
+    output, state, control = _scenario_dirs(tmp_path)
     staging = output / "A_staging.tar"
     a_bytes = b"A's archive that must never be published"
     staging.write_bytes(a_bytes)
-    identity = _linux_identity(staging)
-    _write_stale_overwrite_request(control_a)
+    maintenance._write_control_request(
+        control,
+        _LEGACY_PUBLISH_REQUEST,
+        "A_staging.tar\npoint.tar\nreplace\n",
+    )
 
     tools = _LocalLinuxHolders(state)
-    holder = tools.start_lock_holder(
-        name="previous-recovery", control_dir=control_a, output_dir=output
-    )
+    holder = tools.start_lock_holder(name="stale", control_dir=control)
     try:
-        replayed = tools._wait_result(
-            holder, control_a / maintenance.LOCK_RESULT_NAME, timeout=60
-        )
-        # The stale overwrite was executed by the publishing holder.
-        assert replayed.startswith("ok ")
-        assert (output / "point.tar").read_bytes() == a_bytes
-        # And the old recovery cleanup then removed B's archive.
-        assert (
-            tools.cleanup_in_holder(
-                holder,
-                control_dir=control_a,
-                output_name="point.tar",
-                identity=identity,
-            )
-            == "removed"
-        )
+        time.sleep(1.0)  # several holder loop iterations
         assert not (output / "point.tar").exists()
+        assert staging.read_bytes() == a_bytes
+        # The holder is alive and still owns the mutex; the message is untouched.
+        tools.confirm_lock_holder(holder, control_dir=control)
+        assert (control / _LEGACY_PUBLISH_REQUEST).exists()
     finally:
         tools.remove(holder)
+
+
+def test_a_detached_holder_cannot_publish_after_the_host_authority_transition(tmp_path):
+    """The auditor's exact sequence, with the real holder, flock and journal.
+
+    1. The holder starts and owns the state-volume locks.
+    2. It is paused before publication.
+    3. A publication is queued (the legacy message).
+    4. The host authority transitions: a successor acquires `operation.lock` and appends
+       an unresolved handoff (UNKNOWN).
+    5. The holder resumes.
+
+    Required result: no final archive appears. The holder has no output access and no
+    publication branch, so the queued message is inert; the UNKNOWN handoff is still
+    pending, so even the host would refuse to publish.
+    """
+    output, state, control = _scenario_dirs(tmp_path)
+    staging = output / "A_staging.tar"
+    a_bytes = b"A's archive that must never be published"
+    staging.write_bytes(a_bytes)
+    j = journal.Journal(tmp_path / "cutover", require_root=False)
+    j.prepare()
+    (control / maintenance.LOCK_DEADLINE_NAME).write_text(
+        str(int(time.time()) + 600), encoding="utf-8"
+    )
+
+    pid_file = tmp_path / "holder.pid"
+    script = (
+        f"echo $$ > {_linux_path(pid_file)}; "
+        + maintenance._lock_holder_script(
+            control_dir=_linux_path(control),
+            state_lock=_linux_path(state / "maintenance.lock"),
+            backup_mutex=_linux_path(state / "backup.lock"),
+        )
+    )
+    holder = subprocess.Popen(
+        _linux_shell_command() + [script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        ready = control / maintenance.LOCK_READY_NAME
+        deadline = time.monotonic() + 30
+        while not ready.exists():
+            if holder.poll() is not None:
+                raise AssertionError(holder.stderr.read().decode("utf-8", "replace"))
+            if time.monotonic() > deadline:
+                raise AssertionError("the holder never signalled readiness")
+            time.sleep(0.02)
+        holder_pid = int(pid_file.read_text())
+
+        # 2. pause the holder before publication
+        assert _linux_run(f"kill -STOP {holder_pid}").returncode == 0
+
+        # 3. queue a publication through the legacy channel
+        maintenance._write_control_request(
+            control, _LEGACY_PUBLISH_REQUEST, "A_staging.tar\npoint.tar\nreplace\n"
+        )
+
+        # 4. the host authority transitions: a successor acquires operation.lock and
+        #    records an unresolved handoff.
+        with j.operation_lock():
+            j.append(
+                "handoff",
+                {
+                    "state": "intent",
+                    "action": "grant_connect:hh_app",
+                    "handoff": enrollment.HANDOFF_EVENTS["hh_app"],
+                    "role": "hh_app",
+                    "database": pg_contract.SERVING_DATABASE,
+                    "operator": "owner",
+                    "run_id": "b" * 32,
+                    "application_name": enrollment.handoff_application_name("b" * 32),
+                    "before": {
+                        "acl_materialized": True,
+                        "entries": [],
+                        "effective": [
+                            [role, privilege, False]
+                            for role in pg_contract.PROJECT_ROLE_NAMES
+                            for privilege in pg_contract.DATABASE_PRIVILEGES
+                        ],
+                    },
+                },
+            )
+        assert enrollment.pending_handoff_intents(j.read().records)
+
+        # 5. resume
+        assert _linux_run(f"kill -CONT {holder_pid}").returncode == 0
+        time.sleep(1.0)
+
+        # Required result: no final archive publication, the staging file is intact, and
+        # the UNKNOWN handoff is still pending.
+        assert not (output / "point.tar").exists()
+        assert staging.read_bytes() == a_bytes
+        assert enrollment.pending_handoff_intents(j.read().records)
+    finally:
+        holder.terminate()
+        try:
+            holder.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            holder.kill()
+            holder.wait(timeout=10)
 
 
 def test_a_holder_that_terminates_before_the_success_ack_reports_no_archive(
@@ -1253,18 +1127,14 @@ def test_a_holder_that_terminates_before_the_success_ack_reports_no_archive(
     with pytest.raises(maintenance.MaintenanceError) as refused:
         maintenance.backup_command(_backup_args(tmp_path, output))
     assert refused.value.code == "backup_lock"
-    # Publication and read-back had completed, but success could not be acknowledged by
-    # the lock owner, so the archive is not left looking like a successful backup.
+    # Publication and read-back had completed, but the state-volume ownership could not
+    # be acknowledged, so the host removes exactly the inode it published.
     assert not output.exists()
     assert list(tmp_path.glob(".point.tar.partial-*")) == []
-    # The dead holder could not clean up; the recovery holder re-acquired the mutex,
-    # matched the staged inode and removed exactly its own archive.
-    assert tools.released == 2
-    assert len(tools.cleanups) == 1
-    assert tools.cleanups[0][1] is True and tools.cleanups[0][3] == "removed"
-    # R4: the removing holder is the cleanup-only one, not a replaying publisher.
-    assert tools.cleanup_holders
-    assert tools.cleanup_control_dirs[0] != tools.holder_control_dirs[0]
+    assert tools.released == 1
+    # A second ownership probe ran: the pre-publication one succeeded, the post-read-back
+    # one failed.
+    assert len(tools.confirmations) == 2
 
 
 def test_an_internal_failure_releases_the_mutex_without_exposing_an_archive(

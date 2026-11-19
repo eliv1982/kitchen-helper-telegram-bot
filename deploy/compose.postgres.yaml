@@ -30,15 +30,17 @@
 #     the service. A separate project name alone does not prevent competing Traefik router
 #     labels.
 #
-# The five one-shot services (migrate, provision, purge, backup, restore) are boundaries, not
-# implementations. Each has only its own login, its own passfile and the database network.
-# Their entrypoint refuses every execution until WP-2C packages the executor; this is
-# deliberate, because a migration path that runs `alembic upgrade head` without the mandatory
-# post-migration re-application of db/privileges.sql would be worse than no path at all.
+# The five one-shot services (migrate, provision, purge, backup, restore) each have only
+# their own login, their own passfile and the database network. `migrate` (WP-2C-A) and
+# `provision` (P0 cutover) are implemented; `purge`, `backup` and `restore` still refuse
+# every execution with EX_CONFIG. A migration path that ran `alembic upgrade head` without
+# the mandatory post-migration re-application of db/privileges.sql would be worse than no
+# path at all, so `migrate` is reachable only through the host tool's bounded authorization.
+# `provision` runs exactly `enroll-user` or `enrollment-status` under `hh_provision`; its
+# `docker compose run` command therefore names the service role and then the admin command.
 # PostgreSQL backup/restore are WP-2D and run in disposable pinned postgres client
 # containers launched by deploy/postgres/maintenance.py (BAK-13), not in these app-image
-# one-shots; production enrollment is WP-2C/WP-2E. See deploy/postgres/README.md and
-# deploy/postgres/backup_restore.md.
+# one-shots. See deploy/postgres/README.md and deploy/postgres/backup_restore.md.
 #
 # Variables read by Compose itself:
 #   HOUSE_HELPER_PG_ACTIVATE          REQUIRED. Set it to exactly 1 only for a deliberate

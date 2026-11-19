@@ -1398,6 +1398,62 @@ def has_database_privilege_sql(database: str) -> str:
         for role in PROJECT_ROLE_NAMES
     ]
     return "SELECT " + ", ".join(columns)
+
+
+# The three database-level privileges PostgreSQL defines. A handoff is authorized to change
+# exactly one of them (`CONNECT`) for exactly one role; every other value is collateral.
+DATABASE_PRIVILEGES = ("CONNECT", "CREATE", "TEMPORARY")
+
+
+def database_acl_matrix_sql(database: str) -> str:
+    """The materialized/none state plus the complete effective privilege matrix.
+
+    The handoff reconciler compares the *whole* state before and after, never a selected
+    field. For each of the three database privileges and each project role the effective
+    value is read from the catalog, so an inherited, PUBLIC or grant-option entry cannot
+    hide behind a `has_database_privilege` answer for one role. The database name is
+    allowlisted and quoted as a literal; nothing is interpolated from operator input.
+    """
+    from house_helper.persistence.pg_artifacts import validate_database_name
+
+    name = validate_database_name(database)
+    literal = "'" + name + "'"
+    columns = ["d.datacl IS NOT NULL"]
+    for privilege in DATABASE_PRIVILEGES:
+        columns.extend(
+            f"pg_catalog.has_database_privilege('{role}', {literal}, '{privilege}')"
+            for role in PROJECT_ROLE_NAMES
+        )
+    return (
+        "SELECT "
+        + ", ".join(columns)
+        + " FROM pg_catalog.pg_database d WHERE d.datname = "
+        + literal
+    )
+
+
+_HANDOFF_APPLICATION_NAME = re.compile(r"hh-handoff-[0-9a-f]{32}")
+
+
+def handoff_session_sql(application_name: str) -> str:
+    """Count the live backends carrying one handoff operation's `application_name`.
+
+    LCK-12 names `pg_stat_activity` by `application_name` as reconciler evidence. The value
+    is checked against the exact generated grammar before it becomes a SQL literal, so a
+    corrupted journal cannot inject SQL through it.
+    """
+    if not isinstance(application_name, str) or not _HANDOFF_APPLICATION_NAME.fullmatch(
+        application_name
+    ):
+        raise ContractError(
+            "handoff_session", "the handoff application name is malformed"
+        )
+    return (
+        "SELECT count(*) FROM pg_catalog.pg_stat_activity "
+        "WHERE application_name = '" + application_name + "'"
+    )
+
+
 ROLES_SQL = (
     "SELECT r.rolname, r.rolcanlogin, r.rolsuper, r.rolcreatedb, r.rolcreaterole, "
     "r.rolinherit, r.rolreplication, r.rolbypassrls, r.rolconnlimit, "

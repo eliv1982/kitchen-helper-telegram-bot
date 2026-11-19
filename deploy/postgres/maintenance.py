@@ -42,6 +42,19 @@ Isolated verification (§8.6 level 2/3)
     discarded clone. A new `system_identifier` is recorded as provenance, never as a
     requirement (ENR-17).
 
+Concurrency (P0)
+    `backup` and `restore` hold the host operation interval (`<journal-dir>/operation.lock`,
+    the same non-reentrant flock `enroll.py` uses for mode-a, migrate, reconcile-migration
+    and handoff) from before Mode B until the last state-changing step. The interval is
+    taken first and non-blockingly, so a conflicting operation is refused with
+    `operation_busy` instead of interleaving. Under that interval both an UNKNOWN handoff
+    (`handoff_unknown`) and an UNKNOWN migration (`migration_unknown`) refuse the operation
+    before anything is changed. The state-volume locks the backup holder takes are a
+    second, container-side layer; the host never takes them. The holder is a pure lock
+    owner: the archive is published by the host process itself, which holds the operation
+    interval, and the holder has no output-directory access at all. Lock order and the
+    deadlock argument are documented on `maintenance_interval`.
+
 No credential is generated, printed, formatted or written by this tool. Passfiles are
 validated on the host, mounted read-only into exactly one disposable container, copied
 to a private `/tmp` path inside that container, and never appear in argv or logs.
@@ -112,6 +125,7 @@ from house_helper.persistence import pg_artifacts as artifacts  # noqa: E402
 from house_helper.persistence import pg_backup as backup  # noqa: E402
 from house_helper.persistence import pg_contract as contract  # noqa: E402
 from house_helper.persistence import pg_credentials as credentials  # noqa: E402
+from house_helper.persistence import pg_enrollment as enrollment  # noqa: E402
 from house_helper.persistence import pg_journal as journal  # noqa: E402
 
 DEFAULT_COMPOSE = REPOSITORY_ROOT / "deploy" / "compose.postgres.yaml"
@@ -125,29 +139,27 @@ DB_PORT = "5432"
 STAGING = "/staging"
 CREDENTIAL_TARGET = "/run/credentials"
 STATE_VOLUME = "house-helper-pg-state"
+# The container-side layer: taken by the disposable lock-holder container, never by the
+# host (a non-reentrant flock must not be acquired on both sides of the container
+# boundary). The host-side layer that excludes `enroll.py`'s operations is the journal
+# directory's `operation.lock`, taken by `maintenance_interval`.
 STATE_LOCK = "/state/.house-helper.lock"
 BACKUP_MUTEX = "/state/.house-helper.backup.lock"
-# LCK-01/F5-B: the holder is not given an unconditional lifetime. The host keeps a
-# heartbeat deadline fresh for as long as the backup operation is actually running; an
-# abandoned holder expires only after the lease has not been refreshed. Publication is
-# performed by the holder itself, so a lapsed or terminated holder cannot publish.
+# LCK-01/P0: the holder is not given an unconditional lifetime. The host keeps a heartbeat
+# deadline fresh for as long as the backup operation is actually running; an abandoned
+# holder expires only after the lease has not been refreshed. The holder never publishes:
+# it owns the two state-volume flocks and answers one ownership probe, nothing else.
 LOCK_HOLDER_LEASE_SECONDS = 15 * 60
 LOCK_HOLDER_REFRESH_SECONDS = 60
-# F5-B/R4: a recovery holder serves exactly one cleanup request and is removed by the
-# host, so its deadline is a bound rather than a lease the host keeps refreshing.
-LOCK_RECOVERY_LEASE_SECONDS = 120
 LOCK_CONTROL_TARGET = "/ctl"
-LOCK_OUTPUT_TARGET = "/out"
 LOCK_READY_NAME = ".house-helper.ready"
 LOCK_DEADLINE_NAME = ".house-helper.deadline"
-LOCK_REQUEST_NAME = ".house-helper.publish.request"
-LOCK_RESULT_NAME = ".house-helper.publish.result"
+# P0: the only request the holder serves is an ownership/liveness probe. The host asks it
+# immediately before publication and again after the read-back. There is deliberately no
+# publication, confirmation-of-success or cleanup request: the holder cannot reach the
+# output directory at all, so none of those channels can exist.
 LOCK_CONFIRM_NAME = ".house-helper.confirm.request"
 LOCK_CONFIRM_RESULT_NAME = ".house-helper.confirm.result"
-# LCK-01/F5-B: failure cleanup is itself a mutex-held publication channel request, so the
-# identity check and the conditional unlink cannot interleave with a successor's publish.
-LOCK_CLEANUP_NAME = ".house-helper.cleanup.request"
-LOCK_CLEANUP_RESULT_NAME = ".house-helper.cleanup.result"
 
 EX_OK = 0
 EX_INTERNAL = 1
@@ -325,40 +337,13 @@ def _write_control_request(control_dir: object, request_name: str, body: str) ->
     """Atomically place one request in a holder's control directory.
 
     LF only: the holder reads line-wise, and a host-side text mode would append `\\r`
-    on Windows, making file names and identities invalid. A temporary name followed by
-    `os.replace` means the holder can never read a half-written request.
+    on Windows. A temporary name followed by `os.replace` means the holder can never read
+    a half-written request.
     """
     control = Path(control_dir)
     temporary = control / f"{request_name}.{secrets.token_hex(4)}"
     temporary.write_bytes(body.encode("utf-8"))
     os.replace(temporary, control / request_name)
-
-
-def _publish_request_body(staging_name: str, output_name: str, replace: bool) -> str:
-    """The three-line publication request the holder parses, LF-only."""
-    return f"{staging_name}\n{output_name}\n{'replace' if replace else 'noreplace'}\n"
-
-
-def _cleanup_request_body(output_name: str, device: int, inode: int) -> str:
-    """The three-line cleanup request the holder parses, LF-only."""
-    return f"{output_name}\n{device}\n{inode}\n"
-
-
-def _private_control_directory(prefix: str) -> Path:
-    """A fresh private control directory for one cleanup-only recovery holder.
-
-    It is deliberately not the failed operation's directory: it never contained a
-    publication request, so there is nothing stale to inherit. The mode/ownership match
-    `WorkDirectory`, so the same Docker bind-mount shape reaches the holder.
-    """
-    created = Path(tempfile.mkdtemp(prefix=prefix))
-    try:
-        os.chmod(created, stat.S_IRWXU)
-        if os.name == "posix":
-            os.chown(created, credentials.RUNTIME_UID, credentials.RUNTIME_GID)
-    except OSError:
-        pass
-    return created
 
 
 # --- Docker tool containers -----------------------------------------------------------------
@@ -532,7 +517,6 @@ class ToolContainers:
         *,
         name: str,
         control_dir: object,
-        output_dir: object,
         timeout: float = 30.0,
     ) -> str:
         ready = Path(control_dir) / LOCK_READY_NAME
@@ -544,10 +528,10 @@ class ToolContainers:
             ["sh", "-c", script],
             name=name,
             volumes=[(STATE_VOLUME, "/state")],
-            mounts=[
-                (control_dir, LOCK_CONTROL_TARGET, False),
-                (output_dir, LOCK_OUTPUT_TARGET, False),
-            ],
+            # P0: the holder receives the state volume and its private control directory
+            # ONLY. The output directory is deliberately not mounted: the holder cannot
+            # create, replace or remove an archive, even after its host is gone.
+            mounts=[(control_dir, LOCK_CONTROL_TARGET, False)],
         )
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -571,168 +555,31 @@ class ToolContainers:
         *,
         name: str,
         control_dir: object,
-        output_dir: object,
         timeout: float = 30.0,
     ) -> str:
-        """LCK-01/F5: start the detached owner of both locks for one backup.
+        """LCK-01/P0: start the detached owner of both state-volume locks.
 
-        The holder also receives two narrow bind mounts: the private control directory
-        (one heartbeat deadline and one publication request/result) and the output
-        directory (the staging file and its final name only). No other host path is
-        visible to it, and it runs with no network.
+        The holder receives the shared state volume and one private control directory (a
+        heartbeat deadline and the ownership probe). It has no output-directory mount and
+        no publication branch: publication belongs to the host operation that holds
+        `<journal-dir>/operation.lock`.
         """
         return self._start_holder(
             _lock_holder_script(),
             name=name,
             control_dir=control_dir,
-            output_dir=output_dir,
             timeout=timeout,
-        )
-
-    def start_cleanup_holder(
-        self,
-        *,
-        name: str,
-        control_dir: object,
-        output_dir: object,
-        timeout: float = 30.0,
-    ) -> str:
-        """LCK-01/F5-B/R4: start a recovery holder that can only clean up.
-
-        The same locks and the same mounts as `start_lock_holder`, but the script has
-        no publication or confirmation branch, and the caller passes a fresh private
-        control directory that never contained a publication request. This is the only
-        holder started after the original holder is gone.
-        """
-        return self._start_holder(
-            _cleanup_holder_script(),
-            name=name,
-            control_dir=control_dir,
-            output_dir=output_dir,
-            timeout=timeout,
-        )
-
-    def publish_in_holder(
-        self,
-        container: str,
-        *,
-        control_dir: object,
-        staging_name: str,
-        output_name: str,
-        replace: bool,
-        timeout: float = 120.0,
-    ) -> str:
-        """LCK-01/F5-B: ask the lock-owning process to publish the archive.
-
-        The holder performs the no-replace link (or the explicitly authorized
-        replacement) itself, so publication cannot happen in a process that does not
-        hold the mutex, and there is no check-then-write window.
-        """
-        for value in (staging_name, output_name):
-            if not re.fullmatch(r"[A-Za-z0-9._-]{1,200}", value):
-                raise MaintenanceError("output_path", "an archive file name is not allowed")
-        control = Path(control_dir)
-        result = control / LOCK_RESULT_NAME
-        try:
-            result.unlink()
-        except FileNotFoundError:
-            pass
-        # LF only: the holder reads line-wise, and a host-side text mode would append
-        # `\r` on Windows, making the file names invalid.
-        _write_control_request(
-            control,
-            LOCK_REQUEST_NAME,
-            _publish_request_body(staging_name, output_name, replace),
-        )
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if result.exists():
-                outcome = result.read_text(encoding="utf-8").strip()
-                try:
-                    result.unlink()
-                except FileNotFoundError:
-                    pass
-                return outcome
-            running = self._run(
-                ["docker", "inspect", "--format", "{{.State.Running}}", container],
-                timeout=30,
-            )
-            if running.returncode != 0 or running.stdout.strip() == b"false":
-                raise MaintenanceError(
-                    "backup_lock",
-                    "the lock holder terminated before the archive was published",
-                )
-            time.sleep(0.05)
-        raise MaintenanceError(
-            "backup_lock", "the lock holder did not confirm publication in time"
-        )
-
-    def cleanup_in_holder(
-        self,
-        container: str,
-        *,
-        control_dir: object,
-        output_name: str,
-        identity: tuple[int, int],
-        timeout: float = 60.0,
-    ) -> str:
-        """LCK-01/F5-B: remove a failed publication from inside the lock-owning process.
-
-        The holder stat()s the final path and unlinks it only when that identity is the
-        exact file the failing operation staged, all in one uninterrupted section of the
-        same loop iteration that holds the mutex. A successor's archive, published under
-        that mutex, can never be removed: either it is not there yet (the holder still
-        holds the mutex) or its inode is not ours.
-        """
-        if not re.fullmatch(r"[A-Za-z0-9._-]{1,200}", output_name):
-            raise MaintenanceError("output_path", "an archive file name is not allowed")
-        try:
-            device, inode = int(identity[0]), int(identity[1])
-        except (TypeError, ValueError, IndexError):
-            raise MaintenanceError("output_path", "a file identity is not valid") from None
-        if device < 0 or inode < 0:
-            raise MaintenanceError("output_path", "a file identity is not valid")
-        control = Path(control_dir)
-        result = control / LOCK_CLEANUP_RESULT_NAME
-        try:
-            result.unlink()
-        except FileNotFoundError:
-            pass
-        # LF only, exactly like the publication request: the holder reads line-wise.
-        _write_control_request(
-            control, LOCK_CLEANUP_NAME, _cleanup_request_body(output_name, device, inode)
-        )
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if result.exists():
-                outcome = result.read_text(encoding="utf-8").strip()
-                try:
-                    result.unlink()
-                except FileNotFoundError:
-                    pass
-                return outcome
-            running = self._run(
-                ["docker", "inspect", "--format", "{{.State.Running}}", container],
-                timeout=30,
-            )
-            if running.returncode != 0 or running.stdout.strip() == b"false":
-                raise MaintenanceError(
-                    "backup_lock",
-                    "the lock holder terminated before the failed output was cleaned up",
-                )
-            time.sleep(0.05)
-        raise MaintenanceError(
-            "backup_lock", "the lock holder did not clean up the failed output in time"
         )
 
     def confirm_lock_holder(
         self, container: str, *, control_dir: object, timeout: float = 60.0
     ) -> None:
-        """LCK-01/F5-B: the lock-owning process acknowledges success, not liveness.
+        """P0: the holder acknowledges that it is alive and still owns both flocks.
 
-        The host asks the holder itself, after the published archive has been read back.
-        A process that has exited cannot answer, so an operation whose mutex was released
-        before success was determined fails instead of reporting a backup.
+        The host asks the holder itself immediately before publication and again after the
+        published archive has been read back. A process that has exited, been paused, or
+        let its lease lapse cannot answer, so an operation whose state-volume mutex was
+        lost fails instead of publishing or reporting a backup.
         """
         control = Path(control_dir)
         result = control / LOCK_CONFIRM_RESULT_NAME
@@ -752,7 +599,7 @@ class ToolContainers:
                 if value == "alive":
                     return
                 raise MaintenanceError(
-                    "backup_lock", "the lock holder did not acknowledge success"
+                    "backup_lock", "the lock holder did not acknowledge ownership"
                 )
             running = self._run(
                 ["docker", "inspect", "--format", "{{.State.Running}}", container],
@@ -761,11 +608,11 @@ class ToolContainers:
             if running.returncode != 0 or running.stdout.strip() == b"false":
                 raise MaintenanceError(
                     "backup_lock",
-                    "the lock holder terminated before success was acknowledged",
+                    "the lock holder terminated before it could acknowledge ownership",
                 )
             time.sleep(0.05)
         raise MaintenanceError(
-            "backup_lock", "the lock holder did not acknowledge success in time"
+            "backup_lock", "the lock holder did not acknowledge ownership in time"
         )
 
     def exec(
@@ -978,64 +825,25 @@ def _holder_deadline_check(control_dir: str) -> str:
     )
 
 
-def _cleanup_request_block(control_dir: str, output_dir: str) -> str:
-    """LCK-01/F5-B: the identity-checked cleanup request, shared by both holders.
-
-    The final path is removed only when its identity is exactly the failed operation's
-    own staged inode. The check and the unlink run in one uninterrupted section of the
-    loop iteration that holds the mutex, so a successor's archive — published under that
-    same mutex — can never be removed. A symlink is never treated as our archive.
-    """
-    return (
-        f"  if [ -f {control_dir}/{LOCK_CLEANUP_NAME} ]; then "
-        f'    output="$(sed -n 1p {control_dir}/{LOCK_CLEANUP_NAME})"; '
-        f'    device="$(sed -n 2p {control_dir}/{LOCK_CLEANUP_NAME})"; '
-        f'    inode="$(sed -n 3p {control_dir}/{LOCK_CLEANUP_NAME})"; '
-        f"    rm -f {control_dir}/{LOCK_CLEANUP_NAME}; "
-        "    valid=1; "
-        "    outcome=error; "
-        "    case \"$output\" in ''|*[!A-Za-z0-9._-]*) valid=0;; esac; "
-        "    case \"$device\" in ''|*[!0-9]*) valid=0;; esac; "
-        "    case \"$inode\" in ''|*[!0-9]*) valid=0;; esac; "
-        '    if [ "$valid" = 1 ]; then '
-        f'      if [ -L "{output_dir}/$output" ]; then :; '
-        f'      elif [ ! -e "{output_dir}/$output" ]; then outcome=absent; '
-        "      else "
-        f'        identity="$(stat -c "%d %i" {output_dir}/"$output" 2>/dev/null)"; '
-        '        if [ "$identity" = "$device $inode" ]; then '
-        f'          if rm -f "{output_dir}/$output" 2>/dev/null; then outcome=removed; fi; '
-        "        else outcome=retained; fi; "
-        "      fi; "
-        "    fi; "
-        f"    printf '%s\\n' \"$outcome\" > {control_dir}/{LOCK_CLEANUP_RESULT_NAME}.tmp; "
-        f"    mv -f {control_dir}/{LOCK_CLEANUP_RESULT_NAME}.tmp"
-        f" {control_dir}/{LOCK_CLEANUP_RESULT_NAME}; "
-        "  fi; "
-    )
-
-
 def _lock_holder_script(
     *,
     control_dir: str = LOCK_CONTROL_TARGET,
-    output_dir: str = LOCK_OUTPUT_TARGET,
     state_lock: str = STATE_LOCK,
     backup_mutex: str = BACKUP_MUTEX,
 ) -> str:
-    """LCK-01/F5-B: the detached owner of both locks, and the only publisher.
+    """LCK-01/P0: the detached owner of both state-volume flocks. It cannot publish.
 
-    The holder keeps the locks for the whole backup, signals readiness, and serves one
-    publication request. It performs the publication in this same process, so the mutex
-    is held at the instant the final path is created, and reports the published file's
-    `st_dev st_ino` alongside the outcome so the host knows which inode it owns.
-
-    It also serves one failure-cleanup request. The identity check and the conditional
-    unlink run in the same loop iteration, under the same mutex: a successor operation
-    cannot publish between them, so a successor's archive is never removed.
+    The holder keeps the shared maintenance lock and the exclusive backup mutex for the
+    whole backup, signals readiness, and answers one ownership probe. It has no
+    output-directory mount and no publication, success or cleanup branch: publication is
+    performed by the host process, which holds `<journal-dir>/operation.lock` across the
+    atomic link/rename. A holder that outlives its host therefore cannot create, replace
+    or remove an archive; it can only release the state-volume flocks when its lease
+    lapses.
 
     A heartbeat deadline (refreshed by the host while the operation is active) is the
-    only expiry: a live operation never expires, and an abandoned holder exits instead
-    of blocking every later backup. A lapsed or terminated holder cannot publish,
-    because it never sees the request.
+    only expiry: a live operation never expires, and an abandoned holder exits instead of
+    blocking every later backup.
 
     The path parameters exist so the contract can be executed end-to-end against a
     private directory in tests; production always uses the container mounts.
@@ -1045,43 +853,9 @@ def _lock_holder_script(
         + f"touch {control_dir}/{LOCK_READY_NAME}; "
         "while :; do "
         + _holder_deadline_check(control_dir)
-        + f"  if [ -f {control_dir}/{LOCK_REQUEST_NAME} ]; then "
-        f'    staging="$(sed -n 1p {control_dir}/{LOCK_REQUEST_NAME})"; '
-        f'    output="$(sed -n 2p {control_dir}/{LOCK_REQUEST_NAME})"; '
-        f'    mode="$(sed -n 3p {control_dir}/{LOCK_REQUEST_NAME})"; '
-        f"    rm -f {control_dir}/{LOCK_REQUEST_NAME}; "
-        "    valid=1; "
-        "    case \"$staging\" in ''|*[!A-Za-z0-9._-]*) valid=0;; esac; "
-        "    case \"$output\" in ''|*[!A-Za-z0-9._-]*) valid=0;; esac; "
-        "    outcome=error; "
-        '    if [ "$valid" = 1 ]; then '
-        # The staged inode is the file that a successful link/rename publishes, so it is
-        # also the identity a later cleanup must match. A failure to read it publishes
-        # nothing and reports an error.
-        f'      identity="$(stat -c "%d %i" {output_dir}/"$staging" 2>/dev/null)"; '
-        '      if [ -n "$identity" ]; then '
-        '        if [ "$mode" = replace ]; then '
-        f'          if mv -f "{output_dir}/$staging" "{output_dir}/$output"'
-        ' 2>/dev/null; then outcome="ok $identity"; fi; '
-        "        else "
-        f'          if ln "{output_dir}/$staging" "{output_dir}/$output"'
-        " 2>/dev/null; then "
-        f'            rm -f "{output_dir}/$staging"; outcome="ok $identity"; '
-        f'          elif [ -e "{output_dir}/$output" ]'
-        f' || [ -L "{output_dir}/$output" ]; then outcome=exists; fi; '
-        "        fi; "
-        "      fi; "
-        "    fi; "
-        f"    printf '%s\\n' \"$outcome\" > {control_dir}/{LOCK_RESULT_NAME}.tmp; "
-        f"    mv -f {control_dir}/{LOCK_RESULT_NAME}.tmp"
-        f" {control_dir}/{LOCK_RESULT_NAME}; "
-        "  fi; "
-        # F5-B failure cleanup: serialized with publication by construction, because the
-        # holder owns the mutex for this whole iteration.
-        + _cleanup_request_block(control_dir, output_dir)
-        # Success is acknowledged by this same process, after the host has read the
-        # published archive back. A holder that died cannot acknowledge, so its operation
-        # is never reported successful.
+        # P0: the only request the holder serves. Readiness is written only after both
+        # flocks are taken, so answering here proves the process is alive and still owns
+        # them. The host asks before publication and again after the read-back.
         + f"  if [ -f {control_dir}/{LOCK_CONFIRM_NAME} ]; then "
         f"    rm -f {control_dir}/{LOCK_CONFIRM_NAME}; "
         f"    printf 'alive\\n' > {control_dir}/{LOCK_CONFIRM_RESULT_NAME}.tmp; "
@@ -1089,36 +863,6 @@ def _lock_holder_script(
         f" {control_dir}/{LOCK_CONFIRM_RESULT_NAME}; "
         "  fi; "
         "  sleep 0.2; "
-        "done"
-    )
-
-
-def _cleanup_holder_script(
-    *,
-    control_dir: str = LOCK_CONTROL_TARGET,
-    output_dir: str = LOCK_OUTPUT_TARGET,
-    state_lock: str = STATE_LOCK,
-    backup_mutex: str = BACKUP_MUTEX,
-) -> str:
-    """LCK-01/F5-B/R4: a recovery holder that can only remove one exact inode.
-
-    Recovery must never replay the failed operation's control directory: it may still
-    hold a publication request the dead original holder never consumed, and replaying
-    it would publish (and then delete) an archive a successor has since completed.
-
-    This holder therefore takes the *same* maintenance lock and backup mutex with the
-    same commands as the publishing holder, but it has no publication branch at all —
-    no `ln`, no `mv` of an archive, no confirm branch. The only request it reads is the
-    cleanup request. The restriction is structural in this script, so a stale
-    publication message is inert even if one were present in its control directory.
-    """
-    return (
-        _lock_commands(state_lock=state_lock, backup_mutex=backup_mutex)
-        + f"touch {control_dir}/{LOCK_READY_NAME}; "
-        "while :; do "
-        + _holder_deadline_check(control_dir)
-        + _cleanup_request_block(control_dir, output_dir)
-        + "  sleep 0.2; "
         "done"
     )
 
@@ -1257,16 +1001,55 @@ class Target:
         return str(self.completed.get("system_identifier", ""))
 
 
-def verify_target(compose_file: Path, journal_dir: Path) -> Target:
+def verify_target(
+    compose_file: Path,
+    journal_dir: Path,
+    *,
+    journal_file: Optional[journal.Journal] = None,
+) -> Target:
+    """Verify the target cluster for one maintenance operation.
+
+    The result is an *authorization*: it is only meaningful while `maintenance_interval`
+    holds the host operation interval. Callers hold that interval from before this check
+    until the protected operation (publication, restore, drop) has finished; a bare call
+    from a test exercises the verdicts, not the mutual exclusion.
+    """
+    if journal_file is None:
+        journal_file = journal.Journal(
+            Path(journal_dir), require_root=(os.name == "posix")
+        )
+    # LCK-08/LCK-13: a handoff intent without an observed outcome is UNKNOWN; only the
+    # handoff entry point may reconcile it. Both callers of this target check (backup and
+    # restore) advance the machine, so neither may proceed through that state. The gate is
+    # the FIRST thing this check does - before the compose file, the image inspection and
+    # Mode B - so a journaled UNKNOWN refuses ahead of every cluster read that could
+    # journal a mismatch, and before any state-changing step. It is not inside Mode B
+    # itself: the handoff reconciler calls Mode B to observe the cluster and must not be
+    # blocked by the intent it is resolving.
+    blocked = enroll.pending_handoff_refusal(journal_file.read().records)
+    if blocked is not None:
+        raise MaintenanceError("handoff_unknown", blocked)
+    # LCK-08/LCK-13: a migrate intent without an observed outcome is UNKNOWN too. It is
+    # checked under the same host operation interval (the caller holds
+    # `operation.lock`), and only `enroll.py reconcile-migration` may release it. Both
+    # maintenance operations advance the machine, so neither may proceed through that
+    # state; the gate is ahead of the compose parse, the image inspection, Mode B, the
+    # archive publication and any `CREATE DATABASE`.
+    migration = enrollment.pending_migration_unknown(journal_file.read().records)
+    if migration is not None:
+        run_id = str(migration.payload.get("run_id", ""))[:80]
+        raise MaintenanceError(
+            "migration_unknown",
+            "an earlier migrate run has no observed outcome; run "
+            "`enroll.py reconcile-migration` before a backup or restore",
+            f"run_id {run_id}",
+        )
     spec = enroll.load_spec(compose_file)
     docker = enroll.Docker(spec)
     try:
         enroll.validate_image(spec, docker.inspect_image())
     except enroll.DockerError as error:
         raise MaintenanceError(error.code, error.message, error.detail) from None
-    journal_file = journal.Journal(
-        Path(journal_dir), require_root=(os.name == "posix")
-    )
     report = enroll.verify_mode_b(
         journal_file, enroll.ClusterAdapter(docker, compose_file=compose_file)
     )
@@ -1278,6 +1061,51 @@ def verify_target(compose_file: Path, journal_dir: Path) -> Target:
         )
     return Target(spec=spec, completed=dict(report.verdict.completed or {}), journal_file=journal_file)
 
+
+@contextlib.contextmanager
+def maintenance_interval(compose_file: Path, journal_dir: Path):
+    """P0: the host operation interval every cluster-advancing command holds.
+
+    `backup` and `restore` take this interval at their entry point, before Mode B, and
+    keep it until their last state-changing step (archive publication and read-back, the
+    temporary database's creation/verification/drop). The handoff, migrate, mode-a and
+    reconcile-migration entry points take the same interval inside `enroll.py`, so all of
+    them are mutually exclusive ACROSS PROCESSES, not merely within one.
+
+    Lock order - the one direction, never reversed:
+
+    1. `<journal-dir>/operation.lock`  - this interval, host side, EXCLUSIVE. "Shared" in
+       LCK-01 means the state-volume lock a backup holds in shared mode so the serving app
+       keeps running; the host interval is the one common lock the host operations must
+       share, and it has to be exclusive for them to exclude each other;
+    2. `<journal-dir>/journal.lock`    - one journal append, inside the interval;
+    3. the state-volume flocks          - `/state/.house-helper.lock` (shared: coexists
+       with serving) and `/state/.house-helper.backup.lock` (exclusive), taken only by the
+       disposable lock-holder CONTAINER, never by the host.
+
+    Layers 1-2 are taken by the host, layer 3 by a container that never takes 1 or 2, so
+    the wait-for graph has one direction and no cycle. Every acquisition is
+    non-blocking (`flock -n` / `LOCK_NB`): a conflict is an immediate refusal, never a
+    wait, so a stuck holder cannot deadlock a successor.
+
+    The archive publication is performed by the host process while it holds layer 1, so
+    the authorization boundary and the publication are the same process and the same
+    lock. The container-side holder (layer 3) can never publish: a holder that outlives
+    its host is inert and expires on its lease.
+
+    The interval is NOT reentrant - an `flock` belongs to the descriptor - so a command
+    takes it exactly once. It carries no database authority; it only serializes this
+    tool's own supported operations. An interrupted process releases it when the kernel
+    closes its descriptors, and releases it without any record that could be read as a
+    completed operation: the journal intent/outcome records of the operation itself stay
+    authoritative. Releasing the interval never resolves an unresolved database operation.
+    """
+    journal.reject_conflicting_journal_directories(journal_dir)
+    journal_file = journal.Journal(
+        Path(journal_dir), require_root=(os.name == "posix")
+    )
+    with journal_file.operation_lock():
+        yield verify_target(compose_file, journal_dir, journal_file=journal_file)
 
 # --- archive validation ----------------------------------------------------------------------
 
@@ -1334,13 +1162,14 @@ def manifest_summary(point: backup.RecoveryPoint) -> str:
 
 
 class _BackupLock:
-    """LCK-01/F5: the exclusive backup mutex and the publication it owns.
+    """LCK-01/P0: the state-volume locks, owned by a holder that cannot publish.
 
-    The detached holder (a disposable, network-less client container) owns both flocks
-    and performs the archive publication itself. The host refreshes a heartbeat deadline
-    while the operation is active, so a legitimately active holder never expires, while
-    a crashed host's holder exits after the unrefreshed lease instead of blocking every
-    later backup forever.
+    The detached holder (a disposable, network-less client container) owns both flocks for
+    the whole backup and can do nothing else: it has no output-directory mount and serves
+    only an ownership probe. Publication belongs to the HOST process, which performs the
+    atomic link/rename while it holds `<journal-dir>/operation.lock`. The host refreshes a
+    heartbeat deadline, so a legitimately active holder never expires, while a crashed
+    host's holder exits after the unrefreshed lease instead of blocking every later backup.
     """
 
     def __init__(
@@ -1381,12 +1210,8 @@ class _BackupLock:
         for name in (
             LOCK_READY_NAME,
             LOCK_DEADLINE_NAME,
-            LOCK_REQUEST_NAME,
-            LOCK_RESULT_NAME,
             LOCK_CONFIRM_NAME,
             LOCK_CONFIRM_RESULT_NAME,
-            LOCK_CLEANUP_NAME,
-            LOCK_CLEANUP_RESULT_NAME,
         ):
             try:
                 (self.control_dir / name).unlink()
@@ -1396,16 +1221,31 @@ class _BackupLock:
         self.container = self.tools.start_lock_holder(
             name=self.name,
             control_dir=self.control_dir,
-            output_dir=self.output_dir,
         )
         self._thread = threading.Thread(
             target=self._refresh, name="backup-lock-heartbeat", daemon=True
         )
         self._thread.start()
 
+    def assert_owned(self) -> None:
+        """The holder confirms it is alive and still owns both state-volume flocks."""
+        if self.container is None:
+            raise MaintenanceError("backup_lock", "the backup mutex is not held")
+        self.tools.confirm_lock_holder(self.container, control_dir=self.control_dir)
+
     def publish(
         self, staging: Path, output: Path, replace: bool
     ) -> Optional[tuple[int, int]]:
+        """Publish the archive on the host, while the host operation interval is held.
+
+        The host is the authorization boundary: it holds `<journal-dir>/operation.lock`
+        from before Mode B until after the read-back, so no handoff, migration or second
+        backup/restore can change the cluster between this call and the completed backup.
+        The holder is asked to confirm ownership immediately before the atomic link, so a
+        holder that has died or lapsed refuses the publication; a holder that outlives the
+        host can never publish, replace or remove anything because it has no access to
+        this directory.
+        """
         if (
             Path(staging).parent.resolve() != self.output_dir.resolve()
             or Path(output).parent.resolve() != self.output_dir.resolve()
@@ -1413,59 +1253,21 @@ class _BackupLock:
             raise MaintenanceError(
                 "output_path", "the archive is not published into the locked output directory"
             )
-        if self.container is None:
-            raise MaintenanceError("backup_lock", "the backup mutex is not held")
         try:
-            recorded = Path(staging).stat()
+            Path(staging).stat()
         except OSError:
             raise MaintenanceError("output_path", "the staging file is absent") from None
-        staged_identity = (recorded.st_dev, recorded.st_ino)
-        try:
-            outcome = self.tools.publish_in_holder(
-                self.container,
-                control_dir=self.control_dir,
-                staging_name=Path(staging).name,
-                output_name=Path(output).name,
-                replace=replace,
-            )
-        except MaintenanceError:
-            # The holder may have been killed in the instant after `ln`. If the final
-            # path is the very inode we staged, it is ours and unreported. F5-B: that
-            # removal is itself serialized by the mutex and identity-checked inside the
-            # holder, so it cannot race a successor's publication. Never unlink directly
-            # here: the holder may already be gone and a successor may hold the mutex.
-            self.cleanup(output, staged_identity)
-            raise
-        fields = outcome.split()
-        if fields and fields[0] == "ok":
-            # The holder reports the published inode (`st_dev st_ino`) from inside the
-            # mutex, so later failure cleanup verifies the exact file it created.
-            if len(fields) == 3:
-                try:
-                    return int(fields[1]), int(fields[2])
-                except ValueError:
-                    return staged_identity
-            return staged_identity
-        if outcome == "exists":
-            raise MaintenanceError(
-                "output_exists",
-                "the output path already exists; refusing to overwrite",
-            )
-        raise MaintenanceError(
-            "output_path",
-            "the lock holder could not publish the archive",
-            outcome,
-        )
+        self.assert_owned()
+        return _host_publish(staging, output, replace)
 
     def cleanup(self, output: object, identity: Optional[Sequence[int]]) -> bool:
-        """LCK-01/F5-B: remove the failed publication only while the mutex is held.
+        """Remove a failed publication only when it is exactly the inode we published.
 
-        The request goes to the lock-owning holder, which performs the identity check
-        and the conditional unlink in one uninterrupted mutex-protected section. If the
-        original holder is gone, a recovery holder acquires the same mutex with a
-        non-blocking `flock` and performs the same check. If exclusive ownership cannot
-        be established (a successor holds the mutex, or no holder can start), nothing is
-        removed: the failure stays fail-closed. This method never raises.
+        The removal runs in this host process while it still holds the host operation
+        interval, so no successor operation can publish concurrently. The identity check
+        additionally refuses to remove any file this operation did not create (a staging
+        file that was replaced, or a path that never became ours). This method never
+        raises: failure cleanup must not mask the original failure.
         """
         if identity is None:
             return False
@@ -1479,79 +1281,14 @@ class _BackupLock:
                 return False
         except OSError:
             return False
-        name = target.name
         try:
-            if self.container is not None:
-                try:
-                    outcome = self.tools.cleanup_in_holder(
-                        self.container,
-                        control_dir=self.control_dir,
-                        output_name=name,
-                        identity=expected,
-                    )
-                except MaintenanceError:
-                    pass
-                else:
-                    return outcome == "removed"
-            return self._recover_cleanup(name, expected)
-        except Exception:  # noqa: BLE001 - failure cleanup must never mask the failure
+            return _unlink_if_identity(target, expected)
+        except Exception:  # noqa: BLE001 - cleanup must never mask the failure
             return False
-
-    def _recover_cleanup(self, name: str, expected: tuple[int, int]) -> bool:
-        """LCK-01/F5-B/R4: re-acquire the mutex for cleanup when the original holder died.
-
-        `flock -n` in the recovery holder makes this non-blocking: if a successor holds
-        the mutex, the holder exits and the archive is left exactly as the successor
-        published it. The original holder being alive is handled before this point, so
-        no two live holders ever contend for the same mutex.
-
-        R4: recovery never reuses the failed operation's control directory and never
-        starts a publishing holder. A dead operation may have left an unconsumed
-        publication request there; a recovery holder started on that directory would
-        replay it, overwrite a successor's completed archive and then clean it up. The
-        recovery holder is a distinct cleanup-only script mounted on a fresh private
-        directory holding at most our one cleanup request, and that script has no
-        publication branch to reach.
-        """
-        recovery: Optional[str] = None
-        control: Optional[Path] = None
-        try:
-            control = _private_control_directory(f"{self.name}-cleanup-")
-            # A recovery holder has no heartbeat thread: its deadline is a hard bound
-            # on how long the host may wait for one cleanup request.
-            (control / LOCK_DEADLINE_NAME).write_text(
-                str(int(time.time()) + LOCK_RECOVERY_LEASE_SECONDS), encoding="utf-8"
-            )
-            recovery = self.tools.start_cleanup_holder(
-                name=f"{self.name}-cleanup-{secrets.token_hex(4)}",
-                control_dir=control,
-                output_dir=self.output_dir,
-            )
-        except (MaintenanceError, OSError):
-            if control is not None:
-                shutil.rmtree(control, ignore_errors=True)
-            return False
-        try:
-            outcome = self.tools.cleanup_in_holder(
-                recovery,
-                control_dir=control,
-                output_name=name,
-                identity=expected,
-            )
-        except MaintenanceError:
-            return False
-        finally:
-            try:
-                self.tools.remove(recovery)
-            except Exception:  # noqa: BLE001 - the cleanup outcome is already decided
-                pass
-            shutil.rmtree(control, ignore_errors=True)
-        return outcome == "removed"
 
     def confirm(self) -> None:
-        if self.container is None:
-            raise MaintenanceError("backup_lock", "the backup mutex is not held")
-        self.tools.confirm_lock_holder(self.container, control_dir=self.control_dir)
+        """The holder confirms it still owns both flocks after the archive was read back."""
+        self.assert_owned()
 
     def release(self) -> None:
         self._stop.set()
@@ -1572,38 +1309,40 @@ def _file_identity(path: object) -> Optional[tuple[int, int]]:
     return (value.st_dev, value.st_ino)
 
 
-def _unlink_if_identity(output: Path, identity: Optional[Sequence[int]]) -> None:
+def _unlink_if_identity(output: Path, identity: Optional[Sequence[int]]) -> bool:
     """Remove `output` only when its identity is still the expected one.
 
-    Used as the fallback failure cleanup when no lock holder is supplied (direct
-    callers and tests). Production always cleans up through `_BackupLock.cleanup`,
-    which performs the same check under the backup mutex so it cannot race a successor.
+    Used by `_publish_archive`'s failure cleanup and by `_BackupLock.cleanup`. The host
+    that calls it holds the host operation interval, so no successor operation can
+    publish concurrently; the identity check additionally refuses to remove anything this
+    operation did not create. Returns whether a file was removed.
     """
     if identity is None:
-        return
+        return False
     try:
         expected = (int(identity[0]), int(identity[1]))
     except (TypeError, ValueError, IndexError):
-        return
+        return False
     if Path(output).is_symlink():
-        return
+        return False
     if _file_identity(output) != expected:
-        return
+        return False
     try:
         Path(output).unlink()
     except OSError:
-        pass
+        return False
+    return True
 
 
 def _host_publish(
     staging: Path, output: Path, replace: bool
 ) -> Optional[tuple[int, int]]:
-    """The host-side atomic publication used when no lock holder is supplied.
+    """The host-side atomic publication: a hard link, or an authorized rename.
 
-    Production backups pass the holder's own `publish`; this default keeps the same
-    no-replace guarantee for direct callers and makes the primitive independently
-    testable. The returned identity is the published file's, which equals the staged
-    file's because `link` and `replace` preserve the inode.
+    The caller (the host backup process) holds `<journal-dir>/operation.lock`, so this is
+    the one authorization boundary for publication; no detached helper performs it. The
+    returned identity is the published file's, which equals the staged file's because
+    `link` and `replace` preserve the inode.
     """
     if replace:
         os.replace(staging, output)
@@ -1640,18 +1379,17 @@ def _publish_archive(
     confirm: Optional[Callable[[], None]] = None,
     cleanup: Optional[Callable[[Path, Optional[tuple[int, int]]], object]] = None,
 ) -> backup.RecoveryPoint:
-    """F5-A/F5-B: validate into a private staging file, then publish atomically.
+    """Write into a private staging file, validate it, then publish atomically.
 
-    `publish` is the lock holder's own publication step when a backup runs under the
-    exclusive mutex; the default is the equivalent host-side atomic no-replace link.
-    With `overwrite=false` an existing final path is never replaced, even if it appears
-    between the last check and publication. A failure leaves no output and removes the
-    staging file, so an incomplete archive is never visible as a recovery point.
+    `publish` is the host's publication step while it holds the host operation interval;
+    the default is the same atomic no-replace link for direct callers. With
+    `overwrite=false` an existing final path is never replaced, even if it appears between
+    the last check and publication. A failure leaves no output and removes the staging
+    file, so an incomplete archive is never visible as a recovery point.
 
-    F5-B: failure cleanup of a published output goes through `cleanup` when supplied
-    (the lock holder's mutex-serialized, identity-checked removal). It removes the
-    output only if it is still the exact inode `publish` returned, so an archive a
-    successor published after the mutex was lost is never touched.
+    `cleanup` is the failure cleanup of a published output (identity-checked, and under
+    the host interval that excludes a successor). It removes the output only if it is
+    still the exact inode `publish` returned.
     """
     if output.is_symlink():
         raise MaintenanceError(
@@ -1677,24 +1415,21 @@ def _publish_archive(
             raise MaintenanceError(
                 "output_verify", "the published archive did not read back"
             )
-        # The lock owner acknowledges after publication *and* read-back, so success is
-        # never reported for an operation whose holder has already gone.
+        # The holder confirms ownership after publication *and* read-back, so success is
+        # never reported for an operation whose state-volume ownership is already gone.
         if confirm is not None:
             confirm()
     except BaseException:
         if published:
-            # Never unlink unconditionally: after a lost holder a successor may have
-            # published its own archive here. Removal happens under the mutex and only
-            # for the exact inode this operation published.
+            # Never unlink unconditionally. The host interval excludes a successor, and
+            # the identity check refuses to remove anything this operation did not
+            # publish.
             if cleanup is not None:
                 try:
                     cleanup(output, identity)
                 except Exception:  # noqa: BLE001 - preserve the original failure
                     pass
             elif publish is None:
-                # The host-side primitive has no mutex to serialize against; the same
-                # identity check still applies. A supplied publisher without its
-                # mutex-held cleanup is treated as unknown ownership: fail closed.
                 _unlink_if_identity(output, identity)
         raise
     finally:
@@ -1707,7 +1442,12 @@ def _publish_archive(
 
 
 def backup_command(args) -> int:
-    target = verify_target(args.compose_file, args.journal_dir)
+    """P0: the whole backup, publication included, runs inside one host operation interval."""
+    with maintenance_interval(args.compose_file, args.journal_dir) as target:
+        return _backup_command_locked(args, target)
+
+
+def _backup_command_locked(args, target: Target) -> int:
     tools = ToolContainers(target.spec.image)
     tools.image_digest()
     role_passfile = passfile(args.credentials_dir, "hh_backup", database=contract.SERVING_DATABASE)
@@ -1727,10 +1467,16 @@ def backup_command(args) -> int:
         output_dir=output.parent.resolve(),
     )
     try:
-        # LCK-01/F5: the exclusive backup mutex covers the dump, the manifest, the
-        # output-path checks, archive publication and its read-back. The holder performs
-        # the publication itself; it is released by removing the holder, so an internal
-        # error cannot leave it held.
+        # LCK-01/P0: the container-side holder owns the shared maintenance lock and the
+        # exclusive backup mutex for the dump, the manifest, the output-path checks,
+        # archive publication and its read-back. It cannot publish or even see the output
+        # directory: the host process publishes while it holds the operation interval. The
+        # holder is released by removing it, so an internal error cannot leave it held.
+        #
+        # P0: this container-side mutex is the SECOND layer. The host operation interval
+        # taken by `backup_command` is the one that excludes the handoff, migrate, mode-a
+        # and restore entry points, which never take a state-volume flock. The order is
+        # always host interval -> state-volume locks (see `maintenance_interval`).
         lock.acquire()
         script = backup.backup_script(
             tables=contract.expected_tables(), staging=STAGING
@@ -3317,10 +3063,15 @@ def _local_sql(
 
 
 def restore_command(args) -> int:
+    """P0: the whole restore, from the target check to the final drop, is one interval."""
+    with maintenance_interval(args.compose_file, args.journal_dir) as target:
+        return _restore_command_locked(args, target)
+
+
+def _restore_command_locked(args, target: Target) -> int:
     tools_template: Optional[ToolContainers] = None
     work = WorkDirectory(args.work_dir, prefix="house-helper-restore-")
     try:
-        target = verify_target(args.compose_file, args.journal_dir)
         tools = ToolContainers(target.spec.image)
         tools.image_digest()
         point, entries = validate_archive(args.archive, tools, work=work.path)
@@ -3767,6 +3518,7 @@ def _rehearsal_cleanup_command(compose_file: object, run_id: str) -> str:
 _STRUCTURED_FAILURES = (
     MaintenanceError,
     journal.JournalError,
+    enroll.enrollment.EnrollmentError,
     artifacts.ArtifactError,
     contract.ContractError,
     credentials.PassfileError,
@@ -4051,6 +3803,9 @@ def _dispatch(args: argparse.Namespace, outcome: _Outcome) -> int:
             _record_outcome(outcome, error, outcome.cleanup)
         detail = "" if not error.detail else f" ({error.detail})"
         print(f"refused [{error.code}]: {error.message}{detail}", file=sys.stderr)
+        if error.code in ("handoff_unknown", "migration_unknown"):
+            # The cluster is in a reconciled-first UNKNOWN, not a plain refusal (LCK-08).
+            return EX_UNKNOWN
         return EX_UNAVAILABLE if error.code in (
             "docker_unavailable", "docker_infrastructure", "image_unavailable", "rehearsal_cleanup",
             "attachment_proof_environment",
@@ -4062,6 +3817,7 @@ def _dispatch(args: argparse.Namespace, outcome: _Outcome) -> int:
         return EX_UNAVAILABLE if error.code in ("docker_unavailable", "docker_inspect") else EX_REFUSED
     except (
         journal.JournalError,
+        enroll.enrollment.EnrollmentError,
         artifacts.ArtifactError,
         contract.ContractError,
         credentials.PassfileError,

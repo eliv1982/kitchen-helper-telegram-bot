@@ -10,8 +10,20 @@ The Clean-Slate PostgreSQL Cutover is governed by
 
 WP-2C-A adds the host-side enrollment/verification tool and the in-container `migrate`
 executor. The executor is reachable only through a Mode B authorization; the deployment
-surface and the four other one-shots are unchanged. The authority flow is recorded in
+surface is unchanged. The authority flow is recorded in
 `docs/architecture/HH-DB-01_WP-2C-A_Authority_Flow.md`.
+
+The P0 cutover work adds the two missing application paths without changing the surface:
+
+* `enroll.py handoff --role <hh_app|hh_provision|hh_backup> --approved-by <owner>` is the
+  journaled ROL-16/HOF-01 connection handoff. It verifies Mode B and the schema head, records
+  an intent, issues exactly one `GRANT CONNECT ON DATABASE house_helper`, re-reads the live
+  privilege, and records the observed outcome. A repeated run is an observed no-op; an
+  unobservable result stays UNKNOWN and is reconciled by the next run.
+* the `provision` one-shot now runs exactly `enroll-user` and `enrollment-status` as
+  `hh_provision`, inside the shared state-volume lock, after checking its own passfile, the
+  enrolled marker and the H2 CONNECT handoff. It delegates the user/invitation rules to
+  `house_helper.admin.cli`; it does not reimplement them.
 
 WP-2D adds PostgreSQL backup and restore through `deploy/postgres/maintenance.py` and the
 pure format-v2 contract in `house_helper/persistence/pg_backup.py`. The operating
@@ -51,11 +63,11 @@ These decisions do **not** close any other open Owner choice:
 | `deploy/postgres/pg_hba.conf` | AUTH-01 host-based authentication, with explicit first-match ordering and remote-superuser rejection. |
 | `deploy/postgres/postgresql.conf` | The minimal server configuration: listener, scram-sha-256, the explicit HBA file and the socket directory. |
 | `deploy/postgres/preflight.py` | The read-only deployment preflight. It creates nothing and runs only `docker compose ... config`, `docker network ls` and `docker network inspect`. |
-| `deploy/postgres/enroll.py` | WP-2C-A host tool: Mode A enrollment (including the ENR-04 schema/default-ACL step before the marker), authoritative Mode B verification, the bounded migrate authorization, worker-lifecycle reconciliation evidence, credential checks and the bootstrap-retirement plan. Root + Docker socket; never copied into the image. |
+| `deploy/postgres/enroll.py` | WP-2C-A host tool plus the P0-1 handoff: Mode A enrollment (including the ENR-04 schema/default-ACL step before the marker), authoritative Mode B verification, the bounded migrate authorization, the journaled H1/H2/H3 `CONNECT` handoff, worker-lifecycle reconciliation evidence, credential checks and the bootstrap-retirement plan. Root + Docker socket; never copied into the image. |
 | `deploy/postgres/maintenance.py` | WP-2D host tool: Mode B verification, format-v2 backup, archive verification, target-cluster restore with temporary-database records and isolated `--network none` rehearsal. Root + Docker socket; never copied into the image. |
 | `deploy/postgres/backup_restore.md` | The WP-2D operating procedure, prerequisites, failure matrix and explicit non-claims. |
 | `deploy/postgres/credentials/README.md` | The credential layout. Real files are git-ignored and are not generated here. |
-| `deploy/ops/pg_oneshot.py` | The fail-closed entrypoint of the five one-shots. `migrate` and the enrollment-time `schema` step are implemented in WP-2C-A; `provision`, `purge`, `backup` and `restore` still exit `78` before connecting or writing. `schema` is run through the `migrate` service, so the Compose topology is unchanged. |
+| `deploy/ops/pg_oneshot.py` | The fail-closed entrypoint of the five one-shots. `migrate` and the enrollment-time `schema` step are implemented in WP-2C-A; `provision` is implemented by P0-2 (`enroll-user`, `enrollment-status` only); `purge`, `backup` and `restore` still exit `78` before connecting or writing. `schema` is run through the `migrate` service, so the Compose topology is unchanged. |
 
 `deploy/compose.yaml`, `deploy/backup.sh`, `deploy/upgrade.sh`, the existing systemd units,
 `db/*.sql` and the WP-2A start gate are unchanged.
@@ -170,15 +182,162 @@ Stage 7 inventory and this preflight both pass.
 | Service | Login | Status |
 |---|---|---|
 | `migrate` | `hh_migrate` | **Implemented in WP-2C-A**, reachable only through `enroll.py migrate`. It re-verifies the live cluster, runs the ordered fresh initializer or a verified upgrade, and **re-applies `db/privileges.sql` after every migration**. |
-| `provision` | `hh_provision` | Refuses. Production enrollment is WP-2C/WP-2E. |
+| `provision` | `hh_provision` | **Implemented by P0-2**, reachable only with `enroll-user` or `enrollment-status`. Takes the shared state-volume lock, validates its own passfile, and refuses unless the live session is `hh_provision` on the enrolled `house_helper` with CONNECT and no TEMPORARY. The admin CLI owns every user and invitation rule. |
 | `purge` | `hh_purge` | Refuses. Scheduled execution and timer re-arm are WP-2F. |
-| `backup` | `hh_backup` | Refuses. The application image has no client binaries (BAK-13); WP-2D runs `pg_dump` in a disposable pinned `postgres:16.x` client container from `maintenance.py`. |
+| `backup` | `hh_backup` | Refuses. The application image has no client binaries (BAK-13); WP-2D runs `pg_dump` in a disposable pinned `postgres:16.x` client container from `maintenance.py`. **H3 (`enroll.py handoff --role hh_backup`) must succeed before the first backup, including a manual one.** |
 | `restore` | `hh_restore` | Refuses for the same reason. WP-2D runs the ordered restore and isolated rehearsal from `maintenance.py`; the OD-2 maintenance database is an explicit required argument. |
 
 Each service has exactly one login, one read-only passfile, the database network only and the
 `/state` lock volume. `backup` and `restore` also have an anonymous `/staging` volume, as the
 SQLite operator tool does. `pg_oneshot.py` first requires the exact activation value, then
-validates its own wiring; the four unimplemented roles exit with `EX_CONFIG` (78).
+validates its own wiring; the three unimplemented roles exit with `EX_CONFIG` (78).
+
+### 7.1 Provisioning invocation
+
+The first word after `run` is the Compose service (`provision`). Its declared command
+(`["provision"]`) is replaced by the arguments given, so the one-shot's role argument
+(`provision`) is repeated first and the administrative command follows:
+
+```bash
+docker compose -f deploy/compose.postgres.yaml --profile ops run --rm -T \
+  provision provision enroll-user --display-name "Owner"
+docker compose -f deploy/compose.postgres.yaml --profile ops run --rm -T \
+  provision provision enrollment-status
+```
+
+`HOUSE_HELPER_PG_ACTIVATE=1`, `HOUSE_HELPER_PG_CREDENTIALS_DIR` and
+`HOUSE_HELPER_IMAGE_TAG` are the same as for `migrate`. The provisioning service has
+`logging: driver: none`, so the invitation secret (`invitation code: ...`, printed once on
+stdout by the admin CLI) is not kept in Docker's logs. Run it in a terminal whose scrollback
+you control; do not pipe it through `tee`.
+
+### 7.2 CONNECT handoffs
+
+`enroll.py handoff` is the only supported way to give a runtime login its database access.
+The P0 window authorizes `hh_app` (H1, before the web container starts), `hh_provision` (H2,
+before the first `enroll-user`) and `hh_backup` (H3). **H3 is required before the first
+PostgreSQL backup of any kind, including a manual `maintenance.py backup` or
+`pg_dump`-equivalent run.** Before H3, `hh_backup` has no `CONNECT` and the backup refuses at
+the connection; a backup attempt must never be treated as an implicit handoff. `hh_purge` is
+deliberately not in this P0 surface. The command:
+
+1. takes the host operation lock and requires an exactly-one completed enrollment record;
+2. verifies the live container/volume/image identity, marker and role/database/predefined
+   inventories (Mode B);
+3. requires the schema at this image's head, a materialized database ACL, no PUBLIC entry,
+   no grant option, no `CREATE`/`TEMPORARY` for any login role, and CONNECT provenance for
+   **every** login role: only `hh_migrate` (pre-handoff) and roles with a journaled
+   successful handoff may hold CONNECT. An unjournaled CONNECT on any role - including one
+   not targeted by the current command - is refused;
+4. resolves every earlier handoff intent that has no outcome **before** attempting a new
+   transition (see below), and refuses a pre-existing CONNECT on the target role that has no
+   journaled handoff;
+5. appends a `handoff` intent carrying the complete pre-state ACL and the operation's unique
+   `application_name`, issues exactly `GRANT CONNECT ON DATABASE "house_helper" TO "<role>"`
+   in one tagged psql session, compares the complete post-state ACL, and appends the outcome.
+   The post-state must equal the pre-state plus exactly one explicit, non-grantable CONNECT
+   entry for that role. Any other entry, effective privilege or grant option - on any role -
+   is a collateral change and is never accepted.
+
+**Immutable operation identity (Finding 5).** Every GRANT, probe and ACL readback of one
+handoff is bound to the exact 64-hex container **id** that Mode B verified; the mutable
+Compose name is never an `exec` target. The id is re-inspected before the GRANT and again
+after termination, and the name must still resolve to the same id. A replaced, removed,
+stopped or renamed-away container fails closed: the intent stays pending and no GRANT is
+sent to the replacement.
+
+**SQL delivery (Alpine/BusyBox).** The pinned `postgres:16-alpine` wrapper reads stdin into
+a private `/tmp` file **before** it backgrounds psql. An asynchronous list receives
+`/dev/null` as its standard input under a non-interactive shell, so the former
+`psql -f - <&0 &` form delivered zero bytes on that runtime. The file is removed on exit and
+carries only the fixed, non-secret CONNECT statement for an allowlisted role.
+
+**Termination before reconciliation (LCK-08/LCK-12).** A client timeout, interruption or
+unobservable readback leaves the intent pending; `enroll.py status` reports it as UNKNOWN. A
+later `handoff` invocation does **not** clear it from an instantaneous privilege snapshot,
+and no Docker client return status (including `2`, `-15`, `124` or `125`) is ever read as
+completion. The operation runs with a run-id-derived `application_name` and a bounded
+container-side wrapper that records its own and its child's process ids, psql's exit status
+and a start/stop marker under `/tmp`. The probe receives its tag in the environment, never
+in its own argv, so it cannot match itself; it counts only the wrapper shell and `psql` as
+live clients, not the BusyBox `timeout`/`env` transport supervisors. The reconciler reads
+`pg_stat_activity` by `application_name`, checks those markers and probes for any surviving
+tagged client. **Termination is established from the container-side client and tagged
+session evidence before the complete ACL is read**; a snapshot taken earlier is never used
+to decide the outcome. The intent is resolved only after:
+
+* the tagged session and client are positively gone, and the wrapper recorded completion or
+  was observed to have started and terminated; and
+* the complete ACL is **exactly** the intent's recorded pre-state (the GRANT did not commit)
+  or **exactly** the pre-state plus the one expected CONNECT (it committed).
+
+An intent whose recorded pre-state already held CONNECT never issued a GRANT; it has no
+operation to terminate and is resolved from the exact pre-state alone.
+
+Anything else - including a still-live client, a never-started operation, `CONNECT WITH GRANT
+OPTION`, a stray `CREATE`, or an unjournaled CONNECT on another role - keeps the intent
+UNKNOWN and blocks every subsequent H1/H2/H3 transition. The journal is also validated as a
+paired history: an outcome must follow exactly one intent with the same run id, role,
+action, event and database; orphan outcomes, duplicate outcomes, duplicate operation ids and
+cross-role pairings are journal corruption and are refused before provenance is derived.
+
+**Client failure is not a server refusal (Finding 2).** With `ON_ERROR_STOP=1` and a script
+whose only statement is the GRANT, psql exit `3` is a definitive server-side refusal; it is
+recorded `failed` only when the complete readback still shows the pre-state. Exit `0` is
+recorded `observed` only when the readback is the exact expected post-state. Connection loss
+(`2`), Docker/client failures and signals are ambiguous. The pinned BusyBox `timeout`
+returns **143** (128 + SIGTERM), not the GNU `124`; a timeout status never proves the SQL
+statement stopped on the server. After termination is proven, the complete ACL decides
+between `applied` and `unchanged`; otherwise the intent stays UNKNOWN and the privilege is
+never claimed unchanged.
+
+`enroll.py status` also reports any pending handoff. While one remains unresolved, `migrate`,
+`maintenance.py backup` and `maintenance.py restore` refuse as well (LCK-08/LCK-13): only
+`handoff` may reconcile it, from positive termination and the complete ACL. The same rule
+applies to an unresolved **migration** (a `migrate` intent with no observed outcome): both
+`backup` and `restore` refuse with `migration_unknown` (exit 5) until
+`enroll.py reconcile-migration` records the resolution. `hh_purge` and any future additional
+grantee are outside this P0 surface and require a separate approved handoff design.
+
+**One host operation interval (P0).** `mode-a`, `migrate`, `reconcile-migration`, `handoff`,
+`maintenance.py backup` and `maintenance.py restore` all take the same exclusive,
+non-blocking flock on `<journal-dir>/operation.lock`, and hold it from before Mode B until
+their last state-changing step (backup: through archive publication and read-back; restore:
+through the temporary database's verified drop; handoff: through the recorded outcome). A
+competing operation is refused with `operation_busy` before it reads or changes anything, so
+a handoff can neither begin inside a backup's window nor leave an UNKNOWN intent behind for
+one. Under that interval an UNKNOWN handoff (`handoff_unknown`) and an UNKNOWN migration
+(`migration_unknown`) both refuse before the compose parse, image inspection, Mode B, archive
+publication or any `CREATE DATABASE`. The backup holder's state-volume locks are a second,
+container-side layer that the host never takes; the holder is a **pure lock owner** with no
+output-directory mount, so it cannot publish, replace or remove an archive even if it
+outlives its host. The **host process** publishes the archive atomically while it still holds
+the operation interval, and asks the holder to acknowledge ownership immediately before
+publication and again after the read-back. The order is always host interval, then
+state-volume locks, and no acquisition blocks, so the locks cannot deadlock. An interrupted
+process releases the interval when the kernel closes its descriptors, and that release never
+resolves an unresolved database operation. **Both tools must name the same `--journal-dir`**
+(or inherit the same `HOUSE_HELPER_PG_JOURNAL_DIR`): the interval is one file in that
+directory, and a backup pointed at a different directory would take a different lock. An
+explicit `--journal-dir` that resolves to a different directory than
+`HOUSE_HELPER_PG_JOURNAL_DIR` is refused with `journal_mismatch` rather than silently taking
+two disjoint locks; sameness is compared by `(st_dev, st_ino)` when both exist, not by the
+text of the path.
+
+For an isolated rehearsal, give every host tool the **same** journal directory and make the
+environment agree with it:
+
+```sh
+export HOUSE_HELPER_PG_JOURNAL_DIR=/srv/hh-rehearsal/cutover
+python deploy/postgres/enroll.py    --journal-dir /srv/hh-rehearsal/cutover ...
+python deploy/postgres/maintenance.py --journal-dir /srv/hh-rehearsal/cutover ...
+python deploy/offsite_backup.py run --postgres-journal-dir /srv/hh-rehearsal/cutover ...
+```
+
+Use the same `--compose-file`, `--credentials-dir` and `--object-contract` the deployed
+tools use; their defaults are the installed layout. A rehearsal must not inherit a
+production `HOUSE_HELPER_PG_JOURNAL_DIR`, because a `--journal-dir` that disagrees with it
+is refused (`journal_mismatch`).
 
 The `migrate` one-shot additionally requires the host tool's stdin channel
 (`HOUSE_HELPER_PG_AUTHORIZATION_STDIN=1`) and a bounded Mode B record. A bare environment

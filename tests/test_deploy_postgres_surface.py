@@ -16,6 +16,7 @@ generated. The tests pin the properties the WP-2B brief requires:
   * the SQLite deployment surface is not redirected to the PostgreSQL file.
 """
 
+import ast
 import copy
 import importlib.util
 import json
@@ -246,21 +247,48 @@ def test_the_sqlite_surface_is_not_redirected_to_the_postgres_file():
     assert "postgres" not in sqlite.lower()
 
 
-def test_the_one_shot_is_a_fail_closed_boundary_with_no_execution_path():
+def test_the_one_shot_is_a_fail_closed_boundary_without_a_module_level_execution_path():
     text = read(ONESHOT_PATH)
     for forbidden in (
         "import subprocess",
         "import socket",
         "os.exec",
         "import psycopg",
-        "import sqlalchemy",
-        "connect(",
         "alembic.command",
         "sys.environ",
     ):
         assert forbidden not in text, forbidden
     assert "os.environ" in text
     assert "EX_CONFIG = 78" in text
+
+    # P0-2 implements `provision`, so a connection is finally an allowed capability - but
+    # only lazily, inside the one function that checks the enrolled-cluster/H2 gate. The
+    # module still imports no database driver and executes nothing at import time.
+    tree = ast.parse(text)
+    top_level: list = []
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            top_level.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            top_level.append(node.module or "")
+    assert "sqlalchemy" not in top_level
+    sqlalchemy_functions = []
+    connect_functions = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            for child in ast.walk(node):
+                if isinstance(child, ast.Import) and any(
+                    alias.name == "sqlalchemy" for alias in child.names
+                ):
+                    sqlalchemy_functions.append(node.name)
+                if (
+                    isinstance(child, ast.Call)
+                    and isinstance(child.func, ast.Attribute)
+                    and child.func.attr == "connect"
+                ):
+                    connect_functions.append(node.name)
+    assert set(sqlalchemy_functions) == {"_verify_provision_connection"}
+    assert set(connect_functions) == {"_verify_provision_connection"}
 
 
 def test_only_the_web_service_joins_both_networks_and_postgres_has_no_proxy():
@@ -460,8 +488,11 @@ def oneshot_environment(role: str) -> dict:
     return environment
 
 
-@pytest.mark.parametrize("role", sorted(set(ONE_SHOTS) - {"migrate"}))
-def test_every_unimplemented_one_shot_refuses_before_it_connects(role, capsys):
+UNIMPLEMENTED_ONE_SHOTS = sorted(set(ONE_SHOTS) - {"migrate", "provision"})
+
+
+@pytest.mark.parametrize("role", UNIMPLEMENTED_ONE_SHOTS)
+def test_every_remaining_unimplemented_one_shot_refuses_before_it_connects(role, capsys):
     code = oneshot.main([role], oneshot_environment(role))
     captured = capsys.readouterr()
     assert code == 78
@@ -533,8 +564,8 @@ def run_oneshot_cli(role: str, **override) -> subprocess.CompletedProcess:
     )
 
 
-@pytest.mark.parametrize("role", sorted(set(ONE_SHOTS) - {"migrate"}))
-def test_every_unimplemented_real_one_shot_cli_enters_its_validation_path(role):
+@pytest.mark.parametrize("role", UNIMPLEMENTED_ONE_SHOTS)
+def test_every_remaining_unimplemented_real_one_shot_cli_enters_its_validation_path(role):
     # Real invocation with `environ is None`, which is the path that used to raise
     # AttributeError on the nonexistent `sys.environ`.
     done = run_oneshot_cli(role)

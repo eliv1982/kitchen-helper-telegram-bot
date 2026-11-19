@@ -1,6 +1,8 @@
 """The PostgreSQL operational one-shots (HH-DB-01 Stage 2 WP-2B / WP-2C-A).
 
     python /opt/house-helper/ops/pg_oneshot.py migrate|schema|provision|purge|backup|restore
+    python /opt/house-helper/ops/pg_oneshot.py provision enroll-user --display-name <name>
+    python /opt/house-helper/ops/pg_oneshot.py provision enrollment-status
 
 WP-2B defined the five per-role service boundaries. WP-2C-A implements **migrate** and the
 enrollment-time **schema** step (F8):
@@ -14,12 +16,19 @@ enrollment-time **schema** step (F8):
     under the authenticated `hh_migrate` -> `hh_owner` session, before the marker, and can
     never run Alembic or arbitrary SQL.
 
-`provision`, `purge`, `backup` and `restore` remain boundaries that refuse with
-EX_CONFIG (78). The application image intentionally has no `pg_dump`/`pg_restore`
-(BAK-13), so the backup/restore roles are executed by the host tool
-`deploy/postgres/maintenance.py` in disposable pinned `postgres:16.x` client containers,
-not by these app-image one-shots. Production account enrollment is WP-2C/WP-2E; the
-systemd re-arm is WP-2F.
+**provision** (P0 cutover) runs exactly two administrative commands, `enroll-user` and
+`enrollment-status`, under the `hh_provision` login. It takes the shared state-volume lock,
+requires the enrolled-cluster marker and the H2 CONNECT handoff (a successful connection is
+server-enforced evidence of it), and delegates to `house_helper.admin.cli` without
+reimplementing an invitation, a user rule or a transaction. The invitation secret is
+printed only by the admin CLI on stdout, exactly once; the provisioning service has no log
+driver and the one-shot never copies the secret anywhere.
+
+`purge`, `backup` and `restore` remain boundaries that refuse with EX_CONFIG (78). The
+application image intentionally has no `pg_dump`/`pg_restore` (BAK-13), so the
+backup/restore roles are executed by the host tool `deploy/postgres/maintenance.py` in
+disposable pinned `postgres:16.x` client containers, not by these app-image one-shots.
+Scheduled operations and the systemd re-arm are WP-2F.
 
 The authority channel
 ---------------------
@@ -43,6 +52,7 @@ Exit codes (the same shape as deploy/ops/dbtool.py):
   3   refused: a wiring, authorization, identity or state condition failed
   4   database unavailable
   78  EX_CONFIG: the one-shot is not implemented, or the activation/wiring is wrong
+  130 the provisioning command was interrupted
 """
 
 import os
@@ -84,9 +94,11 @@ EX_DATABASE = 4
 EX_CONFIG = 78
 
 
-def _refuse(code: str, message: str, exit_code: int = EX_CONFIG) -> int:
+def _refuse(
+    code: str, message: str, exit_code: int = EX_CONFIG, *, status: str = "refused"
+) -> int:
     # Nothing here formats an environment value into the message.
-    print(f"refused [{code}]: {message}", file=sys.stderr)
+    print(f"{status} [{code}]: {message}", file=sys.stderr)
     return exit_code
 
 
@@ -197,6 +209,263 @@ def _default_lock(purpose: str = "the PostgreSQL migration"):
         purpose=purpose,
         location="state volume",
     )
+
+
+# --- provision: the two supported administrative commands -----------------------------------
+
+PROVISION_COMMANDS = ("enroll-user", "enrollment-status")
+PROVISION_LOGIN = EXPECTED_LOGIN["provision"]
+
+
+class ProvisionError(Exception):
+    """A fail-closed provisioning refusal. `code` is stable and carries no secret."""
+
+    def __init__(self, code: str, message: str, exit_code: int = EX_REFUSED) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.exit_code = exit_code
+
+
+def _shared_lock(purpose: str = "the PostgreSQL provisioning command"):
+    """The WP-2A state-volume lock, SHARED (LCK-01/LCK-02).
+
+    Provisioning coexists with the serving app, a backup and a purge; it is refused while
+    a migration or restore holds the volume exclusively. This is not the worker's
+    exclusive lock and never the journal lock.
+    """
+    try:
+        import dbtool
+    except ImportError:  # pragma: no cover - the image and the repository both contain it
+        raise RuntimeError("dbtool.py is unavailable") from None
+    return dbtool.MaintenanceLock(
+        Path(STATE_DIR) / dbtool.LOCK_FILE_NAME,
+        exclusive=False,
+        purpose=purpose,
+        location="state volume",
+    )
+
+
+def _as_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value) in ("t", "true", "True", "1")
+
+
+def _sqlstate(error: BaseException) -> str:
+    """The driver's SQLSTATE, from either psycopg 3 (`sqlstate`) or psycopg 2 (`pgcode`)."""
+    for candidate in (getattr(error, "orig", None), error):
+        for attribute in ("sqlstate", "pgcode"):
+            value = getattr(candidate, attribute, None)
+            if value:
+                return str(value)
+    return ""
+
+
+def provision_target_failures(
+    *,
+    session_user: object,
+    current_user: object,
+    database: object,
+    connect: object,
+    temporary: object,
+    marker: object,
+) -> tuple[str, ...]:
+    """The enrolled-cluster/H2-handoff gate, as one pure decision.
+
+    A valid target is: this login (`hh_provision`), in the serving database, holding
+    CONNECT and no TEMPORARY privilege, with a parseable enrollment marker. A missing or
+    foreign marker is not an enrolled cluster; a failed connection never reaches here.
+    """
+    from house_helper.persistence import pg_journal
+
+    failures: list[str] = []
+    if str(session_user) != PROVISION_LOGIN:
+        failures.append("session_user")
+    if str(current_user) != PROVISION_LOGIN:
+        failures.append("current_user")
+    if str(database) != DB_NAME:
+        failures.append("database")
+    if _as_bool(connect) is not True:
+        failures.append("connect_handoff")
+    if _as_bool(temporary) is not False:
+        failures.append("temporary_privilege")
+    try:
+        pg_journal.parse_marker(marker)
+    except pg_journal.JournalError:
+        failures.append("marker")
+    return tuple(failures)
+
+
+def _verify_provision_connection(engine) -> None:
+    """Read the live session, privilege and marker facts, and fail closed.
+
+    This is a pre-check, not a replacement for the admin CLI's own schema-at-head check:
+    it proves the connection really is `hh_provision` on the enrolled serving database and
+    that the H2 CONNECT handoff is in effect. The password, DSN and driver text are never
+    formatted into a message.
+
+    The physical `system_identifier` is host-authoritative, exactly as for the migrate
+    executor: an `hh_provision` session cannot read `pg_control_system()`. The host's H2
+    `handoff` binds that identity with Mode B; this function enforces the half the login
+    can observe (its own session, the serving database, the marker and the privilege).
+    """
+    import sqlalchemy as sa
+
+    from house_helper.persistence import pg_contract as contract
+
+    try:
+        with engine.connect() as connection:
+            row = connection.exec_driver_sql(
+                "SELECT session_user, current_user, pg_catalog.current_database()"
+            ).fetchone()
+            if row is None or len(row) != 3:
+                raise ProvisionError(
+                    "provision_observation",
+                    "the provisioning session could not be read; nothing was executed.",
+                )
+            session_user, current_user, database = (str(value) for value in row)
+            privilege = connection.exec_driver_sql(
+                "SELECT pg_catalog.has_database_privilege(current_user, "
+                "pg_catalog.current_database(), 'CONNECT'), "
+                "pg_catalog.has_database_privilege(current_user, "
+                "pg_catalog.current_database(), 'TEMPORARY')"
+            ).fetchone()
+            if privilege is None or len(privilege) != 2:
+                raise ProvisionError(
+                    "provision_observation",
+                    "the provisioning privileges could not be read; nothing was executed.",
+                )
+            connect, temporary = _as_bool(privilege[0]), _as_bool(privilege[1])
+            marker_row = connection.exec_driver_sql(
+                contract.marker_sql(contract.SERVING_DATABASE)
+            ).fetchone()
+            marker = "" if marker_row is None else str(marker_row[0] or "")
+    except sa.exc.DBAPIError as error:
+        if _sqlstate(error) == "42501":
+            raise ProvisionError(
+                "provision_connect_handoff",
+                "the database refused the hh_provision connection: the H2 CONNECT "
+                "handoff is not in place; nothing was executed.",
+            ) from None
+        raise ProvisionError(
+            "provision_database_unavailable",
+            "the database could not be used: it is not reachable or refused the "
+            "hh_provision credential. The driver's details are withheld; nothing was "
+            "executed.",
+            EX_DATABASE,
+        ) from None
+    except ProvisionError:
+        raise
+
+    failures = provision_target_failures(
+        session_user=session_user,
+        current_user=current_user,
+        database=database,
+        connect=connect,
+        temporary=temporary,
+        marker=marker,
+    )
+    if failures:
+        if "connect_handoff" in failures:
+            code = "provision_connect_handoff"
+        elif "temporary_privilege" in failures:
+            code = "provision_privilege_boundary"
+        elif "marker" in failures:
+            code = "provision_marker"
+        else:
+            code = "provision_identity"
+        raise ProvisionError(
+            code,
+            "the provisioning target is not the enrolled hh_provision database ("
+            + ", ".join(failures)
+            + "); nothing was executed.",
+        )
+
+
+def _provision(
+    environment: Mapping[str, str],
+    arguments: list,
+    *,
+    admin_main=None,
+    engine_factory=None,
+    lock_factory=None,
+    verifier=None,
+) -> int:
+    """Run exactly one supported administrative command as `hh_provision`.
+
+    The admin CLI owns the user/invitation rules (cap, unique display name, advisory
+    lock, single-use invitation, no identity matching). This function adds only the
+    deployment's missing preconditions: its own wiring, its passfile, the shared lock,
+    the enrolled marker and the H2 CONNECT handoff.
+    """
+    if not arguments:
+        return _refuse(
+            "provision_command",
+            "the provision one-shot needs exactly one supported administrative command "
+            "(enroll-user or enrollment-status); nothing was executed.",
+            EX_USAGE,
+            status="usage",
+        )
+    if arguments[0] not in PROVISION_COMMANDS:
+        # Never echo the rejected text: an operator may have pasted a secret by mistake.
+        return _refuse(
+            "provision_command",
+            "the provision one-shot runs only enroll-user and enrollment-status; "
+            "nothing was executed.",
+            EX_REFUSED,
+        )
+
+    from house_helper.persistence import pg_credentials as credentials
+
+    try:
+        credentials.validate_passfile(
+            environment.get("PGPASSFILE"),
+            login=EXPECTED_LOGIN["provision"],
+            host=DB_HOST,
+            port=DB_PORT,
+            database=DB_NAME,
+            require_private=os.name == "posix",
+            require_owner=os.name == "posix",
+        )
+    except credentials.PassfileError as error:
+        return _refuse(error.code, error.message, EX_REFUSED)
+
+    try:
+        with (lock_factory or _shared_lock)("the PostgreSQL provisioning command"):
+            if engine_factory is None:
+                from house_helper.persistence import pg_executor
+
+                engine_factory = pg_executor.create_db_engine
+            engine = engine_factory()
+            try:
+                (verifier or _verify_provision_connection)(engine)
+            finally:
+                engine.dispose()
+            if admin_main is None:
+                from house_helper.admin import cli as admin_cli
+
+                admin_main = admin_cli.main
+            return int(admin_main(list(arguments), environ=dict(environment)))
+    except ProvisionError as error:
+        return _refuse(error.code, error.message, error.exit_code)
+    except KeyboardInterrupt:
+        print(
+            "error [interrupted]: the provisioning command was interrupted; an unfinished "
+            "change was rolled back or not confirmed. Run the same command again to see "
+            "the state (it is safe to repeat).",
+            file=sys.stderr,
+        )
+        return 130
+    except Exception as error:  # an exception's text can carry SQL, a DSN or a secret
+        if hasattr(error, "code") and hasattr(error, "exit_code"):
+            # A WP-2A dbtool ToolError (the shared state-volume lock is busy, ...).
+            return _refuse(str(error.code), str(error.message), EX_REFUSED)
+        print(
+            f"error [internal]: the provision command failed with {type(error).__name__}.",
+            file=sys.stderr,
+        )
+        return EX_INTERNAL
 
 
 def _migrate(
@@ -381,13 +650,19 @@ def main(
     executor=None,
     lock_factory=None,
     engine_factory=None,
+    admin_main=None,
+    verifier=None,
 ) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     environment = dict(os.environ if environ is None else environ)
-    if len(arguments) != 1 or arguments[0] not in ROLES:
+    if not arguments or arguments[0] not in ROLES:
         print(f"usage: pg_oneshot.py {{{','.join(ROLES)}}}", file=sys.stderr)
         return EX_USAGE
     role = arguments[0]
+    extra = arguments[1:]
+    if role != "provision" and extra:
+        print(f"usage: pg_oneshot.py {{{','.join(ROLES)}}}", file=sys.stderr)
+        return EX_USAGE
 
     refused = _wiring_refusal(role, environment)
     if refused is not None:
@@ -410,11 +685,21 @@ def main(
             lock_factory=lock_factory,
         )
 
+    if role == "provision":
+        return _provision(
+            environment,
+            extra,
+            admin_main=admin_main,
+            engine_factory=engine_factory,
+            lock_factory=lock_factory,
+            verifier=verifier,
+        )
+
     return _refuse(
         "oneshot_not_implemented",
-        f"the PostgreSQL {role} one-shot is not implemented in WP-2C (backup and restore are "
-        "WP-2D; enrollment and the scheduled operations follow). No statement was executed "
-        "and nothing was changed.",
+        f"the PostgreSQL {role} one-shot is not implemented (backup and restore run from "
+        "the host tool; the scheduled operations follow). No statement was executed and "
+        "nothing was changed.",
     )
 
 

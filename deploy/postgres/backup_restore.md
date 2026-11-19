@@ -31,7 +31,8 @@ are **not** the implementation: the application image intentionally contains no
 Mode B must pass (`enroll.py verify`). In addition:
 
 * `hh_backup` must have `CONNECT` on `house_helper` (the H3 handoff, HOF-01). Before H3,
-  backup correctly refuses at the connection.
+  backup correctly refuses at the connection. H3 is required before the first PostgreSQL
+  backup of any kind, including a manual run; a backup is never an implicit handoff.
 * `hh_backup` holds `SELECT` on every table and sequence and on `alembic_version`
   (ROL-12), and no `pg_read_all_data`.
 * `hh_restore` holds `CREATEDB` and the `pg_database` `CONNECT` grant on the chosen
@@ -92,42 +93,57 @@ this same tool, re-validates it with `verify-archive`, encrypts it with `age` an
 
 What the tool does, in order:
 
-0. Takes a **shared** `flock` on `/state/.house-helper.lock` and an independent
+0. Takes the **host operation interval** - the exclusive, non-blocking `flock` on
+   `<journal-dir>/operation.lock` that `enroll.py` mode-a, migrate, reconcile-migration
+   and handoff also take - before Mode B, and holds it until the archive has been
+   published and read back. A handoff, migration or second backup/restore that is already
+   running makes the run refuse (`operation_busy`) before anything is read, dumped or
+   written; a handoff that never started cannot begin while the backup holds the
+   interval. An UNKNOWN handoff (`handoff_unknown`) or an UNKNOWN migration
+   (`migration_unknown`) refuses the run before any state-changing step. Both UNKNOWN
+   states are evaluated under this same interval.
+1. Takes a **shared** `flock` on `/state/.house-helper.lock` and an independent
    **exclusive** `flock` on `/state/.house-helper.backup.lock` (LCK-01), in a detached
    holder that keeps both locks until the whole backup has finished. A migration's
    exclusive maintenance holder or a second backup makes the run refuse before any
-   statement. The locks cover the dump, the facts, the manifest, the output existence
-   checks, archive publication and its read-back; they are released by removing the
-   holder (the kernel closes the descriptors) on success or failure. The same holder
-   process performs the final publication, so the mutex is owned at the instant the
-   output path is created (there is no check-then-write window).
-1. Verifies Mode B against the enrolled record (ENR-15..ENR-17). No fallback to Mode A.
-2. Validates the `hh_backup` passfile and the pinned image digest.
-3. In one disposable client container, opens `REPEATABLE READ`, exports a snapshot,
+   statement. These container-side locks are the second layer, and the host never takes
+   them; the order is always host interval, then state-volume locks. They cover the
+   dump, the facts, the manifest, the output existence checks, archive publication and
+   its read-back; they are released by removing the holder (the kernel closes the
+   descriptors) on success or failure. The holder is a **pure lock owner**: it has no
+   output-directory mount and no publication branch, so it cannot publish, replace or
+   remove an archive even if it outlives its host. It answers one ownership probe. The
+   **host process** performs the final atomic publication while it still holds the
+   operation interval, and asks the holder to acknowledge ownership immediately before
+   publication and again after the read-back.
+2. Verifies Mode B against the enrolled record (ENR-15..ENR-17). No fallback to Mode A.
+3. Validates the `hh_backup` passfile and the pinned image digest.
+4. In one disposable client container, opens `REPEATABLE READ`, exports a snapshot,
    runs `pg_dump --snapshot=<id>` **inside that transaction** with the frozen flags
    (`--format=custom --compress=zstd --schema=public --encoding=UTF8 --no-owner
    --no-privileges --no-tablespaces --no-subscriptions --no-publications
    --no-large-objects`), computes every table count/digest in the same transaction, and
    commits. A post-dump count would be a different dataset and is never used.
-4. Refuses non-empty `pg_largeobject_metadata`, any non-system schema other than
+5. Refuses non-empty `pg_largeobject_metadata`, any non-system schema other than
    `public`, and any subscription.
-5. Lists the archive TOC, requires exactly one `SEQUENCE SET` entry for
+6. Lists the archive TOC, requires exactly one `SEQUENCE SET` entry for
    `public.messages_id_seq`, extracts only that entry with `--use-list`, and parses the
    result as **data** under the strict SEQ-05 envelope. It never executes the extraction
    and never reads the sequence from the live database (SEQ-01).
-6. Builds and validates the manifest: server/dump versions, provenance
+7. Builds and validates the manifest: server/dump versions, provenance
    `system_identifier`, revision, encoding/locale, the exact seven roles, the ACL
    artifact digest, every table's `{rows,digest}`, the raw sequence pair, the dump's
    byte count and SHA-256, and the pinned dump settings.
-7. Writes the tar to a private staging file in the output directory and reads it back;
-   only then does the lock holder publish it atomically. With the default
+8. Writes the tar to a private staging file in the output directory and reads it back;
+   only then does the host publish it atomically, while the operation interval and the
+   holder's ownership are both confirmed. With the default
    `overwrite=false` publication is an atomic same-filesystem **hard link**, which fails
    if the final path exists; an existing file is never replaced, even one that appears
    in the instant before publication. `--overwrite` is the explicit authorization to
-   replace it. The published archive is then read back and the lock owner acknowledges
-   success; a holder that terminated before that acknowledgement makes the run fail and
-   removes the unreported archive. A failure leaves no output and removes the staging
-   file. A missing dump or success marker is a failure; no archive is reported.
+   replace it. The published archive is then read back and the lock holder acknowledges
+   ownership; a holder that terminated before that acknowledgement makes the run fail and
+   the host removes the exact inode it published. A failure leaves no output and removes
+   the staging file. A missing dump or success marker is a failure; no archive is reported.
 
 The manifest's `system_identifier` is **provenance** ("this archive came from that
 cluster"), never a restore precondition. A replacement cluster has a new identifier and
@@ -159,6 +175,12 @@ python deploy/postgres/maintenance.py \
 
 The ordered flow:
 
+0. Takes the **host operation interval** (`<journal-dir>/operation.lock`), exactly as
+   `backup` does, and holds it from before the target check until the temporary database
+   has been verified and dropped (or retained). A concurrent handoff, migration, backup
+   or restore is refused (`operation_busy`) before the archive is read or a database is
+   created; an UNKNOWN handoff (`handoff_unknown`) or an UNKNOWN migration
+   (`migration_unknown`) is refused before anything changes.
 1. Validates the archive (level 1) and Mode B on the target. The archive validation
    includes the extracted sequence payload and the `TABLE DATA` inventory; an invalid
    archive is refused **before** any target database is created.
@@ -266,7 +288,12 @@ verification of §4.8. It then:
 
 | Refusal | Meaning | Action |
 |---|---|---|
-| `backup_lock` | The maintenance lock is held exclusively, another backup holds the backup mutex, or the lock holder terminated before publication completed. | Wait for the competing operation; never bypass the lock. The holder owns both locks and performs publication itself; a live operation refreshes its heartbeat deadline and never expires. A holder left behind by a crashed host (`house-helper-backup-hold-<token>`) exits after its unrefreshed lease (`LOCK_HOLDER_LEASE_SECONDS`, 15 minutes) and releases the mutex by itself; confirm no backup is running before removing one by exact name. A holder that has already died can neither publish nor report success. |
+| `backup_lock` | The maintenance lock is held exclusively, another backup holds the backup mutex, or the lock holder terminated before publication or before it could acknowledge ownership. | Wait for the competing operation; never bypass the lock. The holder owns both state-volume locks but cannot publish: the host performs the atomic publication while it holds `operation.lock`. A live operation refreshes the holder's heartbeat deadline, so it never expires; a holder left behind by a crashed host (`house-helper-backup-hold-<token>`) exits after its unrefreshed lease (`LOCK_HOLDER_LEASE_SECONDS`, 15 minutes) and releases the mutex by itself. Confirm no backup is running before removing one by exact name. A holder that has already died can neither publish nor acknowledge ownership. |
+| `operation_busy` | Another host operation (`mode-a`, `migrate`, `reconcile-migration`, `handoff`, `backup` or `restore`) holds `<journal-dir>/operation.lock`. | Wait for it to finish and re-run; never delete the lock file or work around it. Exit 3, before anything was read or changed. |
+| `handoff_unknown` | A handoff intent has no observed outcome (LCK-08/LCK-13). | Only `enroll.py handoff --role <role> --approved-by <owner>` may resolve it, from proven termination plus the complete ACL. Exit 5. Maintenance refuses before any state change. |
+| `migration_unknown` | A `migrate` intent has no observed outcome: the run timed out, was interrupted, or was recorded UNKNOWN (LCK-08). | Only `enroll.py reconcile-migration` may resolve it, from the enrolled cluster, positive worker termination and the observed schema revision. Exit 5. Backup refuses before it publishes; restore refuses before any `CREATE DATABASE`. |
+| `handoff_journal` | The handoff history is not a valid intent/outcome pairing - including a malformed outcome type such as `[]`, `{}`, `null` or an unknown string. | Journal corruption: inspect the named `seq`, do not edit or truncate the journal, and do not infer a handoff from the live ACL. Exit 3, never an internal error. |
+| `journal_mismatch` | An explicit `--journal-dir` resolves to a different directory than `HOUSE_HELPER_PG_JOURNAL_DIR`, so the tools would take different `operation.lock` files. | Use one directory for every host tool (or unset the variable). Exit 3, before anything is read or changed. |
 | `cluster_identity` | Mode B differs from the enrollment record. | Read the mismatch items; do not bypass. Reconcile the cluster or perform a separate authorized enrollment. |
 | `image_unavailable` / `image_identity` | The pinned `postgres@sha256:...` client image is absent or was replaced. | Restore the pinned image. Do not substitute another tag. |
 | `docker_infrastructure` | Docker did not execute the program at all: the CLI/daemon failed (exit 125/126/127, an unreachable daemon) or `docker exec` found the container stopped. | An environment failure, never evidence about the archive: fix Docker or the image and re-run. It is exit 4 and is never reported as `archive_integrity`, `sequence_extraction` or `isolated_restore`. |

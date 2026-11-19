@@ -11,12 +11,14 @@ import json
 import os
 import subprocess
 import threading
+import types
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
 from deploy.postgres import enroll
+from deploy.postgres import maintenance
 from house_helper.persistence import pg_contract as contract
 from house_helper.persistence import pg_enrollment as enrollment
 from house_helper.persistence import pg_journal as journal
@@ -114,12 +116,38 @@ class FakeDocker:
         self.rm_argv = []
         self.rm_returncode = 0
         self.on_rm = None
+        # A handoff test hook: called with every SQL text before it is answered.
+        self.on_sql = None
+        self.grants = []
+        # The tagged handoff transport. `on_grant(tag, sql)` selects a behaviour; the
+        # default applies the grant and returns psql exit 0. The per-operation evidence
+        # models what the container-side wrapper would have left behind.
+        self.on_grant = None
+        self.handoff_transports = {}
+        self.delayed = {}
+        # A hook that runs once, immediately before the first handoff exec (Finding 5).
+        self.on_handoff_exec = None
+        # A delayed GRANT that commits between the ACL readback and the probe (Finding 3).
+        self.commit_on_acl_read = None
+        self._pending_commit = None
+        # Counts calls to the complete-ACL read; tests may make the Nth observation fail.
+        self.acl_matrix_calls = 0
+        self.acl_matrix_fail_on_call = None
+        # Every container target the tool actually exec'ed or inspected.
+        self.exec_targets = []
+        self.inspect_targets = []
+        self.handoff_exec_targets = []
 
     # -- the runner interface ----------------------------------------------------------
 
     def __call__(self, argv, *, input=None, capture_output=True, timeout=None, check=False, env=None):
         if argv[:3] == ["docker", "inspect", "--type"]:
             target = argv[-1]
+            self.inspect_targets.append(target)
+            # An immutable id resolves only while THAT container exists. A replacement
+            # container with the same name gets a new id, so the old id is gone.
+            if target == self.container_id:
+                return self._json([self._container()])
             if target in (
                 self.container_name,
                 self.container_name.lstrip("/"),
@@ -153,6 +181,30 @@ class FakeDocker:
                 self.on_rm()
             return subprocess.CompletedProcess(argv, self.rm_returncode, b"", b"")
         if argv[:2] == ["docker", "exec"]:
+            # `docker exec [-i] -u postgres <target> ...`: record the target and refuse an
+            # immutable id that no longer names the live container (a replacement).
+            kind = self._handoff_kind(argv)
+            if self.on_handoff_exec is not None and kind is not None:
+                hook = self.on_handoff_exec
+                self.on_handoff_exec = None
+                hook()
+            target = argv[argv.index("-u") + 2]
+            self.exec_targets.append(target)
+            if kind is not None:
+                self.handoff_exec_targets.append(target)
+            if target != self.container_name and target != self.container_name.lstrip(
+                "/"
+            ):
+                if target != self.container_id:
+                    return subprocess.CompletedProcess(
+                        argv, 1, b"", b"no such container"
+                    )
+            # The two handoff operations run a fixed container-side script; neither is a
+            # psql observation. They are recognised by their fixed `$0` argument.
+            if kind == "grant":
+                return self._grant_wrapper(argv, input)
+            if kind == "probe":
+                return self._handoff_probe(self._probe_tag(argv))
             database = argv[argv.index("-d") + 1]
             return subprocess.CompletedProcess(argv, 0, self._psql(database, input.decode()), b"")
         if argv[:2] == ["docker", "compose"]:
@@ -176,6 +228,102 @@ class FakeDocker:
     @staticmethod
     def _json(value):
         return subprocess.CompletedProcess([], 0, json.dumps(value).encode(), b"")
+
+    @staticmethod
+    def _handoff_kind(argv):
+        if len(argv) >= 2 and argv[-2] == enroll.HANDOFF_GRANT_WRAPPER_NAME:
+            return "grant"
+        if argv and argv[-1] == enroll.HANDOFF_PROBE_NAME:
+            return "probe"
+        return None
+
+    @staticmethod
+    def _probe_tag(argv):
+        for index, value in enumerate(argv[:-1]):
+            if value == "-e" and argv[index + 1].startswith("HANDOFF_PROBE_TAG="):
+                return argv[index + 1].split("=", 1)[1]
+        raise AssertionError(f"the probe did not carry HANDOFF_PROBE_TAG: {argv}")
+
+    # -- the tagged handoff transport -------------------------------------------------
+
+    def _transport(self, tag, **values):
+        state = {
+            "started": False,
+            "stopped": False,
+            "psql_exit": None,
+            "client_alive": False,
+            "session_alive": False,
+        }
+        state.update(values)
+        self.handoff_transports[tag] = state
+        return state
+
+    def _grant_wrapper(self, argv, stdin):
+        sql = (stdin or b"").decode("utf-8")
+        tag = argv[-1]
+        mode = "apply" if self.on_grant is None else self.on_grant(tag, sql)
+        if isinstance(mode, tuple) and mode[0] == "client_status":
+            # The Docker client returns (2, -15, 124, 125, ...) while the tagged operation
+            # is still active. The return must never be read as completion.
+            self._transport(tag, started=True, client_alive=True, session_alive=True)
+            self.delayed[tag] = sql
+            return subprocess.CompletedProcess(argv, mode[1], b"", b"")
+        if isinstance(mode, tuple) and mode[0] == "delayed_readback":
+            # The GRANT commits in the window between an early ACL readback and the probe.
+            self._transport(tag, started=True, client_alive=True, session_alive=True)
+            self.delayed[tag] = sql
+            self.commit_on_acl_read = (tag, sql, mode[1])
+            return subprocess.CompletedProcess(argv, 2, b"", b"")
+        if mode in ("timeout_inflight", "delayed_inflight"):
+            self._transport(tag, started=True, client_alive=True)
+            if mode == "delayed_inflight":
+                self.delayed[tag] = sql
+            raise subprocess.TimeoutExpired(argv, 120)
+        if mode == "interrupt":
+            self._transport(tag, started=True, client_alive=True)
+            raise KeyboardInterrupt
+        if mode == "server_refused":
+            self._transport(tag, started=True, stopped=True, psql_exit=3)
+            return subprocess.CompletedProcess(argv, 3, b"", b"ERROR: permission denied")
+        if mode == "commit_then_client_failure":
+            role = sql.split('TO "', 1)[1].split('"', 1)[0]
+            if role not in self.grants:
+                self.grants.append(role)
+            self._grant_connect(role)
+            self._transport(tag, started=True, stopped=True, psql_exit=2)
+            return subprocess.CompletedProcess(argv, 2, b"", b"connection lost")
+        self._psql("postgres", sql)
+        self._transport(tag, started=True, stopped=True, psql_exit=0)
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    def _handoff_probe(self, tag):
+        pending = self._pending_commit
+        if pending is not None and pending[0] == tag:
+            # Finding 3: the delayed GRANT lands after the ACL snapshot and before this
+            # probe. A reader that probed after its snapshot would see termination plus a
+            # stale pre-state and could resolve the operation incorrectly.
+            _tag, _sql, exit_code = pending
+            self._pending_commit = None
+            self.complete_delayed(tag, apply=True, psql_exit=exit_code)
+        state = self.handoff_transports.get(tag, {})
+        exit_code = state.get("psql_exit")
+        lines = [
+            f"started={1 if state.get('started') else 0}",
+            f"stopped={1 if state.get('stopped') else 0}",
+            f"rc={'' if exit_code is None else exit_code}",
+            f"client={1 if state.get('client_alive') else 0}",
+        ]
+        return subprocess.CompletedProcess([], 0, ("\n".join(lines) + "\n").encode(), b"")
+
+    def complete_delayed(self, tag, *, apply=True, psql_exit=0):
+        """Model the delayed operation finally terminating (Finding 1)."""
+        sql = self.delayed.pop(tag)
+        if apply:
+            role = sql.split('TO "', 1)[1].split('"', 1)[0]
+            if role not in self.grants:
+                self.grants.append(role)
+            self._grant_connect(role)
+        self._transport(tag, started=True, stopped=True, psql_exit=psql_exit)
 
     def _container(self):
         mounts = [
@@ -249,6 +397,13 @@ class FakeDocker:
     # -- psql answers ------------------------------------------------------------------
 
     def _psql(self, database: str, sql: str) -> bytes:
+        if self.on_sql is not None:
+            self.on_sql(sql)
+        if sql.strip().startswith('GRANT CONNECT ON DATABASE "house_helper" TO "'):
+            role = sql.split('TO "', 1)[1].split('"', 1)[0]
+            self.grants.append(role)
+            self._grant_connect(role)
+            return b""
         if "pg_control_system" in sql:
             return _out([(SID,)])
         if sql.strip() == "SELECT d.datname FROM pg_catalog.pg_database d ORDER BY d.datname":
@@ -287,6 +442,39 @@ class FakeDocker:
             return _out(self.edges)
         if sql == contract.DATABASE_ACLS_SQL:
             return _out(self.acl_entries)
+        if sql == contract.database_acl_matrix_sql(contract.SERVING_DATABASE):
+            self.acl_matrix_calls += 1
+            if self.commit_on_acl_read is not None:
+                # Return the current (pre-commit) state on this read, then let the commit
+                # land before the next probe. This is the exact Codex interleaving.
+                tag, grant_sql, exit_code = self.commit_on_acl_read
+                self.commit_on_acl_read = None
+                self._pending_commit = (tag, grant_sql, exit_code)
+            if self.acl_matrix_fail_on_call == self.acl_matrix_calls:
+                raise enroll.DockerError(
+                    "handoff_observation", "the ACL matrix is unobservable"
+                )
+            materialized = self.databases.get("house_helper", {}).get("acl", False)
+            entries = tuple(
+                (name, privilege, grantable == "t")
+                for database_name, _oid, name, privilege, grantable in self.acl_entries
+                if database_name == "house_helper"
+            )
+            row = ["t" if materialized else "f"]
+            for privilege in contract.DATABASE_PRIVILEGES:
+                for role in contract.PROJECT_ROLE_NAMES:
+                    row.append(
+                        _take(
+                            contract.database_privilege(
+                                materialized, entries, role, privilege
+                            )
+                        )
+                    )
+            return _out([tuple(row)])
+        if sql.startswith("SELECT count(*) FROM pg_catalog.pg_stat_activity"):
+            tag = sql.split("application_name = '", 1)[1].split("'", 1)[0]
+            state = self.handoff_transports.get(tag, {})
+            return _out([(1 if state.get("session_alive") else 0,)])
         if "has_database_privilege('hh_owner'" in sql:
             entries = tuple(
                 (
@@ -376,6 +564,15 @@ class FakeDocker:
             self.databases["house_helper"]["marker"] = self.marker
             return b""
         raise AssertionError(f"unexpected SQL: {sql[:120]}")
+
+    def _grant_connect(self, role: str):
+        oids = {"hh_app": "12", "hh_provision": "13", "hh_backup": "14"}
+        self.databases["house_helper"]["acl"] = True
+        if not any(
+            row[0] == "house_helper" and row[2] == role and row[3] == "CONNECT"
+            for row in self.acl_entries
+        ):
+            self.acl_entries.append(("house_helper", oids[role], role, "CONNECT", "f"))
 
     def _apply_roles(self):
         self.operations.append("roles")
@@ -928,6 +1125,46 @@ def test_run_migrate_refuses_before_compose_when_mode_b_fails(tmp_path):
     )
     assert code == 3
     assert fake.compose_input is None
+
+
+def test_run_migrate_refuses_before_compose_while_a_handoff_is_unknown(tmp_path, capsys):
+    """LCK-08/LCK-13: reconcile the handoff before any later operation advances the machine."""
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    fake.on_grant = lambda tag, sql: "interrupt"
+    assert _run_handoff(fake, journal_file) == enroll.EX_UNKNOWN
+    fake.on_grant = None
+    assert enrollment.pending_handoff_intents(journal_file.read().records)
+    before = len(journal_file.read().records)
+
+    code = enroll.run_migrate(
+        enroll.Docker(SPEC, runner=fake),
+        enroll.DEFAULT_COMPOSE,
+        journal_file,
+        _adapter(fake),
+    )
+
+    assert code == enroll.EX_UNKNOWN
+    # Nothing was launched and no migration intent was appended.
+    assert fake.compose_input is None
+    assert len(journal_file.read().records) == before
+    error = capsys.readouterr().err
+    assert "handoff" in error and "hh_app" in error
+
+
+def test_a_reconciled_handoff_does_not_block_a_later_migrate(tmp_path):
+    """The gate is the unresolved intent, not the handoff itself."""
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    assert _run_handoff(fake, journal_file) == enroll.EX_OK
+    assert enrollment.pending_handoff_intents(journal_file.read().records) == ()
+
+    code = enroll.run_migrate(
+        enroll.Docker(SPEC, runner=fake),
+        enroll.DEFAULT_COMPOSE,
+        journal_file,
+        _adapter(fake),
+    )
+
+    assert code == enroll.EX_OK
 
 
 # --- F1: the Mode B -> worker interval is one host operation ---------------------------------
@@ -1515,3 +1752,1071 @@ def test_a_cleanup_failure_is_not_an_uncertain_migration_outcome(
     # container is an operational follow-up, not an UNKNOWN.
     assert outcome["outcome"] == "completed"
     assert outcome["exit_code"] == 0
+
+
+# --- §7.3 CONNECT handoffs (P0-1) -------------------------------------------------------------
+
+
+def _enrolled_at_head(tmp_path):
+    """A completed Mode A/Mode B fixture whose schema is at this image's head."""
+    fake, journal_file = _enrolled(tmp_path)
+    head, _chart = contract.known_revision_chart()
+    fake.schema_versions = (head,)
+    fake.public_tables = tuple(sorted(contract.expected_tables()))
+    fake.inventory = _head_inventory()
+    return fake, journal_file
+
+
+def _handoff_records(journal_file):
+    return [record for record in journal_file.read().records if record.kind == "handoff"]
+
+
+def _run_handoff(fake, journal_file, role="hh_app", approved_by="owner"):
+    return enroll.run_handoff(
+        enroll.Docker(SPEC, runner=fake),
+        journal_file,
+        _adapter(fake),
+        role=role,
+        approved_by=approved_by,
+    )
+
+
+HANDOFF_OIDS = {"hh_app": "12", "hh_provision": "13", "hh_backup": "14"}
+
+
+@pytest.mark.parametrize(
+    "role, event",
+    [("hh_app", "app"), ("hh_provision", "provision"), ("hh_backup", "scheduled")],
+)
+def test_each_p0_handoff_grants_only_connect_and_journals_intent_then_outcome(
+    tmp_path, role, event, capsys
+):
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    assert _run_handoff(fake, journal_file, role=role) == enroll.EX_OK
+    assert fake.grants == [role]
+    records = _handoff_records(journal_file)
+    assert [record.payload["state"] for record in records] == ["intent", "outcome"]
+    intent, outcome = records
+    assert intent.payload["action"] == f"grant_connect:{role}"
+    assert intent.payload["handoff"] == event
+    assert intent.payload["database"] == "house_helper"
+    assert intent.payload["operator"] == "owner"
+    assert intent.payload["role"] == role
+    assert outcome.payload["run_id"] == intent.payload["run_id"]
+    assert outcome.payload["outcome"] == "observed"
+    assert outcome.payload["evidence"]["has_database_privilege"] is True
+    assert outcome.payload["evidence"]["has_temporary"] is False
+    assert outcome.payload["evidence"]["has_create"] is False
+    assert outcome.payload["evidence"]["changed"] is True
+    # The operation is journaled with its session tag and its complete pre-state.
+    assert intent.payload["application_name"] == enrollment.handoff_application_name(
+        intent.payload["run_id"]
+    )
+    assert "before" in intent.payload
+    # Exactly CONNECT: no TEMPORARY, no PUBLIC entry and no grant option.
+    entries = [
+        row for row in fake.acl_entries if row[0] == "house_helper" and row[2] == role
+    ]
+    assert entries == [
+        ("house_helper", HANDOFF_OIDS[role], role, "CONNECT", "f")
+    ]
+    assert enrollment.pending_handoff_intents(journal_file.read().records) == ()
+    assert "ok [handoff]" in capsys.readouterr().out
+
+
+def test_a_repeated_handoff_is_an_idempotent_observed_noop(tmp_path, capsys):
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    assert _run_handoff(fake, journal_file) == enroll.EX_OK
+    assert _run_handoff(fake, journal_file) == enroll.EX_OK
+    # The second run issues no second GRANT; it records what it observed.
+    assert fake.grants == ["hh_app"]
+    outcomes = [
+        record.payload
+        for record in _handoff_records(journal_file)
+        if record.payload["state"] == "outcome"
+    ]
+    assert [outcome["outcome"] for outcome in outcomes] == ["observed", "observed"]
+    assert [outcome["evidence"]["changed"] for outcome in outcomes] == [True, False]
+    assert "nothing was changed" in capsys.readouterr().out
+
+
+def test_a_pre_existing_grant_without_a_journaled_handoff_is_refused(tmp_path, capsys):
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    # Simulate an out-of-band GRANT: the privilege is there, the journal has no record.
+    fake._grant_connect("hh_app")
+    assert _run_handoff(fake, journal_file) == enroll.EX_REFUSED
+    assert fake.grants == []
+    assert _handoff_records(journal_file) == []
+    assert "handoff_unrecorded" in capsys.readouterr().err
+
+
+def test_the_maintenance_target_refuses_while_a_handoff_is_unknown(tmp_path, monkeypatch):
+    """Backup and restore share `verify_target`; neither may advance through UNKNOWN."""
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    fake.on_grant = lambda tag, sql: "interrupt"
+    assert _run_handoff(fake, journal_file) == enroll.EX_UNKNOWN
+
+    real_journal = journal.Journal
+
+    def portable_journal(directory, require_root=False):
+        # The fixture runs unprivileged on POSIX CI; the gate under test is not ownership.
+        return real_journal(directory, require_root=False)
+
+    monkeypatch.setattr(maintenance.enroll, "load_spec", lambda path: SPEC)
+    monkeypatch.setattr(
+        maintenance.enroll,
+        "Docker",
+        lambda spec: types.SimpleNamespace(inspect_image=lambda: {}),
+    )
+    monkeypatch.setattr(
+        maintenance.enroll, "validate_image", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        maintenance.enroll,
+        "verify_mode_b",
+        lambda journal_file, adapter, **kwargs: types.SimpleNamespace(
+            verdict=types.SimpleNamespace(ok=True, mismatches=(), completed={})
+        ),
+    )
+    monkeypatch.setattr(maintenance.journal, "Journal", portable_journal)
+
+    with pytest.raises(maintenance.MaintenanceError) as refused:
+        maintenance.verify_target(tmp_path / "compose.yaml", tmp_path / "cutover")
+
+    assert refused.value.code == "handoff_unknown"
+    assert "hh_app" in refused.value.message
+
+
+def test_the_maintenance_cli_reports_a_pending_handoff_as_unknown(
+    tmp_path, monkeypatch, capsys
+):
+    def refuse(*args, **kwargs):
+        raise maintenance.MaintenanceError(
+            "handoff_unknown", "the hh_app handoff intent has no observed outcome"
+        )
+
+    real_journal = journal.Journal
+
+    def portable_journal(directory, require_root=False):
+        # P0: the command takes the host operation interval first, so the journal it
+        # opens must be a test-private one; ownership is not what this test exercises.
+        return real_journal(directory, require_root=False)
+
+    monkeypatch.setattr(maintenance.journal, "Journal", portable_journal)
+    monkeypatch.setattr(maintenance, "verify_target", refuse)
+
+    code = maintenance.main(
+        [
+            "--journal-dir",
+            str(tmp_path / "cutover"),
+            "--work-dir",
+            str(tmp_path),
+            "backup",
+            "--output",
+            str(tmp_path / "point.tar"),
+        ]
+    )
+
+    assert code == maintenance.EX_UNKNOWN
+    assert "handoff_unknown" in capsys.readouterr().err
+
+
+def test_a_wrong_cluster_is_refused_and_never_grants(tmp_path):
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    fake.container_id = "9" * 64
+    assert _run_handoff(fake, journal_file) == enroll.EX_REFUSED
+    assert fake.grants == []
+    assert _handoff_records(journal_file) == []
+    assert journal_file.read().records[-1].kind == "cluster_identity"
+    assert "container:id" in journal_file.read().records[-1].payload["items"]
+
+
+def test_a_mismatched_marker_is_refused_before_the_grant(tmp_path):
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    fake.databases["house_helper"]["marker"] = journal.make_marker("0" * 32, SID)
+    assert _run_handoff(fake, journal_file) == enroll.EX_REFUSED
+    assert fake.grants == []
+    assert _handoff_records(journal_file) == []
+    assert "marker:token" in journal_file.read().records[-1].payload["items"]
+
+
+def test_an_incomplete_enrollment_is_refused(tmp_path, capsys):
+    fake = FakeDocker()
+    journal_file = journal.Journal(tmp_path / "cutover")
+    assert _run_handoff(fake, journal_file) == enroll.EX_REFUSED
+    assert fake.grants == []
+    assert "completed_record:missing" in capsys.readouterr().err
+
+
+def test_a_schema_that_is_not_at_the_head_is_refused(tmp_path, capsys):
+    fake, journal_file = _enrolled(tmp_path)  # schema contract only, no Alembic chain
+    assert _run_handoff(fake, journal_file) == enroll.EX_REFUSED
+    assert fake.grants == []
+    assert _handoff_records(journal_file) == []
+    assert "schema_not_head" in capsys.readouterr().err
+
+
+def test_a_pending_migration_unknown_blocks_a_handoff(tmp_path):
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    _timed_out_worker(fake, journal_file)
+    with pytest.raises(enrollment.EnrollmentError) as refused:
+        _run_handoff(fake, journal_file)
+    assert refused.value.code == "migration_unknown"
+    assert fake.grants == []
+
+
+def test_an_interrupted_grant_stays_pending_until_the_client_is_proven_gone(tmp_path):
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    fake.on_grant = lambda tag, sql: "interrupt"
+    assert _run_handoff(fake, journal_file) == enroll.EX_UNKNOWN
+    # The grant never reached the fixture; the intent is UNKNOWN, never success.
+    assert fake.grants == []
+    assert [record.payload["state"] for record in _handoff_records(journal_file)] == [
+        "intent"
+    ]
+    pending = enrollment.pending_handoff_intents(journal_file.read().records)
+    assert len(pending) == 1 and pending[0].payload["role"] == "hh_app"
+    tag = enrollment.handoff_application_name(pending[0].payload["run_id"])
+
+    # Finding 1: an instantaneous ACL snapshot is not enough. While the tagged client may
+    # still execute, a later handoff is refused and no new intent is appended.
+    fake.on_grant = None
+    assert _run_handoff(fake, journal_file) == enroll.EX_UNKNOWN
+    assert fake.grants == []
+    assert [record.payload["state"] for record in _handoff_records(journal_file)] == [
+        "intent"
+    ]
+
+    # Once the tagged client/session is positively gone, the complete ACL shows the
+    # recorded pre-state, so the intent resolves as unchanged and the handoff reruns.
+    fake.handoff_transports[tag].update(
+        {"client_alive": False, "session_alive": False}
+    )
+    assert _run_handoff(fake, journal_file) == enroll.EX_OK
+    assert fake.grants == ["hh_app"]
+    payloads = [record.payload for record in _handoff_records(journal_file)]
+    assert [payload["state"] for payload in payloads] == [
+        "intent",
+        "outcome",
+        "intent",
+        "outcome",
+    ]
+    assert payloads[1]["outcome"] == "reconciled"
+    assert payloads[1]["run_id"] == payloads[0]["run_id"]
+    assert payloads[1]["evidence"]["has_database_privilege"] is False
+    assert payloads[1]["evidence"]["privileges_unchanged"] is True
+    assert payloads[3]["outcome"] == "observed"
+    assert enrollment.pending_handoff_intents(journal_file.read().records) == ()
+
+
+def test_a_postgresql_refusal_resolves_the_intent_as_failed(tmp_path):
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    fake.on_grant = lambda tag, sql: "server_refused"
+    assert _run_handoff(fake, journal_file) == enroll.EX_REFUSED
+    assert fake.grants == []
+    payloads = [record.payload for record in _handoff_records(journal_file)]
+    assert [payload["state"] for payload in payloads] == ["intent", "outcome"]
+    assert payloads[1]["outcome"] == "failed"
+    assert payloads[1]["evidence"] == {
+        "code": "server_refused",
+        "psql_exit": 3,
+        "privileges_unchanged": True,
+    }
+    assert enrollment.pending_handoff_intents(journal_file.read().records) == ()
+
+
+def test_a_committed_grant_followed_by_a_client_failure_is_not_failed(tmp_path):
+    """Finding 2: psql exit 2 after a committed GRANT is not a PostgreSQL refusal."""
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    fake.on_grant = lambda tag, sql: "commit_then_client_failure"
+    assert _run_handoff(fake, journal_file) == enroll.EX_OK
+    assert fake.grants == ["hh_app"]
+    outcomes = [
+        record.payload
+        for record in _handoff_records(journal_file)
+        if record.payload["state"] == "outcome"
+    ]
+    assert [outcome["outcome"] for outcome in outcomes] == ["reconciled"]
+    assert outcomes[0]["evidence"]["has_database_privilege"] is True
+    assert outcomes[0]["evidence"]["applied"] is True
+    assert outcomes[0]["evidence"]["psql_exit"] == 2
+    assert all(outcome["outcome"] != "failed" for outcome in outcomes)
+    assert enrollment.pending_handoff_intents(journal_file.read().records) == ()
+
+
+def test_a_pending_noop_intent_resolves_without_transport_termination(tmp_path):
+    """A no-op intent never issued a GRANT, so no tagged operation exists to terminate."""
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    assert _run_handoff(fake, journal_file) == enroll.EX_OK
+    docker = enroll.Docker(SPEC, runner=fake)
+    before = enroll._database_acl_state(docker, container_id=CONTAINER_ID)
+    assert before.privilege("hh_app", "CONNECT") is True
+
+    run_id = "1" * 32
+    journal_file.append(
+        "handoff",
+        {
+            "state": "intent",
+            "action": "grant_connect:hh_app",
+            "handoff": "app",
+            "role": "hh_app",
+            "database": "house_helper",
+            "operator": "owner",
+            "run_id": run_id,
+            "application_name": enrollment.handoff_application_name(run_id),
+            "before": before.as_journal(),
+        },
+    )
+    assert enrollment.pending_handoff_intents(journal_file.read().records)
+    assert _run_handoff(fake, journal_file) == enroll.EX_OK
+    payloads = [record.payload for record in _handoff_records(journal_file)]
+    reconciled = payloads[3]
+    assert reconciled["state"] == "outcome"
+    assert reconciled["run_id"] == run_id
+    assert reconciled["outcome"] == "reconciled"
+    assert reconciled["evidence"]["privileges_unchanged"] is True
+    assert reconciled["evidence"]["has_database_privilege"] is True
+    assert reconciled["evidence"]["transport"] == "not_attempted"
+    assert enrollment.pending_handoff_intents(journal_file.read().records) == ()
+
+
+def test_a_noop_intent_whose_acl_changed_stays_unknown(tmp_path):
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    assert _run_handoff(fake, journal_file) == enroll.EX_OK
+    docker = enroll.Docker(SPEC, runner=fake)
+    before = enroll._database_acl_state(docker, container_id=CONTAINER_ID)
+    run_id = "2" * 32
+    journal_file.append(
+        "handoff",
+        {
+            "state": "intent",
+            "action": "grant_connect:hh_app",
+            "handoff": "app",
+            "role": "hh_app",
+            "database": "house_helper",
+            "operator": "owner",
+            "run_id": run_id,
+            "application_name": enrollment.handoff_application_name(run_id),
+            "before": before.as_journal(),
+        },
+    )
+    fake._grant_connect("hh_backup")  # an out-of-band change after the intent
+    assert _run_handoff(fake, journal_file) == enroll.EX_UNKNOWN
+    outcomes = [
+        record.payload
+        for record in _handoff_records(journal_file)
+        if record.payload["run_id"] == run_id and record.payload["state"] == "outcome"
+    ]
+    assert outcomes == []
+    pending = enrollment.pending_handoff_intents(journal_file.read().records)
+    assert len(pending) == 1 and pending[0].payload["run_id"] == run_id
+
+
+def test_a_confirmed_launch_failure_is_resolved_not_started(tmp_path):
+    """A Popen failure with positive container-side absence is not a running operation."""
+    fake, journal_file = _enrolled_at_head(tmp_path)
+
+    def launch_error(tag, sql):
+        raise OSError("the docker client could not be launched")
+
+    fake.on_grant = launch_error
+    assert _run_handoff(fake, journal_file) == enroll.EX_REFUSED
+    assert fake.grants == []
+    payloads = [record.payload for record in _handoff_records(journal_file)]
+    assert [payload["state"] for payload in payloads] == ["intent", "outcome"]
+    assert payloads[1]["outcome"] == "failed"
+    assert payloads[1]["evidence"]["code"] == "client_not_started"
+    assert payloads[1]["evidence"]["privileges_unchanged"] is True
+    assert enrollment.pending_handoff_intents(journal_file.read().records) == ()
+
+
+def test_an_oserror_after_launch_stays_unknown(tmp_path):
+    """A client error is not proof that the operation never started (Finding 2)."""
+    fake, journal_file = _enrolled_at_head(tmp_path)
+
+    def post_launch_error(tag, sql):
+        fake._transport(tag, started=True, client_alive=True)
+        fake.delayed[tag] = sql
+        raise OSError("the pipe broke after launch")
+
+    fake.on_grant = post_launch_error
+    assert _run_handoff(fake, journal_file) == enroll.EX_UNKNOWN
+    assert fake.grants == []
+    assert [record.payload["state"] for record in _handoff_records(journal_file)] == [
+        "intent"
+    ]
+    assert enrollment.pending_handoff_intents(journal_file.read().records)
+
+
+def test_a_delayed_grant_cannot_be_cleared_by_a_later_handoff(tmp_path):
+    """Finding 1: H1 timeout -> H2 attempt -> delayed H1 completion."""
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    fake.on_grant = lambda tag, sql: "delayed_inflight"
+    assert _run_handoff(fake, journal_file, role="hh_app") == enroll.EX_UNKNOWN
+    assert [record.payload["role"] for record in _handoff_records(journal_file)] == [
+        "hh_app"
+    ]
+
+    # H2 is attempted while H1 is still in flight: it must be blocked, with no H2 intent.
+    fake.on_grant = None
+    assert _run_handoff(fake, journal_file, role="hh_provision") == enroll.EX_UNKNOWN
+    assert [record.payload["role"] for record in _handoff_records(journal_file)] == [
+        "hh_app"
+    ]
+    assert "hh_provision" not in fake.grants
+
+    # The delayed H1 now commits and terminates. Only now may the H2 handoff proceed.
+    delayed_tag = next(iter(fake.delayed))
+    fake.complete_delayed(delayed_tag, apply=True)
+    assert _run_handoff(fake, journal_file, role="hh_provision") == enroll.EX_OK
+    payloads = [record.payload for record in _handoff_records(journal_file)]
+    assert [payload["role"] for payload in payloads] == [
+        "hh_app",
+        "hh_app",
+        "hh_provision",
+        "hh_provision",
+    ]
+    assert payloads[1]["outcome"] == "reconciled"
+    assert payloads[1]["evidence"]["has_database_privilege"] is True
+    assert payloads[1]["evidence"]["applied"] is True
+    assert payloads[3]["outcome"] == "observed"
+    assert enrollment.pending_handoff_intents(journal_file.read().records) == ()
+
+
+@pytest.mark.parametrize("status", [2, -15, 124, 125])
+def test_a_docker_client_return_never_completes_an_active_operation(tmp_path, status):
+    """Finding 2: statuses 2, -15, 124 and 125 never stand in for termination.
+
+    Reproduces the Codex scenario: three overlapping H1 attempts were allowed while the
+    first operation was still active, and H2 then proceeded. Every return now probes the
+    tagged client/session first, and no new intent is appended until H1 is resolved.
+    """
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    fake.on_grant = lambda tag, sql: ("client_status", status)
+    assert _run_handoff(fake, journal_file, role="hh_app") == enroll.EX_UNKNOWN
+    assert fake.grants == []
+
+    for _ in range(3):
+        assert _run_handoff(fake, journal_file, role="hh_app") == enroll.EX_UNKNOWN
+    assert [record.payload["state"] for record in _handoff_records(journal_file)] == [
+        "intent"
+    ]
+
+    # H2 must not proceed while H1 is unresolved.
+    assert (
+        _run_handoff(fake, journal_file, role="hh_provision") == enroll.EX_UNKNOWN
+    )
+    assert [record.payload["role"] for record in _handoff_records(journal_file)] == [
+        "hh_app"
+    ]
+    assert "hh_provision" not in fake.grants
+
+    # Only positive termination of H1 releases H2.
+    fake.on_grant = None
+    tag = next(iter(fake.delayed))
+    fake.complete_delayed(tag, apply=True, psql_exit=status)
+    assert _run_handoff(fake, journal_file, role="hh_provision") == enroll.EX_OK
+    payloads = [record.payload for record in _handoff_records(journal_file)]
+    assert [payload["role"] for payload in payloads] == [
+        "hh_app",
+        "hh_app",
+        "hh_provision",
+        "hh_provision",
+    ]
+    assert payloads[1]["outcome"] == "reconciled"
+    assert payloads[1]["evidence"]["applied"] is True
+    assert enrollment.pending_handoff_intents(journal_file.read().records) == ()
+
+
+@pytest.mark.parametrize("psql_exit", [0, 2])
+def test_a_grant_committing_between_readback_and_probe_is_never_resolved_stale(
+    tmp_path, psql_exit
+):
+    """Finding 3: the ACL is read only after termination, never before it.
+
+    The delayed GRANT lands between the old readback point and the probe. Under the
+    corrected order the probe runs first and reports the operation still active, so the
+    intent stays UNKNOWN; the stale pre-state can never become `failed` (psql exit 0) or
+    `reconciled unchanged` (psql exit 2).
+    """
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    fake.on_grant = lambda tag, sql: ("delayed_readback", psql_exit)
+    assert _run_handoff(fake, journal_file, role="hh_app") == enroll.EX_UNKNOWN
+    assert [record.payload["state"] for record in _handoff_records(journal_file)] == [
+        "intent"
+    ]
+    assert fake.grants == []
+
+    tag = next(iter(fake.delayed))
+    fake.complete_delayed(tag, apply=True, psql_exit=psql_exit)
+    fake.on_grant = None
+    assert _run_handoff(fake, journal_file, role="hh_app") == enroll.EX_OK
+    payloads = [record.payload for record in _handoff_records(journal_file)]
+    assert payloads[1]["outcome"] == "reconciled"
+    assert payloads[1]["evidence"]["applied"] is True
+    assert payloads[1]["evidence"]["psql_exit"] == psql_exit
+    assert all(
+        payload["outcome"] != "failed"
+        for payload in payloads
+        if payload["state"] == "outcome"
+    )
+    assert enrollment.pending_handoff_intents(journal_file.read().records) == ()
+
+
+def test_a_container_replaced_at_grant_launch_is_never_granted(tmp_path):
+    """Finding 5: a replacement container with the same name is never a GRANT target."""
+    fake, journal_file = _enrolled_at_head(tmp_path)
+
+    def replace_container():
+        fake.container_id = "9" * 64
+
+    fake.on_handoff_exec = replace_container
+    assert _run_handoff(fake, journal_file) == enroll.EX_UNKNOWN
+    assert fake.grants == []
+    assert [record.payload["state"] for record in _handoff_records(journal_file)] == [
+        "intent"
+    ]
+    assert enrollment.pending_handoff_intents(journal_file.read().records)
+
+
+def test_the_handoff_mutation_and_probe_run_against_the_immutable_container_id(
+    tmp_path,
+):
+    """Finding 5: GRANT and probe never exec against the mutable Compose name."""
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    assert _run_handoff(fake, journal_file) == enroll.EX_OK
+    assert fake.handoff_exec_targets
+    assert set(fake.handoff_exec_targets) == {CONTAINER_ID}
+
+
+def test_an_unobservable_readback_keeps_the_intent_pending(tmp_path, capsys):
+    """Finding 2: an uncertain readback never becomes a resolution."""
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    fake.acl_matrix_fail_on_call = 2  # the post-grant observation
+    assert _run_handoff(fake, journal_file) == enroll.EX_UNKNOWN
+    assert fake.grants == ["hh_app"]
+    assert [record.payload["state"] for record in _handoff_records(journal_file)] == [
+        "intent"
+    ]
+    assert enrollment.pending_handoff_intents(journal_file.read().records)
+    assert "remains pending" in capsys.readouterr().err
+
+
+def test_a_pending_grant_with_a_grant_option_and_create_is_never_reconciled(
+    tmp_path, capsys
+):
+    """Finding 3.1: an unsafe pending ACL is never marked as reconciled."""
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    fake.on_grant = lambda tag, sql: "delayed_inflight"
+    assert _run_handoff(fake, journal_file, role="hh_app") == enroll.EX_UNKNOWN
+    tag = next(iter(fake.delayed))
+    fake.delayed.pop(tag)
+
+    # The delayed GRANT committed an unsafe effect: CONNECT WITH GRANT OPTION plus CREATE.
+    fake.grants.append("hh_app")
+    fake._grant_connect("hh_app")
+    fake.acl_entries[-1] = ("house_helper", "12", "hh_app", "CONNECT", "t")
+    fake.acl_entries.append(("house_helper", "12", "hh_app", "CREATE", "f"))
+    fake._transport(
+        tag, started=True, stopped=True, psql_exit=0, client_alive=False
+    )
+    capsys.readouterr()
+
+    assert _run_handoff(fake, journal_file, role="hh_provision") == enroll.EX_UNKNOWN
+    assert [record.payload["state"] for record in _handoff_records(journal_file)] == [
+        "intent"
+    ]
+    assert enrollment.pending_handoff_intents(journal_file.read().records)
+    error = capsys.readouterr().err
+    assert "remains UNKNOWN" in error
+    assert "hh_provision" not in fake.grants
+
+
+def test_an_unjournaled_connect_on_another_role_is_refused(tmp_path, capsys):
+    """Finding 3.2: CONNECT provenance is checked for every login role."""
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    fake._grant_connect("hh_backup")
+    assert _run_handoff(fake, journal_file, role="hh_app") == enroll.EX_REFUSED
+    assert fake.grants == []
+    assert _handoff_records(journal_file) == []
+    error = capsys.readouterr().err
+    assert "handoff_privilege" in error
+    assert "unrecorded_connect:hh_backup" in error
+
+
+def test_a_collateral_grant_to_another_role_fails_the_handoff(tmp_path):
+    """Finding 3.3: any privilege change outside the single CONNECT is collateral."""
+    fake, journal_file = _enrolled_at_head(tmp_path)
+
+    def collateral(tag, sql):
+        role = sql.split('TO "', 1)[1].split('"', 1)[0]
+        fake._grant_connect(role)
+        fake._grant_connect("hh_backup")
+        fake.acl_entries.append(("house_helper", "14", "hh_backup", "CREATE", "f"))
+        return "apply"
+
+    fake.on_grant = collateral
+    assert _run_handoff(fake, journal_file, role="hh_app") == enroll.EX_REFUSED
+    outcome = _handoff_records(journal_file)[-1].payload
+    assert outcome["outcome"] == "failed"
+    items = outcome["evidence"]["items"]
+    assert "acl_entry:hh_backup:CONNECT:0" in items
+    assert "unexpected_privilege:hh_backup:CREATE" in items
+    assert "create:hh_backup" in items
+
+
+def test_the_owners_inherent_grant_options_are_not_collateral_privileges():
+    """Real PostgreSQL materializes the owner's `CTc` entries with grant option."""
+    effective = tuple(
+        (
+            role,
+            privilege,
+            role == contract.OWNER_ROLE or (role == "hh_migrate" and privilege == "CONNECT"),
+        )
+        for privilege in contract.DATABASE_PRIVILEGES
+        for role in contract.PROJECT_ROLE_NAMES
+    )
+    state = enrollment.DatabaseAclState(
+        acl_materialized=True,
+        entries=(
+            ("hh_owner", "CONNECT", True),
+            ("hh_owner", "CREATE", True),
+            ("hh_owner", "TEMPORARY", True),
+            ("hh_migrate", "CONNECT", False),
+        ),
+        effective=effective,
+    )
+    assert enrollment.database_acl_failures(state, records=()) == ()
+
+
+def test_handoff_termination_requires_positive_client_liveness_evidence():
+    evidence = enrollment.HandoffTransportEvidence
+    assert enrollment.handoff_termination_failures(evidence(observed=False)) == (
+        "transport:unobserved",
+    )
+    assert enrollment.handoff_termination_failures(
+        evidence(observed=True, client_alive=True)
+    ) == ("transport:client_alive",)
+    assert enrollment.handoff_termination_failures(
+        evidence(observed=True, session_alive=True)
+    ) == ("transport:session_alive",)
+    assert enrollment.handoff_termination_failures(evidence(observed=True)) == (
+        "transport:never_started",
+    )
+    assert (
+        enrollment.handoff_termination_failures(evidence(observed=True, started=True))
+        == ()
+    )
+    assert (
+        enrollment.handoff_termination_failures(
+            evidence(observed=True, psql_exit=2)
+        )
+        == ()
+    )
+
+
+def test_an_intent_with_a_foreign_application_name_is_journal_corruption(tmp_path):
+    journal_file = journal.Journal(tmp_path / "cutover")
+    payload = _handoff_intent_payload("hh_app", "0" * 32)
+    payload["application_name"] = enrollment.handoff_application_name("1" * 32)
+    journal_file.append("handoff", payload)
+    with pytest.raises(enrollment.EnrollmentError) as refused:
+        enrollment.pending_handoff_intents(journal_file.read().records)
+    assert refused.value.code == "handoff_journal"
+
+
+def test_an_intent_without_its_recorded_pre_state_is_journal_corruption(tmp_path):
+    journal_file = journal.Journal(tmp_path / "cutover")
+    payload = _handoff_intent_payload("hh_app", "0" * 32)
+    del payload["before"]
+    journal_file.append("handoff", payload)
+    with pytest.raises(enrollment.EnrollmentError) as refused:
+        enrollment.pending_handoff_intents(journal_file.read().records)
+    assert refused.value.code == "handoff_journal"
+
+
+def _handoff_outcome_payload(role, run_id, *, outcome="observed", evidence=None):
+    return {
+        "state": "outcome",
+        "action": f"grant_connect:{role}",
+        "handoff": enrollment.HANDOFF_EVENTS[role],
+        "role": role,
+        "database": "house_helper",
+        "operator": "owner",
+        "run_id": run_id,
+        "outcome": outcome,
+        "evidence": (
+            evidence
+            if evidence is not None
+            else {"has_database_privilege": True, "changed": True}
+        ),
+    }
+
+
+def _connected_acl_state_journal(role):
+    base = enrollment.DatabaseAclState.from_journal(_acl_state_journal())
+    return enrollment.expected_after_handoff(base, role).as_journal()
+
+
+def test_a_structurally_valid_orphan_outcome_is_refused(tmp_path):
+    """Finding 4: an outcome with no matching prior intent can never authorize CONNECT."""
+    journal_file = journal.Journal(tmp_path / "cutover")
+    journal_file.append("handoff", _handoff_outcome_payload("hh_app", "0" * 32))
+    with pytest.raises(enrollment.EnrollmentError) as refused:
+        enrollment.pending_handoff_intents(journal_file.read().records)
+    assert refused.value.code == "handoff_journal"
+    with pytest.raises(enrollment.EnrollmentError):
+        enrollment.successful_handoff_roles(journal_file.read().records)
+
+
+def test_an_orphan_outcome_cannot_justify_an_otherwise_unjournaled_connect(tmp_path):
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    fake._grant_connect("hh_app")  # an out-of-band CONNECT with no journaled handoff
+    journal_file.append("handoff", _handoff_outcome_payload("hh_app", "0" * 32))
+    with pytest.raises(enrollment.EnrollmentError) as refused:
+        _run_handoff(fake, journal_file)
+    assert refused.value.code == "handoff_journal"
+    assert fake.grants == []
+
+
+def test_a_duplicate_outcome_is_journal_corruption(tmp_path):
+    journal_file = journal.Journal(tmp_path / "cutover")
+    run_id = "0" * 32
+    journal_file.append("handoff", _handoff_intent_payload("hh_app", run_id))
+    journal_file.append("handoff", _handoff_outcome_payload("hh_app", run_id))
+    journal_file.append("handoff", _handoff_outcome_payload("hh_app", run_id))
+    with pytest.raises(enrollment.EnrollmentError) as refused:
+        enrollment.pending_handoff_intents(journal_file.read().records)
+    assert refused.value.code == "handoff_journal"
+
+
+def test_a_duplicate_operation_id_is_journal_corruption(tmp_path):
+    journal_file = journal.Journal(tmp_path / "cutover")
+    run_id = "0" * 32
+    journal_file.append("handoff", _handoff_intent_payload("hh_app", run_id))
+    journal_file.append("handoff", _handoff_intent_payload("hh_app", run_id))
+    with pytest.raises(enrollment.EnrollmentError) as refused:
+        enrollment.pending_handoff_intents(journal_file.read().records)
+    assert refused.value.code == "handoff_journal"
+
+
+def test_an_outcome_before_any_intent_is_journal_corruption(tmp_path):
+    journal_file = journal.Journal(tmp_path / "cutover")
+    journal_file.append("handoff", _handoff_outcome_payload("hh_app", "0" * 32))
+    with pytest.raises(enrollment.EnrollmentError) as refused:
+        enrollment.successful_handoff_roles(journal_file.read().records)
+    assert refused.value.code == "handoff_journal"
+
+
+@pytest.mark.parametrize(
+    "outcome, evidence",
+    [
+        # claims a change its pre-state already contained
+        ("observed", {"has_database_privilege": True, "changed": True}),
+        # a failed outcome cannot establish the privilege
+        ("failed", {"has_database_privilege": True, "code": "server_refused"}),
+        # a reconciliation must be exactly applied or exactly unchanged
+        (
+            "reconciled",
+            {
+                "has_database_privilege": True,
+                "reconciled": True,
+                "applied": True,
+                "privileges_unchanged": True,
+            },
+        ),
+        # an observed outcome must record the observed privilege
+        ("observed", {"changed": True}),
+    ],
+)
+def test_a_semantically_inconsistent_history_is_refused(tmp_path, outcome, evidence):
+    journal_file = journal.Journal(tmp_path / "cutover")
+    run_id = "0" * 32
+    journal_file.append(
+        "handoff",
+        _handoff_intent_payload(
+            "hh_app", run_id, before=_connected_acl_state_journal("hh_app")
+        ),
+    )
+    journal_file.append(
+        "handoff",
+        _handoff_outcome_payload("hh_app", run_id, outcome=outcome, evidence=evidence),
+    )
+    with pytest.raises(enrollment.EnrollmentError) as refused:
+        enrollment.pending_handoff_intents(journal_file.read().records)
+    assert refused.value.code == "handoff_journal"
+
+
+def test_a_valid_noop_outcome_confirms_earlier_provenance(tmp_path):
+    journal_file = journal.Journal(tmp_path / "cutover")
+    first = "0" * 32
+    journal_file.append("handoff", _handoff_intent_payload("hh_app", first))
+    journal_file.append("handoff", _handoff_outcome_payload("hh_app", first))
+    noop = "1" * 32
+    journal_file.append(
+        "handoff",
+        _handoff_intent_payload(
+            "hh_app", noop, before=_connected_acl_state_journal("hh_app")
+        ),
+    )
+    journal_file.append(
+        "handoff",
+        _handoff_outcome_payload(
+            "hh_app",
+            noop,
+            evidence={"has_database_privilege": True, "changed": False},
+        ),
+    )
+    assert enrollment.pending_handoff_intents(journal_file.read().records) == ()
+    assert enrollment.successful_handoff_roles(journal_file.read().records) == {
+        "hh_app"
+    }
+
+
+def test_a_lone_noop_outcome_cannot_create_provenance(tmp_path):
+    """A no-op only confirms an earlier journaled CONNECT; it never launders one."""
+    journal_file = journal.Journal(tmp_path / "cutover")
+    run_id = "0" * 32
+    journal_file.append(
+        "handoff",
+        _handoff_intent_payload(
+            "hh_app", run_id, before=_connected_acl_state_journal("hh_app")
+        ),
+    )
+    journal_file.append(
+        "handoff",
+        _handoff_outcome_payload(
+            "hh_app",
+            run_id,
+            evidence={"has_database_privilege": True, "changed": False},
+        ),
+    )
+    with pytest.raises(enrollment.EnrollmentError) as refused:
+        enrollment.successful_handoff_roles(journal_file.read().records)
+    assert refused.value.code == "handoff_journal"
+
+
+def test_public_access_or_temporary_privilege_is_refused_before_the_intent(tmp_path):
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    fake.acl_entries.append(("house_helper", "0", "PUBLIC", "CONNECT", "f"))
+    fake.databases["house_helper"]["acl"] = True
+    assert _run_handoff(fake, journal_file) == enroll.EX_REFUSED
+    assert fake.grants == []
+    assert _handoff_records(journal_file) == []
+
+    fake2, journal_file2 = _enrolled_at_head(tmp_path / "second")
+    fake2.acl_entries.append(("house_helper", "12", "hh_app", "TEMPORARY", "f"))
+    fake2.databases["house_helper"]["acl"] = True
+    assert _run_handoff(fake2, journal_file2) == enroll.EX_REFUSED
+    assert fake2.grants == []
+    assert _handoff_records(journal_file2) == []
+
+
+def test_a_grant_with_a_grant_option_is_an_observed_failure(tmp_path):
+    class WithGrantOption(FakeDocker):
+        def _grant_connect(self, role):
+            self.databases["house_helper"]["acl"] = True
+            self.acl_entries.append(("house_helper", "12", role, "CONNECT", "t"))
+
+    fake = WithGrantOption()
+    journal_file = journal.Journal(tmp_path / "cutover")
+    enrollment.ModeA(
+        journal_file, _adapter(fake), token_source=lambda: "f" * 32
+    ).run()
+    head, _chart = contract.known_revision_chart()
+    fake.schema_versions = (head,)
+    fake.public_tables = tuple(sorted(contract.expected_tables()))
+    fake.inventory = _head_inventory()
+    assert _run_handoff(fake, journal_file) == enroll.EX_REFUSED
+    outcome = _handoff_records(journal_file)[-1].payload
+    assert outcome["state"] == "outcome" and outcome["outcome"] == "failed"
+    assert "grant_option:hh_app:CONNECT" in outcome["evidence"]["items"]
+    assert "acl_entry:hh_app:CONNECT:1" in outcome["evidence"]["items"]
+
+
+def test_a_grant_that_also_adds_another_privilege_is_an_observed_failure(tmp_path):
+    class WithExtraPrivilege(FakeDocker):
+        def _grant_connect(self, role):
+            super()._grant_connect(role)
+            self.acl_entries.append(("house_helper", "12", role, "CREATE", "f"))
+
+    fake = WithExtraPrivilege()
+    journal_file = journal.Journal(tmp_path / "cutover")
+    enrollment.ModeA(
+        journal_file, _adapter(fake), token_source=lambda: "f" * 32
+    ).run()
+    head, _chart = contract.known_revision_chart()
+    fake.schema_versions = (head,)
+    fake.public_tables = tuple(sorted(contract.expected_tables()))
+    fake.inventory = _head_inventory()
+    assert _run_handoff(fake, journal_file) == enroll.EX_REFUSED
+    outcome = _handoff_records(journal_file)[-1].payload
+    assert outcome["outcome"] == "failed"
+    assert "unexpected_privilege:hh_app:CREATE" in outcome["evidence"]["items"]
+    assert "create:hh_app" in outcome["evidence"]["items"]
+
+
+def test_grant_connect_names_only_the_serving_database_and_authorized_roles(tmp_path):
+    fake = FakeDocker()
+    docker = enroll.Docker(SPEC, runner=fake)
+    with pytest.raises(enroll.DockerError) as refused:
+        enroll.grant_connect(
+            docker, "postgres", run_id="0" * 32, container_id=CONTAINER_ID
+        )
+    assert refused.value.code == "handoff_role"
+    with pytest.raises(enroll.DockerError) as refused:
+        enroll.grant_connect(
+            docker,
+            "hh_app",
+            run_id="0" * 32,
+            container_id=CONTAINER_ID,
+            database="other_database",
+        )
+    assert refused.value.code == "handoff_database"
+    assert fake.grants == []
+
+
+def test_the_handoff_command_refuses_an_unauthorized_role_before_docker(monkeypatch):
+    class Args:
+        role = "hh_purge"
+        approved_by = "owner"
+
+    monkeypatch.setattr(
+        enroll, "load_spec", lambda *a, **k: pytest.fail("Docker must not be touched")
+    )
+    assert enroll._handoff_command(Args()) == enroll.EX_REFUSED
+
+
+@pytest.mark.parametrize(
+    "label",
+    ["  ", "bad\nlabel", "bad\x85label", "bad label", "x" * 201],
+)
+def test_the_handoff_command_requires_a_single_printable_operator_label(label):
+    class Args:
+        role = "hh_app"
+        approved_by = label
+
+    assert enroll._handoff_command(Args()) == enroll.EX_USAGE
+
+
+def test_the_handoff_cli_refuses_an_unauthorized_role_without_touching_docker(tmp_path):
+    code = enroll.main(
+        [
+            "--journal-dir",
+            str(tmp_path / "cutover"),
+            "handoff",
+            "--role",
+            "hh_purge",
+            "--approved-by",
+            "owner",
+        ]
+    )
+    assert code == enroll.EX_REFUSED
+
+
+def test_the_handoff_cli_refuses_a_blank_operator_label(tmp_path):
+    code = enroll.main(
+        [
+            "--journal-dir",
+            str(tmp_path / "cutover"),
+            "handoff",
+            "--role",
+            "hh_app",
+            "--approved-by",
+            "  ",
+        ]
+    )
+    assert code == enroll.EX_USAGE
+
+
+def test_a_malformed_handoff_payload_is_journal_corruption(tmp_path):
+    journal_file = journal.Journal(tmp_path / "cutover")
+    journal_file.append(
+        "handoff",
+        {
+            "state": "intent",
+            "action": "grant_connect:postgres",
+            "handoff": "app",
+            "role": "postgres",
+            "database": "house_helper",
+            "operator": "owner",
+            "run_id": "0" * 32,
+        },
+    )
+    with pytest.raises(enrollment.EnrollmentError) as refused:
+        enrollment.pending_handoff_intents(journal_file.read().records)
+    assert refused.value.code == "handoff_journal"
+
+
+def _handoff_intent_payload(role, run_id, *, before=None):
+    return {
+        "state": "intent",
+        "action": f"grant_connect:{role}",
+        "handoff": enrollment.HANDOFF_EVENTS[role],
+        "role": role,
+        "database": "house_helper",
+        "operator": "owner",
+        "run_id": run_id,
+        "application_name": enrollment.handoff_application_name(run_id),
+        "before": before if before is not None else _acl_state_journal(),
+    }
+
+
+def _acl_state_journal():
+    effective = tuple(
+        (role, privilege, False)
+        for privilege in contract.DATABASE_PRIVILEGES
+        for role in contract.PROJECT_ROLE_NAMES
+    )
+    return enrollment.DatabaseAclState(
+        acl_materialized=True, entries=(), effective=effective
+    ).as_journal()
+
+
+def test_a_cross_role_outcome_is_journal_corruption(tmp_path):
+    """Finding 4: an outcome may not be paired with another role's intent."""
+    journal_file = journal.Journal(tmp_path / "cutover")
+    run_id = "0" * 32
+    journal_file.append(
+        "handoff",
+        _handoff_intent_payload("hh_app", run_id),
+    )
+    journal_file.append(
+        "handoff",
+        {
+            "state": "outcome",
+            "action": "grant_connect:hh_provision",
+            "handoff": "provision",
+            "role": "hh_provision",
+            "database": "house_helper",
+            "operator": "owner",
+            "run_id": run_id,
+            "outcome": "observed",
+            "evidence": {"has_database_privilege": True, "changed": True},
+        },
+    )
+    with pytest.raises(enrollment.EnrollmentError) as refused:
+        enrollment.pending_handoff_intents(journal_file.read().records)
+    assert refused.value.code == "handoff_journal"
+    with pytest.raises(enrollment.EnrollmentError):
+        enrollment.successful_handoff_roles(journal_file.read().records)
+
+
+def test_a_tampered_journal_is_refused_before_a_handoff(tmp_path):
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    with journal_file.path.open("ab") as handle:
+        handle.write(b'{"not":"a valid record"}\n')
+    with pytest.raises(journal.JournalError):
+        _run_handoff(fake, journal_file)
+    assert fake.grants == []
+
+
+def test_status_reports_a_pending_handoff_as_unknown(tmp_path, capsys):
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    fake.on_grant = lambda tag, sql: "interrupt"
+    assert _run_handoff(fake, journal_file) == enroll.EX_UNKNOWN
+    capsys.readouterr()
+    assert enroll._print_status(journal_file) == enroll.EX_OK
+    output = capsys.readouterr().out
+    assert "handoff UNKNOWN" in output
+    assert "hh_app" in output

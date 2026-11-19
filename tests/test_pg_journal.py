@@ -101,6 +101,13 @@ def test_a_non_canonical_or_unsequenced_line_is_refused(tmp_path):
     journal.head_path.write_text(
         '{"digest":"sha256:' + "0" * 64 + '","seq":0}', encoding="utf-8"
     )
+    if os.name == "posix":
+        # `write_text` creates the files with the process umask; a permissive CI umask
+        # (e.g. 0002) would otherwise make `prepare()` refuse them as non-private before
+        # the canonical-line check this test is about runs. The permission contract itself
+        # is unchanged and still covered by `test_a_group_readable_journal_directory_is_refused`.
+        journal.path.chmod(0o600)
+        journal.head_path.chmod(0o600)
     with pytest.raises(pg_journal.JournalError) as refused:
         journal.read()
     assert refused.value.code in ("journal_not_canonical", "journal_corrupt", "journal_chain")
@@ -333,3 +340,61 @@ def test_a_group_readable_journal_directory_is_refused(tmp_path):
     with pytest.raises(pg_journal.JournalError) as refused:
         journal.read()
     assert refused.value.code == "journal_permissions"
+
+
+# --- the shared journal-directory / operation-lock contract ---------------------------------
+
+
+def test_two_spellings_of_one_directory_name_the_same_lock(tmp_path):
+    journal = _journal(tmp_path)
+    journal.prepare()
+    identity = journal.operation_lock_identity()
+    # The same directory opened twice is the same lock file.
+    again = pg_journal.Journal(journal.directory)
+    assert again.operation_lock_identity() == identity
+    # A trailing separator and a `.` component are the same underlying directory.
+    assert pg_journal.same_directory(str(journal.directory) + os.sep, journal.directory)
+    assert pg_journal.same_directory(journal.directory / ".", journal.directory)
+
+
+def test_a_symlink_to_the_same_directory_is_the_same_lock(tmp_path):
+    journal = _journal(tmp_path)
+    journal.prepare()
+    alias = tmp_path / "alias"
+    try:
+        alias.symlink_to(journal.directory, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("directory symlinks are unavailable here")
+    assert pg_journal.same_directory(alias, journal.directory)
+    assert pg_journal.Journal(alias).operation_lock_identity() == journal.operation_lock_identity()
+
+
+def test_different_directories_are_different_locks(tmp_path):
+    first = _journal(tmp_path, "cutover")
+    second = _journal(tmp_path, "cutover-2")
+    first.prepare()
+    second.prepare()
+    assert not pg_journal.same_directory(first.directory, second.directory)
+    assert first.operation_lock_identity() != second.operation_lock_identity()
+
+
+def test_a_conflicting_journal_directory_is_refused(tmp_path):
+    chosen = _journal(tmp_path, "cutover")
+    chosen.prepare()
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+
+    with pytest.raises(pg_journal.JournalError) as refused:
+        pg_journal.reject_conflicting_journal_directories(
+            chosen.directory,
+            environ={pg_journal.JOURNAL_DIRECTORY_ENV: str(other)},
+        )
+    assert refused.value.code == "journal_mismatch"
+
+    # The same directory (even spelled differently) is accepted, and an unset variable
+    # is not a conflict at all.
+    pg_journal.reject_conflicting_journal_directories(
+        chosen.directory,
+        environ={pg_journal.JOURNAL_DIRECTORY_ENV: str(chosen.directory) + os.sep},
+    )
+    pg_journal.reject_conflicting_journal_directories(chosen.directory, environ={})

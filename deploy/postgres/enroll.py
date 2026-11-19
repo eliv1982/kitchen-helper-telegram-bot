@@ -4,6 +4,7 @@
     python deploy/postgres/enroll.py status
     python deploy/postgres/enroll.py mode-a --approved-by <owner>
     python deploy/postgres/enroll.py verify
+    python deploy/postgres/enroll.py handoff --role <hh_app|hh_provision|hh_backup> --approved-by <owner>
     python deploy/postgres/enroll.py migrate
     python deploy/postgres/enroll.py check-credentials --credentials-dir <dir>
     python deploy/postgres/enroll.py plan-bootstrap-retirement
@@ -29,6 +30,16 @@ validate the digest chain, compare the recorded container identity, volume, imag
 database/predefined-role inventories, and refuse with a journaled
 `cluster_identity:mismatch` on any difference. There is no Mode A fallback.
 
+`handoff`: the ROL-16/HOF-01 connection handoff. One `GRANT CONNECT ON DATABASE
+house_helper` to exactly one of `hh_app` (H1), `hh_provision` (H2) or `hh_backup` (H3),
+after a Mode B identity/marker/inventory check and a schema-at-head gate. The intent -
+including the complete pre-state ACL and a run-id-derived `application_name` - is journaled
+before the statement. A non-zero psql status is classified by its exact meaning, and the
+outcome is journaled only when the operation's termination and the complete ACL are both
+established. An unobservable result stays UNKNOWN, blocks every later H1/H2/H3 transition,
+and is never cleared from an instantaneous snapshot. Repeated invocation is a no-op that
+records the observed state.
+
 `migrate`: after Mode B passes, write a bounded non-secret authorization record to the
 container's stdin (never argv, never the journal, never a file the web app can read) and
 run the `migrate` one-shot under Compose. The one-shot re-reads the live database, checks
@@ -46,8 +57,9 @@ No credential is generated, populated, printed or written. OD-8 remains open; th
 bootstrap password retirement is a printed plan only.
 
 Exit codes: 0 success, 1 internal, 2 usage, 3 refused, 4 environment unavailable,
-5 UNKNOWN (a migrate client timed out or was interrupted after launch; the outcome must be
-reconciled before another migrate).
+5 UNKNOWN (a migrate or handoff client timed out or was interrupted, or a handoff's
+termination/ACL could not be established; the outcome must be reconciled before another
+operation).
 """
 
 from __future__ import annotations
@@ -61,7 +73,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 if str(REPOSITORY_ROOT) not in sys.path:
@@ -281,6 +293,59 @@ class Docker:
             raise DockerError("container_identity", "the container inspection is not one object")
         return value[0]
 
+    def inspect_container_id(self, container_id: str) -> Mapping[str, Any]:
+        """Inspect the exact immutable container id, never a mutable name.
+
+        Every handoff mutation and observation is bound to the id Mode B verified. A
+        replacement container with the same name is therefore never a valid target: this
+        inspect names the old id, and `docker exec` names the old id too.
+        """
+        if not isinstance(container_id, str) or not _ID.fullmatch(container_id):
+            raise DockerError("container_identity", "the container id is malformed")
+        value = self._json(
+            ["docker", "inspect", "--type", "container", container_id]
+        )
+        if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], dict):
+            raise DockerError(
+                "container_identity", "the container inspection is not one object"
+            )
+        container = value[0]
+        if str(container.get("Id", "")) != container_id:
+            raise DockerError(
+                "container_identity", "the inspected container is not the verified one"
+            )
+        return container
+
+    def verify_handoff_container(self, container_id: str) -> Mapping[str, Any]:
+        """Re-verify the immutable identity before and after a handoff step (Finding 5).
+
+        The container is re-inspected by id, its full WP-2B identity is validated, and the
+        name must still resolve to the same id. A replaced, removed, stopped or
+        renamed-away container fails closed; the caller retains UNKNOWN or refuses before
+        any GRANT. The name is never used as the execution target.
+        """
+        container = self.inspect_container_id(container_id)
+        validate_container(self.spec, container)
+        named = self.inspect_container()
+        if str(named.get("Id", "")) != container_id:
+            raise DockerError(
+                "container_replacement",
+                "the container name no longer resolves to the verified container",
+            )
+        return container
+
+    def _exec_target(self, container_id: Optional[str]) -> str:
+        """The exact exec target: a validated immutable id, or the recorded name.
+
+        A handoff passes the id Mode B verified. Other read-only observations keep the
+        name, whose identity is validated at the start of their own operation.
+        """
+        if container_id is None:
+            return self.spec.container_name
+        if not isinstance(container_id, str) or not _ID.fullmatch(container_id):
+            raise DockerError("container_identity", "the container id is malformed")
+        return container_id
+
     def inspect_volume(self) -> Mapping[str, Any]:
         value = self._json(["docker", "volume", "inspect", self.spec.volume])
         if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], dict):
@@ -314,8 +379,14 @@ class Docker:
             if line.strip()
         )
 
-    def psql(self, database: str, sql: str) -> str:
-        """Run SQL as the container's `postgres` OS user over the local peer socket."""
+    def psql(
+        self, database: str, sql: str, *, container_id: Optional[str] = None
+    ) -> str:
+        """Run SQL as the container's `postgres` OS user over the local peer socket.
+
+        `container_id` binds a handoff observation to the exact container Mode B verified;
+        without it, the recorded name is used for the tool's other read-only operations.
+        """
         if database not in ("postgres", contract.SERVING_DATABASE):
             raise DockerError("psql_database", "the maintenance SQL names another database")
         if not isinstance(sql, str) or not sql.strip():
@@ -327,7 +398,7 @@ class Docker:
                 "-i",
                 "-u",
                 "postgres",
-                self.spec.container_name,
+                self._exec_target(container_id),
                 "psql",
                 "-X",
                 "-q",
@@ -1108,8 +1179,1000 @@ def verify_mode_b(
     )
 
 
+def pending_handoff_refusal(records: Iterable[journal.Record]) -> Optional[str]:
+    """LCK-08/LCK-13: an unresolved handoff blocks every operation that advances the machine.
+
+    The intent is never reinterpreted here. Only `handoff` may resolve it, after positive
+    termination and a complete ACL comparison, so this gate cannot deadlock reconciliation.
+    """
+    pending = enrollment.pending_handoff_intents(records)
+    if not pending:
+        return None
+    if len(pending) > 1:
+        return (
+            "more than one handoff intent has no observed outcome; each must be resolved "
+            "from its own evidence before another operation"
+        )
+    role = str(pending[0].payload.get("role", ""))
+    return (
+        f"the {role} handoff intent has no observed outcome; run "
+        f"`enroll.py handoff --role {role} --approved-by <owner>` to reconcile it before "
+        "another operation"
+    )
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# --- §7.3 CONNECT handoffs -------------------------------------------------------------------
+
+
+# --- the tagged handoff operation (Findings 1 and 2) -----------------------------------------
+#
+# A GRANT is executed in exactly one psql session whose `application_name` is derived from
+# the intent's run id. A tiny container-side wrapper records, under `/tmp`, that the client
+# started, its process ids and the psql exit status. The host never treats an instantaneous
+# privilege snapshot as proof that the operation is over: reconciliation requires the
+# tagged session and client to be gone (Finding 1). A non-zero psql status is classified by
+# its exact meaning; only `ON_ERROR_STOP` exit 3 is a definitive server refusal, and even
+# that is accepted only when the complete ACL readback shows the pre-state (Finding 2).
+
+HANDOFF_GRANT_WRAPPER_NAME = "house-helper-handoff"
+HANDOFF_PROBE_NAME = "house-helper-handoff-probe"
+# The client-side wait is deliberately longer than the in-container psql bound, so a host
+# timeout never races the client's own termination.
+_HANDOFF_CLIENT_TIMEOUT = 120
+_HANDOFF_CONTAINER_TIMEOUT = 60
+
+# The wrapper captures stdin to a private file BEFORE it starts anything. POSIX assigns
+# `/dev/null` as the standard input of an asynchronous list (job control is disabled in
+# this container), so the previous `psql ... <&0 &` form delivered zero bytes on the
+# pinned BusyBox runtime. Reading the stream synchronously into a file, then giving psql
+# that file, makes the SQL bytes deterministic and independent of shell redirection
+# ordering. The SQL is the fixed CONNECT statement for an allowlisted role; it is not a
+# secret, but the file is still created under `umask 077` and removed on exit.
+#
+# `timeout` is BusyBox: it exits 143 (128+SIGTERM), not 124, and that status says only
+# that the *command* was signalled. It is never treated as proof that PostgreSQL stopped
+# executing the statement; termination is decided by the tagged client/session probe.
+_HANDOFF_GRANT_SCRIPT = """\
+tag="$1"
+d=/tmp
+umask 077
+printf '%s' "$$" > "$d/$tag.wpid"
+printf '%s' "$$" > "$d/$tag.pid"
+printf started > "$d/$tag.start"
+sql="$d/$tag.sql"
+cat > "$sql" || exit 99
+trap 'printf stopped > "$d/$tag.stop"; rm -f "$sql"' EXIT
+timeout __HANDOFF_TIMEOUT__ env PGAPPNAME="$tag" psql \\
+  -X -q -v ON_ERROR_STOP=1 -v hh_handoff_tag="$tag" -d postgres -f "$sql" &
+child=$!
+printf '%s %s' "$$" "$child" > "$d/$tag.pid"
+wait "$child"
+rc=$?
+printf '%s' "$rc" > "$d/$tag.rc"
+exit "$rc"
+""".replace("__HANDOFF_TIMEOUT__", str(_HANDOFF_CONTAINER_TIMEOUT))
+
+# Prints the recorded completion and the liveness of the wrapper shell and psql. The tag
+# arrives in the environment, so neither the probe nor its subshells can match themselves;
+# a surviving wrapper/psql is matched by `kill -0`, its `comm` (a shell or psql, never the
+# `timeout`/`env` supervisors) and the tag in its `/proc/<pid>/cmdline`.
+_HANDOFF_PROBE_SCRIPT = """\
+# The tag arrives in the environment, never in this process's argv: the probe and its
+# subshells therefore cannot match their own cmdline in the fallback scan below, and a
+# reused pid that now belongs to the probe cannot impersonate the operation.
+tag="${HANDOFF_PROBE_TAG:?}"
+d=/tmp
+if [ -e "$d/$tag.start" ]; then echo started=1; else echo started=0; fi
+if [ -e "$d/$tag.stop" ]; then echo stopped=1; else echo stopped=0; fi
+if [ -e "$d/$tag.rc" ]; then printf 'rc='; cat "$d/$tag.rc"; printf '\\n'; else echo rc=; fi
+# A live client is the wrapper shell or the psql process itself. BusyBox `timeout`
+# and `env` are transport supervisors: their cmdline also carries the tag, and the
+# `timeout` supervisor can outlive a completed psql by a fraction of a second. They are
+# never evidence that the SQL client is still running; counting them would turn every
+# successful handoff into a spurious UNKNOWN.
+consider() {
+  pid="$1"
+  case "$pid" in ''|*[!0-9]*) return ;; esac
+  [ "$pid" = "$$" ] && return
+  kill -0 "$pid" 2>/dev/null || return
+  comm=$(cat "/proc/$pid/comm" 2>/dev/null) || return
+  case "$comm" in psql|sh|ash|dash) ;; *) return ;; esac
+  grep -aqF -- "$tag" "/proc/$pid/cmdline" 2>/dev/null && alive=1
+}
+alive=0
+if [ -e "$d/$tag.pid" ]; then
+  read -r wrapper child < "$d/$tag.pid" || true
+  consider "$wrapper"
+  consider "$child"
+fi
+if [ "$alive" = 0 ] && [ -e "$d/$tag.wpid" ]; then
+  read -r wrapper < "$d/$tag.wpid" || true
+  consider "$wrapper"
+fi
+# Fallback: an orphaned psql/shell may outlive a killed wrapper. Its argv carries the
+# tag (psql via `-v hh_handoff_tag`, the wrapper via `$1`), so a full /proc scan closes the
+# gap. The probe's own shell carries the tag in its environment, never its argv.
+if [ "$alive" = 0 ]; then
+  for p in /proc/[0-9]*; do
+    pid=${p#/proc/}
+    [ "$pid" = "$$" ] && continue
+    comm=$(cat "$p/comm" 2>/dev/null) || continue
+    case "$comm" in psql|sh|ash|dash) ;; *) continue ;; esac
+    cmd=$(tr '\\000' '\\n' < "$p/cmdline" 2>/dev/null) || continue
+    case "$cmd" in *"$tag"*) alive=1 ;; esac
+  done
+fi
+echo client=$alive
+"""
+
+
+@dataclass(frozen=True)
+class GrantAttempt:
+    """What the host observed of the Docker *client* only.
+
+    Nothing here establishes that the operation terminated. `returned=True` means the
+    client process exited; statuses such as 2, -15, 124 and 125 do not prove the tagged
+    psql session or wrapper is gone, so the container-side probe always decides.
+    `transport_error="client_error"` means `Popen` itself failed and no exec was ever
+    launched; that is a confirmed launch failure, not an inferred termination.
+    """
+
+    run_id: str
+    returned: bool
+    returncode: Optional[int]
+    transport_error: str = ""
+
+
+def _database_acl_state(
+    docker: Docker, *, container_id: Optional[str] = None
+) -> enrollment.DatabaseAclState:
+    """The complete serving-database ACL: materialization, explicit entries, effective matrix.
+
+    This is the Finding-3 observation. It reads every database privilege for every project
+    role plus every explicit `datacl` entry, so grant options, `CREATE`, `TEMPORARY`,
+    PUBLIC, foreign grantees and collateral changes cannot hide. A handoff reads it only
+    with the verified container id and only after termination is established.
+    """
+    rows = _rows(
+        docker.psql(
+            "postgres",
+            contract.database_acl_matrix_sql(contract.SERVING_DATABASE),
+            container_id=container_id,
+        )
+    )
+    expected_columns = 1 + len(contract.DATABASE_PRIVILEGES) * len(
+        contract.PROJECT_ROLE_NAMES
+    )
+    if len(rows) != 1 or len(rows[0]) != expected_columns:
+        raise DockerError(
+            "handoff_observation", "the database ACL matrix could not be read"
+        )
+    materialized = _boolean_value(rows[0][0])
+    effective: list[tuple[str, str, bool]] = []
+    offset = 1
+    for privilege in contract.DATABASE_PRIVILEGES:
+        for index, role in enumerate(contract.PROJECT_ROLE_NAMES):
+            effective.append(
+                (role, privilege, _boolean_value(rows[0][offset + index]))
+            )
+        offset += len(contract.PROJECT_ROLE_NAMES)
+    entries: list[tuple[str, str, bool]] = []
+    for row in _rows(
+        docker.psql(
+            "postgres", contract.DATABASE_ACLS_SQL, container_id=container_id
+        )
+    ):
+        if len(row) != 5:
+            raise DockerError("handoff_observation", "a database ACL row is malformed")
+        database, _grantee_oid, grantee, privilege, grantable = row
+        if str(database) != contract.SERVING_DATABASE:
+            continue
+        if privilege not in contract.DATABASE_PRIVILEGES:
+            raise DockerError(
+                "handoff_observation",
+                "a database ACL row names an unknown privilege",
+            )
+        entries.append((str(grantee), str(privilege), _boolean_value(grantable)))
+    return enrollment.DatabaseAclState(
+        acl_materialized=materialized,
+        entries=tuple(entries),
+        effective=tuple(effective),
+    )
+
+
+def _acl_evidence(state: enrollment.DatabaseAclState, role: str) -> dict[str, bool]:
+    return {
+        "has_database_privilege": state.privilege(role, "CONNECT") is True,
+        "has_temporary": state.privilege(role, "TEMPORARY") is True,
+        "has_create": state.privilege(role, "CREATE") is True,
+    }
+
+
+def _grant_connect_transport(
+    docker: Docker, role: str, run_id: str, *, container_id: str
+) -> GrantAttempt:
+    """Run exactly the authorized GRANT through the tagged, bounded wrapper.
+
+    No SQL text reaches argv: the statement is the fixed literal for the allowlisted role
+    and database, and it travels on stdin. The tag is passed as an argument, never
+    interpolated into the shell script. The exec target is the immutable container id Mode
+    B verified, never the mutable Compose name (Finding 5).
+    """
+    tag = enrollment.handoff_application_name(run_id)
+    sql = (
+        f'GRANT CONNECT ON DATABASE "{contract.SERVING_DATABASE}" TO "{role}";\n'
+    )
+    argv = [
+        "docker",
+        "exec",
+        "-i",
+        "-u",
+        "postgres",
+        docker._exec_target(container_id),
+        "sh",
+        "-c",
+        _HANDOFF_GRANT_SCRIPT,
+        HANDOFF_GRANT_WRAPPER_NAME,
+        tag,
+    ]
+    try:
+        done = docker.runner(
+            argv,
+            input=sql.encode("utf-8"),
+            capture_output=True,
+            timeout=_HANDOFF_CLIENT_TIMEOUT,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return GrantAttempt(run_id, False, None, "timeout")
+    except OSError:
+        return GrantAttempt(run_id, False, None, "client_error")
+    return GrantAttempt(run_id, True, int(done.returncode), "")
+
+
+def _handoff_transport(
+    docker: Docker, run_id: str, *, container_id: str
+) -> enrollment.HandoffTransportEvidence:
+    """The operation's completion/liveness evidence; never inferred from the ACL.
+
+    Both halves are read inside the exact verified container: the tagged client/wrapper
+    processes (the positive-absence probe) and the tagged PostgreSQL backend
+    (`pg_stat_activity`). Either being alive, or the probe failing, keeps the result
+    unobserved/alive and therefore UNKNOWN.
+    """
+    tag = enrollment.handoff_application_name(run_id)
+
+    def unobserved() -> enrollment.HandoffTransportEvidence:
+        return enrollment.HandoffTransportEvidence(run_id=run_id, observed=False)
+
+    try:
+        done = docker.runner(
+            [
+                "docker",
+                "exec",
+                "-e",
+                f"HANDOFF_PROBE_TAG={tag}",
+                "-u",
+                "postgres",
+                docker._exec_target(container_id),
+                "sh",
+                "-c",
+                _HANDOFF_PROBE_SCRIPT,
+                HANDOFF_PROBE_NAME,
+            ],
+            capture_output=True,
+            timeout=_HANDOFF_CLIENT_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return unobserved()
+    if done.returncode != 0:
+        return unobserved()
+    values: dict[str, str] = {}
+    for line in done.stdout.decode("utf-8", "replace").splitlines():
+        key, separator, value = line.partition("=")
+        if not separator:
+            return unobserved()
+        values[key.strip()] = value.strip()
+    if not {"started", "stopped", "rc", "client"} <= set(values):
+        return unobserved()
+    try:
+        psql_exit = int(values["rc"]) if values["rc"] else None
+    except ValueError:
+        return unobserved()
+    try:
+        rows = _rows(
+            docker.psql(
+                "postgres",
+                contract.handoff_session_sql(tag),
+                container_id=container_id,
+            )
+        )
+        if len(rows) != 1 or len(rows[0]) != 1:
+            return unobserved()
+        session_alive = int(rows[0][0]) > 0
+    except (DockerError, contract.ContractError, ValueError):
+        return unobserved()
+    return enrollment.HandoffTransportEvidence(
+        run_id=run_id,
+        observed=True,
+        started=values["started"] == "1",
+        stopped=values["stopped"] == "1",
+        psql_exit=psql_exit,
+        client_alive=values["client"] == "1",
+        session_alive=session_alive,
+    )
+
+
+def grant_connect(
+    docker: Docker,
+    role: str,
+    *,
+    run_id: str,
+    container_id: str,
+    database: str = contract.SERVING_DATABASE,
+) -> GrantAttempt:
+    """Issue exactly `GRANT CONNECT ON DATABASE house_helper TO <authorized role>`.
+
+    The role is an allowlisted constant and the database is the serving one; neither is
+    interpolated from operator input. There is deliberately no path to a broad grant,
+    SUPERUSER, another database or a role outside the three P0 handoffs. The GRANT runs
+    only against the immutable container id Mode B verified. The returned `GrantAttempt`
+    distinguishes a returned client from a timeout/interruption; it never turns the psql
+    status into an outcome by itself.
+    """
+    if role not in enrollment.HANDOFF_ROLES:
+        raise DockerError("handoff_role", "the role is not an authorized handoff role")
+    if database != contract.SERVING_DATABASE:
+        raise DockerError("handoff_database", "the handoff names another database")
+    enrollment.handoff_application_name(run_id)
+    return _grant_connect_transport(
+        docker, role, run_id, container_id=container_id
+    )
+
+
+def _handoff_outcome(
+    journal_file: journal.Journal,
+    intent: Mapping[str, Any],
+    *,
+    outcome: str,
+    operator: str,
+    evidence: Mapping[str, Any],
+    clock=None,
+) -> journal.Record:
+    return journal_file.append(
+        "handoff",
+        {
+            "state": "outcome",
+            "action": intent["action"],
+            "handoff": intent["handoff"],
+            "role": intent["role"],
+            "database": contract.SERVING_DATABASE,
+            "run_id": intent["run_id"],
+            "outcome": outcome,
+            "operator": operator,
+            "evidence": dict(evidence),
+        },
+        at=(clock or _utcnow)(),
+    )
+
+
+_HANDOFF_MAX_ATTEMPTS = 3
+_HANDOFF_RETRY = "retry"
+
+
+def _resolve_pending_handoffs(
+    docker: Docker,
+    journal_file: journal.Journal,
+    *,
+    operator: str,
+    container_id: str,
+    clock=None,
+) -> Optional[tuple[str, int]]:
+    """Resolve an earlier UNKNOWN, or explain why a new transition is blocked.
+
+    Finding 1: a new H1/H2/H3 intent is never appended while an earlier one is unresolved.
+    Resolution requires BOTH positive termination of the original tagged operation and a
+    complete ACL state that is exactly its recorded pre-state or its exact single-CONNECT
+    post-state. The ACL is therefore read only AFTER termination is established; an
+    instantaneous privilege snapshot is never enough. An intent whose recorded pre-state
+    already held CONNECT never issued a GRANT, so it has no operation to terminate and is
+    resolved from the exact pre-state alone.
+    """
+    pending = enrollment.pending_handoff_intents(journal_file.read().records)
+    if not pending:
+        return None
+    if len(pending) > 1:
+        return (
+            "unknown [handoff]: more than one handoff intent has no outcome; no new "
+            "handoff was attempted. Each must be resolved from its own evidence.",
+            EX_UNKNOWN,
+        )
+    intent = pending[0]
+    payload = intent.payload
+    run_id = payload["run_id"]
+    role = payload["role"]
+    before = enrollment.DatabaseAclState.from_journal(
+        payload["before"], where=f"seq {intent.seq}"
+    )
+    # A no-op intent (the role already held CONNECT when the intent was written) never
+    # issued a GRANT, so there is no tagged operation to terminate. Its only safe
+    # resolution is the exact pre-state with the fence intact; requiring termination
+    # evidence for an operation that never existed would keep it UNKNOWN forever.
+    noop = before.privilege(role, "CONNECT") is True
+    evidence: Optional[enrollment.HandoffTransportEvidence] = None
+    try:
+        docker.verify_handoff_container(container_id)
+        if not noop:
+            evidence = _handoff_transport(docker, run_id, container_id=container_id)
+            termination = enrollment.handoff_termination_failures(evidence)
+            if termination:
+                return (
+                    f"unknown [handoff]: the {role} intent at seq {intent.seq} remains "
+                    "UNKNOWN: the original operation's termination is not established ("
+                    + ", ".join(termination)
+                    + "); no new handoff was attempted.",
+                    EX_UNKNOWN,
+                )
+        after = _database_acl_state(docker, container_id=container_id)
+    except DockerError:
+        return (
+            f"unknown [handoff]: the {role} intent at seq {intent.seq} remains UNKNOWN: "
+            "the live ACL or the verified container could not be observed; no new "
+            "handoff was attempted.",
+            EX_UNKNOWN,
+        )
+    decision, failures = enrollment.reconcile_acl_decision(
+        before,
+        after,
+        role,
+        records=journal_file.read().records,
+    )
+    if decision == "unsafe":
+        return (
+            f"unknown [handoff]: the {role} intent at seq {intent.seq} remains UNKNOWN: "
+            "the observed ACL is neither its recorded pre-state nor its exact "
+            "single-CONNECT post-state (" + ", ".join(failures) + "); no new handoff was "
+            "attempted.",
+            EX_UNKNOWN,
+        )
+    observation = {
+        **_acl_evidence(after, role),
+        "reconciled": True,
+        "psql_exit": None if evidence is None else evidence.psql_exit,
+        "transport": "not_attempted" if evidence is None else "client_gone",
+    }
+    if decision == "applied":
+        observation["applied"] = True
+    else:
+        observation["privileges_unchanged"] = True
+    _handoff_outcome(
+        journal_file,
+        payload,
+        outcome="reconciled",
+        operator=operator,
+        evidence=observation,
+        clock=clock,
+    )
+    return None
+
+
+def _record_handoff_attempt(
+    journal_file: journal.Journal,
+    intent: Mapping[str, Any],
+    *,
+    role: str,
+    before: enrollment.DatabaseAclState,
+    after: enrollment.DatabaseAclState,
+    attempt: Optional[GrantAttempt],
+    evidence: Optional[enrollment.HandoffTransportEvidence],
+    changed: bool,
+    operator: str,
+    clock=None,
+) -> Any:
+    """Classify one attempt from termination and the complete ACL, never the client alone.
+
+    Findings 1-3 in one place: an ambiguous client outcome is decided only after the
+    operation is proven terminated AND the ACL is exactly the pre-state or the expected
+    post-state; a definitive psql refusal is recorded `failed` only if the readback still
+    shows the pre-state; an unsafe state is never recorded as a successful reconciliation.
+    """
+    records = journal_file.read().records
+    event = enrollment.HANDOFF_EVENTS[role]
+
+    if not changed:
+        if not enrollment.acl_state_equal(before, after):
+            print(
+                "unknown [handoff]: the privilege state changed during an intended no-op "
+                "handoff; the intent remains pending.",
+                file=sys.stderr,
+            )
+            return EX_UNKNOWN
+        failures = enrollment.database_acl_failures(after, records=records)
+        if failures:
+            print(
+                "unknown [handoff]: the no-op handoff state is not the ACL contract ("
+                + ", ".join(failures)
+                + "); the intent remains pending.",
+                file=sys.stderr,
+            )
+            return EX_UNKNOWN
+        record = _handoff_outcome(
+            journal_file,
+            intent,
+            outcome="observed",
+            operator=operator,
+            evidence={
+                **_acl_evidence(after, role),
+                "changed": False,
+                "transport": "not_attempted",
+                "psql_exit": None,
+            },
+            clock=clock,
+        )
+        print(
+            f"ok [handoff]: {role} already holds CONNECT on "
+            f"{contract.SERVING_DATABASE}; nothing was changed "
+            f"(journal seq {record.seq}, event handoff:{event})."
+        )
+        return EX_OK
+
+    assert attempt is not None
+
+    # A confirmed launch failure is not a client return and not an inferred termination:
+    # `Popen` itself failed, so no exec was ever sent. It may be resolved only when the
+    # complete ACL is still the recorded pre-state and the fence is intact.
+    if attempt.transport_error == "client_error":
+        if enrollment.acl_state_equal(before, after) and not enrollment.database_acl_failures(
+            after, records=records
+        ):
+            _handoff_outcome(
+                journal_file,
+                intent,
+                outcome="failed",
+                operator=operator,
+                evidence={
+                    "code": "client_not_started",
+                    "psql_exit": None,
+                    "privileges_unchanged": True,
+                },
+                clock=clock,
+            )
+            print(
+                "refused [handoff]: the GRANT client could not be launched, so no GRANT "
+                "was sent; the intent is resolved as failed and the readback shows the "
+                "privilege unchanged.",
+                file=sys.stderr,
+            )
+            return EX_REFUSED
+        print(
+            "unknown [handoff]: the GRANT client could not be launched but the readback "
+            "is not the recorded pre-state; the intent remains pending.",
+            file=sys.stderr,
+        )
+        return EX_UNKNOWN
+
+    # Termination is established ONLY by the container-side evidence, never by the Docker
+    # client's return status (2, -15, 124, 125, ...). The caller has already read the ACL
+    # after this gate; re-checking here keeps the classification self-contained.
+    assert evidence is not None
+    termination_failures = enrollment.handoff_termination_failures(evidence)
+    if termination_failures:
+        print(
+            "unknown [handoff]: the GRANT operation's termination is not established ("
+            + ", ".join(termination_failures)
+            + "); the intent remains pending. Run the same command again to reconcile.",
+            file=sys.stderr,
+        )
+        return EX_UNKNOWN
+    psql_exit = evidence.psql_exit
+    transport = "client_returned" if attempt.returned else "client_gone"
+
+    # A definitive server refusal needs the container-side completion status: the exit-3
+    # meaning comes from psql's ON_ERROR_STOP, not from a generic client failure. BusyBox
+    # `timeout` exits 143, which is ambiguous and is handled by the ACL comparison below.
+    if psql_exit == enrollment.GRANT_SERVER_REFUSED:
+        if enrollment.acl_state_equal(before, after) and not enrollment.database_acl_failures(
+            after, records=records
+        ):
+            _handoff_outcome(
+                journal_file,
+                intent,
+                outcome="failed",
+                operator=operator,
+                evidence={
+                    "code": "server_refused",
+                    "psql_exit": psql_exit,
+                    "privileges_unchanged": True,
+                },
+                clock=clock,
+            )
+            print(
+                "refused [handoff]: PostgreSQL refused the CONNECT grant; the intent is "
+                "resolved as failed and the readback shows the privilege unchanged.",
+                file=sys.stderr,
+            )
+            return EX_REFUSED
+        print(
+            "unknown [handoff]: the GRANT client reported a server refusal but the readback "
+            "is not the recorded pre-state; the intent remains pending.",
+            file=sys.stderr,
+        )
+        return EX_UNKNOWN
+
+    if psql_exit == enrollment.GRANT_SUCCEEDED:
+        failures = enrollment.acl_transition_failures(
+            before, after, role, records=records
+        )
+        if not failures:
+            record = _handoff_outcome(
+                journal_file,
+                intent,
+                outcome="observed",
+                operator=operator,
+                evidence={
+                    **_acl_evidence(after, role),
+                    "changed": True,
+                    "psql_exit": psql_exit,
+                    "transport": transport,
+                },
+                clock=clock,
+            )
+            print(
+                f"ok [handoff]: granted CONNECT on {contract.SERVING_DATABASE} to {role} "
+                f"(journal seq {record.seq}, event handoff:{event})."
+            )
+            return EX_OK
+        _handoff_outcome(
+            journal_file,
+            intent,
+            outcome="failed",
+            operator=operator,
+            evidence={"items": list(failures), "psql_exit": psql_exit},
+            clock=clock,
+        )
+        print(
+            "refused [handoff]: the observed privilege state is not the handoff contract ("
+            + ", ".join(failures)
+            + "); the intent is resolved as failed.",
+            file=sys.stderr,
+        )
+        return EX_REFUSED
+
+    # An ambiguous psql/transport status. The operation is terminated (above); only the
+    # complete ACL comparison may decide whether the GRANT committed.
+    decision, failures = enrollment.reconcile_acl_decision(
+        before, after, role, records=records
+    )
+    if decision == "unsafe":
+        print(
+            "unknown [handoff]: the operation terminated but the observed ACL is neither its "
+            "recorded pre-state nor its exact single-CONNECT post-state ("
+            + ", ".join(failures)
+            + "); the intent remains pending.",
+            file=sys.stderr,
+        )
+        return EX_UNKNOWN
+    observation = {
+        **_acl_evidence(after, role),
+        "reconciled": True,
+        "psql_exit": psql_exit,
+        "transport": transport,
+    }
+    if decision == "applied":
+        observation["applied"] = True
+        record = _handoff_outcome(
+            journal_file,
+            intent,
+            outcome="reconciled",
+            operator=operator,
+            evidence=observation,
+            clock=clock,
+        )
+        print(
+            f"ok [handoff]: the GRANT committed despite the client outcome; reconciled from "
+            f"the complete ACL (journal seq {record.seq}, event handoff:{event})."
+        )
+        return EX_OK
+    observation["privileges_unchanged"] = True
+    _handoff_outcome(
+        journal_file,
+        intent,
+        outcome="reconciled",
+        operator=operator,
+        evidence=observation,
+        clock=clock,
+    )
+    print(
+        "ok [handoff]: the GRANT client failed without applying the change; the intent was "
+        "reconciled as unchanged. Retrying the handoff.",
+        file=sys.stderr,
+    )
+    return _HANDOFF_RETRY
+
+
+def run_handoff(
+    docker: Docker,
+    journal_file: journal.Journal,
+    adapter: ClusterAdapter,
+    *,
+    role: str,
+    approved_by: str,
+    clock=None,
+) -> int:
+    """Journaled H1/H2/H3 CONNECT handoff (ROL-16, HOF-01/HOF-02, LCK-07/LCK-08).
+
+    One host operation, under `operation.lock`: Mode B identity+marker+inventory
+    verification, a schema-at-head gate, resolution of every earlier UNKNOWN from positive
+    termination plus the complete ACL, then one intent, at most one GRANT, and one outcome.
+
+    A GRANT whose client outcome is ambiguous is never recorded `failed`. If the operation
+    has terminated, the complete ACL decides between "applied" and "unchanged"; otherwise
+    the intent stays pending and every later H1/H2/H3 transition is blocked until evidence
+    establishes termination (Findings 1 and 2). Every ACL check is total (Finding 3).
+    """
+    if role not in enrollment.HANDOFF_ROLES:
+        raise enrollment.EnrollmentError(
+            "handoff_role", "the role is not an authorized handoff role"
+        )
+    with journal_file.operation_lock():
+        view = journal_file.read()
+        if enrollment.pending_migration_unknown(view.records) is not None:
+            raise enrollment.EnrollmentError(
+                "migration_unknown",
+                "an earlier migrate run has no observed outcome; run "
+                "`enroll.py reconcile-migration` before a handoff",
+            )
+        verdict = enrollment.mode_b(view.records, adapter.mode_b_observation())
+        if not verdict.ok:
+            enrollment.record_mismatch(journal_file, verdict, clock=clock)
+            print(
+                "refused [cluster_identity]: Mode B found a mismatch: "
+                + ", ".join(verdict.mismatches),
+                file=sys.stderr,
+            )
+            return EX_REFUSED
+        observation = verdict.observed
+        # Finding 5: every mutation, probe and readback of this handoff is bound to the
+        # exact immutable container id Mode B verified. The name is never an exec target.
+        container_id = observation.identity.container_id
+        try:
+            docker.verify_handoff_container(container_id)
+        except DockerError:
+            print(
+                "refused [container_identity]: the verified PostgreSQL container could not "
+                "be re-established; CONNECT was not granted.",
+                file=sys.stderr,
+            )
+            return EX_REFUSED
+        state, schema_failures = contract.classify_schema_state(
+            versions=observation.schema_versions,
+            public_tables=observation.public_tables,
+            schema_contract_present=bool(observation.default_acls),
+        )
+        if state != contract.SCHEMA_HEAD or schema_failures:
+            print(
+                "refused [schema_not_head]: the enrolled database is not initialized at "
+                "this image's head; CONNECT was not granted.",
+                file=sys.stderr,
+            )
+            return EX_REFUSED
+
+        for _attempt_number in range(_HANDOFF_MAX_ATTEMPTS):
+            blocked = _resolve_pending_handoffs(
+                docker,
+                journal_file,
+                operator=approved_by,
+                container_id=container_id,
+                clock=clock,
+            )
+            if blocked is not None:
+                message, code = blocked
+                print(message, file=sys.stderr)
+                return code
+
+            records = journal_file.read().records
+            try:
+                before = _database_acl_state(docker, container_id=container_id)
+            except DockerError:
+                print(
+                    "unknown [handoff]: the live ACL could not be observed; nothing was "
+                    "changed and no intent was appended.",
+                    file=sys.stderr,
+                )
+                return EX_UNKNOWN
+
+            if before.privilege(role, "CONNECT") is True and role not in (
+                enrollment.successful_handoff_roles(records)
+            ):
+                print(
+                    f"refused [handoff_unrecorded]: {role} already holds CONNECT on "
+                    f"{contract.SERVING_DATABASE} without a journaled handoff; this change "
+                    "was not made by this tool. Revoke it and run the handoff again.",
+                    file=sys.stderr,
+                )
+                return EX_REFUSED
+            failures = enrollment.database_acl_failures(before, records=records)
+            if failures:
+                print(
+                    "refused [handoff_privilege]: the database privilege fence is not in the "
+                    "handoff state (" + ", ".join(failures) + "); nothing was changed.",
+                    file=sys.stderr,
+                )
+                return EX_REFUSED
+
+            run_id = os.urandom(16).hex()
+            intent = {
+                "state": "intent",
+                "action": f"grant_connect:{role}",
+                "handoff": enrollment.HANDOFF_EVENTS[role],
+                "role": role,
+                "database": contract.SERVING_DATABASE,
+                "operator": approved_by,
+                "run_id": run_id,
+                "application_name": enrollment.handoff_application_name(run_id),
+                "before": before.as_journal(),
+            }
+            journal_file.append("handoff", intent, at=(clock or _utcnow)())
+            changed = before.privilege(role, "CONNECT") is not True
+            attempt: Optional[GrantAttempt] = None
+            evidence: Optional[enrollment.HandoffTransportEvidence] = None
+            try:
+                if changed:
+                    # Re-verify immediately before the mutation: a replacement container
+                    # with the same name is refused, never silently exercised (Finding 5).
+                    docker.verify_handoff_container(container_id)
+                    attempt = grant_connect(
+                        docker, role, run_id=run_id, container_id=container_id
+                    )
+            except KeyboardInterrupt:
+                print(
+                    "unknown [handoff]: interrupted while the GRANT client was running; the "
+                    "intent remains pending. Run the same command again to reconcile.",
+                    file=sys.stderr,
+                )
+                return EX_UNKNOWN
+            except DockerError:
+                print(
+                    "unknown [handoff]: the verified container's identity changed before the "
+                    "GRANT; the intent remains pending and no GRANT was sent.",
+                    file=sys.stderr,
+                )
+                return EX_UNKNOWN
+            try:
+                if changed:
+                    # Finding 3: establish termination from the tagged client/session BEFORE
+                    # the ACL snapshot. A GRANT committing in this window then appears in the
+                    # readback instead of being masked by a stale pre-state.
+                    evidence = _handoff_transport(
+                        docker, run_id, container_id=container_id
+                    )
+                    if attempt is not None and attempt.transport_error == "client_error":
+                        # A Popen failure is a *candidate* launch failure, not proof. Only
+                        # positive container-side evidence that the wrapper never started
+                        # and no tagged client/session exists may resolve it; an OSError
+                        # raised after a launch must stay UNKNOWN.
+                        never_started = (
+                            evidence.observed
+                            and not evidence.started
+                            and not evidence.client_alive
+                            and not evidence.session_alive
+                        )
+                        if not never_started:
+                            print(
+                                "unknown [handoff]: the GRANT client failed but the container "
+                                "does not prove that no operation started; the intent remains "
+                                "pending. Run the same command again to reconcile.",
+                                file=sys.stderr,
+                            )
+                            return EX_UNKNOWN
+                    else:
+                        termination = enrollment.handoff_termination_failures(evidence)
+                        if termination:
+                            print(
+                                "unknown [handoff]: the GRANT operation's termination is not "
+                                "established (" + ", ".join(termination) + "); the intent "
+                                "remains pending. Run the same command again to reconcile.",
+                                file=sys.stderr,
+                            )
+                            return EX_UNKNOWN
+                    # The readback must still come from the verified container.
+                    docker.verify_handoff_container(container_id)
+                after = _database_acl_state(docker, container_id=container_id)
+            except KeyboardInterrupt:
+                print(
+                    "unknown [handoff]: interrupted while the handoff outcome was being "
+                    "observed; the intent remains pending. Run the same command again to "
+                    "reconcile.",
+                    file=sys.stderr,
+                )
+                return EX_UNKNOWN
+            except DockerError:
+                print(
+                    "unknown [handoff]: the live ACL could not be observed after the handoff "
+                    "attempt; the intent remains pending. Run the same command again to "
+                    "reconcile.",
+                    file=sys.stderr,
+                )
+                return EX_UNKNOWN
+            result = _record_handoff_attempt(
+                journal_file,
+                intent,
+                role=role,
+                before=before,
+                after=after,
+                attempt=attempt,
+                evidence=evidence,
+                changed=changed,
+                operator=approved_by,
+                clock=clock,
+            )
+            if result == _HANDOFF_RETRY:
+                continue
+            return result
+        print(
+            "refused [handoff]: the handoff did not apply after "
+            f"{_HANDOFF_MAX_ATTEMPTS} attempts; each attempt's ambiguous outcome was "
+            "reconciled from the complete ACL and every intent has an outcome. Run the "
+            "command again to retry.",
+            file=sys.stderr,
+        )
+        return EX_REFUSED
+
+
+def _approved_by(value: object) -> Optional[str]:
+    """The journaled operator label: non-empty, bounded, printable text.
+
+    ASCII control characters (including the C1 range, which holds NEL) and the Unicode
+    line separators are refused: the label is one JSON string, and it must stay one
+    journal line even if a future reader splits lines differently.
+    """
+    text = str(value or "").strip()
+    if not text or len(text) > 200:
+        return None
+    if any(
+        ord(character) < 0x20
+        or 0x7F <= ord(character) <= 0x9F
+        or ord(character) in (0x2028, 0x2029)
+        for character in text
+    ):
+        return None
+    return text
+
+
+def _handoff_command(args) -> int:
+    """Validate the handoff request BEFORE anything touches Docker or the journal."""
+    if args.role not in enrollment.HANDOFF_ROLES:
+        print(
+            "refused [handoff_role]: the handoff supports only "
+            + ", ".join(enrollment.HANDOFF_ROLES)
+            + "; nothing was changed.",
+            file=sys.stderr,
+        )
+        return EX_REFUSED
+    approved_by = _approved_by(args.approved_by)
+    if approved_by is None:
+        print(
+            "usage [handoff_authorization]: --approved-by must be a non-empty, printable "
+            "label of at most 200 characters; nothing was changed.",
+            file=sys.stderr,
+        )
+        return EX_USAGE
+    journal_file = _journal_file(args)
+    spec = load_spec(args.compose_file)
+    docker = Docker(spec)
+    adapter = ClusterAdapter(docker, compose_file=args.compose_file)
+    return run_handoff(
+        docker,
+        journal_file,
+        adapter,
+        role=args.role,
+        approved_by=approved_by,
+    )
 
 
 def cleanup_worker(docker: Docker, run_id: str) -> None:
@@ -1180,7 +2243,8 @@ def run_migrate(
     `reconcile-migration` observes the cluster.
     """
     with journal_file.operation_lock():
-        pending = enrollment.pending_migration_unknown(journal_file.read().records)
+        records = journal_file.read().records
+        pending = enrollment.pending_migration_unknown(records)
         if pending is not None:
             raise enrollment.EnrollmentError(
                 "migration_unknown",
@@ -1188,6 +2252,16 @@ def run_migrate(
                 "`enroll.py reconcile-migration` before another migrate",
                 f"run_id {pending.payload.get('run_id', '')}"[:80],
             )
+        # LCK-08/LCK-13: an UNKNOWN handoff is reconciled before any operation advances the
+        # machine. The worker cannot see the host journal, so the gate belongs here, where
+        # both the journal and the operation interval are held.
+        blocked = pending_handoff_refusal(records)
+        if blocked is not None:
+            print(
+                f"unknown [handoff]: {blocked}; no migration was started.",
+                file=sys.stderr,
+            )
+            return EX_UNKNOWN
         report = verify_mode_b(journal_file, adapter, clock=clock)
         if report.authorization is None:
             print(
@@ -1347,6 +2421,20 @@ def _parser() -> argparse.ArgumentParser:
     mode_a = commands.add_parser("mode-a", help="perform or resume the one-time Mode A enrollment")
     mode_a.add_argument("--approved-by", default="", help="the Owner/operator authorization label")
     commands.add_parser("verify", help="authoritative Mode B verification (read-only)")
+    handoff = commands.add_parser(
+        "handoff",
+        help="journaled CONNECT handoff to one authorized runtime role",
+    )
+    handoff.add_argument(
+        "--role",
+        required=True,
+        help="the grantee: hh_app (H1), hh_provision (H2) or hh_backup (H3)",
+    )
+    handoff.add_argument(
+        "--approved-by",
+        required=True,
+        help="the Owner/operator authorization label recorded with the intent",
+    )
     commands.add_parser("migrate", help="Mode B verification followed by the migrate one-shot")
     commands.add_parser(
         "reconcile-migration",
@@ -1361,6 +2449,10 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _journal_file(args) -> journal.Journal:
+    # One operation interval: an explicit --journal-dir that names a different directory
+    # than HOUSE_HELPER_PG_JOURNAL_DIR would take a different `operation.lock`, so it is
+    # refused rather than silently interleaving with a differently-configured tool.
+    journal.reject_conflicting_journal_directories(args.journal_dir)
     return journal.Journal(args.journal_dir, require_root=(os.name == "posix"))
 
 
@@ -1380,6 +2472,12 @@ def _print_status(journal_file: journal.Journal) -> int:
         print(
             "migration UNKNOWN: run `enroll.py reconcile-migration` before another "
             f"migrate (run_id {pending.payload.get('run_id', '')})"
+        )
+    for record in enrollment.pending_handoff_intents(view.records):
+        role = record.payload.get("role", "")
+        print(
+            f"handoff UNKNOWN: {role} intent at seq {record.seq} has no observed outcome; "
+            f"run `enroll.py handoff --role {role} --approved-by <owner>` to reconcile it"
         )
     return EX_OK
 
@@ -1425,6 +2523,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return EX_OK
         if args.command == "check-credentials":
             return _check_credentials(args.credentials_dir)
+        if args.command == "handoff":
+            return _handoff_command(args)
         journal_file = _journal_file(args)
         if args.command == "status":
             return _print_status(journal_file)

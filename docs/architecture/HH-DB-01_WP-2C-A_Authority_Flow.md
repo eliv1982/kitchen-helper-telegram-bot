@@ -133,14 +133,38 @@ dump, in the journal, or in a file the web application can read.
 **One host operation interval.** `enroll.py migrate` holds a host-side operation lock
 (`<journal-dir>/operation.lock`) from before Mode B verification until the worker has
 finished and a final identity observation has passed. Every supported host
-identity-changing operation (`mode-a`, `migrate`, `reconcile-migration`) takes the same
-lock. Read-only `verify` does not take it and therefore still creates no journal on a
+identity-changing operation (`mode-a`, `migrate`, `reconcile-migration`, `handoff`, and
+`maintenance.py backup`/`restore`) takes the same lock - maintenance holds it from before
+its own Mode B until the archive is published and read back (backup) or the temporary
+database is verified and dropped (restore). Read-only `verify` does not take it and
+therefore still creates no journal on a
 host that has never enrolled. This closes the previous check/use gap
-between host Mode B and the worker's own lock acquisition. It is deliberately a *different*
+between host Mode B and the worker's own lock acquisition, and the equivalent gap between
+the maintenance target check and a concurrent handoff. It is deliberately a *different*
 lock file from the worker's exclusive `/state/.house-helper.lock`: acquiring that
 non-reentrant flock on both sides of the container boundary could deadlock. Journal
 appends keep their own `journal.lock` inside the interval; the two locks are never nested
-in reverse.
+in reverse, and the container-side state locks come after both (lock order: operation,
+journal, state volume).
+
+**Maintenance refuses every UNKNOWN under that interval.** Before the compose parse, the
+image inspection, Mode B, archive publication or any `CREATE DATABASE`, `backup` and
+`restore` read the journal while holding `operation.lock`. An unresolved handoff refuses
+with `handoff_unknown`; an unresolved migration (a `migrate` intent with no observed
+outcome) refuses with `migration_unknown`. The migration reconciler is unaffected: it
+takes the same interval itself and does not pass through this target check, so it can
+always observe the cluster and record the resolution. A handoff or migration that becomes
+UNKNOWN in a successor process can therefore never be bypassed by a surviving backup.
+
+**The publication authority and the publication are the same process.** The detached
+holder (a network-less disposable container) owns the two state-volume flocks as a second
+layer, but it has no output-directory mount and no publication branch. It can only signal
+readiness and answer an ownership probe. The host process publishes the archive atomically
+while it still holds `operation.lock`, and probes the holder immediately before the
+publication and again after the read-back. A holder that outlives its host is therefore
+inert: it cannot create, replace or remove an archive. This replaces the earlier design in
+which the holder itself published, which allowed a holder orphaned by a killed host to
+publish after a successor had recorded an UNKNOWN.
 
 The one-shot refuses unless the channel was explicitly opened and stdin is not a TTY. The
 record is validated structurally and its lifetime bounded. The executor then:
