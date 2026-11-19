@@ -59,7 +59,10 @@ class FakeDocker:
         if argv[:2] == ["docker", "inspect"]:
             return subprocess.CompletedProcess(argv, 0, (self.image + "\n").encode(), b"")
         if argv[:3] == ["docker", "rm", "-f"]:
-            self.containers.pop(argv[3], None)
+            # FIX-01: the forced removal also carries `-v`; every non-flag argument after it
+            # is the one identifier being removed.
+            for identifier in (arg for arg in argv[3:] if not arg.startswith("-")):
+                self.containers.pop(identifier, None)
             return subprocess.CompletedProcess(argv, 0, b"", b"")
         return subprocess.CompletedProcess(argv, 99, b"", b"unexpected")
 
@@ -97,6 +100,93 @@ def test_a_listing_that_fails_is_never_read_as_gone():
     fake = FakeDocker({"c" * 64: NAME}, listing_fails=True)
     assert containers(fake).remove_verified(NAME, image=IMAGE) is False
     assert fake.containers == {"c" * 64: NAME}
+
+
+# --- FIX-01: the anonymous PGDATA volume of a disposable container ------------------------------
+#
+# The pinned PostgreSQL image declares `VOLUME /var/lib/postgresql/data`. A detached holder has
+# no mount there, so Docker creates an anonymous volume for it; `docker rm -f` retains that
+# volume, while `docker rm -f -v` removes it and never touches a NAMED volume. Every container
+# this boundary removes is one it started itself, so the flag is safe on every caller.
+
+
+def _docker_removals(fake):
+    return [call for call in fake.calls if call[:3] == ["docker", "rm", "-f"]]
+
+
+def test_removal_is_forced_and_deletes_only_the_containers_anonymous_volumes():
+    fake = FakeDocker({"c" * 64: NAME})
+    assert containers(fake).remove_verified(NAME, image=IMAGE) is True
+    assert _docker_removals(fake) == [["docker", "rm", "-f", "-v", "c" * 64]]
+    # A named volume is never named for removal: no `docker volume` command is issued.
+    assert not any(call[:2] == ["docker", "volume"] for call in fake.calls)
+
+
+def test_a_direct_removal_is_forced_and_deletes_only_anonymous_volumes():
+    fake = FakeDocker()
+    containers(fake).remove("c" * 64)
+    assert fake.calls == [["docker", "rm", "-f", "-v", "c" * 64]]
+
+
+@pytest.mark.parametrize("identifier", ["", "c" * 11, "C" * 64, "../x", "c" * 65])
+def test_an_identifier_that_is_not_a_container_id_is_never_removed(identifier):
+    fake = FakeDocker()
+    containers(fake).remove(identifier)
+    assert fake.calls == []
+
+
+def test_the_cleanup_command_removes_with_the_volume_flag(monkeypatch):
+    fake = FakeDocker({"c" * 64: NAME})
+    _install(monkeypatch, fake)
+    assert maintenance.main(["cleanup-rehearsal", "--run-id", RUN_ID]) == maintenance.EX_OK
+    assert _docker_removals(fake) == [["docker", "rm", "-f", "-v", "c" * 64]]
+
+
+class _RecordingDocker:
+    """A Docker CLI boundary that records argv; `docker run -d` answers with one container id."""
+
+    def __init__(self, identifier: str = "c" * 64):
+        self.identifier = identifier
+        self.calls = []
+
+    def __call__(self, argv, *, input=None, capture_output=True, timeout=120, check=False, env=None):
+        argv = list(argv)
+        self.calls.append(argv)
+        if argv[:2] == ["docker", "run"]:
+            return subprocess.CompletedProcess(argv, 0, (self.identifier + "\n").encode(), b"")
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+
+def test_a_normal_holder_release_removes_its_container_and_anonymous_volume(tmp_path):
+    fake = _RecordingDocker()
+    tools = maintenance.ToolContainers(IMAGE, runner=fake)
+    lock = maintenance._BackupLock(
+        tools,
+        name="house-helper-backup-hold-" + "d" * 16,
+        control_dir=tmp_path / "control",
+        output_dir=tmp_path,
+    )
+    lock.container = "c" * 64
+    lock.release()
+    assert fake.calls == [["docker", "rm", "-f", "-v", "c" * 64]]
+
+
+def test_an_interrupted_holder_start_is_removed_with_the_volume_flag(tmp_path):
+    fake = _RecordingDocker()
+    tools = maintenance.ToolContainers(IMAGE, runner=fake)
+    control = tmp_path / "control"
+    control.mkdir()
+    with pytest.raises(maintenance.MaintenanceError) as refused:
+        tools.start_lock_holder(
+            name="house-helper-backup-hold-" + "d" * 16,
+            control_dir=control,
+            timeout=0,
+        )
+    assert refused.value.code == "backup_lock"
+    # The holder's NAMED state volume is mounted exactly as before (it is never removed with it).
+    run = next(call for call in fake.calls if call[:2] == ["docker", "run"])
+    assert f"{maintenance.STATE_VOLUME}:/state" in run
+    assert fake.calls[-1] == ["docker", "rm", "-f", "-v", "c" * 64]
 
 
 @pytest.mark.parametrize("run_id", ["", "ABC", "0123456789abcde", "z" * 32, "a" * 65, "a" * 32 + "\n"])
@@ -326,7 +416,8 @@ if argv[:1] == ["inspect"]:
     sys.exit(0)
 if argv[:2] == ["rm", "-f"]:
     current = present()
-    if current and current[0] == argv[2]:
+    identifiers = [arg for arg in argv[2:] if not arg.startswith("-")]
+    if current and current[0] in identifiers:
         (state / "present").unlink()
     sys.exit(0)
 sys.exit(99)
@@ -430,7 +521,7 @@ cat "{_linux_path(state / "log")}"
     assert "NO-BLOCK" not in output, output + done.stderr.decode("utf-8", "replace")
     assert "EXIT=6" in output, output + done.stderr.decode("utf-8", "replace")
     assert "GONE" in output and "REMAINS" not in output
-    assert "rm -f cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" in output
+    assert "rm -f -v cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" in output
     # The probe's own error log must show the cancellation, never a traceback.
     errors = (probe / "err.log").read_text()
     assert "cancelled [rehearsal_cleanup]" in errors and "Traceback" not in errors

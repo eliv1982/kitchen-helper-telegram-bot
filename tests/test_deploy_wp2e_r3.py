@@ -509,7 +509,8 @@ if argv[:1] == ["inspect"]:
     sys.exit(0)
 if argv[:2] == ["rm", "-f"]:
     current = present()
-    if current and current[0] == argv[2]:
+    identifiers = [arg for arg in argv[2:] if not arg.startswith("-")]
+    if current and current[0] in identifiers:
         (state / "present").unlink()
     sys.exit(0)
 sys.exit(99)

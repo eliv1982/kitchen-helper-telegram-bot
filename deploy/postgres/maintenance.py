@@ -644,7 +644,12 @@ class ToolContainers:
     def remove(self, container: str) -> None:
         if not re.fullmatch(r"[0-9a-f]{12,64}", container):
             return
-        self._run(["docker", "rm", "-f", container], timeout=60)
+        # `-v` removes only ANONYMOUS volumes. Every container this boundary removes is one
+        # it started itself and is disposable: the detached holders mount the deployment's
+        # NAMED state volume at /state, which `docker rm -v` never removes (verified against
+        # the pinned image). Without it, the pinned PostgreSQL image's anonymous
+        # `/var/lib/postgresql/data` volume outlives every normal or forced holder removal.
+        self._run(["docker", "rm", "-f", "-v", container], timeout=60)
 
     def present_container(self, name: str) -> Optional[str]:
         """The id of the ONE container whose name is exactly `name`, or None. The filter is anchored,
@@ -679,7 +684,11 @@ class ToolContainers:
                     return False
                 if done.stdout.decode("utf-8", "replace").strip() != image:
                     return False
-            self._run(["docker", "rm", "-f", identifier], timeout=60)
+            # `-v` removes only ANONYMOUS volumes of the one container this run owns (a
+            # rehearsal container, whose PGDATA is a tmpfs and therefore has none). Named
+            # volumes are never removed by `docker rm -v`, and the identity checks above are
+            # unchanged.
+            self._run(["docker", "rm", "-f", "-v", identifier], timeout=60)
             return self.present_container(name) is None
         except MaintenanceError:
             return False
@@ -3184,41 +3193,128 @@ def _restore_command_locked(args, target: Target) -> int:
             "creation and ACL application"
         )
         rehearsal_failure: Optional[BaseException] = None
+        rehearsal_container: Optional[str] = None
+        rehearsal_removed = True
+        rehearsal_released = False
+
+        def release_rehearsal() -> None:
+            """Remove this run's ONE disposable container and confirm it is gone (F2).
+
+            `rehearse` never removes its own container: its exact name is the run's ownership
+            identity, and the caller owns the removal on every path. The critical section is
+            cancellation-deferred, so a signal cannot abandon a removal half-way (R3-F1); a
+            signal that arrived there becomes the run's outcome afterwards."""
+            nonlocal rehearsal_failure, rehearsal_removed, rehearsal_released
+            if rehearsal_released or rehearsal_container is None or args.keep_rehearsal:
+                return
+            rehearsal_released = True
+            with _deferred_cancellation() as deferred:
+                rehearsal_removed = tools.remove_verified(
+                    rehearsal_container, image=tools.image
+                )
+            if deferred.signums and rehearsal_failure is None:
+                rehearsal_failure = RehearsalCancelled(deferred.signums[0])
+
         if not args.no_rehearse:
+            # The restore's own operation id is this rehearsal's ownership identity. The
+            # journal already records it with the temporary database, so the one container a
+            # run could leave behind is named from the record an operator can read.
+            run_id = plan.operation_id
+            rehearsal_container = _rehearsal_container_name(run_id)
+            rehearsal_removed = False
             try:
-                rehearsal = rehearse(
-                    tools,
-                    point=point,
-                    work=work.path,
-                    fixture=fixture,
-                    app_image=args.app_image,
-                    keep=args.keep_rehearsal,
-                )
-                print(
-                    "ok [rehearse]: isolated --network none restore verified; "
-                    f"{rehearsal['tables']} tables, revision {rehearsal['revision']}; "
-                    f"provenance system_identifier {rehearsal['system_identifier']}"
-                )
-                print(f"     attachments: {_attachment_summary(rehearsal['attachments'])}")
-            except BaseException as error:  # still clean up the verified target
-                rehearsal_failure = error
+                with _cancellation_handlers():
+                    try:
+                        rehearsal = rehearse(
+                            tools,
+                            point=point,
+                            work=work.path,
+                            fixture=fixture,
+                            app_image=args.app_image,
+                            run_id=run_id,
+                            keep=args.keep_rehearsal,
+                        )
+                        print(
+                            "ok [rehearse]: isolated --network none restore verified; "
+                            f"{rehearsal['tables']} tables, revision {rehearsal['revision']}; "
+                            f"provenance system_identifier {rehearsal['system_identifier']}"
+                        )
+                        print(
+                            f"     attachments: {_attachment_summary(rehearsal['attachments'])}"
+                        )
+                    except BaseException as error:  # still clean up the verified target
+                        rehearsal_failure = error
+                    finally:
+                        release_rehearsal()
+            except BaseException as error:
+                # A signal that landed outside the deferred removal section is still this
+                # run's outcome; the removal above has already been attempted.
+                if rehearsal_failure is None:
+                    rehearsal_failure = error
+        database_failure: Optional[BaseException] = None
         if args.keep_database:
             print(
                 "warning [restore]: the temporary database is retained under the explicit "
                 f"Owner recovery decision; drop it with a reviewed operation ({plan.database})"
             )
-            if rehearsal_failure is not None:
-                raise rehearsal_failure
-            return EX_OK
-        _drop_temporary_database(
-            target.journal_file,
-            tools=tools,
-            passfile_value=role_passfile,
-            plan=plan,
-            record=record,
-            network=target.spec.network,
-        )
-        print(f"ok [cleanup]: {plan.database} dropped and absence verified")
+        else:
+            try:
+                _drop_temporary_database(
+                    target.journal_file,
+                    tools=tools,
+                    passfile_value=role_passfile,
+                    plan=plan,
+                    record=record,
+                    network=target.spec.network,
+                )
+                print(f"ok [cleanup]: {plan.database} dropped and absence verified")
+            except BaseException as error:  # FIX-01B: never let it hide the container outcome
+                database_failure = error
+        # R2/FIX-01B: the resource outcome takes precedence over both the rehearsal's own verdict
+        # and a database clean-up refusal. A container that may still hold plaintext is never
+        # suppressed by the later failure, and both failures are reported together rather than
+        # one overwriting the other.
+        if (
+            rehearsal_container is not None
+            and not args.keep_rehearsal
+            and not rehearsal_removed
+        ):
+            detail = (
+                f"{rehearsal_container}; remove it with: "
+                f"{_rehearsal_cleanup_command(args.compose_file, run_id)}"
+            )
+            if database_failure is not None:
+                detail += (
+                    f"; additionally the temporary database {plan.database} was not "
+                    f"confirmed cleaned up: {_cleanup_failure_label(database_failure)}"
+                )
+                journal_action = _temporary_journal_action(
+                    target.journal_file, plan.database
+                )
+                if journal_action is not None:
+                    detail += f"; its journal entry remains '{journal_action}'"
+            raise MaintenanceError(
+                "rehearsal_cleanup",
+                "the disposable container could not be confirmed removed",
+                detail,
+            ) from database_failure
+        # FIX-01B: when only the temporary-database clean-up failed, its documented refusal and
+        # exit-status contract are unchanged.
+        if database_failure is not None:
+            raise database_failure
+        if isinstance(rehearsal_failure, RehearsalCancelled):
+            signum = rehearsal_failure.signum
+            state = (
+                "is retained under --keep-rehearsal"
+                if args.keep_rehearsal
+                else "was confirmed removed"
+            )
+            print(
+                f"cancelled [restore]: signal {signum}; the disposable container "
+                f"{rehearsal_container} {state}",
+                file=sys.stderr,
+            )
+            return EX_CANCELLED
         if rehearsal_failure is not None:
             raise rehearsal_failure
         return EX_OK
@@ -3525,6 +3621,47 @@ _STRUCTURED_FAILURES = (
     backup.BackupError,
     enroll.DockerError,
 )
+
+
+def _cleanup_failure_label(failure: BaseException) -> str:
+    """One captured clean-up failure as a safe `[code] message` token pair.
+
+    Only authored fields are used; the exception's `detail` is deliberately excluded because it
+    may quote a tool's stderr, matching `_refuse_unconfirmed_cleanup`. A failure this contract
+    does not know is reported as internal, never with its own text."""
+    if isinstance(failure, _STRUCTURED_FAILURES):
+        return f"[{failure.code}] {failure.message}"
+    return f"[internal] unexpected {type(failure).__name__}."
+
+
+def _temporary_journal_action(
+    journal_file: journal.Journal, database: str
+) -> Optional[str]:
+    """The last journal action recorded for one temporary database, or None if unavailable.
+
+    A read-only observation used only to describe an unresolved clean-up to the operator. A
+    journal that cannot be read is reported as unknown, never assumed retired. `UnicodeError`
+    covers a head anchor (or record line) that is not valid UTF-8: `Journal.read` decodes the
+    head before its own JSON guard can apply, so such a file surfaces as a decode failure
+    rather than a `JournalError`. It is observation-only; the corrupt file is never repaired."""
+    try:
+        view = journal_file.read()
+    except (journal.JournalError, OSError, UnicodeError):
+        return None
+    latest: Optional[tuple[int, str]] = None
+    for record in view.records:
+        if getattr(record, "kind", None) != "temp_db":
+            continue
+        payload = getattr(record, "payload", None)
+        if not isinstance(payload, Mapping) or payload.get("database") != database:
+            continue
+        action = payload.get("action")
+        if not isinstance(action, str):
+            continue
+        seq = int(getattr(record, "seq", -1))
+        if latest is None or seq >= latest[0]:
+            latest = (seq, action)
+    return latest[1] if latest is not None else None
 
 
 class _Outcome:
