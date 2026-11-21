@@ -4,10 +4,16 @@
     python deploy/postgres/enroll.py status
     python deploy/postgres/enroll.py mode-a --approved-by <owner>
     python deploy/postgres/enroll.py verify
-    python deploy/postgres/enroll.py handoff --role <hh_app|hh_provision|hh_backup> --approved-by <owner>
+    python deploy/postgres/enroll.py handoff --role <hh_app|hh_provision|hh_purge|hh_backup> --approved-by <owner>
+    python deploy/postgres/enroll.py lock-handoff --approved-by <owner>
     python deploy/postgres/enroll.py migrate
     python deploy/postgres/enroll.py check-credentials --credentials-dir <dir>
     python deploy/postgres/enroll.py plan-bootstrap-retirement
+
+Every command that resolves the Compose surface takes `--credentials-dir` explicitly (the
+units' `HOUSE_HELPER_PG_CREDENTIALS_DIR`). An ordinary `sudo` does not carry the invoking
+shell's environment, so the repository default must never be the answer the tool relies on
+(F-03).
 
 This tool runs on the deployment host, as root, with the Docker socket. It is NOT copied
 into the application image (the image contains only `house_helper/`, `deploy/ops/`,
@@ -31,14 +37,36 @@ database/predefined-role inventories, and refuse with a journaled
 `cluster_identity:mismatch` on any difference. There is no Mode A fallback.
 
 `handoff`: the ROL-16/HOF-01 connection handoff. One `GRANT CONNECT ON DATABASE
-house_helper` to exactly one of `hh_app` (H1), `hh_provision` (H2) or `hh_backup` (H3),
-after a Mode B identity/marker/inventory check and a schema-at-head gate. The intent -
+house_helper` to exactly one of `hh_app` (H1), `hh_provision` (H2), `hh_purge` (H3) or
+`hh_backup` (H3), after a Mode B identity/marker/inventory check and a schema-at-head gate.
+The two H3 scheduled logins share the frozen `handoff:scheduled` event, but each GRANT is
+its own single-role statement with its own intent and observed outcome (HOF-02). The intent -
 including the complete pre-state ACL and a run-id-derived `application_name` - is journaled
 before the statement. A non-zero psql status is classified by its exact meaning, and the
 outcome is journaled only when the operation's termination and the complete ACL are both
 established. An unobservable result stays UNKNOWN, blocks every later H1/H2/H3 transition,
 and is never cleared from an instantaneous snapshot. Repeated invocation is a no-op that
 records the observed state.
+
+`lock-handoff`: HOF-03 item 4. Inside the verified running web container it runs the
+frozen `dbtool check-idle` observation, and on the host it reads the kernel's own lock
+ownership twice: the validated web process (its cgroup names the immutable container id,
+its argv is the deployed image's real uvicorn command after the kernel's `#!` rewrite) must
+hold a `FLOCK ... READ` on the state-volume lock file through its own descriptor, and the
+fdinfo record's device/inode must be that file's. No temporary shared probe is taken, so a
+probe's lock can never be published as web-owned. A host-held **shared witness** on the
+same validated inode is retained from the final snapshot through the journal outcome
+append and its fsync, so no exclusive holder can appear in that window; it is not evidence
+of web ownership. Only the coherent observation is journaled as an `observed`
+`handoff_lock` outcome (event `handoff:lock`); a determinate negative is `failed`; an
+indeterminate or contradictory observation appends no outcome and leaves the intent
+UNKNOWN. The latest outcome is the state, and every re-observation first appends a new
+intent: a repeated confirmation for the same container is a fresh `observed` outcome in
+that new epoch, a replacement container is observed in it, and a later failed outcome
+supersedes an earlier observed one. The intent is durable before the observation, so an
+UNKNOWN or an interrupted re-observation leaves a pending intent that fences every later
+transition instead of letting the previous `observed` outcome stand. An unresolved intent
+is resolved before any re-observation.
 
 `migrate`: after Mode B passes, write a bounded non-secret authorization record to the
 container's stdin (never argv, never the journal, never a file the web app can read) and
@@ -85,9 +113,33 @@ from house_helper.persistence import pg_credentials as credentials  # noqa: E402
 from house_helper.persistence import pg_enrollment as enrollment  # noqa: E402
 from house_helper.persistence import pg_journal as journal  # noqa: E402
 
+from deploy.postgres import lock_owner  # noqa: E402
+
 DEFAULT_COMPOSE = REPOSITORY_ROOT / "deploy" / "compose.postgres.yaml"
 DEFAULT_JOURNAL_DIR = Path("/var/lib/house-helper/cutover")
-DEFAULT_CREDENTIALS_DIR = REPOSITORY_ROOT / "deploy" / "postgres" / "credentials"
+# F-03: the one configuration variable Compose interpolates for the credential
+# directory. The approved value is an external, root-owned directory named in the units'
+# environment file; the repository default is only the file's own fallback. An ordinary
+# `sudo` does not carry the invoking shell's environment, so every host enrollment
+# command takes `--credentials-dir` and the tool never depends on this variable alone.
+# Even `check-credentials` resolves its directory through the same precedence contract.
+CREDENTIALS_DIRECTORY_ENV = "HOUSE_HELPER_PG_CREDENTIALS_DIR"
+WEB_SERVICE = "house-helper"
+# The dbtool the frozen `check-idle` observation executes inside the web container (the
+# accepted image layout).
+DBTOOL_PATH = "/opt/house-helper/ops/dbtool.py"
+# HOF-03 item 4: the ASGI application the recorded Compose web command starts. The lock
+# proof accepts only the deployed image's real uvicorn process shape. dbtool execs the
+# `uvicorn` console script, and the kernel rewrites a `#!` script's argv, so the live
+# `/proc/<pid>/cmdline` is `[/opt/venv/bin/python, /opt/venv/bin/uvicorn, <app>, ...]`;
+# `lock_owner.is_web_process` accepts that form (and the direct and `-m uvicorn` forms)
+# but not a probe, a one-shot or an unrelated container process.
+WEB_APP_SPEC = lock_owner.WEB_APP_SPEC
+# The command as recorded in Compose, before exec. Kept so the documentation test can
+# prove the proof and the recorded Compose surface name the same application.
+WEB_PROCESS_ARGV = ("uvicorn", WEB_APP_SPEC)
+# The state-volume lock file, as dbtool names it (LCK-01/LCK-02).
+LOCK_FILE_NAME = lock_owner.LOCK_FILE_NAME
 
 EX_OK = 0
 EX_INTERNAL = 1
@@ -127,6 +179,13 @@ class ClusterSpec:
     image: str
     volume: str
     network: str
+    # The canonical per-role credential directory (OD-8 as approved for this work
+    # package). F-03: it is configuration the operator passes explicitly, so an ordinary
+    # `sudo` that loses the shell environment still resolves the approved directory.
+    credentials_directory: str
+    # HOF-03 item 4: the named state volume the web service's shared lock lives on. The
+    # lock observation validates the web container mounts exactly this volume at /state.
+    state_volume: str
     # F3: the full canonical host source of each accepted read-only bind, resolved from
     # the recorded Compose configuration (never from the inspected container).
     postgresql_conf_source: str
@@ -185,6 +244,25 @@ def _compose_path(compose_dir: Path, raw: str) -> str:
     return _canonical_path(path)
 
 
+def _compose_directory(compose_file: Path) -> Path:
+    """The directory Compose resolves a relative value in: the file's own, real path."""
+    return Path(os.path.realpath(compose_file)).parent
+
+
+def resolve_compose_path(compose_file: Path, value: object) -> Path:
+    """The one path rule for every host command: Compose-relative, canonical, absolute.
+
+    A relative value - an explicit option, an inherited environment value or the
+    Compose `${VAR:-default}` - is resolved against the compose file's directory, never
+    against the caller's working directory. An ordinary `sudo` changes neither rule, and
+    symlinks are resolved so the same directory reached two ways is the same identity.
+    """
+    path = Path(str(value))
+    if not path.is_absolute():
+        path = _compose_directory(compose_file) / path
+    return Path(_canonical_path(path))
+
+
 def _single(pattern: str, text: str, key: str) -> str:
     found = re.findall(pattern, text, re.MULTILINE)
     if len(found) != 1:
@@ -196,7 +274,92 @@ def _single(pattern: str, text: str, key: str) -> str:
     return found[0]
 
 
-def load_spec(compose_file: Path) -> ClusterSpec:
+_CREDENTIAL_SOURCE_PATTERN = (
+    r"^\s*source:\s*\$\{HOUSE_HELPER_PG_CREDENTIALS_DIR:-([^}]*)\}"
+    r"/postgres_superuser\.password\s*$"
+)
+
+
+def _credential_directory_default(text: str, compose_dir: Path) -> Path:
+    """`${HOUSE_HELPER_PG_CREDENTIALS_DIR:-<default>}`, resolved as Compose resolves it."""
+    raw = _single(_CREDENTIAL_SOURCE_PATTERN, text, "bootstrap credential bind source")
+    path = Path(raw)
+    return path if path.is_absolute() else compose_dir / path
+
+
+def _resolve_credentials(
+    compose_file: Path,
+    default: object,
+    explicit: Optional[Path],
+    configured: str,
+) -> Path:
+    """The one credential-directory precedence: explicit, environment, Compose default.
+
+    Every value passes through `resolve_compose_path`, so a relative spelling of the
+    same directory is not a false conflict and an absolute spelling is not a different
+    answer. An explicit value wins over the repository default (an ordinary `sudo` does
+    not carry the invoking shell's environment, F-03), but it may not silently disagree
+    with the environment: the container's credential mount and the host check would then
+    describe different directories, so the contradiction is refused instead of resolved.
+    """
+    explicit_path = (
+        None if explicit is None else resolve_compose_path(compose_file, explicit)
+    )
+    configured_path = (
+        resolve_compose_path(compose_file, configured) if configured else None
+    )
+    if explicit_path is not None:
+        if configured_path is not None and configured_path != explicit_path:
+            raise DockerError(
+                "credentials_conflict",
+                f"--credentials-dir and {CREDENTIALS_DIRECTORY_ENV} name different "
+                "directories; nothing was done",
+            )
+        return explicit_path
+    if configured_path is not None:
+        return configured_path
+    return resolve_compose_path(compose_file, default)
+
+
+def resolve_credentials_directory(
+    compose_file: Path,
+    *,
+    top_level: Optional[Path] = None,
+    subcommand: Optional[Path] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Path:
+    """Resolve `check-credentials`' effective directory by the shared precedence contract.
+
+    Both spellings of `--credentials-dir` are accepted, but a contradiction between them
+    is refused rather than silently letting the subcommand option override the top-level
+    one. The resolved directory is returned in the same canonical form every other host
+    command uses, so the identity checked here is the identity the mount check uses.
+    """
+    if top_level is not None and subcommand is not None:
+        if resolve_compose_path(compose_file, top_level) != resolve_compose_path(
+            compose_file, subcommand
+        ):
+            raise DockerError(
+                "credentials_conflict",
+                "the top-level and check-credentials --credentials-dir name different "
+                "directories; nothing was done",
+            )
+        explicit = subcommand
+    else:
+        explicit = subcommand if subcommand is not None else top_level
+    try:
+        text = compose_file.read_text(encoding="utf-8")
+    except OSError:
+        raise DockerError("compose_file", "the compose file cannot be read") from None
+    default = _credential_directory_default(text, _compose_directory(compose_file))
+    values = os.environ if environ is None else environ
+    configured = values.get(CREDENTIALS_DIRECTORY_ENV) or ""
+    return _resolve_credentials(compose_file, default, explicit, configured)
+
+
+def load_spec(
+    compose_file: Path, credentials_dir: Optional[Path] = None
+) -> ClusterSpec:
     """Read the container identity AND the authorized bind sources from Compose.
 
     Each fact is taken from an exactly shaped line. A missing or ambiguous fact is a
@@ -204,12 +367,19 @@ def load_spec(compose_file: Path) -> ClusterSpec:
     the inspected container's `Source` as the authority (F3). The credential directory is
     `${HOUSE_HELPER_PG_CREDENTIALS_DIR:-<default>}`, resolved exactly as Compose resolves
     it: relative paths are relative to the compose file's directory.
+
+    F-03: `credentials_dir` is the approved non-secret configuration passed explicitly on
+    every host command (the units' `HOUSE_HELPER_PG_CREDENTIALS_DIR`). An explicit value
+    wins over the repository default under an ordinary `sudo`. If the environment names a
+    different directory as well, the ambiguity is refused: the two sources would otherwise
+    silently resolve the container's credential mount and the host tool's check against
+    different directories.
     """
     try:
         text = compose_file.read_text(encoding="utf-8")
     except OSError:
         raise DockerError("compose_file", "the compose file cannot be read") from None
-    compose_dir = compose_file.resolve().parent
+    compose_dir = _compose_directory(compose_file)
     patterns = {
         "project": r"^name:\s*(house-helper-pg)\s*$",
         "container_name": r"^\s*container_name:\s*(house-helper-db)\s*$",
@@ -230,24 +400,24 @@ def load_spec(compose_file: Path) -> ClusterSpec:
         text,
         "pg_hba.conf bind source",
     )
-    credential_default = _single(
-        r"^\s*source:\s*\$\{HOUSE_HELPER_PG_CREDENTIALS_DIR:-([^}]*)\}"
-        r"/postgres_superuser\.password\s*$",
-        text,
-        "bootstrap credential bind source",
+    state_volume = _single(
+        r"^\s*name:\s*(house-helper-pg-state)\s*$", text, "state volume"
     )
-    credential_dir = (
-        os.environ.get("HOUSE_HELPER_PG_CREDENTIALS_DIR") or credential_default
+    configured = os.environ.get(CREDENTIALS_DIRECTORY_ENV) or ""
+    credential_path = _resolve_credentials(
+        compose_file,
+        _credential_directory_default(text, compose_dir),
+        credentials_dir,
+        configured,
     )
-    credential_path = Path(credential_dir)
-    if not credential_path.is_absolute():
-        credential_path = compose_dir / credential_path
     return ClusterSpec(
         project=values["project"],
         container_name=values["container_name"],
         image=values["image"],
         volume=values["volume"],
         network=values["network"],
+        credentials_directory=str(credential_path),
+        state_volume=state_volume,
         postgresql_conf_source=_compose_path(compose_dir, postgresql_conf),
         pg_hba_source=_compose_path(compose_dir, pg_hba),
         bootstrap_credential_source=_canonical_path(
@@ -262,9 +432,23 @@ def load_spec(compose_file: Path) -> ClusterSpec:
 class Docker:
     """Every call is a fixed argv list to `docker`; there is no shell and no discovery."""
 
-    def __init__(self, spec: ClusterSpec, *, runner=subprocess.run) -> None:
+    def __init__(
+        self,
+        spec: ClusterSpec,
+        *,
+        runner=subprocess.run,
+        proc_root: Optional[Path] = None,
+        witness_factory=None,
+    ) -> None:
         self.spec = spec
         self.runner = runner
+        # HOF-03 item 4 reads the kernel's lock ownership on the host. It is injectable so
+        # the proof can be exercised offline; production always uses the real /proc.
+        self.proc_root = Path(proc_root) if proc_root is not None else Path("/proc")
+        # Option A's host-held shared witness. Production takes a real flock(2); tests on
+        # platforms without fcntl inject an equivalent context manager, and the real
+        # Linux tests exercise the production factory.
+        self.witness_factory = witness_factory or lock_owner.shared_witness
 
     def _run(self, argv: Sequence[str], *, stdin: Optional[bytes] = None) -> subprocess.CompletedProcess:
         try:
@@ -441,6 +625,10 @@ class Docker:
         environment = dict(os.environ)
         environment["HOUSE_HELPER_PG_ACTIVATE"] = "1"
         environment["HOUSE_HELPER_PG_AUTHORIZATION_STDIN"] = "1"
+        # F-03: the child Compose resolves the same approved credential directory the
+        # host tool resolved, instead of falling back to the repository default under an
+        # ordinary `sudo` (which would mount a different passfile into the worker).
+        environment[CREDENTIALS_DIRECTORY_ENV] = self.spec.credentials_directory
         try:
             return self.runner(
                 [
@@ -487,6 +675,7 @@ class Docker:
         environment = dict(os.environ)
         environment["HOUSE_HELPER_PG_ACTIVATE"] = "1"
         environment["HOUSE_HELPER_PG_AUTHORIZATION_STDIN"] = "1"
+        environment[CREDENTIALS_DIRECTORY_ENV] = self.spec.credentials_directory
         try:
             return self.runner(
                 [
@@ -562,6 +751,122 @@ class Docker:
                 )
             )
         return tuple(rows)
+
+    def web_container(self) -> str:
+        """The one running web service container of this project, as an immutable id.
+
+        HOF-03 item 4 is evidence about the web process that holds the shared lock, so the
+        container is selected by its own Compose project/service labels (never a guessed
+        name), required to be exactly one and running, and validated against the recorded
+        state volume before any probe runs inside it.
+        """
+        rows = self.worker_containers()
+        running = [
+            row
+            for row in rows
+            if row[3] == self.spec.project
+            and row[4] == WEB_SERVICE
+            and row[1] == "running"
+        ]
+        if len(running) != 1:
+            raise DockerError(
+                "web_container",
+                f"exactly one running {WEB_SERVICE} container of project "
+                f"{self.spec.project} is required; observed {len(running)}",
+            )
+        container_id = running[0][0]
+        self.verify_web_container(container_id)
+        return container_id
+
+    def verify_web_container(self, container_id: str) -> Mapping[str, Any]:
+        """Re-verify the immutable web container id at the moment of the observation."""
+        container = self.inspect_container_id(container_id)
+        validate_web_container(self.spec, container)
+        return container
+
+    def state_volume_mountpoint(self) -> Path:
+        """The host mountpoint of the recorded state volume (local driver only).
+
+        The lock proof must stat the same file the container locks. The volume name is
+        already validated against the running web container's `/state` mount; its local
+        mountpoint is then the host path of that same inode.
+        """
+        value = self._json(
+            ["docker", "volume", "inspect", self.spec.state_volume]
+        )
+        if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], dict):
+            raise DockerError(
+                "state_volume", "the state volume inspection is not one object"
+            )
+        volume = value[0]
+        if volume.get("Name") != self.spec.state_volume:
+            raise DockerError("state_volume", "the inspected volume is not the recorded state volume")
+        if volume.get("Driver") != "local" or volume.get("Scope") != "local":
+            raise DockerError("state_volume", "the state volume is not a local volume")
+        mountpoint = volume.get("Mountpoint")
+        if not isinstance(mountpoint, str) or not mountpoint:
+            raise DockerError("state_volume", "the state volume has no mountpoint")
+        return Path(mountpoint)
+
+    def lock_idle_probe(self, container_id: str) -> subprocess.CompletedProcess:
+        """`dbtool check-idle` inside the verified web container.
+
+        It asks for the state-volume lock EXCLUSIVELY, so it is refused while any shared
+        holder (the web process) or exclusive holder exists. The refusal alone is
+        ambiguous; HOF-03 item 4 requires the direct kernel proof in
+        `web_lock_snapshot`, and this answer is retained because the frozen specification
+        names `check-idle`. Nothing is mutated by the failed acquisition.
+        """
+        if not isinstance(container_id, str) or not _ID.fullmatch(container_id):
+            raise DockerError("web_container", "the web container id is malformed")
+        return self._run(
+            [
+                "docker",
+                "exec",
+                container_id,
+                "python",
+                DBTOOL_PATH,
+                "check-idle",
+            ]
+        )
+
+    def web_lock_snapshot(
+        self, container_id: str, mountpoint: Optional[Path] = None
+    ) -> lock_owner.Snapshot:
+        """One host-side read of the kernel lock held by the validated web process.
+
+        The process is selected by the immutable container id in its cgroup and by the
+        deployed image's real uvicorn argv; the lock is read from that process's own
+        descriptor (fdinfo), never inferred from an acquisition probe. `mountpoint` is
+        the one host path the caller already validated for this operation; both snapshots
+        and the witness must name that same path.
+        """
+        if not isinstance(container_id, str) or not _ID.fullmatch(container_id):
+            raise DockerError("web_container", "the web container id is malformed")
+        if mountpoint is None:
+            mountpoint = self.state_volume_mountpoint()
+        return lock_owner.inspect(
+            self.proc_root,
+            mountpoint,
+            container_id,
+            WEB_APP_SPEC,
+        )
+
+    def web_lock_witness(
+        self, identity, *, mountpoint: Optional[Path] = None, on_held=None
+    ):
+        """A host-held shared witness on the same validated lock inode (Option A).
+
+        The caller enters the returned context manager and keeps it held across the final
+        ownership snapshot, the fresh container verification and the journal outcome
+        append. The factory is injectable so offline tests can model it; production is
+        the real `flock(2)` implementation in `lock_owner`.
+        """
+        if mountpoint is None:
+            mountpoint = self.state_volume_mountpoint()
+        return self.witness_factory(
+            mountpoint / LOCK_FILE_NAME, identity, on_held=on_held
+        )
 
     def inspect_worker(self, container_id: str) -> Mapping[str, Any]:
         """The exact observed identity/lifecycle of one worker container."""
@@ -722,6 +1027,19 @@ def _rows(output: str) -> list[list[str]]:
     return [line.split("\x1f") for line in output.splitlines() if line]
 
 
+def _session_pid(value: str) -> int:
+    """One `pg_stat_activity.pid`; a malformed observation is a refusal, never a traceback."""
+    try:
+        pid = int(value)
+    except (TypeError, ValueError):
+        pid = 0
+    if pid <= 0:
+        raise DockerError(
+            "sessions_observation", "a session observation row is malformed"
+        )
+    return pid
+
+
 def validate_container(spec: ClusterSpec, container: Mapping[str, Any]) -> None:
     """The positive container identity: exact name/id/running image, PGDATA volume, network,
     no published port."""
@@ -802,6 +1120,46 @@ def validate_container(spec: ClusterSpec, container: Mapping[str, Any]) -> None:
     networks = (container.get("NetworkSettings") or {}).get("Networks") or {}
     if spec.network not in networks:
         raise DockerError("network_identity", "the container is not on the recorded database network")
+
+
+def validate_web_container(spec: ClusterSpec, container: Mapping[str, Any]) -> None:
+    """The running web service HOF-03 item 4 names, and the state volume it locks.
+
+    The lock handoff is evidence only about the project's own web service on the recorded
+    state volume: a lookalike container or a foreign volume at `/state` would make the
+    lock-owner proof describe a different process or file. The web image tag is
+    deliberately not compared: the recorded Compose surface names it through
+    `HOUSE_HELPER_IMAGE_TAG`, which the host tool does not resolve, and the project/service
+    labels plus the canonical state volume are what bind the observation. The lock-owner
+    proof selects the process by this immutable container id in its cgroup; the lock file
+    is read from the recorded volume's host mountpoint and cross-checked against the
+    process's own descriptors.
+    """
+    if not _ID.fullmatch(str(container.get("Id", ""))):
+        raise DockerError("web_container", "the web container id is malformed")
+    state = container.get("State") or {}
+    if _boolean(state.get("Running", False)) is not True:
+        raise DockerError("web_container", "the web service is not running")
+    config = container.get("Config") or {}
+    labels = config.get("Labels") or {}
+    if labels.get("com.docker.compose.project") != spec.project:
+        raise DockerError("web_container", "the web container is not this Compose project's")
+    if labels.get("com.docker.compose.service") != WEB_SERVICE:
+        raise DockerError("web_container", "the web container is not the web service")
+    state_mounts = [
+        mount
+        for mount in (container.get("Mounts") or [])
+        if mount.get("Destination") == "/state"
+    ]
+    if len(state_mounts) != 1:
+        raise DockerError("web_container", "the web container does not mount exactly one /state")
+    mount = state_mounts[0]
+    if mount.get("Type") != "volume" or mount.get("Name") != spec.state_volume:
+        raise DockerError(
+            "web_container", "the web container's /state is not the recorded state volume"
+        )
+    if _boolean(mount.get("RW", False)) is not True:
+        raise DockerError("web_container", "the web container's /state is not writable")
 
 
 def validate_volume(spec: ClusterSpec, volume: Mapping[str, Any], attached: Sequence[str], container_id: str) -> None:
@@ -904,10 +1262,20 @@ class ClusterAdapter:
                 role: _boolean_value(privilege[0][len(contract.PROJECT_ROLE_NAMES) + index])
                 for index, role in enumerate(contract.PROJECT_ROLE_NAMES)
             }
+            # `contract.database_facts` takes the full `SESSIONS_SQL` row shape
+            # `(datname, pid, usename, backend_type)` and applies the serving-database /
+            # client-backend filter itself. Passing a reduced `(pid, role)` pair here made
+            # every ordinary Web session crash the observation (and therefore every
+            # scheduled backup); a malformed catalog row is a controlled refusal.
+            session_rows = _rows(self.docker.psql("postgres", contract.SESSIONS_SQL))
+            for row in session_rows:
+                if len(row) != 4:
+                    raise DockerError(
+                        "sessions_observation", "a session observation row is malformed"
+                    )
             sessions = tuple(
-                (int(row[1]), str(row[2]))
-                for row in _rows(self.docker.psql("postgres", contract.SESSIONS_SQL))
-                if row[0] == contract.SERVING_DATABASE and row[3] == "client backend"
+                (str(row[0]), _session_pid(row[1]), str(row[2]), str(row[3]))
+                for row in session_rows
             )
             subscriptions = tuple(
                 (int(row[0]), str(row[1]), int(row[2]))
@@ -1520,7 +1888,7 @@ def grant_connect(
 
     The role is an allowlisted constant and the database is the serving one; neither is
     interpolated from operator input. There is deliberately no path to a broad grant,
-    SUPERUSER, another database or a role outside the three P0 handoffs. The GRANT runs
+    SUPERUSER, another database or a role outside the four authorized H1/H2/H3 logins. The GRANT runs
     only against the immutable container id Mode B verified. The returned `GrantAttempt`
     distinguishes a returned client from a timeout/interruption; it never turns the psql
     status into an outcome by itself.
@@ -1927,6 +2295,16 @@ def run_handoff(
                 "an earlier migrate run has no observed outcome; run "
                 "`enroll.py reconcile-migration` before a handoff",
             )
+        # LCK-08: a lock-handoff intent with no outcome is UNKNOWN. Only `enroll.py
+        # lock-handoff` may resolve it, so no grant handoff (a later transition) may
+        # proceed through that state.
+        lock_unknown = enrollment.pending_lock_handoff_refusal(view.records)
+        if lock_unknown is not None:
+            print(
+                f"unknown [handoff]: {lock_unknown}; no CONNECT was granted.",
+                file=sys.stderr,
+            )
+            return EX_UNKNOWN
         verdict = enrollment.mode_b(view.records, adapter.mode_b_observation())
         if not verdict.ok:
             enrollment.record_mismatch(journal_file, verdict, clock=clock)
@@ -2163,7 +2541,7 @@ def _handoff_command(args) -> int:
         )
         return EX_USAGE
     journal_file = _journal_file(args)
-    spec = load_spec(args.compose_file)
+    spec = load_spec(args.compose_file, args.credentials_dir)
     docker = Docker(spec)
     adapter = ClusterAdapter(docker, compose_file=args.compose_file)
     return run_handoff(
@@ -2172,6 +2550,492 @@ def _handoff_command(args) -> int:
         adapter,
         role=args.role,
         approved_by=approved_by,
+    )
+
+
+# --- HOF-03 item 4: the journaled lock handoff -----------------------------------------------
+
+
+def _probe_refusal_code(done: subprocess.CompletedProcess) -> Optional[str]:
+    """The stable `refused [code]:` / `error [code]:` token of a dbtool probe, or None."""
+    lines = done.stderr.decode("utf-8", "replace").strip().splitlines()
+    if not lines:
+        return None
+    match = re.match(r"^(?:refused|error) \[([a-z][a-z0-9_]{0,63})\]:", lines[0])
+    return match.group(1) if match else None
+
+
+def _probe_observation(
+    done: subprocess.CompletedProcess,
+) -> Optional[tuple[int, Optional[str]]]:
+    """dbtool's own answer as `(exit, code)`, or None when the probe is indeterminate.
+
+    Only dbtool's three outcome classes describe the lock: `0` success, `3` refused and
+    `4` unusable. Each must be internally coherent (success carries no refusal code; a
+    refusal/unusable answer carries one). `docker exec` reports its own client failures
+    with exit 1, 125, 126 or 127 and text such as `Error: No such container`; those say
+    nothing about the lock and leave the intent UNKNOWN (LCK-08), never a `failed` claim.
+    """
+    exit_code = done.returncode
+    if not isinstance(exit_code, int):
+        return None
+    code = _probe_refusal_code(done)
+    if exit_code == 0:
+        return (0, None) if code is None else None
+    if exit_code in (3, 4):
+        return (exit_code, code) if code is not None else None
+    return None
+
+
+def _inspection_reason(error: object) -> str:
+    """A non-secret description of why the lock state is not established."""
+    if isinstance(error, lock_owner.LockInspectionError):
+        return error.message
+    if isinstance(error, DockerError):
+        return error.message
+    return "the lock state could not be inspected"
+
+
+@dataclass
+class _LockObservation:
+    """One lock-handoff observation, with the host witness when it is still held.
+
+    A caller that publishes an `observed` outcome appends the journal record while
+    `witness` is held and releases it afterwards. A caller that publishes `failed` has
+    no witness (it was released before return, or could not be taken).
+    """
+
+    outcome: Optional[str]
+    evidence: Optional[dict]
+    reason: Optional[str]
+    witness: Optional[Any] = None
+
+    def release(self) -> None:
+        if self.witness is not None:
+            self.witness.__exit__(None, None, None)
+            self.witness = None
+
+
+def _lock_observation(
+    docker: Docker,
+    container_id: str,
+    spec: ClusterSpec,
+    *,
+    on_witness_held=None,
+    publication_hook=None,
+) -> _LockObservation:
+    """Observe HOF-03 item 4 and decide `observed`/`failed`, or UNKNOWN.
+
+    The sequence is the approved Option A boundary:
+
+    1. a kernel ownership snapshot of the validated web process;
+    2. the frozen `check-idle` exclusive observation (it must be refused);
+    3. a host-held shared flock witness on the same validated lock inode;
+    4. a second ownership snapshot, a re-verification of the immutable container id and
+       a fresh selection of the project's current running web container;
+    5. for `observed`, the witness is retained until the caller has appended the journal
+       outcome and it has been fsynced.
+
+    The witness guarantees that no exclusive holder can appear from step 3 through the
+    publication; it is never evidence of web ownership (the host is outside the container
+    cgroup and only the web process's own descriptor satisfies the holder test). The web
+    process is attested at the two snapshots only, not after the fsync.
+
+    Returns `_LockObservation`:
+      * `outcome="observed"` - every required fact was established; the witness is held;
+      * `outcome="failed"` - the evidence is determinate and does not meet the condition;
+      * `outcome=None` - indeterminate or contradictory; no outcome may be published and
+        the intent stays UNKNOWN (LCK-08).
+    """
+    def unknown(reason: str) -> _LockObservation:
+        return _LockObservation(None, None, reason)
+
+    try:
+        # One validated host path for both snapshots and the witness. If the volume's
+        # mountpoint cannot be established, nothing about the lock file is observed.
+        mountpoint = docker.state_volume_mountpoint()
+        first = docker.web_lock_snapshot(container_id, mountpoint)
+    except (lock_owner.LockInspectionError, DockerError) as error:
+        return unknown(_inspection_reason(error))
+    idle = docker.lock_idle_probe(container_id)
+    idle_answer = _probe_observation(idle)
+    if idle_answer is None:
+        return unknown("the idle check could not be run inside the web container")
+    idle_exit, idle_code = idle_answer
+
+    witness = None
+    if first.lock_present:
+        if first.identity is None:
+            return unknown("the state-volume lock file identity was not established")
+        try:
+            candidate = docker.web_lock_witness(
+                first.identity, mountpoint=mountpoint, on_held=on_witness_held
+            )
+            candidate.__enter__()
+            witness = candidate
+        except lock_owner.LockWitnessBusy:
+            # An exclusive lock exists now. A first snapshot showing the web process's
+            # *shared* lock is inconsistent with that (the witness cannot conflict with a
+            # shared holder), so an exclusive holder appeared after the observation. A
+            # first snapshot showing no holder, or the web's own WRITE lock, is consistent
+            # with the refusal; the observation continues without a witness and can finish
+            # as a determinate `failed`. It can never become `observed`.
+            if first.holders and any(
+                holder.access == lock_owner.LOCK_ACCESS_READ
+                for holder in first.holders
+            ):
+                return unknown(
+                    "an exclusive holder acquired the state-volume lock after the first "
+                    "observation"
+                )
+        except (lock_owner.LockInspectionError, DockerError) as error:
+            return unknown(_inspection_reason(error))
+
+    try:
+        second = docker.web_lock_snapshot(container_id, mountpoint)
+        # Both snapshots were taken through the immutable id; confirm that id is still the
+        # validated running web service, and freshly select the project's current running
+        # web container. A replacement, removal or rename fails closed.
+        docker.verify_web_container(container_id)
+        if docker.web_container() != container_id:
+            raise DockerError(
+                "container_replacement",
+                "the current web container is not the verified one",
+            )
+    except (lock_owner.LockInspectionError, DockerError) as error:
+        if witness is not None:
+            witness.__exit__(None, None, None)
+        return unknown(_inspection_reason(error))
+    if first != second:
+        if witness is not None:
+            witness.__exit__(None, None, None)
+        return unknown("the lock ownership changed between the two observations")
+    if len(second.holders) > 1:
+        if witness is not None:
+            witness.__exit__(None, None, None)
+        return unknown("more than one web process holds the state-volume lock")
+    holder = second.holders[0] if second.holders else None
+    if idle_exit == 0 and holder is not None:
+        # The exclusive idle check succeeded, so no shared holder existed at that instant,
+        # yet the kernel snapshot shows one: the two observations contradict each other.
+        if witness is not None:
+            witness.__exit__(None, None, None)
+        return unknown("the idle check and the kernel lock record disagree")
+    identity = second.identity
+    evidence = {
+        "container_id": container_id,
+        "state_volume": spec.state_volume,
+        "lock_present": second.lock_present,
+        "lock_device": (
+            None if identity is None else lock_owner.device_text(identity)
+        ),
+        "lock_inode": None if identity is None else identity[1],
+        "idle_exit": idle_exit,
+        "idle_code": idle_code,
+        "holder_pid": None if holder is None else holder.pid,
+        "holder_start_ticks": None if holder is None else holder.start_ticks,
+        "holder_access": None if holder is None else holder.access,
+        "observations": 2,
+        "witness_access": (
+            enrollment.LOCK_WITNESS_ACCESS if witness is not None else None
+        ),
+        "observation_boundary": (
+            enrollment.LOCK_OBSERVATION_BOUNDARY if witness is not None else None
+        ),
+    }
+    if enrollment.lock_handoff_satisfied(evidence):
+        if publication_hook is not None:
+            publication_hook()
+        return _LockObservation("observed", evidence, None, witness)
+    if witness is not None:
+        witness.__exit__(None, None, None)
+    return _LockObservation(
+        "failed", evidence, _lock_failure_reason(evidence)
+    )
+
+
+def _lock_failure_reason(evidence: Mapping[str, Any]) -> str:
+    """A stable, non-secret explanation of why the positive condition was not observed."""
+    if evidence["holder_access"] == "write":
+        return (
+            "the web process holds the state-volume lock exclusively, not shared"
+        )
+    if evidence["holder_pid"] is None:
+        if not evidence["lock_present"]:
+            return (
+                "the state volume has no lock file: the web process cannot be holding "
+                "the shared lock"
+            )
+        if evidence["idle_code"] == enrollment.LOCK_EXCLUSIVE_REFUSAL_CODE:
+            return (
+                "the state-volume lock is held, but not by the validated web process "
+                "(an exclusive holder or another process owns it)"
+            )
+        if evidence["idle_exit"] == 0:
+            return (
+                "the exclusive idle check succeeded: no process inside the web container "
+                "holds the shared state-volume lock"
+            )
+        return (
+            f"the idle check exited {evidence['idle_exit']} "
+            f"({evidence['idle_code'] or 'unreported'}) and no web-owned shared lock was "
+            "observed"
+        )
+    return (
+        "the idle check did not report the state-volume lock as held "
+        f"(exit {evidence['idle_exit']}, {evidence['idle_code'] or 'unreported'})"
+    )
+
+
+def run_lock_handoff(
+    docker: Docker,
+    journal_file: journal.Journal,
+    *,
+    approved_by: str,
+    clock=None,
+    on_witness_held=None,
+    publication_hook=None,
+) -> int:
+    """Journaled HOF-03 item 4 lock handoff, under the host operation interval.
+
+    The evidence is the kernel's own lock ownership: the validated web process (container
+    cgroup + the deployed image's real uvicorn argv) holds a `FLOCK ... READ` on the
+    state-volume lock file through one of its own descriptors, observed twice with
+    `check-idle` refused in between, while a host-held shared witness covers the final
+    verification through the journal append. No acquisition probe is taken, so a probe
+    lock can never be published as web-owned.
+
+    The latest journal state decides the action, not "an observed record exists":
+
+    * `pending` - the unresolved intent is resolved by this observation; no new intent.
+    * `observed` - re-observe. A NEW intent is appended before the observation, so the
+      earlier successful observation stops being the latest state before any fallible
+      work begins. A repeated confirmation of the same container is recorded as a fresh
+      `observed` outcome in that new epoch; a different container is observed in it; a
+      determinate negative appends a `failed` outcome, so the historical observation
+      cannot authorize a re-arm after it was contradicted.
+    * `failed` / `none` - a new intent is appended before the observation (LCK-08), then
+      one outcome.
+
+    An indeterminate or contradictory observation appends no outcome and leaves the
+    intent UNKNOWN. A `failed` outcome is terminal for that epoch.
+    """
+    with journal_file.operation_lock():
+        view = journal_file.read()
+        if enrollment.pending_migration_unknown(view.records) is not None:
+            raise enrollment.EnrollmentError(
+                "migration_unknown",
+                "an earlier migrate run has no observed outcome; run "
+                "`enroll.py reconcile-migration` before the lock handoff",
+            )
+        # LCK-08/LCK-13: an unresolved grant handoff blocks every operation that advances
+        # the cutover machine, and the lock handoff is HOF-03 re-arm evidence. Only
+        # `enroll.py handoff` may resolve the intent, so this gate cannot deadlock.
+        blocked = pending_handoff_refusal(view.records)
+        if blocked is not None:
+            print(
+                f"unknown [lock-handoff]: {blocked}; no lock observation was recorded.",
+                file=sys.stderr,
+            )
+            return EX_UNKNOWN
+        # Validate the whole lock history and derive the latest state before touching
+        # Docker: corruption fails before any probe, and a pending UNKNOWN is never
+        # mistaken for the observation it must resolve (LCK-08).
+        state = enrollment.lock_handoff_state(view.records)
+        container_id = docker.web_container()
+        spec = docker.spec
+
+        def append_intent(run_id: str):
+            return journal_file.append(
+                "handoff_lock",
+                {
+                    "state": "intent",
+                    "action": enrollment.LOCK_HANDOFF_ACTION,
+                    "handoff": enrollment.LOCK_HANDOFF_EVENT,
+                    "operator": approved_by,
+                    "run_id": run_id,
+                },
+                at=(clock or _utcnow)(),
+            )
+
+        def append_outcome(run_id: str, outcome: str, evidence: Mapping[str, Any]):
+            return journal_file.append(
+                "handoff_lock",
+                {
+                    "state": "outcome",
+                    "action": enrollment.LOCK_HANDOFF_ACTION,
+                    "handoff": enrollment.LOCK_HANDOFF_EVENT,
+                    "operator": approved_by,
+                    "run_id": run_id,
+                    "outcome": outcome,
+                    "evidence": evidence,
+                },
+                at=(clock or _utcnow)(),
+            )
+
+        if state.pending is not None:
+            # Resolve the earlier intent; never open a second one over it.
+            run_id = str(state.pending.payload["run_id"])
+            print(
+                f"resolved [lock-handoff]: observing the pending intent at seq "
+                f"{state.pending.seq} of the earlier run.",
+                file=sys.stderr,
+            )
+            observation = _lock_observation(
+                docker,
+                container_id,
+                spec,
+                on_witness_held=on_witness_held,
+                publication_hook=publication_hook,
+            )
+            if observation.outcome is None:
+                observation.release()
+                print(
+                    f"unknown [lock-handoff]: {observation.reason}; the intent remains "
+                    "pending and no outcome was appended. Run the same command again to "
+                    "reconcile.",
+                    file=sys.stderr,
+                )
+                return EX_UNKNOWN
+            try:
+                record = append_outcome(
+                    run_id, observation.outcome, observation.evidence
+                )
+            finally:
+                observation.release()
+            return _report_lock_outcome(
+                observation.outcome, observation.evidence, record.seq, run_id
+            )
+
+        if state.observed is not None:
+            prior = state.observed
+            prior_id = str(prior.payload["evidence"]["container_id"])
+            # Publish a new intent BEFORE the fallible re-observation. The intent makes the
+            # earlier `observed` outcome stop being the latest state immediately: if this
+            # observation is indeterminate, or the process is interrupted after this
+            # append, the pending intent is the current state, `lock_handoff_observed` is
+            # None, and every later transition is fenced (LCK-08). Appending the intent
+            # only after a successful observation would leave the earlier `observed`
+            # authoritative through an UNKNOWN.
+            run_id = os.urandom(16).hex()
+            intent = append_intent(run_id)
+            observation = _lock_observation(
+                docker,
+                container_id,
+                spec,
+                on_witness_held=on_witness_held,
+                publication_hook=publication_hook,
+            )
+            if observation.outcome is None:
+                observation.release()
+                print(
+                    f"unknown [lock-handoff]: {observation.reason}; the new intent at "
+                    f"seq {intent.seq} remains pending and no outcome was appended. The "
+                    f"earlier observation at seq {prior.seq} is superseded by that pending "
+                    "intent and no longer authorizes a re-arm. Run the same command again "
+                    "to reconcile.",
+                    file=sys.stderr,
+                )
+                return EX_UNKNOWN
+            current_id = str(observation.evidence["container_id"])
+            try:
+                record = append_outcome(
+                    run_id, observation.outcome, observation.evidence
+                )
+            finally:
+                observation.release()
+            if observation.outcome == "observed" and current_id == prior_id:
+                print(
+                    "ok [lock-handoff]: re-observed at seq "
+                    f"{record.seq}; the current web container ({current_id}) still holds "
+                    "the shared lock and no exclusive holder remains. The earlier "
+                    f"observation at seq {prior.seq} is superseded by this fresh epoch "
+                    f"(intent seq {intent.seq})."
+                )
+                return EX_OK
+            if observation.outcome == "observed":
+                print(
+                    "ok [lock-handoff]: the current web container "
+                    f"({current_id}) differs from the earlier observation at seq "
+                    f"{prior.seq} ({prior_id}); the current container is now observed at "
+                    f"seq {record.seq} (event handoff:lock, run {run_id}). The earlier "
+                    "record is retained as history and is no longer the latest state."
+                )
+                return EX_OK
+            print(
+                "refused [lock-handoff]: "
+                + (observation.reason or _lock_failure_reason(observation.evidence))
+                + f"; recorded as a failed observation at seq {record.seq}. The earlier "
+                f"observation at seq {prior.seq} is superseded and no longer authorizes "
+                "a re-arm.",
+                file=sys.stderr,
+            )
+            return EX_REFUSED
+
+        # No pending intent and no current observation: a new epoch. The intent is written
+        # before the observation, so an indeterminate result remains a journaled UNKNOWN.
+        run_id = os.urandom(16).hex()
+        append_intent(run_id)
+        observation = _lock_observation(
+            docker,
+            container_id,
+            spec,
+            on_witness_held=on_witness_held,
+            publication_hook=publication_hook,
+        )
+        if observation.outcome is None:
+            observation.release()
+            print(
+                f"unknown [lock-handoff]: {observation.reason}; the intent remains pending "
+                "and no outcome was appended. Run the same command again to reconcile.",
+                file=sys.stderr,
+            )
+            return EX_UNKNOWN
+        try:
+            record = append_outcome(run_id, observation.outcome, observation.evidence)
+        finally:
+            observation.release()
+        return _report_lock_outcome(
+            observation.outcome, observation.evidence, record.seq, run_id
+        )
+
+
+def _report_lock_outcome(
+    outcome: str, evidence: Mapping[str, Any], seq: int, run_id: str
+) -> int:
+    """The one success/refusal report shared by every published outcome."""
+    if outcome == "observed":
+        print(
+            "ok [lock-handoff]: the web service holds the shared state-volume lock and no "
+            "exclusive holder remains (journal seq "
+            f"{seq}, event handoff:lock, run {run_id}). A host-held shared witness covered "
+            "the final verification through the journal fsync; ownership after that "
+            "boundary is not claimed."
+        )
+        return EX_OK
+    print(
+        "refused [lock-handoff]: "
+        + _lock_failure_reason(evidence)
+        + f"; recorded as a failed observation at seq {seq}.",
+        file=sys.stderr,
+    )
+    return EX_REFUSED
+
+
+def _lock_handoff_command(args) -> int:
+    """Validate the request before anything touches Docker or the journal."""
+    approved_by = _approved_by(args.approved_by)
+    if approved_by is None:
+        print(
+            "usage [lock_handoff_authorization]: --approved-by must be a non-empty, "
+            "printable label of at most 200 characters; nothing was done.",
+            file=sys.stderr,
+        )
+        return EX_USAGE
+    journal_file = _journal_file(args)
+    spec = load_spec(args.compose_file, args.credentials_dir)
+    return run_lock_handoff(
+        Docker(spec), journal_file, approved_by=approved_by
     )
 
 
@@ -2259,6 +3123,16 @@ def run_migrate(
         if blocked is not None:
             print(
                 f"unknown [handoff]: {blocked}; no migration was started.",
+                file=sys.stderr,
+            )
+            return EX_UNKNOWN
+        # LCK-08: an unresolved lock handoff is UNKNOWN and only `enroll.py
+        # lock-handoff` may resolve it. A migration is a later transition, so it must not
+        # advance through that state.
+        lock_unknown = enrollment.pending_lock_handoff_refusal(records)
+        if lock_unknown is not None:
+            print(
+                f"unknown [lock-handoff]: {lock_unknown}; no migration was started.",
                 file=sys.stderr,
             )
             return EX_UNKNOWN
@@ -2416,6 +3290,15 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path(os.environ.get("HOUSE_HELPER_PG_JOURNAL_DIR", DEFAULT_JOURNAL_DIR)),
     )
+    # F-03: the approved credential directory, passed explicitly on every host command.
+    # An ordinary `sudo` does not carry the shell's environment, so the tool must not
+    # depend on the variable alone; the value is non-secret and is never printed.
+    parser.add_argument(
+        "--credentials-dir",
+        type=Path,
+        default=None,
+        help=f"the approved credential directory (the units' {CREDENTIALS_DIRECTORY_ENV})",
+    )
     commands = parser.add_subparsers(dest="command", required=True, metavar="command")
     commands.add_parser("status", help="print the durable enrollment state (non-secret)")
     mode_a = commands.add_parser("mode-a", help="perform or resume the one-time Mode A enrollment")
@@ -2428,9 +3311,18 @@ def _parser() -> argparse.ArgumentParser:
     handoff.add_argument(
         "--role",
         required=True,
-        help="the grantee: hh_app (H1), hh_provision (H2) or hh_backup (H3)",
+        help="the grantee: hh_app (H1), hh_provision (H2), hh_purge or hh_backup (H3)",
     )
     handoff.add_argument(
+        "--approved-by",
+        required=True,
+        help="the Owner/operator authorization label recorded with the intent",
+    )
+    lock = commands.add_parser(
+        "lock-handoff",
+        help="journal the HOF-03 item 4 lock handoff (observed, never assumed)",
+    )
+    lock.add_argument(
         "--approved-by",
         required=True,
         help="the Owner/operator authorization label recorded with the intent",
@@ -2441,7 +3333,11 @@ def _parser() -> argparse.ArgumentParser:
         help="observe the cluster and resolve an UNKNOWN migrate outcome",
     )
     check = commands.add_parser("check-credentials", help="validate per-role passfiles, no values")
-    check.add_argument("--credentials-dir", type=Path, default=DEFAULT_CREDENTIALS_DIR)
+    # A separate destination: a subparser default would otherwise overwrite the
+    # top-level `--credentials-dir` value with the repository default.
+    check.add_argument(
+        "--credentials-dir", dest="check_credentials_dir", type=Path, default=None
+    )
     commands.add_parser(
         "plan-bootstrap-retirement", help="print the bootstrap password retirement plan (no execution)"
     )
@@ -2479,10 +3375,33 @@ def _print_status(journal_file: journal.Journal) -> int:
             f"handoff UNKNOWN: {role} intent at seq {record.seq} has no observed outcome; "
             f"run `enroll.py handoff --role {role} --approved-by <owner>` to reconcile it"
         )
+    pending_lock = enrollment.pending_lock_handoff_intent(view.records)
+    if pending_lock is not None:
+        print(
+            f"lock handoff UNKNOWN: intent at seq {pending_lock.seq} has no observed "
+            "outcome; run `enroll.py lock-handoff --approved-by <owner>` to reconcile it"
+        )
     return EX_OK
 
 
 def _check_credentials(directory: Path) -> int:
+    """Validate the passfiles in the effective credential directory.
+
+    The directory is the one the shared precedence contract resolved (F-03): the caller
+    passes a canonical path, so a top-level option, a subcommand option, an inherited
+    environment value and the Compose default can never silently describe different
+    directories. The path is non-secret configuration and is printed so the operator can
+    compare it with the mount source; no passfile content is printed.
+    """
+    # Verify the effective directory identity, not merely that some passfiles exist.
+    if not directory.is_dir():
+        print(
+            "refused [credentials_directory]: the effective credential directory "
+            "does not exist or is not a directory; nothing was checked.",
+            file=sys.stderr,
+        )
+        return EX_REFUSED
+    print(f"credentials directory: {directory}")
     expected = {
         "hh_app": contract.SERVING_DATABASE,
         "hh_migrate": contract.SERVING_DATABASE,
@@ -2514,6 +3433,47 @@ def _check_credentials(directory: Path) -> int:
     return EX_REFUSED if failed else EX_OK
 
 
+def reconcile_migration_command(
+    docker: Docker, journal_file: journal.Journal, adapter: ClusterAdapter
+) -> int:
+    """Resolve a pending migrate intent from positive termination evidence (F10)."""
+    run_id = ""
+    with journal_file.operation_lock():
+        # LCK-08: reconciliation is an advancement decision. A pending lock handoff is a
+        # different UNKNOWN whose only resolver is `lock-handoff`; until it is resolved,
+        # no reconciliation may invent a transition.
+        lock_unknown = enrollment.pending_lock_handoff_refusal(
+            journal_file.read().records
+        )
+        if lock_unknown is not None:
+            print(
+                f"unknown [reconcile-migration]: {lock_unknown}; no migration outcome "
+                "was reconciled.",
+                file=sys.stderr,
+            )
+            return EX_UNKNOWN
+        # F10: the Docker container lifecycle of THE pending run is observed inside the
+        # same host interval as the database observation. Neither the client's exit nor an
+        # unchanged revision is evidence on its own.
+        pending = enrollment.pending_migration_unknown(journal_file.read().records)
+        run_id = "" if pending is None else str(pending.payload.get("run_id", ""))
+        evidence = adapter.worker_evidence(run_id)
+        record = enrollment.reconcile_migration(
+            journal_file,
+            adapter.mode_b_observation(),
+            worker=evidence,
+        )
+    # The reconciliation record is durable; a confirmed terminal worker may now be removed
+    # with the same exact-identity checks. A cleanup failure is a warning, not a reopened
+    # UNKNOWN.
+    cleanup_worker(docker, run_id)
+    print(
+        f"ok [reconcile-migration]: run {record.payload.get('run_id', '')} "
+        f"resolved as {record.payload.get('outcome', '')}."
+    )
+    return EX_OK
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -2522,13 +3482,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print(f"{number}. {step}")
             return EX_OK
         if args.command == "check-credentials":
-            return _check_credentials(args.credentials_dir)
+            # F-03: the same precedence and conflict reconciliation as every other host
+            # command. A subcommand option never silently overrides the top-level one,
+            # and an explicit value never silently disagrees with the environment.
+            return _check_credentials(
+                resolve_credentials_directory(
+                    args.compose_file,
+                    top_level=args.credentials_dir,
+                    subcommand=args.check_credentials_dir,
+                )
+            )
         if args.command == "handoff":
             return _handoff_command(args)
+        if args.command == "lock-handoff":
+            return _lock_handoff_command(args)
         journal_file = _journal_file(args)
         if args.command == "status":
             return _print_status(journal_file)
-        spec = load_spec(args.compose_file)
+        spec = load_spec(args.compose_file, args.credentials_dir)
         docker = Docker(spec)
         adapter = ClusterAdapter(docker, compose_file=args.compose_file)
         if args.command == "mode-a":
@@ -2554,31 +3525,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             return EX_REFUSED
         if args.command == "reconcile-migration":
-            with journal_file.operation_lock():
-                # F10: the Docker container lifecycle of THE pending run is observed
-                # inside the same host interval as the database observation. Neither the
-                # client's exit nor an unchanged revision is evidence on its own.
-                pending = enrollment.pending_migration_unknown(
-                    journal_file.read().records
-                )
-                run_id = (
-                    "" if pending is None else str(pending.payload.get("run_id", ""))
-                )
-                evidence = adapter.worker_evidence(run_id)
-                record = enrollment.reconcile_migration(
-                    journal_file,
-                    adapter.mode_b_observation(),
-                    worker=evidence,
-                )
-            # The reconciliation record is durable; a confirmed terminal worker may now be
-            # removed with the same exact-identity checks. A cleanup failure is a warning,
-            # not a reopened UNKNOWN.
-            cleanup_worker(docker, run_id)
-            print(
-                f"ok [reconcile-migration]: run {record.payload.get('run_id', '')} "
-                f"resolved as {record.payload.get('outcome', '')}."
-            )
-            return EX_OK
+            return reconcile_migration_command(docker, journal_file, adapter)
         if args.command == "migrate":
             return run_migrate(docker, args.compose_file, journal_file, adapter)
         return EX_USAGE

@@ -24,11 +24,26 @@ reimplementing an invitation, a user rule or a transaction. The invitation secre
 printed only by the admin CLI on stdout, exactly once; the provisioning service has no log
 driver and the one-shot never copies the secret anywhere.
 
-`purge`, `backup` and `restore` remain boundaries that refuse with EX_CONFIG (78). The
+**purge** (C7-P3) runs the existing `purge-expired` administrative command (optionally
+`--dry-run`) under the `hh_purge` login. It takes the same shared state-volume lock, so it
+runs beside the web service and a backup and is refused while a migration or restore holds
+the volume exclusively. Before the command runs it observes its own session, database and
+CONNECT privilege and the enrolled marker: a missing H3 `hh_purge` handoff is refused by
+the server before any statement of the command runs, and no SQL of the command is ever
+executed without the CONNECT privilege that handoff grants. Naming that refusal is a
+separate question (`_connection_failure`): the pinned psycopg 3.3.6 exposes no SQLSTATE for
+a failed startup, so it is reported fail-closed as `purge_database_unavailable` (exit 4)
+with the handoff named, and never guessed from the driver's (localized) message text.
+Retention semantics, batching, transaction boundaries and the report stay in
+`house_helper.admin.retention`; this one-shot does not reimplement them. A partial, degraded
+or refused run keeps the admin command's non-zero exit status, so the systemd unit (and its
+heartbeat) can never record a success that did not happen.
+
+`backup` and `restore` remain boundaries that refuse with EX_CONFIG (78). The
 application image intentionally has no `pg_dump`/`pg_restore` (BAK-13), so the
 backup/restore roles are executed by the host tool `deploy/postgres/maintenance.py` in
 disposable pinned `postgres:16.x` client containers, not by these app-image one-shots.
-Scheduled operations and the systemd re-arm are WP-2F.
+The scheduled purge path and its systemd units are C7-P3 (`deploy/postgres/scheduled_maintenance.md`).
 
 The authority channel
 ---------------------
@@ -47,12 +62,17 @@ explicitly opened channel is not an authorization: `pg_executor` validates the r
 re-reads the live cluster, and compares the artifact manifest with this image's own files.
 
 Exit codes (the same shape as deploy/ops/dbtool.py):
-  0   the migration/initialization completed
-  2   usage: the role argument is missing or unknown
-  3   refused: a wiring, authorization, identity or state condition failed
-  4   database unavailable
+  0   the migration/initialization or the retention command completed
+  1   the retention command failed unexpectedly (its own report says what committed)
+  2   usage: the role argument is missing or unknown, or a purge argument is not accepted
+  3   refused: a wiring, authorization, identity or state condition failed, including a
+      handoff refusal the driver *did* report with SQLSTATE 42501 (`<role>_connect_handoff`,
+      i.e. `purge_connect_handoff` / `provision_connect_handoff`) and `database_busy`
+  4   database unavailable: the connection did not complete, or the schema is not the image's
+      head. A startup refusal (including a missing H3 CONNECT handoff) carries no SQLSTATE in
+      the pinned driver, so it is reported here, fail-closed, with the handoff named
   78  EX_CONFIG: the one-shot is not implemented, or the activation/wiring is wrong
-  130 the provisioning command was interrupted
+  130 the provisioning or purge command was interrupted
 """
 
 import os
@@ -262,6 +282,45 @@ def _sqlstate(error: BaseException) -> str:
     return ""
 
 
+def _connection_failure(
+    error: BaseException, *, role: str, login: str, handoff: str, handoff_command: str
+) -> tuple[str, str, int]:
+    """Classify a failed connection from structured driver evidence ONLY (F-02).
+
+    A connection that fails at *startup* carries no SQLSTATE in this deployment's driver.
+    psycopg 3.3.6 (pinned in requirements.txt) has `generators._connect` raise
+    `psycopg.OperationalError` from `PQconnectPoll` with only `pgconn=`: no `info=` is
+    supplied, so `Error.sqlstate`, `Error.diag.sqlstate` and `pgcode` are all absent, and
+    SQLAlchemy wraps it unchanged with `.orig` pointing at that exception. Reproduced with
+    the pinned driver against PostgreSQL 16.15 for a refused CONNECT (the server's
+    ErrorResponse does carry 42501), a refused password (28P01), a missing database (3D000)
+    and a closed port (`psycopg.errors.ConnectionTimeout`). The only evidence the driver
+    keeps is the finished `PGconn`; its message is libpq's, localized, and is therefore never
+    read here as an authorization fact - nor as a cause.
+
+    So 42501 is believed only when the driver actually supplies it (psycopg 2's `pgcode`, a
+    driver that attaches `info=`, or a denial raised after the session exists). Every other
+    startup failure is one fail-closed `database unavailable` (exit 4) that names the
+    ambiguity and the handoff to verify, and states that nothing was executed.
+    """
+    if _sqlstate(error) == "42501":
+        return (
+            f"{role}_connect_handoff",
+            f"the database refused the {login} connection: the {handoff} CONNECT handoff "
+            "is not in place; nothing was executed.",
+            EX_REFUSED,
+        )
+    return (
+        f"{role}_database_unavailable",
+        f"the database could not be used: the {login} connection did not complete "
+        "(unreachable, a refused credential, or a refused CONNECT). The driver supplies no "
+        f"SQLSTATE for a connection that fails at startup, so a missing {handoff} CONNECT "
+        "handoff cannot be told apart from the others here. Nothing was executed; if that "
+        f"handoff was expected, check `enroll.py status` and re-run `{handoff_command}`.",
+        EX_DATABASE,
+    )
+
+
 def provision_target_failures(
     *,
     session_user: object,
@@ -342,19 +401,11 @@ def _verify_provision_connection(engine) -> None:
             ).fetchone()
             marker = "" if marker_row is None else str(marker_row[0] or "")
     except sa.exc.DBAPIError as error:
-        if _sqlstate(error) == "42501":
-            raise ProvisionError(
-                "provision_connect_handoff",
-                "the database refused the hh_provision connection: the H2 CONNECT "
-                "handoff is not in place; nothing was executed.",
-            ) from None
-        raise ProvisionError(
-            "provision_database_unavailable",
-            "the database could not be used: it is not reachable or refused the "
-            "hh_provision credential. The driver's details are withheld; nothing was "
-            "executed.",
-            EX_DATABASE,
-        ) from None
+        code, message, exit_code = _connection_failure(
+            error, role="provision", login=PROVISION_LOGIN, handoff="H2",
+            handoff_command="enroll.py handoff --role hh_provision",
+        )
+        raise ProvisionError(code, message, exit_code) from None
     except ProvisionError:
         raise
 
@@ -463,6 +514,233 @@ def _provision(
             return _refuse(str(error.code), str(error.message), EX_REFUSED)
         print(
             f"error [internal]: the provision command failed with {type(error).__name__}.",
+            file=sys.stderr,
+        )
+        return EX_INTERNAL
+
+
+# --- purge: the scheduled retention command under hh_purge -----------------------------------
+
+PURGE_LOGIN = EXPECTED_LOGIN["purge"]
+
+
+class PurgeError(Exception):
+    """A fail-closed purge refusal. `code` is stable and carries no secret."""
+
+    def __init__(self, code: str, message: str, exit_code: int = EX_REFUSED) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.exit_code = exit_code
+
+
+def _purge_arguments(arguments: list) -> Optional[list]:
+    """The only accepted purge arguments: none (a real run) or exactly `--dry-run`.
+
+    The admin command's own parser is intentionally narrow, but this one-shot adds the
+    deployment checks ahead of it, so it must not forward an arbitrary argument list that
+    could change what is deleted. Anything else is a usage refusal before a connection.
+    """
+    if not arguments:
+        return []
+    if arguments == ["--dry-run"]:
+        return ["--dry-run"]
+    return None
+
+
+def purge_target_failures(
+    *,
+    session_user: object,
+    current_user: object,
+    database: object,
+    connect: object,
+    temporary: object,
+    marker: object,
+) -> tuple[str, ...]:
+    """The enrolled-cluster/H3-handoff gate for the purge login, as one pure decision.
+
+    A valid target is this login (`hh_purge`), in the serving database, holding CONNECT
+    and no TEMPORARY privilege, with a parseable enrollment marker. A failed connection
+    never reaches here: the server refuses it when the H3 handoff is absent.
+    """
+    from house_helper.persistence import pg_journal
+
+    failures: list[str] = []
+    if str(session_user) != PURGE_LOGIN:
+        failures.append("session_user")
+    if str(current_user) != PURGE_LOGIN:
+        failures.append("current_user")
+    if str(database) != DB_NAME:
+        failures.append("database")
+    if _as_bool(connect) is not True:
+        failures.append("connect_handoff")
+    if _as_bool(temporary) is not False:
+        failures.append("temporary_privilege")
+    try:
+        pg_journal.parse_marker(marker)
+    except pg_journal.JournalError:
+        failures.append("marker")
+    return tuple(failures)
+
+
+def _verify_purge_connection(engine) -> None:
+    """Observe the purge session, privilege boundary and enrolled marker before any DELETE.
+
+    This is the H3 half of ENR-15/§7.3 that the login itself can see. The physical
+    `system_identifier` and the container identity are host-authoritative and are checked
+    by the journaled `enroll.py handoff --role hh_purge` (Mode B) that must precede this
+    command. A missing CONNECT handoff makes PostgreSQL refuse the startup before any
+    statement of `purge-expired` runs; whether the driver can *name* that refusal is a
+    separate question, answered in `_connection_failure`: the pinned psycopg 3.3.6 supplies
+    no SQLSTATE for a failed startup, so the refusal is reported fail-closed as a database
+    refusal that names the handoff, never guessed from the message text. The host journal
+    itself is deliberately not readable from this container: CONNECT is the server-enforced
+    effect of the journaled grant. The password, DSN and driver text are never formatted
+    into a message.
+    """
+    import sqlalchemy as sa
+
+    from house_helper.persistence import pg_contract as contract
+
+    try:
+        with engine.connect() as connection:
+            row = connection.exec_driver_sql(
+                "SELECT session_user, current_user, pg_catalog.current_database()"
+            ).fetchone()
+            if row is None or len(row) != 3:
+                raise PurgeError(
+                    "purge_observation",
+                    "the purge session could not be read; nothing was executed.",
+                )
+            session_user, current_user, database = (str(value) for value in row)
+            privilege = connection.exec_driver_sql(
+                "SELECT pg_catalog.has_database_privilege(current_user, "
+                "pg_catalog.current_database(), 'CONNECT'), "
+                "pg_catalog.has_database_privilege(current_user, "
+                "pg_catalog.current_database(), 'TEMPORARY')"
+            ).fetchone()
+            if privilege is None or len(privilege) != 2:
+                raise PurgeError(
+                    "purge_observation",
+                    "the purge privileges could not be read; nothing was executed.",
+                )
+            connect, temporary = _as_bool(privilege[0]), _as_bool(privilege[1])
+            marker_row = connection.exec_driver_sql(
+                contract.marker_sql(contract.SERVING_DATABASE)
+            ).fetchone()
+            marker = "" if marker_row is None else str(marker_row[0] or "")
+    except sa.exc.DBAPIError as error:
+        code, message, exit_code = _connection_failure(
+            error, role="purge", login=PURGE_LOGIN, handoff="H3",
+            handoff_command="enroll.py handoff --role hh_purge",
+        )
+        raise PurgeError(code, message, exit_code) from None
+    except PurgeError:
+        raise
+
+    failures = purge_target_failures(
+        session_user=session_user,
+        current_user=current_user,
+        database=database,
+        connect=connect,
+        temporary=temporary,
+        marker=marker,
+    )
+    if failures:
+        if "connect_handoff" in failures:
+            code = "purge_connect_handoff"
+        elif "temporary_privilege" in failures:
+            code = "purge_privilege_boundary"
+        elif "marker" in failures:
+            code = "purge_marker"
+        else:
+            code = "purge_identity"
+        raise PurgeError(
+            code,
+            "the purge target is not the enrolled hh_purge database ("
+            + ", ".join(failures)
+            + "); nothing was executed.",
+        )
+
+
+def _purge(
+    environment: Mapping[str, str],
+    arguments: list,
+    *,
+    admin_main=None,
+    engine_factory=None,
+    lock_factory=None,
+    verifier=None,
+) -> int:
+    """Run exactly the retention command as `hh_purge`, under the shared volume lock.
+
+    The shared lock is the same one the web process and a backup hold: purge coexists with
+    them and is refused while a migration or restore holds the state volume exclusively.
+    `house_helper.admin.retention` owns the deletion policy, the batches and the report;
+    this function adds only the deployment's preconditions (its own wiring and passfile,
+    the lock, the enrolled marker and the H3 CONNECT handoff) and returns the admin
+    command's exit status unchanged. It therefore cannot turn a partial run into success.
+    """
+    permitted = _purge_arguments(arguments)
+    if permitted is None:
+        # Never echo the rejected text: an operator may have pasted a secret by mistake.
+        return _refuse(
+            "purge_arguments",
+            "the purge one-shot accepts no arguments or exactly --dry-run; nothing was "
+            "executed.",
+            EX_USAGE,
+            status="usage",
+        )
+
+    from house_helper.persistence import pg_credentials as credentials
+
+    try:
+        credentials.validate_passfile(
+            environment.get("PGPASSFILE"),
+            login=PURGE_LOGIN,
+            host=DB_HOST,
+            port=DB_PORT,
+            database=DB_NAME,
+            require_private=os.name == "posix",
+            require_owner=os.name == "posix",
+        )
+    except credentials.PassfileError as error:
+        return _refuse(error.code, error.message, EX_REFUSED)
+
+    try:
+        with (lock_factory or _shared_lock)("the PostgreSQL purge command"):
+            if engine_factory is None:
+                from house_helper.persistence import pg_executor
+
+                engine_factory = pg_executor.create_db_engine
+            engine = engine_factory()
+            try:
+                (verifier or _verify_purge_connection)(engine)
+            finally:
+                engine.dispose()
+            if admin_main is None:
+                from house_helper.admin import cli as admin_cli
+
+                admin_main = admin_cli.main
+            return int(
+                admin_main(["purge-expired", *permitted], environ=dict(environment))
+            )
+    except PurgeError as error:
+        return _refuse(error.code, error.message, error.exit_code)
+    except KeyboardInterrupt:
+        print(
+            "error [interrupted]: the purge command was interrupted; the batch in progress "
+            "was rolled back and the batches that committed are gone. Run the same command "
+            "again to finish the job.",
+            file=sys.stderr,
+        )
+        return 130
+    except Exception as error:  # an exception's text can carry SQL, a DSN or a secret
+        if hasattr(error, "code") and hasattr(error, "exit_code"):
+            # A WP-2A dbtool ToolError (the shared state-volume lock is busy, ...).
+            return _refuse(str(error.code), str(error.message), EX_REFUSED)
+        print(
+            f"error [internal]: the purge command failed with {type(error).__name__}.",
             file=sys.stderr,
         )
         return EX_INTERNAL
@@ -652,6 +930,7 @@ def main(
     engine_factory=None,
     admin_main=None,
     verifier=None,
+    purge_verifier=None,
 ) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     environment = dict(os.environ if environ is None else environ)
@@ -660,7 +939,10 @@ def main(
         return EX_USAGE
     role = arguments[0]
     extra = arguments[1:]
-    if role != "provision" and extra:
+    # `provision` and `purge` each accept their own bounded argument list; every other
+    # role takes only its name. The purge list is validated again inside `_purge` before a
+    # connection exists.
+    if role not in ("provision", "purge") and extra:
         print(f"usage: pg_oneshot.py {{{','.join(ROLES)}}}", file=sys.stderr)
         return EX_USAGE
 
@@ -693,6 +975,16 @@ def main(
             engine_factory=engine_factory,
             lock_factory=lock_factory,
             verifier=verifier,
+        )
+
+    if role == "purge":
+        return _purge(
+            environment,
+            extra,
+            admin_main=admin_main,
+            engine_factory=engine_factory,
+            lock_factory=lock_factory,
+            verifier=purge_verifier,
         )
 
     return _refuse(

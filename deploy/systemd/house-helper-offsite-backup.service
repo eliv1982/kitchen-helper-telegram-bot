@@ -1,24 +1,27 @@
-# House Helper: the encrypted off-host backup. A systemd oneshot service, started by
-# house-helper-offsite-backup.timer or by hand. NOT installed or enabled by anything in the
-# repository: deploy/RUNBOOK.md section 15 is the procedure, and every step of it is the owner's.
+# House Helper: the encrypted off-host backup (C7-P3, PostgreSQL). A systemd oneshot service,
+# started by house-helper-offsite-backup.timer or by hand. NOT installed or enabled by anything in
+# the repository: deploy/postgres/scheduled_maintenance.md is the transition procedure, and every
+# step of it is the owner's.
 #
-# What it runs is deploy/offsite_backup.py (Python 3 of the host, standard library only): it calls
-# deploy/backup.sh for a verified backup, has a disposable container (no network, read-only root)
-# rewrite the snapshot without deleted rows and verify it, packs it with a checksum and a manifest,
-# encrypts it with `age` for PUBLIC keys only (no private key exists on this host), uploads it with
-# `rclone` into the one dedicated folder, reads the upload back, renames it and commits it with a small
-# checksum record (an object without a matching record is never counted as a recovery point), and
-# only then drops the recovery points beyond 7 daily + 4 weekly. A failed run deletes nothing that is
-# not its own. Section 15 says what is promised and what is not.
+# What it runs is deploy/offsite_backup.py (Python 3 of the host, standard library only) with
+# `--database postgresql`, the explicit v2 path and the only thing that selects it. That path runs
+# the accepted WP-2D host tool `deploy/postgres/maintenance.py backup` against the enrolled
+# cluster (Docker, the pinned postgres:16 client image and the hh_backup passfile), validates the
+# format-v2 recovery point, then packs it with a checksum and a manifest, encrypts it with `age`
+# for PUBLIC keys only (no private key exists on this host), uploads it with `rclone` into the one
+# dedicated folder, reads the upload back, renames it and commits it with a small checksum record
+# (an object without a matching record is never counted as a recovery point), and only then drops
+# the recovery points beyond 7 daily + 4 weekly. A failed run deletes nothing that is not its own.
+# There is deliberately no SQLite fallback: without `--database postgresql` the tool would take the
+# legacy backup.sh path, so the flag is part of the unit and not an operator choice.
 #
 # The temporary plaintext lives in /run/house-helper-offsite: tmpfs, mode 0700, created for the run
 # and removed by systemd when the service stops, in addition to the tool's own clean-up. It is not
 # forensic erasure; section 15 says so.
 #
-# The tag and the checkout come from the file the cleanup already uses (purge.env), so that the one
-# edit after an upgrade or a rollback covers both; the paths and the remote come from offsite.env
-# (template: deploy/systemd/house-helper-offsite.env.example). The tag must be the version that is
-# RUNNING: a tag whose schema is not the database's is refused and nothing is uploaded.
+# Every path of the PostgreSQL operation is named explicitly and comes from the shared purge.env:
+# the checkout, the compose file, the canonical journal directory and the per-role credential
+# directory. The offsite.env holds only the recipients, remote, access mode and rclone config.
 #
 # The access mode (HOUSE_HELPER_OFFSITE_ACCESS_MODE in offsite.env) is "app-folder" unless the owner has written
 # otherwise there: the only other value, "full-disk-temporary", is a TEMPORARY exception for a token that reaches
@@ -50,7 +53,7 @@ RuntimeDirectory=house-helper-offsite
 RuntimeDirectoryMode=0700
 UMask=0077
 # One run at a time is systemd's own rule for a oneshot unit, and the tool takes its own lock too.
-ExecStart=/usr/bin/python3 ${HOUSE_HELPER_CHECKOUT}/deploy/offsite_backup.py run --tag ${HOUSE_HELPER_IMAGE_TAG} --recipients-file ${HOUSE_HELPER_AGE_RECIPIENTS_FILE} --rclone-config ${HOUSE_HELPER_RCLONE_CONFIG} --remote ${HOUSE_HELPER_OFFSITE_REMOTE} --access-mode ${HOUSE_HELPER_OFFSITE_ACCESS_MODE} --work-dir /run/house-helper-offsite
+ExecStart=/usr/bin/python3 ${HOUSE_HELPER_CHECKOUT}/deploy/offsite_backup.py run --database postgresql --postgres-compose-file ${HOUSE_HELPER_CHECKOUT}/deploy/compose.postgres.yaml --postgres-journal-dir ${HOUSE_HELPER_PG_JOURNAL_DIR} --postgres-credentials-dir ${HOUSE_HELPER_PG_CREDENTIALS_DIR} --recipients-file ${HOUSE_HELPER_AGE_RECIPIENTS_FILE} --rclone-config ${HOUSE_HELPER_RCLONE_CONFIG} --remote ${HOUSE_HELPER_OFFSITE_REMOTE} --access-mode ${HOUSE_HELPER_OFFSITE_ACCESS_MODE} --work-dir /run/house-helper-offsite
 # A backup of two users' data takes seconds to minutes. Two hours is a bound for a hung Docker or
 # network, not a budget: when it is over systemd stops the run, and the clean-up removes the plaintext.
 # An unfinished upload (NAME.partial) is NOT deleted by anything: it stays, and every later run reports

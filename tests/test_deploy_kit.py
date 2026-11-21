@@ -114,9 +114,11 @@ COMPOSE_ONLY_VARIABLES = {
     "HOUSE_HELPER_GIT_SHA",
     "HOUSE_HELPER_HSTS_SECONDS",
     # HH-DB-01 WP-2B: the PostgreSQL surface's deliberate-activation guard and the host
-    # directory holding its per-role passfiles (deploy/postgres/README.md).
+    # directory holding its per-role passfiles (deploy/postgres/README.md). C7-P3 adds the
+    # canonical cutover journal directory the scheduled maintenance units share.
     "HOUSE_HELPER_PG_ACTIVATE",
     "HOUSE_HELPER_PG_CREDENTIALS_DIR",
+    "HOUSE_HELPER_PG_JOURNAL_DIR",
 }
 
 

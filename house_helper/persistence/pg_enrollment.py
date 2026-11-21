@@ -263,13 +263,18 @@ def _completed_records(records: Iterable[Record]) -> tuple[Record, ...]:
 # --- §7.3 permission handoffs -----------------------------------------------------------------
 #
 # HOF-01/ROL-16 make each runtime CONNECT grant a separately authorized handoff, with an
-# intent and an observed outcome in the journal. The P0 cutover window authorizes exactly
-# three grantees: the serving app (H1), enrollment (H2) and the scheduled backup login
-# (H3). `hh_purge` is deliberately not part of this surface: its timer is re-armed later.
-HANDOFF_ROLES = ("hh_app", "hh_provision", "hh_backup")
+# intent and an observed outcome in the journal. The authorized surface is three handoffs
+# covering four logins: the serving app (H1), enrollment (H2) and the scheduled operations
+# (H3). H3 covers BOTH scheduled logins - `hh_purge` and `hh_backup` - in the frozen
+# specification's order; each role still gets its own single-role GRANT and its own
+# intent/outcome pair (HOF-02: one statement per role), and both carry the frozen
+# `handoff:scheduled` event. `hh_purge` is appended here for C7-P3, when its timer is
+# re-armed; the earlier records for H1, H2 and the H3 `hh_backup` login are untouched.
+HANDOFF_ROLES = ("hh_app", "hh_provision", "hh_purge", "hh_backup")
 HANDOFF_EVENTS = {
     "hh_app": "app",
     "hh_provision": "provision",
+    "hh_purge": "scheduled",
     "hh_backup": "scheduled",
 }
 # An outcome is a *decision*. `unknown` is deliberately not a value: an unresolved
@@ -699,7 +704,17 @@ def successful_handoff_roles(records: Iterable[Record]) -> frozenset[str]:
     CONNECT) only confirms provenance created earlier in the same history; a no-op that has
     no such predecessor is semantically inconsistent and is refused rather than allowed to
     launder an unjournaled CONNECT.
+
+    The whole lock-handoff history is validated first: a caller that reads only grant
+    events must not silently ignore a corrupted or unresolved lock record (LCK-08).
     """
+    records = tuple(records)
+    # A pending lock intent is an unresolved UNKNOWN (LCK-08). A reader that pairs grant
+    # records must not silently hand an authorization decision to its caller while that
+    # state exists; validating the pairing alone would let a pending intent through.
+    pending_lock = pending_lock_handoff_refusal(records)
+    if pending_lock is not None:
+        raise EnrollmentError("lock_handoff_unknown", pending_lock)
     roles: set[str] = set()
     for record in handoff_events(records):
         payload = record.payload
@@ -718,6 +733,455 @@ def successful_handoff_roles(records: Iterable[Record]) -> frozenset[str]:
                 f"seq {record.seq}",
             )
     return frozenset(roles)
+
+
+# --- §7.4 HOF-03 item 4: the journaled lock handoff ------------------------------------------
+#
+# HOF-03 makes the lock handoff an *observed* re-arm condition: the web process holds the
+# shared state-volume lock (`dbtool check-idle` refuses) and no exclusive holder remains,
+# and the journal records `handoff:lock`. The event is its own journal kind: it grants
+# nothing, names no role or database, and must never be folded into the grant records the
+# handoff parser pairs and authorizes CONNECT from. Like every LCK-07 observation it is
+# recorded as an intent followed by one outcome, and an intent without an outcome is
+# UNKNOWN (LCK-08), resolved by re-running the same command. The evidence is the kernel's
+# own per-descriptor FLOCK record for the validated web process, not a successful probe.
+LOCK_HANDOFF_KIND = "handoff_lock"
+LOCK_HANDOFF_ACTION = "observe_lock_handoff"
+LOCK_HANDOFF_EVENT = "lock"
+LOCK_EXCLUSIVE_REFUSAL_CODE = "maintenance_lock_busy"
+# An outcome is a decision. `unknown` is deliberately absent: an unresolved observation has
+# no outcome at all and stays pending.
+LOCK_HANDOFF_OUTCOMES = frozenset({"observed", "failed"})
+_LOCK_INTENT_KEYS = frozenset({"state", "action", "handoff", "operator", "run_id"})
+_LOCK_OUTCOME_KEYS = frozenset(
+    {"state", "action", "handoff", "operator", "run_id", "outcome", "evidence"}
+)
+# The lock proof established by `deploy/postgres/lock_owner.py`: the kernel's lock table
+# shows a FLOCK READ held by the validated web process's own descriptor, bracketed by two
+# identical snapshots. `check-idle` must also be refused with the lock-held code, but the
+# refusal alone is never the evidence (a probe's own temporary lock must not count).
+LOCK_HANDOFF_OBSERVATIONS = 2
+LOCK_ACCESS_READ = "read"
+LOCK_ACCESS_WRITE = "write"
+_LOCK_ACCESSES = frozenset({LOCK_ACCESS_READ, LOCK_ACCESS_WRITE})
+# Option A: a host-held shared flock on the same validated inode, acquired after
+# `check-idle` and retained across the final snapshot, the fresh container verification
+# and the journal outcome append/fsync. It is part of the publication procedure, never a
+# substitute for the web process's own fdinfo record.
+LOCK_WITNESS_ACCESS = "read"
+# The closed interval an `observed` outcome describes. Nothing after the fsync is claimed.
+LOCK_OBSERVATION_BOUNDARY = "final_verification_through_publication"
+_LOCK_EVIDENCE_KEYS = frozenset(
+    {
+        "container_id",
+        "state_volume",
+        "lock_present",
+        "lock_device",
+        "lock_inode",
+        "idle_exit",
+        "idle_code",
+        "holder_pid",
+        "holder_start_ticks",
+        "holder_access",
+        "observations",
+        "witness_access",
+        "observation_boundary",
+    }
+)
+_LOCK_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+_LOCK_DEVICE = re.compile(r"\d+:\d+")
+_VOLUME_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+
+
+def _lock_exit_code(value: object) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value <= 255
+    )
+
+
+def _lock_code(value: object) -> bool:
+    return value is None or (isinstance(value, str) and bool(_LOCK_CODE.fullmatch(value)))
+
+
+def _lock_count(value: object, *, minimum: int) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value >= minimum
+    )
+
+
+def lock_handoff_satisfied(evidence: Mapping[str, Any]) -> bool:
+    """The exact positive observation of HOF-03 item 4, and nothing weaker.
+
+    Every conjunct is a fact the kernel-level proof produces: both ownership snapshots
+    agreed (`observations`), the state volume has the lock file, the validated web
+    process itself holds a FLOCK READ on it (`holder_*`), the frozen `check-idle`
+    observation was refused with the lock-held code, and the host's shared witness was
+    held through the final verification and the outcome publication. A refusal for any
+    other reason, a holder whose lock is WRITE, a missing/ambiguous holder, or a missing
+    publication witness is not the lock handoff and can never be recorded `observed`.
+    """
+    return (
+        evidence.get("lock_present") is True
+        and evidence.get("observations") == LOCK_HANDOFF_OBSERVATIONS
+        and evidence.get("idle_exit") == 3
+        and evidence.get("idle_code") == LOCK_EXCLUSIVE_REFUSAL_CODE
+        and _lock_count(evidence.get("holder_pid"), minimum=1)
+        and _lock_count(evidence.get("holder_start_ticks"), minimum=0)
+        and evidence.get("holder_access") == LOCK_ACCESS_READ
+        and evidence.get("witness_access") == LOCK_WITNESS_ACCESS
+        and evidence.get("observation_boundary") == LOCK_OBSERVATION_BOUNDARY
+    )
+
+
+def _validate_lock_evidence(
+    evidence: object, outcome: str, where: str
+) -> None:
+    """Structural and semantic validation of one outcome's evidence.
+
+    The exit status and its semantic code are validated as one coherent result (a
+    successful exit cannot carry a refusal code), the holder triple is all-or-nothing, and
+    an `observed` outcome must reproduce exactly the success condition. A record that
+    cannot be read as one coherent observation is journal corruption, never a milder
+    outcome.
+    """
+    if not isinstance(evidence, Mapping) or set(evidence) != _LOCK_EVIDENCE_KEYS:
+        raise EnrollmentError(
+            "lock_handoff_journal", "a lock handoff evidence record is malformed", where
+        )
+    if not isinstance(evidence.get("container_id"), str) or not re.fullmatch(
+        r"[0-9a-f]{64}", evidence["container_id"]
+    ):
+        raise EnrollmentError(
+            "lock_handoff_journal", "a lock handoff names no container", where
+        )
+    volume = evidence.get("state_volume")
+    if not isinstance(volume, str) or not _VOLUME_NAME.fullmatch(volume):
+        raise EnrollmentError(
+            "lock_handoff_journal", "a lock handoff names no state volume", where
+        )
+    if not isinstance(evidence.get("lock_present"), bool):
+        raise EnrollmentError(
+            "lock_handoff_journal", "a lock handoff does not say whether the lock file exists", where
+        )
+    # The validated lock inode is recorded with the observation. It is present exactly
+    # when the lock file exists, and it is what the host witness was taken on.
+    device = evidence.get("lock_device")
+    inode = evidence.get("lock_inode")
+    if evidence["lock_present"]:
+        if not isinstance(device, str) or not _LOCK_DEVICE.fullmatch(device):
+            raise EnrollmentError(
+                "lock_handoff_journal", "a lock handoff lock device is malformed", where
+            )
+        if not _lock_count(inode, minimum=1):
+            raise EnrollmentError(
+                "lock_handoff_journal", "a lock handoff lock inode is malformed", where
+            )
+    elif device is not None or inode is not None:
+        raise EnrollmentError(
+            "lock_handoff_journal",
+            "a lock handoff names a lock file identity but no lock file",
+            where,
+        )
+    witness = evidence.get("witness_access")
+    boundary = evidence.get("observation_boundary")
+    if witness not in (None, LOCK_WITNESS_ACCESS):
+        raise EnrollmentError(
+            "lock_handoff_journal", "a lock handoff witness access is not recognized", where
+        )
+    if witness is not None and evidence["lock_present"] is not True:
+        raise EnrollmentError(
+            "lock_handoff_journal",
+            "a lock handoff records a witness without a lock file",
+            where,
+        )
+    if witness == LOCK_WITNESS_ACCESS:
+        if boundary != LOCK_OBSERVATION_BOUNDARY:
+            raise EnrollmentError(
+                "lock_handoff_journal",
+                "a lock handoff witness does not name its publication boundary",
+                where,
+            )
+    elif boundary is not None:
+        raise EnrollmentError(
+            "lock_handoff_journal",
+            "a lock handoff names a publication boundary without a witness",
+            where,
+        )
+    if not _lock_exit_code(evidence.get("idle_exit")):
+        raise EnrollmentError(
+            "lock_handoff_journal", "a lock handoff exit status is malformed", where
+        )
+    if not _lock_code(evidence.get("idle_code")):
+        raise EnrollmentError(
+            "lock_handoff_journal", "a lock handoff refusal code is malformed", where
+        )
+    if evidence.get("observations") != LOCK_HANDOFF_OBSERVATIONS:
+        raise EnrollmentError(
+            "lock_handoff_journal",
+            "a lock handoff was not established by the required two observations",
+            where,
+        )
+    exit_code = evidence["idle_exit"]
+    code = evidence["idle_code"]
+    # Exit status and semantic code are one result: dbtool prints a code only for its
+    # refused (3) and unusable (4) classes, and never for success.
+    if exit_code == 0 and code is not None:
+        raise EnrollmentError(
+            "lock_handoff_journal",
+            "a successful idle check carries a refusal code",
+            where,
+        )
+    if exit_code in (3, 4) and code is None:
+        raise EnrollmentError(
+            "lock_handoff_journal",
+            "a refused idle check has no semantic code",
+            where,
+        )
+    holder_fields = (
+        evidence.get("holder_pid"),
+        evidence.get("holder_start_ticks"),
+        evidence.get("holder_access"),
+    )
+    if exit_code == 0 and any(value is not None for value in holder_fields):
+        raise EnrollmentError(
+            "lock_handoff_journal",
+            "a successful idle check records a lock holder",
+            where,
+        )
+    if all(value is None for value in holder_fields):
+        if outcome == "observed":
+            raise EnrollmentError(
+                "lock_handoff_journal",
+                "an observed lock handoff records no web lock holder",
+                where,
+            )
+    else:
+        if any(value is None for value in holder_fields):
+            raise EnrollmentError(
+                "lock_handoff_journal", "a lock handoff holder record is incomplete", where
+            )
+        if not _lock_count(evidence.get("holder_pid"), minimum=1):
+            raise EnrollmentError(
+                "lock_handoff_journal", "a lock handoff holder pid is malformed", where
+            )
+        if not _lock_count(evidence.get("holder_start_ticks"), minimum=0):
+            raise EnrollmentError(
+                "lock_handoff_journal", "a lock handoff holder start time is malformed", where
+            )
+        if evidence.get("holder_access") not in _LOCK_ACCESSES:
+            raise EnrollmentError(
+                "lock_handoff_journal", "a lock handoff holder access is not recognized", where
+            )
+        if evidence.get("lock_present") is not True:
+            raise EnrollmentError(
+                "lock_handoff_journal",
+                "a lock handoff names a holder but no lock file",
+                where,
+            )
+    satisfied = lock_handoff_satisfied(evidence)
+    if outcome == "observed" and not satisfied:
+        raise EnrollmentError(
+            "lock_handoff_journal",
+            "an observed lock handoff contradicts its evidence",
+            where,
+        )
+    if outcome == "failed" and satisfied:
+        raise EnrollmentError(
+            "lock_handoff_journal",
+            "a failed lock handoff records the exact success condition",
+            where,
+        )
+
+
+def lock_handoff_events(records: Iterable[Record]) -> tuple[Record, ...]:
+    """The valid lock-handoff records, in journal order, as one paired history.
+
+    The history is strictly sequential: one intent, then its outcome, then (only after
+    that outcome) another intent. An intent opened while an earlier intent has no outcome
+    is corruption - it would let a later success conceal an unresolved UNKNOWN - and so is
+    an outcome that does not resolve the one pending intent, a duplicate op id, or a
+    second outcome for one op id.
+
+    A later intent *is* allowed after any outcome, because the observation is about a
+    running process at one time and the web container can be replaced. Each intent/outcome
+    pair is one observation epoch; the latest outcome is the current state. That is why
+    `lock_handoff_state` - not "any observed record in history" - decides whether the
+    handoff is observed now. The operator label is recorded on each record and is not
+    required to match, because a later invocation may reconcile an earlier intent after a
+    different operator was named.
+    """
+    found = tuple(record for record in records if record.kind == LOCK_HANDOFF_KIND)
+    intents: dict[str, Record] = {}
+    outcomes: dict[str, Record] = {}
+    pending: Optional[Record] = None
+    for record in found:
+        payload = record.payload
+        where = f"seq {record.seq}"
+        state = payload.get("state")
+        if state not in ("intent", "outcome"):
+            raise EnrollmentError(
+                "lock_handoff_journal", "a lock handoff record has an unknown state", where
+            )
+        expected_keys = _LOCK_INTENT_KEYS if state == "intent" else _LOCK_OUTCOME_KEYS
+        if set(payload) != expected_keys:
+            raise EnrollmentError(
+                "lock_handoff_journal", "a lock handoff record has unexpected fields", where
+            )
+        if payload.get("action") != LOCK_HANDOFF_ACTION:
+            raise EnrollmentError(
+                "lock_handoff_journal", "a lock handoff record names a foreign action", where
+            )
+        if payload.get("handoff") != LOCK_HANDOFF_EVENT:
+            raise EnrollmentError(
+                "lock_handoff_journal", "a lock handoff record names a foreign event", where
+            )
+        operator = payload.get("operator")
+        if not isinstance(operator, str) or not operator:
+            raise EnrollmentError(
+                "lock_handoff_journal", "a lock handoff record has no operator", where
+            )
+        run_id = payload.get("run_id")
+        if not isinstance(run_id, str) or not _HANDOFF_RUN_ID.fullmatch(run_id):
+            raise EnrollmentError(
+                "lock_handoff_journal", "a lock handoff record has no run id", where
+            )
+        if state == "intent":
+            if pending is not None:
+                raise EnrollmentError(
+                    "lock_handoff_journal",
+                    "a lock handoff intent overlaps an earlier intent with no outcome",
+                    where,
+                )
+            if run_id in intents or run_id in outcomes:
+                raise EnrollmentError(
+                    "lock_handoff_journal",
+                    "a lock handoff operation id appears more than once",
+                    where,
+                )
+            intents[run_id] = record
+            pending = record
+            continue
+        outcome = payload.get("outcome")
+        if not isinstance(outcome, str) or outcome not in LOCK_HANDOFF_OUTCOMES:
+            raise EnrollmentError(
+                "lock_handoff_journal", "a lock handoff outcome is not recognized", where
+            )
+        if pending is None:
+            raise EnrollmentError(
+                "lock_handoff_journal",
+                "a lock handoff outcome has no pending intent to resolve",
+                where,
+            )
+        if run_id != pending.payload["run_id"]:
+            raise EnrollmentError(
+                "lock_handoff_journal",
+                "a lock handoff outcome does not resolve the pending intent",
+                where,
+            )
+        if run_id in outcomes:
+            raise EnrollmentError(
+                "lock_handoff_journal",
+                "a lock handoff operation has more than one outcome",
+                where,
+            )
+        # The operator label is not compared with the intent's: a later invocation (a
+        # different operator resolving an UNKNOWN) records its own label, exactly as the
+        # grant-handoff outcomes do.
+        _validate_lock_evidence(payload.get("evidence"), outcome, where)
+        outcomes[run_id] = record
+        pending = None
+    return found
+
+
+@dataclass(frozen=True)
+class LockHandoffState:
+    """The latest lock-handoff state, derived from the validated paired history.
+
+    `pending` is an intent with no outcome (UNKNOWN until resolved). `latest_outcome` is
+    the most recent decision, whatever it is. `observed` is that decision only when it is
+    `observed`; a historical observed outcome followed by a later failed outcome is NOT
+    observed now, and must not authorize a re-arm.
+    """
+
+    pending: Optional[Record]
+    latest_outcome: Optional[Record]
+
+    @property
+    def observed(self) -> Optional[Record]:
+        # A pending intent is the current state: an earlier outcome is history, not a
+        # present observation, until this intent is resolved.
+        if self.pending is not None:
+            return None
+        latest = self.latest_outcome
+        if latest is not None and latest.payload["outcome"] == "observed":
+            return latest
+        return None
+
+    @property
+    def status(self) -> str:
+        if self.pending is not None:
+            return "pending"
+        if self.latest_outcome is None:
+            return "none"
+        return str(self.latest_outcome.payload["outcome"])
+
+
+def lock_handoff_state(records: Iterable[Record]) -> LockHandoffState:
+    """Validate the whole lock history and return its latest state.
+
+    The order matters: `lock_handoff_events` refuses overlapping intents, an outcome
+    without its intent, a mismatched run id and contradictory evidence before any state
+    is derived. Only after that is the last outcome authoritative.
+    """
+    events = lock_handoff_events(records)
+    pending: Optional[Record] = None
+    latest_outcome: Optional[Record] = None
+    for record in events:
+        if record.payload["state"] == "intent":
+            pending = record
+            continue
+        pending = None
+        latest_outcome = record
+    return LockHandoffState(pending=pending, latest_outcome=latest_outcome)
+
+
+def pending_lock_handoff_intent(records: Iterable[Record]) -> Optional[Record]:
+    """LCK-08: the lock-handoff intent with no outcome, if one exists.
+
+    The strict history admits at most one such intent and it is the last record.
+    """
+    return lock_handoff_state(records).pending
+
+
+def pending_lock_handoff_refusal(records: Iterable[Record]) -> Optional[str]:
+    """A non-secret reason when a lock-handoff intent is UNKNOWN, else None.
+
+    Calling this validates the whole lock history: a malformed or overlapping history
+    raises `EnrollmentError` instead of being silently ignored by a caller that only
+    inspects grant events. Every operation that advances the cutover machine calls it.
+    """
+    pending = pending_lock_handoff_intent(records)
+    if pending is None:
+        return None
+    return (
+        f"the lock handoff intent at seq {pending.seq} has no observed outcome; run "
+        "`enroll.py lock-handoff --approved-by <owner>` to reconcile it before another "
+        "operation"
+    )
+
+
+def lock_handoff_observed(records: Iterable[Record]) -> Optional[Record]:
+    """The latest lock-handoff outcome, only when that outcome is `observed`.
+
+    Never a historical observed outcome that a later outcome superseded, and never a
+    `failed` record. A caller deciding whether the re-arm condition holds now must use
+    this (or `lock_handoff_state`), not a scan for any observed record ever written.
+    """
+    return lock_handoff_state(records).observed
 
 
 def acl_state_equal(left: DatabaseAclState, right: DatabaseAclState) -> bool:
@@ -1401,6 +1865,12 @@ class ModeA:
 
     def _run_locked(self) -> EnrollmentReport:
         view = self.journal.read()
+        # LCK-08: an unresolved lock handoff blocks every later transition. Mode A is an
+        # enrollment transition, so it may not proceed through that UNKNOWN; only
+        # `enroll.py lock-handoff` may resolve it.
+        lock_unknown = pending_lock_handoff_refusal(view.records)
+        if lock_unknown is not None:
+            raise EnrollmentError("lock_handoff_unknown", lock_unknown)
         # `read_target` is a request to look; the adapter only reads the target catalog
         # when connections are enabled and the database exists.
         plan = dispatch(view.records, self.cluster.observe(read_target=True))

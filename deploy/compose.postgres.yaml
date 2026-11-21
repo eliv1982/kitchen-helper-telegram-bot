@@ -31,9 +31,9 @@
 #     labels.
 #
 # The five one-shot services (migrate, provision, purge, backup, restore) each have only
-# their own login, their own passfile and the database network. `migrate` (WP-2C-A) and
-# `provision` (P0 cutover) are implemented; `purge`, `backup` and `restore` still refuse
-# every execution with EX_CONFIG. A migration path that ran `alembic upgrade head` without
+# their own login, their own passfile and the database network. `migrate` (WP-2C-A),
+# `provision` (P0 cutover) and `purge` (C7-P3) are implemented; `backup` and `restore` still
+# refuse every execution with EX_CONFIG. A migration path that ran `alembic upgrade head` without
 # the mandatory post-migration re-application of db/privileges.sql would be worse than no
 # path at all, so `migrate` is reachable only through the host tool's bounded authorization.
 # `provision` runs exactly `enroll-user` or `enrollment-status` under `hh_provision`; its

@@ -448,13 +448,18 @@ def test_the_schema_one_shot_uses_the_migrate_login_only(capsys):
 
 
 def test_the_unimplemented_one_shots_keep_their_refusal(capsys):
-    # `provision` is implemented by P0-2; it is refused for a different reason when it
-    # has no supported administrative command (tested in test_deploy_provision_oneshot.py).
-    for role in ("purge", "backup", "restore"):
+    # `provision` is implemented by P0-2 and `purge` by C7-P3; each is refused for its own
+    # reason (tested in test_deploy_provision_oneshot.py and test_deploy_purge_oneshot.py).
+    for role in ("backup", "restore"):
         code = oneshot.main([role], _environment(role))
         captured = capsys.readouterr()
         assert code == 78
         assert "oneshot_not_implemented" in captured.err
+    # The purge one-shot is implemented; without its passfile it stops at its own gate.
+    code = oneshot.main(["purge"], _environment("purge"))
+    captured = capsys.readouterr()
+    assert code != 78
+    assert "oneshot_not_implemented" not in captured.err
 
 
 def test_the_bootstrap_password_retirement_is_a_designed_plan_only():

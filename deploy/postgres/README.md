@@ -41,7 +41,7 @@ the Owner approved for this work package.
 | Topic | Decision | Scope |
 |---|---|---|
 | **OD-8 credential mechanism** | A separate libpq `PGPASSFILE` for each application/operational role. Each file is mode `0600`, owned by the container's running uid, bind-mounted read-only into exactly one service, and selected by `PGPASSFILE`. No real credential is generated or committed. | WP-2B deployment surface. The production credential population and rotation procedure remain an OD-8 operational act for WP-2C/WP-2F; this document does not approve a rotation policy. |
-| **Executor ownership** | **Option A.** WP-2B implements the deployment surface only. The production initializer/executor (Mode A enrollment, ordered schema initialization, post-migration `db/privileges.sql`, enrollment journal) belongs to **WP-2C**. | The `migrate`, `provision`, `purge`, `backup` and `restore` one-shots are boundaries that **fail closed**; they are not implemented. |
+| **Executor ownership** | **Option A.** WP-2B implements the deployment surface only. The production initializer/executor (Mode A enrollment, ordered schema initialization, post-migration `db/privileges.sql`, enrollment journal) belongs to **WP-2C**. | WP-2B left all five one-shots fail-closed. Later packages implement `migrate`/`schema` (WP-2C-A), `provision` (P0-2) and `purge` (C7-P3); `backup` and `restore` run from `maintenance.py`, never from the app-image one-shots. |
 | **Compose identity** | A separate project, `house-helper-pg`. The running SQLite project `house-helper` is independent and untouched. | The PostgreSQL web service intentionally reuses the same Traefik router labels; a deliberate cutover must stop the SQLite project first (WP-2F). |
 | **Database subnet** | `10.213.79.0/24`, a **candidate**, not a verified Production fact. It must be re-validated against the deployment host's existing Docker networks before any future deployment; the preflight fails closed on an overlap. | Changing it requires changing both `deploy/compose.postgres.yaml` and `deploy/postgres/pg_hba.conf`; the preflight refuses a mismatch. |
 
@@ -66,8 +66,9 @@ These decisions do **not** close any other open Owner choice:
 | `deploy/postgres/enroll.py` | WP-2C-A host tool plus the P0-1 handoff: Mode A enrollment (including the ENR-04 schema/default-ACL step before the marker), authoritative Mode B verification, the bounded migrate authorization, the journaled H1/H2/H3 `CONNECT` handoff, worker-lifecycle reconciliation evidence, credential checks and the bootstrap-retirement plan. Root + Docker socket; never copied into the image. |
 | `deploy/postgres/maintenance.py` | WP-2D host tool: Mode B verification, format-v2 backup, archive verification, target-cluster restore with temporary-database records and isolated `--network none` rehearsal. Root + Docker socket; never copied into the image. |
 | `deploy/postgres/backup_restore.md` | The WP-2D operating procedure, prerequisites, failure matrix and explicit non-claims. |
+| `deploy/postgres/scheduled_maintenance.md` | The C7-P3 owner procedure for the PostgreSQL purge and encrypted offsite systemd units: image/unit/credential preflight, the manual-command environment, the live gates (refusal, dry run, real run, backup round trip, monitoring), `Persistent=true` catch-up, first-run verification and the section 6 recovery response (stop the automated maintenance; the legacy SQLite units are historical assets, not a rollback step). |
 | `deploy/postgres/credentials/README.md` | The credential layout. Real files are git-ignored and are not generated here. |
-| `deploy/ops/pg_oneshot.py` | The fail-closed entrypoint of the five one-shots. `migrate` and the enrollment-time `schema` step are implemented in WP-2C-A; `provision` is implemented by P0-2 (`enroll-user`, `enrollment-status` only); `purge`, `backup` and `restore` still exit `78` before connecting or writing. `schema` is run through the `migrate` service, so the Compose topology is unchanged. |
+| `deploy/ops/pg_oneshot.py` | The fail-closed entrypoint of the five one-shots. `migrate` and the enrollment-time `schema` step are implemented in WP-2C-A; `provision` is implemented by P0-2 (`enroll-user`, `enrollment-status` only); `purge` is implemented by C7-P3 (`purge-expired`, optionally `--dry-run`, under `hh_purge`); `backup` and `restore` still exit `78` before connecting or writing and run from `maintenance.py`. `schema` is run through the `migrate` service, so the Compose topology is unchanged. |
 
 `deploy/compose.yaml`, `deploy/backup.sh`, `deploy/upgrade.sh`, the existing systemd units,
 `db/*.sql` and the WP-2A start gate are unchanged.
@@ -183,14 +184,15 @@ Stage 7 inventory and this preflight both pass.
 |---|---|---|
 | `migrate` | `hh_migrate` | **Implemented in WP-2C-A**, reachable only through `enroll.py migrate`. It re-verifies the live cluster, runs the ordered fresh initializer or a verified upgrade, and **re-applies `db/privileges.sql` after every migration**. |
 | `provision` | `hh_provision` | **Implemented by P0-2**, reachable only with `enroll-user` or `enrollment-status`. Takes the shared state-volume lock, validates its own passfile, and refuses unless the live session is `hh_provision` on the enrolled `house_helper` with CONNECT and no TEMPORARY. The admin CLI owns every user and invitation rule. |
-| `purge` | `hh_purge` | Refuses. Scheduled execution and timer re-arm are WP-2F. |
+| `purge` | `hh_purge` | **Implemented by C7-P3**, reachable only as `purge` or `purge --dry-run`. Takes the shared state-volume lock, validates its own passfile, and refuses unless the live session is `hh_purge` on the enrolled `house_helper` with CONNECT and no TEMPORARY. A missing H3 handoff makes the startup fail; because the pinned psycopg 3.3.6 supplies no SQLSTATE for a startup refusal, that case exits 4 as `purge_database_unavailable` (naming the handoff) rather than being guessed as `purge_connect_handoff` — which exit 3 reports only when the driver does supply SQLSTATE 42501 or the connected session fails the CONNECT gate. `schema_not_head` is also exit 4; `scheduled_maintenance.md` §1.1 has the complete status table and the monitoring categories. It then delegates to the unchanged `house_helper.admin purge-expired` and returns its exit status. **H3 (`enroll.py handoff --role hh_purge`) must succeed first.** |
 | `backup` | `hh_backup` | Refuses. The application image has no client binaries (BAK-13); WP-2D runs `pg_dump` in a disposable pinned `postgres:16.x` client container from `maintenance.py`. **H3 (`enroll.py handoff --role hh_backup`) must succeed before the first backup, including a manual one.** |
 | `restore` | `hh_restore` | Refuses for the same reason. WP-2D runs the ordered restore and isolated rehearsal from `maintenance.py`; the OD-2 maintenance database is an explicit required argument. |
 
 Each service has exactly one login, one read-only passfile, the database network only and the
 `/state` lock volume. `backup` and `restore` also have an anonymous `/staging` volume, as the
 SQLite operator tool does. `pg_oneshot.py` first requires the exact activation value, then
-validates its own wiring; the three unimplemented roles exit with `EX_CONFIG` (78).
+validates its own wiring; the two unimplemented roles (`backup`, `restore`) exit with
+`EX_CONFIG` (78).
 
 ### 7.1 Provisioning invocation
 
@@ -214,12 +216,19 @@ you control; do not pipe it through `tee`.
 ### 7.2 CONNECT handoffs
 
 `enroll.py handoff` is the only supported way to give a runtime login its database access.
-The P0 window authorizes `hh_app` (H1, before the web container starts), `hh_provision` (H2,
-before the first `enroll-user`) and `hh_backup` (H3). **H3 is required before the first
-PostgreSQL backup of any kind, including a manual `maintenance.py backup` or
-`pg_dump`-equivalent run.** Before H3, `hh_backup` has no `CONNECT` and the backup refuses at
-the connection; a backup attempt must never be treated as an implicit handoff. `hh_purge` is
-deliberately not in this P0 surface. The command:
+The H1/H2/H3 surface authorizes `hh_app` (H1, before the web container starts),
+`hh_provision` (H2, before the first `enroll-user`) and the two H3 scheduled logins
+`hh_purge` and `hh_backup` (C7-P3 and the P0 cutover respectively), each with its own
+single-role grant and intent/outcome pair under the frozen `handoff:scheduled` event for
+H3. **H3 is required before the first PostgreSQL purge or backup of any kind, including a
+manual `maintenance.py backup` or `pg_dump`-equivalent run.** Before its H3 grant, the login
+has no `CONNECT` and the operation refuses at the connection; such an attempt must never be
+treated as an implicit handoff. That startup refusal is not distinguishable from any other
+failed startup by structured driver evidence: psycopg 3.3.6 raises it with only `pgconn=`,
+so `sqlstate`/`pgcode` are absent even though the server sent 42501. `pg_oneshot.py` reports
+it fail-closed as `purge_database_unavailable` / `provision_database_unavailable` (exit 4),
+naming the handoff to verify, and never classifies from the (localized) message text. The
+command:
 
 1. takes the host operation lock and requires an exactly-one completed enrollment record;
 2. verifies the live container/volume/image identity, marker and role/database/predefined
@@ -296,8 +305,13 @@ never claimed unchanged.
 `handoff` may reconcile it, from positive termination and the complete ACL. The same rule
 applies to an unresolved **migration** (a `migrate` intent with no observed outcome): both
 `backup` and `restore` refuse with `migration_unknown` (exit 5) until
-`enroll.py reconcile-migration` records the resolution. `hh_purge` and any future additional
-grantee are outside this P0 surface and require a separate approved handoff design.
+`enroll.py reconcile-migration` records the resolution. An unresolved **lock handoff** (a
+`handoff_lock` intent with no outcome) likewise blocks `mode-a`, the grant handoff,
+`migrate`, `reconcile-migration`, backup and restore (`lock_handoff_unknown`, exit 5) until
+`enroll.py lock-handoff` publishes an outcome; a corrupted or overlapping lock history is
+journal corruption and is refused before any operation proceeds. `hh_purge` and `hh_backup`
+are both part of the H3 surface; any future additional grantee requires the same separately
+approved handoff design.
 
 **One host operation interval (P0).** `mode-a`, `migrate`, `reconcile-migration`, `handoff`,
 `maintenance.py backup` and `maintenance.py restore` all take the same exclusive,
@@ -306,15 +320,21 @@ their last state-changing step (backup: through archive publication and read-bac
 through the temporary database's verified drop; handoff: through the recorded outcome). A
 competing operation is refused with `operation_busy` before it reads or changes anything, so
 a handoff can neither begin inside a backup's window nor leave an UNKNOWN intent behind for
-one. Under that interval an UNKNOWN handoff (`handoff_unknown`) and an UNKNOWN migration
-(`migration_unknown`) both refuse before the compose parse, image inspection, Mode B, archive
-publication or any `CREATE DATABASE`. The backup holder's state-volume locks are a second,
-container-side layer that the host never takes; the holder is a **pure lock owner** with no
-output-directory mount, so it cannot publish, replace or remove an archive even if it
-outlives its host. The **host process** publishes the archive atomically while it still holds
+one. Under that interval an UNKNOWN handoff (`handoff_unknown`), an UNKNOWN migration
+(`migration_unknown`) and an UNKNOWN lock handoff (`lock_handoff_unknown`) all refuse before
+the compose parse, image inspection, Mode B, archive publication or any `CREATE DATABASE`.
+The backup holder's state-volume locks are a second,
+container-side layer; the holder is a **pure lock owner** with no output-directory mount, so
+it cannot publish, replace or remove an archive even if it outlives its host. The one host
+side exception is the lock handoff's **shared witness**: it opens the validated
+`/state/.house-helper.lock` inode, takes `LOCK_SH|LOCK_NB`, and holds it through the journal
+outcome fsync (HOF-03 item 4, below). It is shared, non-blocking and belongs to the host
+process; a container holding a state-volume lock never waits for the operation interval or
+the journal lock, so the wait-for graph still has no cycle. The **host process** publishes
+the archive atomically while it still holds
 the operation interval, and asks the holder to acknowledge ownership immediately before
-publication and again after the read-back. The order is always host interval, then
-state-volume locks, and no acquisition blocks, so the locks cannot deadlock. An interrupted
+publication and again after the read-back. The order is host interval, then state-volume
+locks, and no acquisition blocks, so the locks cannot deadlock. An interrupted
 process releases the interval when the kernel closes its descriptors, and that release never
 resolves an unresolved database operation. **Both tools must name the same `--journal-dir`**
 (or inherit the same `HOUSE_HELPER_PG_JOURNAL_DIR`): the interval is one file in that
@@ -335,7 +355,9 @@ python deploy/offsite_backup.py run --postgres-journal-dir /srv/hh-rehearsal/cut
 ```
 
 Use the same `--compose-file`, `--credentials-dir` and `--object-contract` the deployed
-tools use; their defaults are the installed layout. A rehearsal must not inherit a
+tools use. `--compose-file` and `--object-contract` default to the installed layout;
+`--credentials-dir` follows the shared resolver (explicit, then environment, then the
+Compose default) and is normally passed explicitly. A rehearsal must not inherit a
 production `HOUSE_HELPER_PG_JOURNAL_DIR`, because a `--journal-dir` that disagrees with it
 is refused (`journal_mismatch`).
 
@@ -364,6 +386,53 @@ cleanup failure is reported as `warning [migrate-cleanup]`: the recorded migrati
 is not reclassified as UNKNOWN. A refused or failed worker is retained for investigation;
 an operator removes it only after confirming the exact run-specific name and an
 `exited`/`dead` state.
+
+**The lock handoff (HOF-03 item 4).** `enroll.py lock-handoff --approved-by <owner>` is the
+journaled observation that the web process holds the shared state-volume lock and no
+exclusive holder remains. It selects the project's one running web container by its Compose
+labels and validates its `/state` mount against the recorded state volume. It then runs the
+frozen `dbtool check-idle` inside that exact container id (it must be refused with
+`maintenance_lock_busy`), and on the host it reads the kernel's lock ownership twice through
+`deploy/postgres/lock_owner.py`.
+
+The holder must be the **deployed image's real process**, not a guessed command string.
+`dbtool.py serve` replaces itself with the `uvicorn` console script, and the kernel rewrites
+a `#!` script's argv, so the live `/proc/<pid>/cmdline` is
+`[/opt/venv/bin/python, /opt/venv/bin/uvicorn, house_helper.web.asgi:app, ...]`. The proof
+accepts that form (and `[uvicorn, app]` / `[python, -m, uvicorn, app]`), and requires the
+process's cgroup to name the immutable container id and one of its own descriptors to carry
+a `FLOCK ... READ` record. The fdinfo record's own device/inode must equal the validated
+lock file's: a descriptor that stat'ed as the lock file but whose record names another
+inode was closed and reused, and is refused as indeterminate. No temporary shared
+acquisition is taken, so a probe's own lock can never be published as the web process's.
+
+Both ownership snapshots must agree. Between them the command runs `check-idle`, then takes
+a **host-held shared witness** on the same validated inode. The witness is retained across
+the final snapshot, a fresh verification of the project's current running web container
+(exact immutable id), the journal outcome append and its fsync. An exclusive holder cannot
+acquire in that interval; the witness itself is never web-ownership evidence (it belongs to
+the host, outside the container cgroup). The recorded interval is exactly
+`final_verification_through_publication`: ownership is attested at the two snapshots, and no
+exclusive holder can exist from witness acquisition through the fsync. Nothing about the
+web process after the fsync is claimed.
+
+A determinate negative is a `failed` outcome; an indeterminate, contradictory, changing or
+disappearing observation appends no outcome and leaves the intent UNKNOWN. Only the coherent
+positive observation is journaled as an `observed` `handoff_lock` pair (the frozen
+`handoff:lock` event). The **latest** outcome is the state, and every re-observation first
+appends a new intent: a repeated confirmation of the same container is recorded as a fresh
+`observed` outcome in that new epoch, a replacement container is observed in it, and a
+later failed re-observation supersedes an earlier observed one so it can no longer
+authorize a re-arm. Because the intent is durable before the observation, an indeterminate
+or interrupted re-observation leaves a pending intent instead of the previous `observed`
+state. An unresolved intent still fences every later transition (exit 5).
+
+Every host command that resolves this surface takes `--credentials-dir` explicitly, because
+an ordinary `sudo` does not carry `HOUSE_HELPER_PG_CREDENTIALS_DIR`. All path-valued
+configuration follows one rule: a relative value from an option, the environment or the
+Compose `${VAR:-default}` is resolved against the compose file's directory, canonicalised
+(symlinks, case) and compared by identity. A genuine disagreement is `credentials_conflict`.
+`maintenance.py` uses the same resolver and has no repository default of its own.
 
 ## 8. What WP-2C-A did not do
 

@@ -96,6 +96,11 @@ JOURNAL_KINDS = frozenset(
         "temp_db",
         "serving_promotion",
         "handoff",
+        # HOF-03 item 4: the lock handoff is a journaled observation of the running web
+        # service's shared state-volume lock. It is a separate kind, not a `handoff`
+        # record: it grants no database privilege and has no role or database field, so
+        # folding it into the grant vocabulary would make the grant parser reject it.
+        "handoff_lock",
     }
 )
 

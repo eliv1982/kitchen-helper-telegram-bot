@@ -218,6 +218,8 @@ class Harness:
             image=self.image,
             volume="unused-native",
             network="unused-native",
+            credentials_directory="/unused/credentials",
+            state_volume="unused-native-state",
             postgresql_conf_source="/unused/postgresql.conf",
             pg_hba_source="/unused/pg_hba.conf",
             bootstrap_credential_source="/unused/password",

@@ -1,5 +1,5 @@
-"""The systemd units of the cleanup (R4C-D2), and how they meet Compose, the operator tool and
-the runbook.
+"""The systemd units of the cleanup (R4C-D2, PostgreSQL path since C7-P3), and how they meet
+Compose, the one-shot and the runbook.
 
 Everything here READS files. Nothing installs, enables or starts a timer or a service, builds
 an image or starts a container. The units are checked as text; the command line they run is
@@ -9,16 +9,18 @@ the service they name is looked up in the file as Compose itself resolves it (th
 daemon and creates nothing).
 """
 
+import importlib.util
+import json
 import os
 import re
 import shlex
 import shutil
 import subprocess
+import sys
 
 import pytest
 
 from house_helper.admin import cli
-from tests.deploy_support import dbtool
 from tests.test_deploy_kit import (
     COMPOSE,
     DEPLOY,
@@ -29,7 +31,6 @@ from tests.test_deploy_kit import (
     code_lines,
     needs_compose,
     read,
-    resolve,
     retention_gate_rows,
     section,
 )
@@ -45,9 +46,8 @@ TIMER = UNITS / "house-helper-purge.timer"
 ENVIRONMENT = UNITS / "house-helper-purge.env.example"
 
 EXEC_START = [
-    "/usr/bin/docker", "compose", "-f", "${HOUSE_HELPER_CHECKOUT}/deploy/compose.yaml",
-    "--profile", "ops", "run", "--rm", "-T", "house-helper-ops",
-    "exec", "--shared", "--", "python", "-m", "house_helper.admin", "purge-expired",
+    "/usr/bin/docker", "compose", "-f", "${HOUSE_HELPER_CHECKOUT}/deploy/compose.postgres.yaml",
+    "--profile", "ops", "run", "--rm", "-T", "purge",
 ]
 
 
@@ -71,6 +71,16 @@ def parse_unit(path) -> dict:
 
 def values(unit: dict, section_name: str, key: str) -> list:
     return [value for name, value in unit.get(section_name, []) if name == key]
+
+
+def load_oneshot():
+    """The PostgreSQL one-shot the purge service runs, loaded by path."""
+    path = DEPLOY / "ops" / "pg_oneshot.py"
+    spec = importlib.util.spec_from_file_location("deploy_scheduler_pg_oneshot", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["deploy_scheduler_pg_oneshot"] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 # --- the files ----------------------------------------------------------------------------------
@@ -114,7 +124,7 @@ def test_the_service_waits_for_docker_and_fails_at_once_if_it_is_not_up():
     assert not values(unit, "Unit", "Wants") and not values(unit, "Unit", "Requires")
 
 
-def test_the_command_is_exactly_the_operator_one_shot_under_the_shared_lock_and_nothing_else():
+def test_the_command_is_exactly_the_postgresql_purge_one_shot_and_nothing_else():
     command = values(parse_unit(SERVICE), "Service", "ExecStart")[0]
     assert shlex.split(command) == EXEC_START
     # No shell, no credential, no extra mount or network, no other entrypoint, no dry run.
@@ -123,15 +133,18 @@ def test_the_command_is_exactly_the_operator_one_shot_under_the_shared_lock_and_
         assert forbidden not in f" {command} ", forbidden
 
 
-def test_the_command_line_parses_with_the_real_parsers_of_the_operator_tool_and_of_the_command():
-    tail = EXEC_START[EXEC_START.index("house-helper-ops") + 1:]
-    parser = dbtool._build_parser()
-    args = parser.parse_args(tail)
-    assert args.command == "exec" and args.shared and not args.exclusive
-    program = dbtool._program(args, parser.error)
-    assert program == ["python", "-m", "house_helper.admin", "purge-expired"]
-    assert os.path.isfile(REPO_ROOT / "house_helper" / "admin" / "__main__.py")  # `python -m house_helper.admin` exists
-    admin = cli._build_parser().parse_args(program[3:])
+def test_the_command_line_names_the_implemented_postgresql_purge_one_shot():
+    tail = EXEC_START[EXEC_START.index("run") + 1:]
+    assert tail == ["--rm", "-T", "purge"]  # the Compose service whose command is ["purge"]
+    oneshot = load_oneshot()
+    assert "purge" in oneshot.ROLES
+    assert oneshot.EXPECTED_LOGIN["purge"] == "hh_purge"
+    # The same bounded argument surface the unit relies on: a scheduled run is a real run.
+    assert oneshot._purge_arguments([]) == []
+    assert oneshot._purge_arguments(["--dry-run"]) == ["--dry-run"]
+    assert oneshot._purge_arguments(["--delete"]) is None
+    assert os.path.isfile(REPO_ROOT / "house_helper" / "admin" / "__main__.py")
+    admin = cli._build_parser().parse_args(["purge-expired"])
     assert admin.command == "purge-expired" and admin.dry_run is False
 
 
@@ -147,10 +160,17 @@ def test_the_variables_the_service_uses_are_the_ones_the_template_defines_and_no
 # --- the environment template -----------------------------------------------------------------------
 
 
-def test_the_environment_template_names_two_paths_and_a_tag_and_holds_no_secret():
+def test_the_environment_template_names_the_postgresql_paths_and_a_tag_and_holds_no_secret():
     lines = code_lines(ENVIRONMENT)
     names = [line.partition("=")[0] for line in lines]
-    assert names == ["HOUSE_HELPER_CHECKOUT", "HOUSE_HELPER_ENV_FILE", "HOUSE_HELPER_IMAGE_TAG"]
+    assert names == [
+        "HOUSE_HELPER_CHECKOUT",
+        "HOUSE_HELPER_ENV_FILE",
+        "HOUSE_HELPER_IMAGE_TAG",
+        "HOUSE_HELPER_PG_ACTIVATE",
+        "HOUSE_HELPER_PG_CREDENTIALS_DIR",
+        "HOUSE_HELPER_PG_JOURNAL_DIR",
+    ]
     assert not [n for n in names if SECRET_NAME.search(n)]
     for line in lines:
         value = line.partition("=")[2]
@@ -161,6 +181,29 @@ def test_the_environment_template_names_two_paths_and_a_tag_and_holds_no_secret(
 
 
 # --- the timer ----------------------------------------------------------------------------------------
+
+
+def test_both_maintenance_units_are_explicitly_postgresql_and_cannot_fall_back():
+    purge = read(SERVICE)
+    backup = read(UNITS / "house-helper-offsite-backup.service")
+    for text in (purge, backup):
+        assert "deploy/compose.yaml" not in text
+        assert "deploy/backup.sh" not in text
+        assert "deploy/compose.postgres.yaml" in text
+    assert "--database postgresql" in backup
+    # The purge unit names the PostgreSQL one-shot service, never the SQLite operator tool.
+    assert "house-helper-ops" not in purge and "dbtool.py" not in purge
+    assert "purge-expired" not in purge
+    # The unit names are unchanged, so the monitoring job identities are unchanged.
+    assert SERVICE.name == "house-helper-purge.service"
+    assert (UNITS / "house-helper-offsite-backup.service").name == "house-helper-offsite-backup.service"
+    identities = {path.name for path in (DEPLOY / "monitoring" / "ops-monitor.d").iterdir()}
+    assert {
+        "hc-house-helper-purge.curl.example",
+        "cronitor-house-helper-purge.curl.example",
+        "hc-house-helper-backup.curl.example",
+        "n8n-webhook.curl.example",
+    } <= identities
 
 
 def test_the_timer_is_daily_in_utc_persistent_and_starts_only_the_service():
@@ -202,21 +245,34 @@ def test_the_compose_file_schedules_nothing_and_has_no_cleanup_service():
 
 
 @needs_compose
-def test_the_unit_names_a_profile_gated_service_that_exists_and_is_unchanged(tmp_path):
-    resolved = resolve(tmp_path)
-    ops = resolved["services"]["house-helper-ops"]
-    assert set(resolved["services"]) == {"house-helper", "house-helper-ops"}  # D2 added no service
-    assert ops["profiles"] == ["ops"] and ops["network_mode"] == "none"
-    assert ops["entrypoint"] == ["python", "/opt/house-helper/ops/dbtool.py"]
-    assert ops["environment"] == {
-        "HOUSE_HELPER_DATABASE_URL": "sqlite:////data/house_helper.db",
-        "HOUSE_HELPER_STAGING_DIR": "/staging",
-    }  # still no credential, and nothing for the cleanup either
-    assert ops["logging"] == {"driver": "none"} and "env_file" not in ops
+def test_the_unit_names_the_postgresql_purge_service_that_exists(tmp_path):
+    from tests.test_deploy_postgres_surface import DEPLOY as PG_DEPLOY
+    from tests.test_deploy_postgres_surface import base_environment
+
+    resolved = json.loads(
+        subprocess.run(
+            [
+                "docker", "compose", "-f", str(PG_DEPLOY / "compose.postgres.yaml"),
+                "--profile", "ops", "config", "--format", "json",
+            ],
+            env=base_environment(tmp_path),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        ).stdout
+    )
+    purge = resolved["services"]["purge"]
+    assert purge["profiles"] == ["ops"]
+    assert purge["entrypoint"] == ["python", "/opt/house-helper/ops/pg_oneshot.py"]
+    assert purge["command"] == ["purge"]
+    assert purge["networks"] == ["db"] or set(purge["networks"]) == {"db"}
+    assert purge["logging"] == {"driver": "none"} and "env_file" not in purge
     # The unit's -f argument, with its variable filled in, is this repository's file.
-    path = EXEC_START[EXEC_START.index("-f") + 1].replace("${HOUSE_HELPER_CHECKOUT}", str(REPO_ROOT))
-    assert os.path.samefile(path, COMPOSE)
-    assert EXEC_START[EXEC_START.index("--profile") + 1] == "ops" and "house-helper-ops" in EXEC_START
+    path = EXEC_START[EXEC_START.index("-f") + 1].replace(
+        "${HOUSE_HELPER_CHECKOUT}", str(REPO_ROOT)
+    )
+    assert os.path.samefile(path, PG_DEPLOY / "compose.postgres.yaml")
+    assert EXEC_START[EXEC_START.index("--profile") + 1] == "ops" and "purge" in EXEC_START
 
 
 @needs_compose

@@ -732,7 +732,10 @@ from house_helper.persistence import pg_journal as journal
 
 real = journal.Journal
 maintenance.journal.Journal = lambda d, require_root=False: real(d, require_root=False)
-maintenance.enroll.load_spec = lambda path: types.SimpleNamespace()
+maintenance.enroll.resolve_credentials_directory = (
+    lambda *a, **k: __import__("pathlib").Path("/credentials")
+)
+maintenance.enroll.load_spec = lambda *a, **k: types.SimpleNamespace()
 maintenance.enroll.Docker = lambda spec: types.SimpleNamespace(inspect_image=lambda: {})
 maintenance.enroll.validate_image = lambda *a, **k: None
 maintenance.enroll.verify_mode_b = lambda jf, adapter, **k: types.SimpleNamespace(
@@ -806,6 +809,7 @@ maintenance.verify_target = lambda *a, **k: types.SimpleNamespace(
         image="postgres@sha256:" + "0" * 64, network="house-helper-pg-db"
     ),
     system_identifier="726485930221",
+    credentials_dir=Path(work),
 )
 maintenance.ToolContainers = lambda image: tools
 maintenance.passfile = lambda *a, **k: maintenance.Passfile(

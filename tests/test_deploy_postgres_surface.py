@@ -232,15 +232,22 @@ def test_the_image_creates_the_state_volume_with_the_application_owner():
 
 
 def test_the_sqlite_surface_is_not_redirected_to_the_postgres_file():
+    # The SQLite rollback assets stay SQLite. The two maintenance systemd units are the
+    # C7-P3 exception and intentionally name the PostgreSQL surface; their preserved
+    # pre-cutover copies under systemd/legacy-sqlite/ stay SQLite (checked below).
     for path in (
         COMPOSE_SQLITE,
         DEPLOY / "backup.sh",
         DEPLOY / "upgrade.sh",
-        *sorted(path for path in (DEPLOY / "systemd").glob("*") if path.is_file()),
     ):
         text = read(path)
         assert "compose.postgres" not in text, path
         assert "house-helper-pg" not in text, path
+    for path in sorted((DEPLOY / "systemd" / "legacy-sqlite").glob("*")):
+        if path.is_file() and path.suffix != ".md":
+            text = read(path)
+            assert "compose.postgres" not in text, path
+            assert "house-helper-pg" not in text, path
     sqlite = read(COMPOSE_SQLITE)
     assert "network_mode: none" in sqlite
     assert "sqlite:////data/house_helper.db" in sqlite
@@ -287,8 +294,18 @@ def test_the_one_shot_is_a_fail_closed_boundary_without_a_module_level_execution
                     and child.func.attr == "connect"
                 ):
                     connect_functions.append(node.name)
-    assert set(sqlalchemy_functions) == {"_verify_provision_connection"}
-    assert set(connect_functions) == {"_verify_provision_connection"}
+    # P0-2 implements `provision` and C7-P3 implements `purge`, so a connection is an
+    # allowed capability - but only lazily, inside the one function per command that checks
+    # its enrolled-cluster gate. The module still imports no database driver and executes
+    # nothing at import time.
+    assert set(sqlalchemy_functions) == {
+        "_verify_provision_connection",
+        "_verify_purge_connection",
+    }
+    assert set(connect_functions) == {
+        "_verify_provision_connection",
+        "_verify_purge_connection",
+    }
 
 
 def test_only_the_web_service_joins_both_networks_and_postgres_has_no_proxy():
@@ -488,7 +505,7 @@ def oneshot_environment(role: str) -> dict:
     return environment
 
 
-UNIMPLEMENTED_ONE_SHOTS = sorted(set(ONE_SHOTS) - {"migrate", "provision"})
+UNIMPLEMENTED_ONE_SHOTS = sorted(set(ONE_SHOTS) - {"migrate", "provision", "purge"})
 
 
 @pytest.mark.parametrize("role", UNIMPLEMENTED_ONE_SHOTS)
@@ -573,6 +590,47 @@ def test_every_remaining_unimplemented_real_one_shot_cli_enters_its_validation_p
     assert "oneshot_not_implemented" in done.stderr
     assert role in done.stderr
     assert "Traceback" not in done.stderr
+
+
+def test_the_real_purge_cli_accepts_only_its_bounded_argument_surface():
+    # C7-P3 implements purge. Anything beyond the documented `--dry-run` is a usage refusal
+    # before the wiring, the passfile or a connection; the rejected text is never echoed.
+    environ = cli_environment("purge")
+    environ["PYTHONPATH"] = str(REPO_ROOT)
+    accepted = subprocess.run(
+        [sys.executable, str(ONESHOT_PATH), "purge", "--dry-run"],
+        env=environ,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    # With no passfile present in this environment, the accepted argument reaches the
+    # passfile gate (exit 3), not the usage or not-implemented exits.
+    assert accepted.returncode == 3, accepted.stderr
+    assert "oneshot_not_implemented" not in accepted.stderr
+    refused = subprocess.run(
+        [sys.executable, str(ONESHOT_PATH), "purge", "--delete"],
+        env=environ,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert refused.returncode == 2, refused.stderr
+    assert "purge_arguments" in refused.stderr and "--delete" not in refused.stderr
+
+
+def test_the_real_purge_cli_is_no_longer_an_unimplemented_boundary():
+    environ = cli_environment("purge")
+    environ["PYTHONPATH"] = str(REPO_ROOT)
+    done = subprocess.run(
+        [sys.executable, str(ONESHOT_PATH), "purge"],
+        env=environ,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert done.returncode != 78, done.stderr
+    assert "oneshot_not_implemented" not in done.stderr
 
 
 def test_the_real_migrate_cli_refuses_without_the_authorization_channel():

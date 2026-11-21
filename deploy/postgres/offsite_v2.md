@@ -1,10 +1,13 @@
 # PostgreSQL format-v2 recovery points off-host (HH-DB-01 WP-2E)
 
-**Status: repository implementation only. Nothing here is activated.** Production remains on
-SQLite and on the v1 off-host schedule (`deploy/offsite_backup.py` without `--database
-postgresql`). No systemd unit passes `--database postgresql`; no PostgreSQL backup has been
-taken or uploaded; the real external round trip has **not** been executed. This document is the
-operator procedure and the list of gates that remain. It is governed by
+**Status: repository implementation and the C7-P3 scheduled-unit configuration.** The
+PostgreSQL deployment is the production surface (C1-C6), and
+`house-helper-offsite-backup.service` now passes `--database postgresql`, so the scheduled
+path is the v2 source. Nothing in the repository installs or enables the unit: activating it
+is the owner's transition step in `deploy/postgres/scheduled_maintenance.md`. No PostgreSQL
+point has been taken or uploaded by a scheduled run until that step is performed, and the
+real external round trip has **not** been executed. This document is the operator procedure
+and the list of gates that remain. It is governed by
 `docs/architecture/HH-DB-01_Architecture_Frozen_Specification_v1.0.md` §8 (BAK-15..BAK-17);
 where this text and the specification differ, the specification wins.
 
@@ -123,8 +126,13 @@ passes, `hh_backup` has `CONNECT` and `SELECT`, the passfiles exist, the pinned 
 present). Run as root, from the checkout:
 
 ```bash
-sudo python3 deploy/offsite_backup.py run --database postgresql --recipients-file /etc/house-helper/age-recipients.txt --rclone-config /etc/house-helper/rclone.conf --remote NAME:house-helper --work-dir /run/house-helper-offsite
+sudo python3 deploy/offsite_backup.py run --database postgresql --postgres-compose-file deploy/compose.postgres.yaml --postgres-journal-dir /var/lib/house-helper/cutover --postgres-credentials-dir <credentials-dir> --recipients-file /etc/house-helper/age-recipients.txt --rclone-config /etc/house-helper/rclone.conf --remote NAME:house-helper --work-dir /run/house-helper-offsite
 ```
+
+Give the three `--postgres-*` options the values `house-helper-offsite-backup.service` passes (they come from
+`house-helper-purge.env`): a manual run then takes the same host `operation.lock`, the same journal directory and the
+same passfiles as the scheduled run, instead of the tools' defaults. `deploy/postgres/scheduled_maintenance.md`
+section 3.5 shows how to read those non-secret values out of the installed file without exporting anything.
 
 The `age` recipients file, the rclone configuration, the one folder, the access mode and the
 work directory are the same ones as v1. The checkout must carry the object-contract fixture
@@ -135,9 +143,11 @@ The command refuses, before anything is uploaded, when: the archive is not produ
 directory is not private; a remote object of the run's name already exists. The exit statuses
 are the existing six: 0, 1, 2, 3, 6, 7.
 
-**Not activated.** The systemd unit and timer are unchanged and pass no `--database`. Do not add
-the flag to `/etc/house-helper/offsite.env` or to the unit, and do not enable a v2 timer, until
-the Owner records the activation approval and the WP-2F cutover work begins.
+**Activation is the owner's step.** The scheduled unit now passes `--database postgresql`;
+installing it, filling in the shared `purge.env`/`offsite.env` values and re-arming the
+timer are the C7-P3 transition in `deploy/postgres/scheduled_maintenance.md`. Do not enable
+a v2 timer until the Owner records the activation approval and the prerequisites of that
+procedure are observed.
 
 ## 5. The one real external rehearsal (Owner GO required)
 
@@ -181,10 +191,11 @@ in the repository, in a log or in a test.
 ## 6. Gates that remain open
 
 * Owner approval to execute the external round trip of §5 (synthetic data, isolated prefix).
-* Owner approval to activate the v2 backup path at all; until then no unit passes
-  `--database postgresql`.
-* PostgreSQL production provisioning, enrollment, cutover and any production credential remain
-  WP-2F and separately authorized; WP-2E changes none of them.
+* Owner approval to activate the v2 backup path at all; the scheduled unit already passes
+  `--database postgresql`, and installing/re-arming it is the transition in
+  `deploy/postgres/scheduled_maintenance.md`.
+* PostgreSQL production provisioning, enrollment, cutover and any production credential are
+  governed by the C1-C6 cutover record and separately authorized; WP-2E changes none of them.
 * Monitoring and alerting stay as they are (BAK-17): the existing exit codes and journal lines
   are the interface; WP-2E adds no field, unit or check.
 * The WP-2D prerequisites themselves (OD-2 maintenance database, per-role passfiles, pinned

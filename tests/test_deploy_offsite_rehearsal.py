@@ -623,7 +623,8 @@ def test_the_rehearsal_never_calls_anything_that_writes_to_the_remote_or_runs_a_
 
 
 def test_the_production_script_and_the_units_know_nothing_of_the_rehearsal_or_an_identity():
-    for path in [DEPLOY / "systemd" / name for name in os.listdir(DEPLOY / "systemd")] + [REPO_ROOT / "Dockerfile"]:
+    units = [path for path in (DEPLOY / "systemd").iterdir() if path.is_file()]
+    for path in units + [REPO_ROOT / "Dockerfile"]:
         text = path.read_text()
         assert "offsite_rehearsal" not in text and "identity" not in text.lower().replace("syslogidentifier", ""), path.name
     script = (DEPLOY / "offsite_backup.py").read_text()

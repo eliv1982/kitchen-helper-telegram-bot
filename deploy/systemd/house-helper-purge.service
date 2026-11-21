@@ -1,29 +1,39 @@
-# House Helper: delete what has expired (R4C-D2). A systemd oneshot service, started by
-# house-helper-purge.timer or by hand. NOT installed or enabled by anything in the repository:
-# deploy/RUNBOOK.md section 14 is the procedure, and every step of it is the owner's.
+# House Helper: delete what has expired (C7-P3, PostgreSQL). A systemd oneshot service,
+# started by house-helper-purge.timer or by hand. NOT installed or enabled by anything in
+# the repository: deploy/postgres/scheduled_maintenance.md is the transition procedure, and
+# every step of it is the owner's.
 #
-# What it runs is the operator one-shot that already exists for migrations, backups and
-# enrollment (compose service `house-helper-ops`, profile `ops`): no network, no credentials, no
-# log driver, read-only root filesystem, no capability, and the same image and volume as the web
-# service. The operator tool takes the SHARED maintenance lock for it (`exec --shared`), so it
-# runs beside the web service and beside a backup; a migration or a restore (exclusive) is
-# refused while it runs, and it is refused while one of those runs. Nothing is started by
-# `docker compose up`: this unit is the only thing that ever invokes it unattended.
+# What it runs is the PostgreSQL purge one-shot of the approved release image: the Compose
+# service `purge` of deploy/compose.postgres.yaml (profile `ops`), whose entrypoint is
+# deploy/ops/pg_oneshot.py. That one-shot takes the SHARED state-volume lock, so it runs
+# beside the web service and beside a scheduled backup; a migration or a restore (exclusive)
+# is refused while it runs, and it is refused while one of those runs. It verifies its own
+# hh_purge session, the enrolled marker and the H3 CONNECT handoff before the retention
+# command executes. The service has no log driver; its wiring (activation value, own
+# passfile, database network, state volume) is the compose file's and is checked both by
+# pg_oneshot.py and by deploy/postgres/preflight.py.
+#
+# There is deliberately no SQLite fallback. The repository never starts this unit; if the
+# PostgreSQL surface is not the running deployment, STOP AND DISABLE THE TIMERS and fix
+# forward (deploy/postgres/scheduled_maintenance.md, section 6). The units preserved under
+# deploy/systemd/legacy-sqlite/ are historical assets, not a recovery step: reactivating the
+# SQLite schedule needs the separate written Owner-approved data-rollback procedure.
 #
 # The report (counts and two timestamps, nothing private) goes to the journal:
 #     journalctl -u house-helper-purge.service
 #
-# Paths and the image tag come from /etc/house-helper/purge.env (template:
-# deploy/systemd/house-helper-purge.env.example). The tag must be the version that is RUNNING:
-# a tag whose schema is not the database's is refused (exit 4) and nothing is deleted.
+# Paths, the image tag and the PostgreSQL activation/credential/journal settings come from
+# /etc/house-helper/purge.env (template: deploy/systemd/house-helper-purge.env.example).
+# The tag must be the version that is RUNNING: a tag whose schema is not the database's is
+# refused (exit 4) and nothing is deleted.
 #
 # It runs as root, like the Docker daemon it talks to: access to Docker is root-equivalent
-# whoever holds it. To use another account add `User=` in a drop-in; that account needs Docker
-# access and read access to the two paths in purge.env.
+# whoever holds it. To use another account add `User=` in a drop-in; that account needs
+# Docker access and read access to the paths in purge.env.
 
 [Unit]
-Description=House Helper: delete expired sign-in artifacts and conversation history older than 365 days
-Documentation=https://github.com/eliv1982/kitchen-helper-telegram-bot/blob/main/deploy/RUNBOOK.md
+Description=House Helper: delete expired sign-in artifacts and conversation history older than 365 days (PostgreSQL)
+Documentation=https://github.com/eliv1982/kitchen-helper-telegram-bot/blob/main/deploy/postgres/scheduled_maintenance.md
 # Docker must already be up. `Requisite=` fails this unit at once, visibly, if it is not; it
 # never starts Docker. If Docker is stopped or restarted while this runs, systemd stops this
 # unit with it: the batch in progress rolls back, and a later run finishes the job.
@@ -35,8 +45,8 @@ Type=oneshot
 EnvironmentFile=/etc/house-helper/purge.env
 # One run at a time is systemd's own rule for a oneshot unit: a start request while it is
 # running joins the running job instead of starting a second. (A manual run through
-# `docker compose` is another matter; RUNBOOK section 14 says why that is safe too.)
-ExecStart=/usr/bin/docker compose -f ${HOUSE_HELPER_CHECKOUT}/deploy/compose.yaml --profile ops run --rm -T house-helper-ops exec --shared -- python -m house_helper.admin purge-expired
+# `docker compose` is another matter; the one-shot's shared lock makes that safe too.)
+ExecStart=/usr/bin/docker compose -f ${HOUSE_HELPER_CHECKOUT}/deploy/compose.postgres.yaml --profile ops run --rm -T purge
 # A purge of two users' data takes seconds. An hour is a bound for a hung Docker, not a
 # budget: when it is over systemd stops the run, and the batch in progress rolls back.
 TimeoutStartSec=1h

@@ -29,11 +29,14 @@ SPEC = enroll.ClusterSpec(
     image="postgres@sha256:" + "a" * 64,
     volume="house-helper-pgdata",
     network="house-helper-pg-db",
+    credentials_directory="/srv/house-helper/postgres/credentials",
+    state_volume="house-helper-pg-state",
     postgresql_conf_source="/srv/house-helper/postgres/postgresql.conf",
     pg_hba_source="/srv/house-helper/postgres/pg_hba.conf",
     bootstrap_credential_source="/srv/house-helper/postgres/credentials/postgres_superuser.password",
 )
 CONTAINER_ID = "b" * 64
+WEB_ID = "d" * 64
 SID = "726485930221"
 MARKER = journal.make_marker("f" * 32, SID)
 
@@ -104,8 +107,12 @@ class FakeDocker:
         self.public_tables = ()
         self.default_acls = []
         self.schema_acl = _public_schema_acl(hardened=False)
+        # `SESSIONS_SQL` rows `(datname, pid, usename, backend_type)`. Empty is the quiet
+        # cluster; ordinary Web sessions must not break an observation (C7-P3).
+        self.sessions = []
         self.compose_input = None
         self.compose_argv = None
+        self.compose_env = None
         self.compose_returncode = 0
         self.compose_exception = None
         self.on_compose = None
@@ -137,6 +144,20 @@ class FakeDocker:
         self.exec_targets = []
         self.inspect_targets = []
         self.handoff_exec_targets = []
+        # HOF-03 item 4: the web service row (None = not running / not created) and the
+        # frozen `check-idle` answer. The answer is `(exit, stderr)`; a callable is called
+        # with the target and returns the answer, so a test can decide per observation.
+        # The lock-ownership proof itself is read from a fixture /proc tree by
+        # `deploy.postgres.lock_owner`.
+        self.web_container = None
+        self.lock_answers = {
+            "idle": (3, b"refused [maintenance_lock_busy]: the state volume is held"),
+        }
+        self.lock_probe_targets = []
+        self.state_mountpoint = None
+        # The host mountpoint is validated once per lock observation; both snapshots and
+        # the witness are given that same path.
+        self.state_volume_inspections = 0
 
     # -- the runner interface ----------------------------------------------------------
 
@@ -154,11 +175,26 @@ class FakeDocker:
                 SPEC.container_name,
             ):
                 return self._json([self._container()])
+            if self.web_container is not None and target == self.web_container["Id"]:
+                return self._json([self._web_inspect()])
             for worker in self.worker_containers:
                 if target in (worker["Id"], worker["Names"]):
                     return self._json([self._worker_inspect(worker)])
             return subprocess.CompletedProcess(argv, 1, b"", b"no such container")
         if argv[:3] == ["docker", "volume", "inspect"]:
+            target = argv[-1]
+            if target == SPEC.state_volume:
+                self.state_volume_inspections += 1
+                return self._json(
+                    [
+                        {
+                            "Name": SPEC.state_volume,
+                            "Driver": "local",
+                            "Scope": "local",
+                            "Mountpoint": str(self.state_mountpoint),
+                        }
+                    ]
+                )
             return self._json(
                 [{"Name": self.volume, "Driver": "local", "Scope": "local"}]
             )
@@ -180,6 +216,20 @@ class FakeDocker:
             if self.on_rm is not None:
                 self.on_rm()
             return subprocess.CompletedProcess(argv, self.rm_returncode, b"", b"")
+        if argv[:2] == ["docker", "exec"] and enroll.DBTOOL_PATH in argv:
+            # HOF-03 item 4: `docker exec <web id> python <dbtool> check-idle`. The
+            # authoritative lock ownership is read separately from the fixture /proc.
+            target = argv[2]
+            self.exec_targets.append(target)
+            self.lock_probe_targets.append(target)
+            if self.web_container is None or target != self.web_container["Id"]:
+                return subprocess.CompletedProcess(argv, 1, b"", b"no such container")
+            which = "idle" if "check-idle" in argv else "unexpected"
+            answer = self.lock_answers[which]
+            if callable(answer):
+                answer = answer(target)
+            code, stderr = answer
+            return subprocess.CompletedProcess(argv, code, b"", stderr)
         if argv[:2] == ["docker", "exec"]:
             # `docker exec [-i] -u postgres <target> ...`: record the target and refuse an
             # immutable id that no longer names the live container (a replacement).
@@ -210,6 +260,7 @@ class FakeDocker:
         if argv[:2] == ["docker", "compose"]:
             self.compose_input = input
             self.compose_argv = list(argv)
+            self.compose_env = dict(env or {})
             if "--name" in argv:
                 self.migrate_name = argv[argv.index("--name") + 1]
             if self.on_compose is not None:
@@ -377,6 +428,32 @@ class FakeDocker:
             "HostConfig": {"PortBindings": ports},
         }
 
+    def _web_inspect(self):
+        web = self.web_container
+        return {
+            "Id": web["Id"],
+            "Name": "/" + web["Names"],
+            "State": {"Status": web["State"], "Running": web["State"] == "running"},
+            "Config": {
+                "Image": web.get("Image", SPEC.image),
+                "Labels": {
+                    "com.docker.compose.project": web["Project"],
+                    "com.docker.compose.service": web["Service"],
+                },
+            },
+            "Mounts": web.get(
+                "Mounts",
+                [
+                    {
+                        "Type": "volume",
+                        "Name": SPEC.state_volume,
+                        "Destination": "/state",
+                        "RW": True,
+                    }
+                ],
+            ),
+        }
+
     def _worker_inspect(self, worker):
         return {
             "Id": worker["Id"],
@@ -496,7 +573,7 @@ class FakeDocker:
             ]
             return _out([connect + temporary])
         if sql == contract.SESSIONS_SQL:
-            return _out([])
+            return _out(self.sessions)
         if sql == contract.SUBSCRIPTIONS_SQL:
             return _out([])
         if sql == contract.INVENTORY_SQL:
@@ -566,7 +643,7 @@ class FakeDocker:
         raise AssertionError(f"unexpected SQL: {sql[:120]}")
 
     def _grant_connect(self, role: str):
-        oids = {"hh_app": "12", "hh_provision": "13", "hh_backup": "14"}
+        oids = {"hh_app": "12", "hh_provision": "13", "hh_purge": "15", "hh_backup": "14"}
         self.databases["house_helper"]["acl"] = True
         if not any(
             row[0] == "house_helper" and row[2] == role and row[3] == "CONNECT"
@@ -820,6 +897,8 @@ def _windows_spec():
         image=SPEC.image,
         volume=SPEC.volume,
         network=SPEC.network,
+        credentials_directory=SPEC.credentials_directory,
+        state_volume=SPEC.state_volume,
         postgresql_conf_source=enroll._canonical_path(
             WINDOWS_REPO + "\\postgresql.conf"
         ),
@@ -943,6 +1022,88 @@ def test_the_spec_resolves_the_full_compose_sources(tmp_path, monkeypatch):
     )
 
 
+def _compose_copy(tmp_path):
+    compose = tmp_path / "compose.postgres.yaml"
+    compose.write_text(
+        (enroll.REPOSITORY_ROOT / "deploy" / "compose.postgres.yaml").read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
+    return compose
+
+
+def _container_for(spec, source):
+    """The fixture container, bound to `spec`'s image, with the given bootstrap source."""
+    value = FakeDocker()._container()
+    value["Config"]["Image"] = spec.image
+    authorized = {
+        "/etc/house-helper/postgresql.conf": spec.postgresql_conf_source,
+        "/etc/house-helper/pg_hba.conf": spec.pg_hba_source,
+        "/run/credentials/postgres_superuser.password": source,
+    }
+    for mount in value["Mounts"]:
+        if mount["Destination"] in authorized:
+            mount["Source"] = authorized[mount["Destination"]]
+        if mount.get("Name") == SPEC.volume:
+            mount["Name"] = spec.volume
+    return value
+
+
+def test_the_approved_credential_directory_is_explicit_configuration(
+    tmp_path, monkeypatch
+):
+    # F-03: the approved external directory is a non-secret value the operator passes on
+    # every host command. It resolves without any inherited environment, which an ordinary
+    # `sudo` would not provide.
+    compose = _compose_copy(tmp_path)
+    approved = tmp_path / "deploy-overlays" / "secrets" / "pg-credentials"
+    monkeypatch.delenv(enroll.CREDENTIALS_DIRECTORY_ENV, raising=False)
+    spec = enroll.load_spec(compose, approved)
+    assert spec.credentials_directory == enroll._canonical_path(approved)
+    assert spec.bootstrap_credential_source == enroll._canonical_path(
+        approved / "postgres_superuser.password"
+    )
+    # HOF-03 item 4 records the state volume this surface names.
+    assert spec.state_volume == "house-helper-pg-state"
+    # The same explicit value wins when the environment happens to agree.
+    monkeypatch.setenv(enroll.CREDENTIALS_DIRECTORY_ENV, str(approved))
+    assert enroll.load_spec(compose, approved).credentials_directory == (
+        enroll._canonical_path(approved)
+    )
+
+
+def test_a_conflicting_credential_directory_is_refused(tmp_path, monkeypatch):
+    compose = _compose_copy(tmp_path)
+    monkeypatch.setenv(
+        enroll.CREDENTIALS_DIRECTORY_ENV, str(tmp_path / "from-the-environment")
+    )
+    with pytest.raises(enroll.DockerError) as refused:
+        enroll.load_spec(compose, tmp_path / "from-the-option")
+    assert refused.value.code == "credentials_conflict"
+
+
+def test_a_mismatched_credential_directory_never_matches_the_container(
+    tmp_path, monkeypatch
+):
+    # The mounted source is compared in full against the explicit configuration: a
+    # passfile of the right name from another directory is a substitution, not the
+    # approved mount. The approved directory itself is accepted.
+    compose = _compose_copy(tmp_path)
+    approved = tmp_path / "approved"
+    monkeypatch.delenv(enroll.CREDENTIALS_DIRECTORY_ENV, raising=False)
+    spec = enroll.load_spec(compose, approved)
+    enroll.validate_container(
+        spec,
+        _container_for(spec, str(approved / "postgres_superuser.password")),
+    )
+    with pytest.raises(enroll.DockerError) as refused:
+        enroll.validate_container(
+            spec, _container_for(spec, SPEC.bootstrap_credential_source)
+        )
+    assert refused.value.code == "volume_identity"
+
+
 def test_a_duplicate_bootstrap_credential_mount_is_refused():
     fake = FakeDocker()
     value = fake._container()
@@ -1014,6 +1175,204 @@ def test_check_credentials_validates_against_the_container_runtime_uid(tmp_path,
     code = enroll._check_credentials(tmp_path)
     assert code == 0
     assert seen == [(10001, 10001)] * 6
+
+
+# --- F-03: check-credentials follows the one credential-directory contract -------------------
+
+
+def _record_summary(monkeypatch):
+    seen: list[Path] = []
+
+    def summary(path, **kwargs):
+        seen.append(Path(path))
+        return {"exists": True, "private": True, "owned": True, "entry": True}
+
+    monkeypatch.setattr(enroll.credentials, "summary", summary)
+    return seen
+
+
+def _canonical(path):
+    return Path(enroll._canonical_path(path))
+
+
+def test_check_credentials_accepts_an_explicit_directory_without_environment(
+    tmp_path, monkeypatch
+):
+    # An ordinary `sudo` loses the shell environment; the explicit value must still work.
+    compose = _compose_copy(tmp_path)
+    approved = tmp_path / "approved-credentials"
+    approved.mkdir()
+    monkeypatch.delenv(enroll.CREDENTIALS_DIRECTORY_ENV, raising=False)
+    seen = _record_summary(monkeypatch)
+    code = enroll.main(
+        [
+            "--compose-file",
+            str(compose),
+            "check-credentials",
+            "--credentials-dir",
+            str(approved),
+        ]
+    )
+    assert code == enroll.EX_OK
+    assert {path.parent for path in seen} == {_canonical(approved)}
+
+
+def test_check_credentials_accepts_the_top_level_spelling(tmp_path, monkeypatch):
+    compose = _compose_copy(tmp_path)
+    approved = tmp_path / "approved-credentials"
+    approved.mkdir()
+    monkeypatch.delenv(enroll.CREDENTIALS_DIRECTORY_ENV, raising=False)
+    seen = _record_summary(monkeypatch)
+    code = enroll.main(
+        [
+            "--compose-file",
+            str(compose),
+            "--credentials-dir",
+            str(approved),
+            "check-credentials",
+        ]
+    )
+    assert code == enroll.EX_OK
+    assert {path.parent for path in seen} == {_canonical(approved)}
+
+
+def test_check_credentials_refuses_contradictory_top_level_and_subcommand_options(
+    tmp_path, monkeypatch, capsys
+):
+    compose = _compose_copy(tmp_path)
+    monkeypatch.delenv(enroll.CREDENTIALS_DIRECTORY_ENV, raising=False)
+    seen = _record_summary(monkeypatch)
+    code = enroll.main(
+        [
+            "--compose-file",
+            str(compose),
+            "--credentials-dir",
+            str(tmp_path / "first"),
+            "check-credentials",
+            "--credentials-dir",
+            str(tmp_path / "second"),
+        ]
+    )
+    assert code == enroll.EX_REFUSED
+    assert "credentials_conflict" in capsys.readouterr().err
+    assert seen == []
+
+
+def test_check_credentials_refuses_an_explicit_directory_that_conflicts_with_the_environment(
+    tmp_path, monkeypatch, capsys
+):
+    compose = _compose_copy(tmp_path)
+    monkeypatch.setenv(enroll.CREDENTIALS_DIRECTORY_ENV, str(tmp_path / "from-env"))
+    seen = _record_summary(monkeypatch)
+    code = enroll.main(
+        [
+            "--compose-file",
+            str(compose),
+            "check-credentials",
+            "--credentials-dir",
+            str(tmp_path / "from-option"),
+        ]
+    )
+    assert code == enroll.EX_REFUSED
+    assert "credentials_conflict" in capsys.readouterr().err
+    assert seen == []
+
+
+def test_check_credentials_accepts_matching_explicit_and_environment_values(
+    tmp_path, monkeypatch
+):
+    compose = _compose_copy(tmp_path)
+    approved = tmp_path / "agreed"
+    approved.mkdir()
+    monkeypatch.setenv(enroll.CREDENTIALS_DIRECTORY_ENV, str(approved))
+    seen = _record_summary(monkeypatch)
+    assert (
+        enroll.main(
+            [
+                "--compose-file",
+                str(compose),
+                "check-credentials",
+                "--credentials-dir",
+                str(approved),
+            ]
+        )
+        == enroll.EX_OK
+    )
+    assert {path.parent for path in seen} == {_canonical(approved)}
+
+
+def test_the_credential_directory_precedence_is_one_contract(tmp_path, monkeypatch):
+    compose = _compose_copy(tmp_path)
+    compose_dir = compose.resolve().parent
+    approved = tmp_path / "approved"
+    other = tmp_path / "other"
+    monkeypatch.delenv(enroll.CREDENTIALS_DIRECTORY_ENV, raising=False)
+    # No explicit value and no environment: the Compose default, resolved beside the file.
+    assert enroll.resolve_credentials_directory(compose) == _canonical(
+        compose_dir / "postgres" / "credentials"
+    )
+    # The environment value is resolved exactly as Compose resolves it.
+    monkeypatch.setenv(enroll.CREDENTIALS_DIRECTORY_ENV, str(other))
+    assert enroll.resolve_credentials_directory(compose) == _canonical(other)
+    # An explicit value wins when the environment has none.
+    monkeypatch.delenv(enroll.CREDENTIALS_DIRECTORY_ENV, raising=False)
+    assert enroll.resolve_credentials_directory(
+        compose, subcommand=approved
+    ) == _canonical(approved)
+    # A relative explicit value follows the compose file's directory, like load_spec.
+    assert enroll.resolve_credentials_directory(
+        compose, top_level=Path("relative/secrets")
+    ) == _canonical(compose_dir / "relative" / "secrets")
+    # Contradictions are refusals, never a silent override.
+    monkeypatch.setenv(enroll.CREDENTIALS_DIRECTORY_ENV, str(other))
+    with pytest.raises(enroll.DockerError) as refused:
+        enroll.resolve_credentials_directory(compose, subcommand=approved)
+    assert refused.value.code == "credentials_conflict"
+    with pytest.raises(enroll.DockerError) as refused:
+        enroll.resolve_credentials_directory(
+            compose, top_level=approved, subcommand=other
+        )
+    assert refused.value.code == "credentials_conflict"
+
+
+def test_check_credentials_verifies_the_effective_directory_identity(
+    tmp_path, monkeypatch, capsys
+):
+    # Passfiles alone are not enough: the effective directory must exist and be a
+    # directory, and the path is named (non-secret) so the operator can compare it with
+    # the container's mount source.
+    compose = _compose_copy(tmp_path)
+    missing = tmp_path / "missing-credentials"
+    monkeypatch.delenv(enroll.CREDENTIALS_DIRECTORY_ENV, raising=False)
+    seen = _record_summary(monkeypatch)
+    code = enroll.main(
+        [
+            "--compose-file",
+            str(compose),
+            "check-credentials",
+            "--credentials-dir",
+            str(missing),
+        ]
+    )
+    assert code == enroll.EX_REFUSED
+    assert "credentials_directory" in capsys.readouterr().err
+    assert seen == []
+
+    approved = tmp_path / "approved-credentials"
+    approved.mkdir()
+    assert (
+        enroll.main(
+            [
+                "--compose-file",
+                str(compose),
+                "check-credentials",
+                "--credentials-dir",
+                str(approved),
+            ]
+        )
+        == enroll.EX_OK
+    )
+    assert f"credentials directory: {_canonical(approved)}" in capsys.readouterr().out
 
 
 def test_mode_a_refuses_a_container_identity_that_does_not_match_the_record(tmp_path):
@@ -1113,6 +1472,12 @@ def test_run_migrate_passes_the_record_on_stdin_and_journals_the_outcome(tmp_pat
     assert records[-2].kind == "migration" and records[-2].payload["state"] == "intent"
     assert records[-1].kind == "migration" and records[-1].payload["state"] == "outcome"
     assert records[-1].payload["exit_code"] == 0
+    # F-03: the child Compose resolves the same approved credential directory the host
+    # tool resolved, instead of the repository default under an ordinary `sudo`.
+    assert (
+        fake.compose_env[enroll.CREDENTIALS_DIRECTORY_ENV]
+        == SPEC.credentials_directory
+    )
 
 
 def test_run_migrate_refuses_before_compose_when_mode_b_fails(tmp_path):
@@ -1754,6 +2119,57 @@ def test_a_cleanup_failure_is_not_an_uncertain_migration_outcome(
     assert outcome["exit_code"] == 0
 
 
+# --- C7-P3: session observation with ordinary Web connections -------------------------------
+
+
+def test_observe_with_no_client_session_is_the_quiet_cluster(tmp_path):
+    fake, _journal = _enrolled_at_head(tmp_path)
+    observation = _adapter(fake).mode_b_observation()
+    assert observation.database is not None
+    assert observation.database.sessions == ()
+
+
+def test_observe_accepts_one_client_session_on_the_serving_database(tmp_path):
+    # The regression: a live Web connection used to be unpacked as four fields from a
+    # two-field pair, so every scheduled backup failed while Web was serving.
+    fake, _journal = _enrolled_at_head(tmp_path)
+    fake.sessions = [("house_helper", 4242, "hh_app", "client backend")]
+    observation = _adapter(fake).mode_b_observation()
+    assert observation.database is not None
+    assert observation.database.sessions == ((4242, "hh_app"),)
+
+
+def test_observe_accepts_multiple_client_sessions_and_ignores_other_databases_and_backends(
+    tmp_path,
+):
+    fake, _journal = _enrolled_at_head(tmp_path)
+    fake.sessions = [
+        ("house_helper", 4242, "hh_app", "client backend"),
+        ("house_helper", 4243, "hh_app", "client backend"),
+        ("postgres", 99, "postgres", "client backend"),
+        ("house_helper", 77, "hh_backup", "walsender"),
+    ]
+    observation = _adapter(fake).mode_b_observation()
+    assert observation.database is not None
+    assert observation.database.sessions == ((4242, "hh_app"), (4243, "hh_app"))
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        ("house_helper", 4242),
+        ("house_helper", "not-a-pid", "hh_app", "client backend"),
+        ("house_helper", "0", "hh_app", "client backend"),
+    ],
+)
+def test_a_malformed_session_row_is_a_controlled_refusal(tmp_path, row):
+    fake, _journal = _enrolled_at_head(tmp_path)
+    fake.sessions = [row]
+    with pytest.raises(enroll.DockerError) as refused:
+        _adapter(fake).mode_b_observation()
+    assert refused.value.code == "sessions_observation"
+
+
 # --- §7.3 CONNECT handoffs (P0-1) -------------------------------------------------------------
 
 
@@ -1781,12 +2197,22 @@ def _run_handoff(fake, journal_file, role="hh_app", approved_by="owner"):
     )
 
 
-HANDOFF_OIDS = {"hh_app": "12", "hh_provision": "13", "hh_backup": "14"}
+HANDOFF_OIDS = {
+    "hh_app": "12",
+    "hh_provision": "13",
+    "hh_purge": "15",
+    "hh_backup": "14",
+}
 
 
 @pytest.mark.parametrize(
     "role, event",
-    [("hh_app", "app"), ("hh_provision", "provision"), ("hh_backup", "scheduled")],
+    [
+        ("hh_app", "app"),
+        ("hh_provision", "provision"),
+        ("hh_purge", "scheduled"),
+        ("hh_backup", "scheduled"),
+    ],
 )
 def test_each_p0_handoff_grants_only_connect_and_journals_intent_then_outcome(
     tmp_path, role, event, capsys
@@ -1822,6 +2248,38 @@ def test_each_p0_handoff_grants_only_connect_and_journals_intent_then_outcome(
     ]
     assert enrollment.pending_handoff_intents(journal_file.read().records) == ()
     assert "ok [handoff]" in capsys.readouterr().out
+
+
+def test_the_h3_purge_handoff_preserves_the_existing_h3_backup_records(tmp_path, capsys):
+    # C7-P3 adds the second H3 grantee without rewriting or reinterpreting the records the
+    # earlier P0 cutover wrote for hh_backup. Both carry the frozen `handoff:scheduled`
+    # event and remain independently resolvable.
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    assert _run_handoff(fake, journal_file, role="hh_backup") == enroll.EX_OK
+    before = _handoff_records(journal_file)
+    assert _run_handoff(fake, journal_file, role="hh_purge") == enroll.EX_OK
+    records = _handoff_records(journal_file)
+    assert records[: len(before)] == before
+    assert [record.payload["role"] for record in records] == [
+        "hh_backup",
+        "hh_backup",
+        "hh_purge",
+        "hh_purge",
+    ]
+    assert [record.payload["handoff"] for record in records] == ["scheduled"] * 4
+    assert enrollment.successful_handoff_roles(journal_file.read().records) == frozenset(
+        {"hh_backup", "hh_purge"}
+    )
+    assert fake.grants == ["hh_backup", "hh_purge"]
+    assert enrollment.pending_handoff_intents(journal_file.read().records) == ()
+
+
+def test_the_h3_purge_handoff_refuses_an_unjournaled_connect(tmp_path, capsys):
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    fake._grant_connect("hh_purge")  # an out-of-band GRANT: privilege, but no history
+    assert _run_handoff(fake, journal_file, role="hh_purge") == enroll.EX_REFUSED
+    assert fake.grants == []
+    assert "handoff_unrecorded" in capsys.readouterr().err
 
 
 def test_a_repeated_handoff_is_an_idempotent_observed_noop(tmp_path, capsys):
@@ -2678,7 +3136,9 @@ def test_grant_connect_names_only_the_serving_database_and_authorized_roles(tmp_
 
 def test_the_handoff_command_refuses_an_unauthorized_role_before_docker(monkeypatch):
     class Args:
-        role = "hh_purge"
+        # A maintenance login is not an H1/H2/H3 handoff grantee; hh_purge IS one since
+        # C7-P3 and is covered by the parametrized authorized-role test above.
+        role = "hh_restore"
         approved_by = "owner"
 
     monkeypatch.setattr(
@@ -2820,3 +3280,103 @@ def test_status_reports_a_pending_handoff_as_unknown(tmp_path, capsys):
     output = capsys.readouterr().out
     assert "handoff UNKNOWN" in output
     assert "hh_app" in output
+
+
+# --- LCK-08: a pending lock handoff fences every advancement ---------------------------------
+
+
+def _pending_lock_intent(journal_file, run_id="e" * 32):
+    journal_file.append(
+        "handoff_lock",
+        {
+            "state": "intent",
+            "action": "observe_lock_handoff",
+            "handoff": "lock",
+            "operator": "owner",
+            "run_id": run_id,
+        },
+    )
+
+
+def _failed_lock_outcome(journal_file, run_id="e" * 32):
+    journal_file.append(
+        "handoff_lock",
+        {
+            "state": "outcome",
+            "action": "observe_lock_handoff",
+            "handoff": "lock",
+            "operator": "owner",
+            "run_id": run_id,
+            "outcome": "failed",
+            "evidence": {
+                "container_id": WEB_ID,
+                "state_volume": SPEC.state_volume,
+                "lock_present": True,
+                "lock_device": "8:1",
+                "lock_inode": 12345,
+                "idle_exit": 0,
+                "idle_code": None,
+                "holder_pid": None,
+                "holder_start_ticks": None,
+                "holder_access": None,
+                "observations": 2,
+                "witness_access": None,
+                "observation_boundary": None,
+            },
+        },
+    )
+
+
+def test_a_pending_lock_handoff_blocks_a_grant_handoff(tmp_path, capsys):
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    _pending_lock_intent(journal_file)
+    before = journal_file.read().records
+    assert _run_handoff(fake, journal_file) == enroll.EX_UNKNOWN
+    assert "lock handoff intent" in capsys.readouterr().err
+    assert fake.grants == []
+    assert journal_file.read().records == before
+
+
+def test_a_pending_lock_handoff_blocks_a_migration(tmp_path, capsys):
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    _pending_lock_intent(journal_file)
+    before_operations = list(fake.operations)
+    code = enroll.run_migrate(
+        enroll.Docker(SPEC, runner=fake),
+        enroll.DEFAULT_COMPOSE,
+        journal_file,
+        _adapter(fake),
+    )
+    assert code == enroll.EX_UNKNOWN
+    assert "no migration was started" in capsys.readouterr().err
+    assert fake.operations == before_operations
+
+
+def test_a_pending_lock_handoff_blocks_reconciliation(tmp_path, capsys):
+    _, journal_file = _enrolled_at_head(tmp_path)
+    _pending_lock_intent(journal_file)
+    # The gate is ahead of every Docker/database observation, so placeholders suffice.
+    code = enroll.reconcile_migration_command(object(), journal_file, object())
+    assert code == enroll.EX_UNKNOWN
+    assert "no migration outcome" in capsys.readouterr().err
+
+
+def test_an_invalid_lock_history_blocks_even_when_grant_records_are_valid(tmp_path):
+    # A caller that only inspects grant events must not silently ignore a corrupted lock
+    # history: the shared gate validates it and fails closed.
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    _pending_lock_intent(journal_file, run_id="a" * 32)
+    _pending_lock_intent(journal_file, run_id="b" * 32)
+    with pytest.raises(enrollment.EnrollmentError) as refused:
+        _run_handoff(fake, journal_file)
+    assert refused.value.code == "lock_handoff_journal"
+    assert fake.grants == []
+
+
+def test_a_resolved_failed_lock_outcome_does_not_block_advancement(tmp_path):
+    # A coherent negative is a resolution, not an UNKNOWN; only an unresolved intent (or
+    # corrupt evidence) fences later transitions.
+    fake, journal_file = _enrolled_at_head(tmp_path)
+    _pending_lock_intent(journal_file)
+    _failed_lock_outcome(journal_file)
+    assert _run_handoff(fake, journal_file) == enroll.EX_OK

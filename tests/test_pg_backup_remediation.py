@@ -513,6 +513,7 @@ def _install_target_fakes(monkeypatch, tmp_path):
         lambda *a, **k: types.SimpleNamespace(
             spec=types.SimpleNamespace(image=_PINNED_IMAGE, network="house-helper-pg-db"),
             system_identifier=SYSTEM_IDENTIFIER,
+            credentials_dir=tmp_path / "credentials",
         ),
     )
     # P0: `backup_command`/`restore_command` take the host operation interval before the

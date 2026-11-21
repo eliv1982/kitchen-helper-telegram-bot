@@ -19,6 +19,8 @@ import sqlalchemy as sa
 from house_helper.persistence import pg_credentials
 from house_helper.persistence import pg_journal
 
+from tests.pg_oneshot_failures import startup_refusal, structured_denial
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ONESHOT_PATH = REPO_ROOT / "deploy" / "ops" / "pg_oneshot.py"
 
@@ -408,16 +410,31 @@ def test_the_live_gate_names_the_failed_part(rows, code):
     assert refused.value.exit_code == 3
 
 
-def test_a_permission_denied_connection_names_the_missing_h2_handoff():
-    class _Denied(Exception):
-        sqlstate = "42501"
-
-    error = sa.exc.DBAPIError("SELECT 1", {}, _Denied())
+def test_a_denial_the_driver_tags_with_42501_names_the_missing_h2_handoff():
+    # The one shape in which 42501 is structured evidence. The pinned psycopg 3.3.6 supplies
+    # no SQLSTATE for a startup refusal (F-02, and the purge suite's driver-faithful tests),
+    # so it is the only shape that may be read as "the handoff is missing".
+    error = sa.exc.DBAPIError("SELECT 1", {}, structured_denial())
     with pytest.raises(oneshot.ProvisionError) as refused:
         oneshot._verify_provision_connection(_Engine(error=error))
     assert refused.value.code == "provision_connect_handoff"
     assert refused.value.exit_code == 3
     assert "H2" in refused.value.message
+
+
+def test_a_driver_faithful_startup_refusal_is_fail_closed_and_names_the_h2_handoff():
+    # Driver-faithful (F-02): no SQLSTATE, only a finished PGconn. The one-shot reports the
+    # ambiguity, names the handoff and never guesses the cause from the message text.
+    error = sa.exc.DBAPIError(
+        "SELECT 1", {}, startup_refusal('permission denied for database "house_helper"')
+    )
+    with pytest.raises(oneshot.ProvisionError) as refused:
+        oneshot._verify_provision_connection(_Engine(error=error))
+    assert refused.value.code == "provision_database_unavailable"
+    assert refused.value.exit_code == 4
+    assert "H2" in refused.value.message
+    assert "enroll.py status" in refused.value.message
+    assert "permission denied" not in refused.value.message
 
 
 def test_any_other_connection_failure_is_a_database_refusal_without_driver_text():

@@ -47,9 +47,10 @@ Concurrency (P0)
     the same non-reentrant flock `enroll.py` uses for mode-a, migrate, reconcile-migration
     and handoff) from before Mode B until the last state-changing step. The interval is
     taken first and non-blockingly, so a conflicting operation is refused with
-    `operation_busy` instead of interleaving. Under that interval both an UNKNOWN handoff
-    (`handoff_unknown`) and an UNKNOWN migration (`migration_unknown`) refuse the operation
-    before anything is changed. The state-volume locks the backup holder takes are a
+    `operation_busy` instead of interleaving. Under that interval an UNKNOWN handoff
+    (`handoff_unknown`), an UNKNOWN migration (`migration_unknown`) and an UNKNOWN lock
+    handoff (`lock_handoff_unknown`) refuse the operation before anything is changed. The
+    state-volume locks the backup holder takes are a
     second, container-side layer; the host never takes them. The holder is a pure lock
     owner: the archive is published by the host process itself, which holds the operation
     interval, and the holder has no output-directory access at all. Lock order and the
@@ -130,7 +131,6 @@ from house_helper.persistence import pg_journal as journal  # noqa: E402
 
 DEFAULT_COMPOSE = REPOSITORY_ROOT / "deploy" / "compose.postgres.yaml"
 DEFAULT_JOURNAL_DIR = Path("/var/lib/house-helper/cutover")
-DEFAULT_CREDENTIALS_DIR = REPOSITORY_ROOT / "deploy" / "postgres" / "credentials"
 DEFAULT_OBJECT_CONTRACT = REPOSITORY_ROOT / "tests" / "fixtures" / "pg_object_contract.json"
 DEFAULT_APP_IMAGE = os.environ.get("HOUSE_HELPER_IMAGE", "house-helper:local")
 
@@ -1004,6 +1004,10 @@ class Target:
     spec: enroll.ClusterSpec
     completed: Mapping[str, Any]
     journal_file: journal.Journal
+    # The one canonical credential directory this operation resolved. It follows the
+    # same explicit > environment > Compose-default rule as `enroll.py`, with every
+    # relative value resolved against the compose file's directory.
+    credentials_dir: Path
 
     @property
     def system_identifier(self) -> str:
@@ -1015,6 +1019,7 @@ def verify_target(
     journal_dir: Path,
     *,
     journal_file: Optional[journal.Journal] = None,
+    credentials_dir: Optional[Path] = None,
 ) -> Target:
     """Verify the target cluster for one maintenance operation.
 
@@ -1038,6 +1043,12 @@ def verify_target(
     blocked = enroll.pending_handoff_refusal(journal_file.read().records)
     if blocked is not None:
         raise MaintenanceError("handoff_unknown", blocked)
+    # LCK-08: a lock-handoff intent without an observed outcome is UNKNOWN too. Only
+    # `enroll.py lock-handoff` may resolve it; neither backup nor restore (both advance
+    # the cutover machine) may proceed through that state.
+    lock_unknown = enrollment.pending_lock_handoff_refusal(journal_file.read().records)
+    if lock_unknown is not None:
+        raise MaintenanceError("lock_handoff_unknown", lock_unknown)
     # LCK-08/LCK-13: a migrate intent without an observed outcome is UNKNOWN too. It is
     # checked under the same host operation interval (the caller holds
     # `operation.lock`), and only `enroll.py reconcile-migration` may release it. Both
@@ -1053,7 +1064,13 @@ def verify_target(
             "`enroll.py reconcile-migration` before a backup or restore",
             f"run_id {run_id}",
         )
-    spec = enroll.load_spec(compose_file)
+    # B: one canonical Compose-relative resolver for every command. `--credentials-dir`
+    # is resolved here, so the directory the passfile is read from, the directory the
+    # Compose surface mounts and the directory `enroll.py` would report are one value.
+    resolved_credentials = enroll.resolve_credentials_directory(
+        compose_file, top_level=credentials_dir
+    )
+    spec = enroll.load_spec(compose_file, resolved_credentials)
     docker = enroll.Docker(spec)
     try:
         enroll.validate_image(spec, docker.inspect_image())
@@ -1068,11 +1085,18 @@ def verify_target(
             "Mode B refused the live cluster; nothing was changed",
             ", ".join(report.verdict.mismatches),
         )
-    return Target(spec=spec, completed=dict(report.verdict.completed or {}), journal_file=journal_file)
+    return Target(
+        spec=spec,
+        completed=dict(report.verdict.completed or {}),
+        journal_file=journal_file,
+        credentials_dir=resolved_credentials,
+    )
 
 
 @contextlib.contextmanager
-def maintenance_interval(compose_file: Path, journal_dir: Path):
+def maintenance_interval(
+    compose_file: Path, journal_dir: Path, *, credentials_dir: Optional[Path] = None
+):
     """P0: the host operation interval every cluster-advancing command holds.
 
     `backup` and `restore` take this interval at their entry point, before Mode B, and
@@ -1114,7 +1138,12 @@ def maintenance_interval(compose_file: Path, journal_dir: Path):
         Path(journal_dir), require_root=(os.name == "posix")
     )
     with journal_file.operation_lock():
-        yield verify_target(compose_file, journal_dir, journal_file=journal_file)
+        yield verify_target(
+            compose_file,
+            journal_dir,
+            journal_file=journal_file,
+            credentials_dir=credentials_dir,
+        )
 
 # --- archive validation ----------------------------------------------------------------------
 
@@ -1452,14 +1481,18 @@ def _publish_archive(
 
 def backup_command(args) -> int:
     """P0: the whole backup, publication included, runs inside one host operation interval."""
-    with maintenance_interval(args.compose_file, args.journal_dir) as target:
+    with maintenance_interval(
+        args.compose_file, args.journal_dir, credentials_dir=args.credentials_dir
+    ) as target:
         return _backup_command_locked(args, target)
 
 
 def _backup_command_locked(args, target: Target) -> int:
     tools = ToolContainers(target.spec.image)
     tools.image_digest()
-    role_passfile = passfile(args.credentials_dir, "hh_backup", database=contract.SERVING_DATABASE)
+    role_passfile = passfile(
+        target.credentials_dir, "hh_backup", database=contract.SERVING_DATABASE
+    )
     tools.inspect_volume(STATE_VOLUME)
     work = WorkDirectory(args.work_dir, prefix="house-helper-backup-")
     output = Path(args.output)
@@ -3073,7 +3106,9 @@ def _local_sql(
 
 def restore_command(args) -> int:
     """P0: the whole restore, from the target check to the final drop, is one interval."""
-    with maintenance_interval(args.compose_file, args.journal_dir) as target:
+    with maintenance_interval(
+        args.compose_file, args.journal_dir, credentials_dir=args.credentials_dir
+    ) as target:
         return _restore_command_locked(args, target)
 
 
@@ -3098,7 +3133,7 @@ def _restore_command_locked(args, target: Target) -> int:
                 ", ".join(contract_failures),
             )
         maintenance = _validate_maintenance_database(args.maintenance_database)
-        role_passfile = passfile(args.credentials_dir, "hh_restore", database="*")
+        role_passfile = passfile(target.credentials_dir, "hh_restore", database="*")
         maintenance_preflight(
             tools,
             role_passfile,
@@ -3525,9 +3560,11 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path(os.environ.get("HOUSE_HELPER_PG_JOURNAL_DIR", DEFAULT_JOURNAL_DIR)),
     )
-    parser.add_argument(
-        "--credentials-dir", type=Path, default=DEFAULT_CREDENTIALS_DIR
-    )
+    # B: no repository default here. The one resolver (`enroll.py`) applies explicit >
+    # environment > the Compose `${...:-default}` rule, with every relative value resolved
+    # against the compose file's directory. A hard-coded default here would silently
+    # disagree with the directory the Compose surface mounts under an ordinary `sudo`.
+    parser.add_argument("--credentials-dir", type=Path, default=None)
     parser.add_argument(
         "--object-contract", type=Path, default=DEFAULT_OBJECT_CONTRACT
     )
@@ -3940,7 +3977,7 @@ def _dispatch(args: argparse.Namespace, outcome: _Outcome) -> int:
             _record_outcome(outcome, error, outcome.cleanup)
         detail = "" if not error.detail else f" ({error.detail})"
         print(f"refused [{error.code}]: {error.message}{detail}", file=sys.stderr)
-        if error.code in ("handoff_unknown", "migration_unknown"):
+        if error.code in ("handoff_unknown", "lock_handoff_unknown", "migration_unknown"):
             # The cluster is in a reconciled-first UNKNOWN, not a plain refusal (LCK-08).
             return EX_UNKNOWN
         return EX_UNAVAILABLE if error.code in (

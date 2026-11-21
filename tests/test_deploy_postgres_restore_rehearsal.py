@@ -163,12 +163,15 @@ class _Rig:
         def portable_journal(directory, require_root=False):
             return real_journal(directory, require_root=False)
 
-        def verify_target(compose_file, journal_dir, *, journal_file=None):
+        def verify_target(
+            compose_file, journal_dir, *, journal_file=None, credentials_dir=None
+        ):
             return types.SimpleNamespace(
                 spec=types.SimpleNamespace(image=IMAGE, network="house-helper-pg-db"),
                 system_identifier=SYSTEM_IDENTIFIER,
                 journal_file=journal_file
                 or real_journal(journal_dir, require_root=False),
+                credentials_dir=self.args.credentials_dir,
             )
 
         monkeypatch.setattr(maintenance.journal, "Journal", portable_journal)

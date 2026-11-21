@@ -991,6 +991,12 @@ encrypted off-host backup (section 15) are separate and still pending. Every ste
 something outside the repository and needs the owner's explicit approval first. The code is
 `house_helper/admin/retention.py`; the units are in `deploy/systemd/`. It adds no migration and changes no table.
 
+**Cutover status (C7).** The legacy SQLite timers this acceptance describes were stopped and
+disabled in C7-P1. C7-P2 verified a fresh PostgreSQL local backup, an isolated restore and the
+encrypted offsite readback. C7-P3 (this repository change) prepares the PostgreSQL purge and
+offsite units; installing them and observing their first PostgreSQL runs are the owner steps in
+`deploy/postgres/scheduled_maintenance.md`, and are not part of the 2026-10-25 acceptance.
+
 ### 14.1 What is deleted, and what never is
 
 One command deletes three kinds of rows, for real (an SQL `DELETE`; hiding expired rows from reads, which the
@@ -1043,6 +1049,32 @@ its `expires_at` is after now); one created a microsecond later is kept. The sec
 (a restored or hand-edited database; the CHECK constraints refuse such a row on a migrated one).
 
 ### 14.2 The command
+
+**PostgreSQL deployment (C7-P3):** the retention command is unchanged, but on the PostgreSQL
+surface it runs inside the `purge` one-shot of the approved image, not through `hhops`:
+
+```bash
+# Both commands read the units' own environment file: `sudo` does not carry the shell's
+# variables, and `--env-file` is what resolves HOUSE_HELPER_PG_ACTIVATE, the credential
+# directory and the image tag (scheduled_maintenance.md, section 3.5).
+# dry run: counts only, one read-only transaction
+sudo docker compose -f <checkout>/deploy/compose.postgres.yaml --env-file /etc/house-helper/purge.env --profile ops run --rm -T purge purge --dry-run
+# real run
+sudo docker compose -f <checkout>/deploy/compose.postgres.yaml --env-file /etc/house-helper/purge.env --profile ops run --rm -T purge
+```
+
+The one-shot takes the shared state-volume lock, refuses before any DELETE unless its
+`hh_purge` session holds the H3 CONNECT handoff, and returns the admin command's exit status
+unchanged. A missing handoff makes the *connection* fail, and the pinned driver supplies no
+SQLSTATE for a startup refusal: that case is reported as `purge_database_unavailable` (exit
+4, naming the handoff) rather than a guessed `purge_connect_handoff` (exit 3, used only when
+the driver does report SQLSTATE 42501 or the connected session fails the CONNECT gate).
+`schema_not_head` is also exit 4, so read the journal line, not only the status.
+`deploy/postgres/scheduled_maintenance.md` is the transition procedure and has the exact
+statuses and their monitoring categories. (In those commands the first `purge` is the Compose
+service and the second is the one-shot's required role argument.) The `hhops` form below is
+the preserved SQLite procedure and a historical asset only (`deploy/systemd/legacy-sqlite/`)
+— not a rollback step.
 
 ```bash
 hhops exec --shared -- python -m house_helper.admin purge-expired --dry-run   # counts only: one read-only transaction
@@ -1121,12 +1153,27 @@ a right one.
 
 ### 14.4 Scheduling with systemd (opt-in) **[OWNER]**
 
-Two units and an environment template, `deploy/systemd/house-helper-purge.service`, `house-helper-purge.timer` and
-`house-helper-purge.env.example`. **Nothing installs, enables or starts them**, `docker compose up` does not run the
-cleanup, and the web service does not schedule anything: no scheduler runs inside the application. The service runs
-`docker compose ... --profile ops run --rm -T house-helper-ops exec --shared -- python -m house_helper.admin
-purge-expired`: the existing operator one-shot, unchanged, with its restrictions (no network, no environment file, no log
-driver, read-only root filesystem, no capability, 1 CPU, 256 MB). The report goes to the journal.
+**PostgreSQL deployment (C7-P3).** The current units run the PostgreSQL purge one-shot of
+the approved release image:
+`docker compose -f <checkout>/deploy/compose.postgres.yaml --profile ops run --rm -T purge`.
+`purge.env` now carries `HOUSE_HELPER_PG_ACTIVATE=1`, the per-role credential directory and
+the canonical journal directory in addition to the checkout, the web env-file path and the
+running image tag. The unit names, timer names and schedules are unchanged, so the existing
+Ops Sentinel, Cronitor and n8n job identities and heartbeats keep working. The full
+transition (stop the legacy schedule, journal the H3 `hh_purge` handoff, install, observe a
+manual dry run and a real run, re-arm, verify the first calendar-triggered runs),
+`Persistent=true` catch-up behavior, and the recovery response (stop the automated
+maintenance; no SQLite reactivation) are in
+`deploy/postgres/scheduled_maintenance.md`. The legacy SQLite unit text is preserved under
+`deploy/systemd/legacy-sqlite/`.
+
+The paragraphs below describe the **preserved SQLite procedure** — historical text kept for
+reference, not a rollback step (see `deploy/postgres/scheduled_maintenance.md`, section 6).
+Its service runs `docker compose ... --profile ops run --rm -T house-helper-ops exec --shared -- python -m house_helper.admin
+purge-expired` against `deploy/compose.yaml`: the existing operator one-shot, unchanged, with its restrictions (no
+network, no environment file, no log driver, read-only root filesystem, no capability, 1 CPU, 256 MB). **Nothing installs,
+enables or starts them** (either variant); `docker compose up` does not run the cleanup, and the web service does not schedule
+anything: no scheduler runs inside the application. The report goes to the journal.
 
 | | |
 |---|---|
@@ -1136,8 +1183,15 @@ driver, read-only root filesystem, no capability, 1 CPU, 256 MB). The report goe
 | **Failure** | the unit fails, visibly (`systemctl --failed`, the journal). **No alert is configured**; deciding where a failure is reported is the owner's |
 | **Account** | root, like the Docker daemon it talks to (Docker access is root-equivalent). Another account: a drop-in with `User=` |
 
-Install (once; the three values in `purge.env` are the checkout, the same environment file the web service uses, and
-the image tag that is **running**):
+Install (once). The current unit is the PostgreSQL variant; its `purge.env` carries the
+checkout, the web env-file path, the running image tag, `HOUSE_HELPER_PG_ACTIVATE=1`, the
+per-role credential directory and the canonical journal directory (the template comments
+name each). The transition sequence — including the H3 `hh_purge` CONNECT handoff that must
+precede the first run, the manual dry run and the first-run verification — is
+`deploy/postgres/scheduled_maintenance.md`. The preserved SQLite variant under
+`deploy/systemd/legacy-sqlite/` is **not** installed by this procedure: reactivating the
+legacy schedule requires the separate written Owner-approved data-rollback procedure of
+`scheduled_maintenance.md`, section 6.
 
 ```bash
 sudo install -d -m 0755 /etc/house-helper
@@ -2267,11 +2321,15 @@ it still does not start the application against a serving database: that remains
 encrypted SHA-256 (the verdict prints it), the mode, the machine, and the result. Plaintext existed on that machine for the length of the
 run: it is unlink, not erasure (15.2).
 
-### 15.14 PostgreSQL format-v2 points (HH-DB-01 WP-2E, not activated) **[OWNER]**
+### 15.14 PostgreSQL format-v2 points (C7-P3 scheduled path) **[OWNER]**
 
-**Status: the repository side only. Nothing is installed, scheduled or deployed, and no PostgreSQL point has been made or uploaded.**
-Production stays on SQLite and on the unchanged v1 schedule. `deploy/postgres/offsite_v2.md` is the operator procedure; this section is
-the pointer and the gate list.
+**Status: the code and the scheduled unit configuration are in the repository; activating them on the host is the
+owner's step.** `house-helper-offsite-backup.service` passes `--database postgresql` explicitly, so the PostgreSQL v2
+path is the scheduled path and the SQLite `backup.sh` path can no longer be selected by that unit. Nothing in the
+repository installs, enables or starts the unit; `deploy/postgres/scheduled_maintenance.md` is the transition
+procedure, including the first-run verification and its section 6 recovery response (stop and disable the automated
+maintenance; the legacy SQLite units are historical assets and are not reactivated). `deploy/postgres/offsite_v2.md` is the
+operator procedure for the v2 format itself; this section is the pointer and the gate list.
 
 The v2 source is selected **only** by `--database postgresql`; without the flag `deploy/offsite_backup.py` is the same SQLite tool as
 before. The v2 path does not take its own backup: it runs the accepted WP-2D tool `deploy/postgres/maintenance.py backup`, then copies
@@ -2283,16 +2341,22 @@ encrypted file onward the upload, read-back, rename, commit record, retention, `
 no `dbtool sanitize` step: a logical dump holds live rows only, so the rewrite is removed, not weakened (BAK-15).
 
 ```bash
-sudo python3 deploy/offsite_backup.py run --database postgresql --recipients-file /etc/house-helper/age-recipients.txt --rclone-config /etc/house-helper/rclone.conf --remote NAME:house-helper --work-dir /run/house-helper-offsite
+sudo python3 deploy/offsite_backup.py run --database postgresql --postgres-compose-file <checkout>/deploy/compose.postgres.yaml --postgres-journal-dir /var/lib/house-helper/cutover --postgres-credentials-dir <credentials-dir> --recipients-file /etc/house-helper/age-recipients.txt --rclone-config /etc/house-helper/rclone.conf --remote NAME:house-helper --work-dir /run/house-helper-offsite
 ```
+
+The three `--postgres-*` options are the ones `house-helper-offsite-backup.service` passes explicitly; give them the
+same values the unit resolves from `/etc/house-helper/purge.env`, so a manual run and a scheduled run take the same
+host `operation.lock`, the same journal and the same passfiles (`scheduled_maintenance.md`, section 3.5).
 
 The rehearsal of 15.13 rehearses a v2 point with the same command: the archive's manifest decides the path. A v2 point is restored in a
 disposable `--network none` PostgreSQL 16 container by the accepted WP-2D tool; the private age identity never reaches it.
 
 **Gates (none closed here):** the Owner's explicit approval to run the one real external round trip with **synthetic** PostgreSQL test
-data in an isolated test prefix; the Owner's approval to activate the v2 path at all (no unit passes `--database postgresql`); every
-WP-2D prerequisite (enrollment, OD-2, per-role passfiles, the pinned client image); PostgreSQL provisioning, cutover, DSN and production
-credentials, which remain WP-2F. Monitoring and alerting are unchanged (BAK-17): the existing exit codes are the interface.
+data in an isolated test prefix (C7-P2's accepted local evidence is the prerequisite); the Owner's approval to activate the v2 path at all
+(the scheduled unit now passes `--database postgresql`; installing and re-arming it is the owner's transition step in
+`deploy/postgres/scheduled_maintenance.md`); every WP-2D prerequisite (enrollment, OD-2, per-role passfiles, the pinned client image);
+PostgreSQL provisioning, cutover, DSN and production credentials, which are governed by the C1-C6 cutover record. Monitoring and alerting
+are unchanged (BAK-17): the existing exit codes are the interface, and a failed unit produces no success heartbeat.
 
 ## 16. The Telegram bot and photos (shared conversations) **[OWNER]**
 

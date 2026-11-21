@@ -1,0 +1,47 @@
+# House Helper: delete what has expired (R4C-D2). A systemd oneshot service, started by
+# house-helper-purge.timer or by hand. NOT installed or enabled by anything in the repository:
+# deploy/RUNBOOK.md section 14 is the procedure, and every step of it is the owner's.
+#
+# What it runs is the operator one-shot that already exists for migrations, backups and
+# enrollment (compose service `house-helper-ops`, profile `ops`): no network, no credentials, no
+# log driver, read-only root filesystem, no capability, and the same image and volume as the web
+# service. The operator tool takes the SHARED maintenance lock for it (`exec --shared`), so it
+# runs beside the web service and beside a backup; a migration or a restore (exclusive) is
+# refused while it runs, and it is refused while one of those runs. Nothing is started by
+# `docker compose up`: this unit is the only thing that ever invokes it unattended.
+#
+# The report (counts and two timestamps, nothing private) goes to the journal:
+#     journalctl -u house-helper-purge.service
+#
+# Paths and the image tag come from /etc/house-helper/purge.env (template:
+# deploy/systemd/house-helper-purge.env.example). The tag must be the version that is RUNNING:
+# a tag whose schema is not the database's is refused (exit 4) and nothing is deleted.
+#
+# It runs as root, like the Docker daemon it talks to: access to Docker is root-equivalent
+# whoever holds it. To use another account add `User=` in a drop-in; that account needs Docker
+# access and read access to the two paths in purge.env.
+
+[Unit]
+Description=House Helper: delete expired sign-in artifacts and conversation history older than 365 days
+Documentation=https://github.com/eliv1982/kitchen-helper-telegram-bot/blob/main/deploy/RUNBOOK.md
+# Docker must already be up. `Requisite=` fails this unit at once, visibly, if it is not; it
+# never starts Docker. If Docker is stopped or restarted while this runs, systemd stops this
+# unit with it: the batch in progress rolls back, and a later run finishes the job.
+After=docker.service
+Requisite=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/house-helper/purge.env
+# One run at a time is systemd's own rule for a oneshot unit: a start request while it is
+# running joins the running job instead of starting a second. (A manual run through
+# `docker compose` is another matter; RUNBOOK section 14 says why that is safe too.)
+ExecStart=/usr/bin/docker compose -f ${HOUSE_HELPER_CHECKOUT}/deploy/compose.yaml --profile ops run --rm -T house-helper-ops exec --shared -- python -m house_helper.admin purge-expired
+# A purge of two users' data takes seconds. An hour is a bound for a hung Docker, not a
+# budget: when it is over systemd stops the run, and the batch in progress rolls back.
+TimeoutStartSec=1h
+NoNewPrivileges=yes
+PrivateTmp=yes
+SyslogIdentifier=house-helper-purge
+# No [Install] section: only the timer is enabled. Enabling this service on its own would
+# run it at every boot instead of on the schedule.

@@ -99,9 +99,10 @@ What the tool does, in order:
    published and read back. A handoff, migration or second backup/restore that is already
    running makes the run refuse (`operation_busy`) before anything is read, dumped or
    written; a handoff that never started cannot begin while the backup holds the
-   interval. An UNKNOWN handoff (`handoff_unknown`) or an UNKNOWN migration
-   (`migration_unknown`) refuses the run before any state-changing step. Both UNKNOWN
-   states are evaluated under this same interval.
+   interval. An UNKNOWN handoff (`handoff_unknown`), an UNKNOWN migration
+   (`migration_unknown`) or an UNKNOWN lock handoff (`lock_handoff_unknown`) refuses the
+   run before any state-changing step. All three UNKNOWN states are evaluated under this
+   same interval.
 1. Takes a **shared** `flock` on `/state/.house-helper.lock` and an independent
    **exclusive** `flock` on `/state/.house-helper.backup.lock` (LCK-01), in a detached
    holder that keeps both locks until the whole backup has finished. A migration's
@@ -179,8 +180,9 @@ The ordered flow:
    `backup` does, and holds it from before the target check until the temporary database
    has been verified and dropped (or retained). A concurrent handoff, migration, backup
    or restore is refused (`operation_busy`) before the archive is read or a database is
-   created; an UNKNOWN handoff (`handoff_unknown`) or an UNKNOWN migration
-   (`migration_unknown`) is refused before anything changes.
+   created; an UNKNOWN handoff (`handoff_unknown`), an UNKNOWN migration
+   (`migration_unknown`) or an UNKNOWN lock handoff (`lock_handoff_unknown`) is refused
+   before anything changes.
 1. Validates the archive (level 1) and Mode B on the target. The archive validation
    includes the extracted sequence payload and the `TABLE DATA` inventory; an invalid
    archive is refused **before** any target database is created.
@@ -292,6 +294,8 @@ verification of §4.8. It then:
 | `operation_busy` | Another host operation (`mode-a`, `migrate`, `reconcile-migration`, `handoff`, `backup` or `restore`) holds `<journal-dir>/operation.lock`. | Wait for it to finish and re-run; never delete the lock file or work around it. Exit 3, before anything was read or changed. |
 | `handoff_unknown` | A handoff intent has no observed outcome (LCK-08/LCK-13). | Only `enroll.py handoff --role <role> --approved-by <owner>` may resolve it, from proven termination plus the complete ACL. Exit 5. Maintenance refuses before any state change. |
 | `migration_unknown` | A `migrate` intent has no observed outcome: the run timed out, was interrupted, or was recorded UNKNOWN (LCK-08). | Only `enroll.py reconcile-migration` may resolve it, from the enrolled cluster, positive worker termination and the observed schema revision. Exit 5. Backup refuses before it publishes; restore refuses before any `CREATE DATABASE`. |
+| `lock_handoff_unknown` | A `handoff_lock` intent has no observed outcome (LCK-08). | Only `enroll.py lock-handoff --approved-by <owner>` may resolve it, from the kernel-level ownership proof (the deployed image's real uvicorn process's own fdinfo record for the validated inode, with a host-held shared witness through publication) plus the frozen `check-idle` observation. Exit 5. Maintenance refuses before any state change. |
+| `lock_handoff_journal` | The lock-handoff history is not a valid sequential intent/outcome pairing, or its evidence is internally contradictory. The latest outcome is the state: a pending intent hides earlier observed evidence, and a later failed outcome supersedes it. | Journal corruption: inspect the named `seq`, do not edit or truncate the journal, and do not infer an observation from a live probe. Exit 3, never an internal error. |
 | `handoff_journal` | The handoff history is not a valid intent/outcome pairing - including a malformed outcome type such as `[]`, `{}`, `null` or an unknown string. | Journal corruption: inspect the named `seq`, do not edit or truncate the journal, and do not infer a handoff from the live ACL. Exit 3, never an internal error. |
 | `journal_mismatch` | An explicit `--journal-dir` resolves to a different directory than `HOUSE_HELPER_PG_JOURNAL_DIR`, so the tools would take different `operation.lock` files. | Use one directory for every host tool (or unset the variable). Exit 3, before anything is read or changed. |
 | `cluster_identity` | Mode B differs from the enrollment record. | Read the mismatch items; do not bypass. Reconcile the cluster or perform a separate authorized enrollment. |

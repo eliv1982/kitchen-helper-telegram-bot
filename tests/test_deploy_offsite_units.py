@@ -113,12 +113,19 @@ def test_the_command_line_parses_with_the_real_parser_and_names_a_run_with_every
     command = values(parse_unit(SERVICE), "Service", "ExecStart")[0]
     args = parsed_command()
     assert args.command == "run"
+    assert args.database == offsite.DATABASE_POSTGRESQL  # C7-P3: the explicit v2 path
+    assert args.tag is None  # the image tag is the purge service's; the v2 path has no backup.sh
+    assert args.postgres_compose_file == Path(
+        substitute("${HOUSE_HELPER_CHECKOUT}")
+    ) / "deploy" / "compose.postgres.yaml"
+    assert args.postgres_journal_dir == Path("/var/lib/house-helper/cutover")
+    assert args.postgres_credentials_dir is not None
     assert args.max_deletions == offsite.DEFAULT_MAX_DELETIONS
     # Everything that makes it a daily job and nothing that bends it: no shell, no override, no wide limit.
     for forbidden in ("sh -c", "bash", "--max-deletions", ";", "&&", "|", ">"):
         assert forbidden not in f" {command} ", forbidden
     # The template values are of a shape the tool accepts (so the placeholders fail at rclone, not at parsing).
-    assert offsite.TAG_RE.fullmatch(args.tag) and offsite.validate_remote(args.remote)
+    assert offsite.validate_remote(args.remote)
 
 
 def test_the_variables_the_service_uses_are_all_defined_by_the_two_templates_and_only_braced():
@@ -127,8 +134,14 @@ def test_the_variables_the_service_uses_are_all_defined_by_the_two_templates_and
     assert not re.search(r"\$(?!\{)", command), "only braced substitutions: they are not split at spaces"
     purge, offsite_env = set(template_values(PURGE_ENVIRONMENT)), set(template_values(ENVIRONMENT))
     assert used <= purge | offsite_env
-    assert {"HOUSE_HELPER_CHECKOUT", "HOUSE_HELPER_IMAGE_TAG"} <= used & purge  # the tag is kept in ONE place
-    assert not {"HOUSE_HELPER_CHECKOUT", "HOUSE_HELPER_IMAGE_TAG"} & offsite_env
+    # The checkout, the canonical journal directory and the credential directory are kept in
+    # ONE place (purge.env); the recipients/remote/rclone settings stay in offsite.env.
+    assert {
+        "HOUSE_HELPER_CHECKOUT",
+        "HOUSE_HELPER_PG_JOURNAL_DIR",
+        "HOUSE_HELPER_PG_CREDENTIALS_DIR",
+    } <= used & purge
+    assert not {"HOUSE_HELPER_CHECKOUT", "HOUSE_HELPER_PG_JOURNAL_DIR"} & offsite_env
     assert offsite_env == {
         "HOUSE_HELPER_AGE_RECIPIENTS_FILE", "HOUSE_HELPER_RCLONE_CONFIG", "HOUSE_HELPER_OFFSITE_REMOTE",
         "HOUSE_HELPER_OFFSITE_ACCESS_MODE",
