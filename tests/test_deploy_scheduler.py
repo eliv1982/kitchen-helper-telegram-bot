@@ -194,16 +194,20 @@ def test_both_maintenance_units_are_explicitly_postgresql_and_cannot_fall_back()
     # The purge unit names the PostgreSQL one-shot service, never the SQLite operator tool.
     assert "house-helper-ops" not in purge and "dbtool.py" not in purge
     assert "purge-expired" not in purge
-    # The unit names are unchanged, so the monitoring job identities are unchanged.
+    # The unit names are unchanged, so the monitoring job identities are unchanged. The
+    # monitoring's installed configuration (drop-ins and curl config files) is host state, not
+    # a repository file, so this checks the tracked contract instead: the identities the
+    # emitter reads off each unit, and the transition procedure, which keeps the monitoring
+    # observation as an acceptance gate before the timers are re-armed.
     assert SERVICE.name == "house-helper-purge.service"
     assert (UNITS / "house-helper-offsite-backup.service").name == "house-helper-offsite-backup.service"
-    identities = {path.name for path in (DEPLOY / "monitoring" / "ops-monitor.d").iterdir()}
-    assert {
-        "hc-house-helper-purge.curl.example",
-        "cronitor-house-helper-purge.curl.example",
-        "hc-house-helper-backup.curl.example",
-        "n8n-webhook.curl.example",
-    } <= identities
+    for path, identifier in ((SERVICE, "house-helper-purge"),
+                             (UNITS / "house-helper-offsite-backup.service", "house-helper-offsite")):
+        assert values(parse_unit(path), "Service", "SyslogIdentifier") == [identifier]
+    procedure = " ".join(read(DEPLOY / "postgres" / "scheduled_maintenance.md").split())
+    assert ("The two unit names, timers and schedules are unchanged, so the existing Ops Sentinel, "
+            "Cronitor and n8n job identities and heartbeats keep working without edits") in procedure
+    assert "An alerting path that has never been seen to fail is not evidence" in procedure
 
 
 def test_the_timer_is_daily_in_utc_persistent_and_starts_only_the_service():
