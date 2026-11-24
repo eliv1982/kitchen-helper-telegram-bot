@@ -995,7 +995,10 @@ something outside the repository and needs the owner's explicit approval first. 
 disabled in C7-P1. C7-P2 verified a fresh PostgreSQL local backup, an isolated restore and the
 encrypted offsite readback. C7-P3 (this repository change) prepares the PostgreSQL purge and
 offsite units; installing them and observing their first PostgreSQL runs are the owner steps in
-`deploy/postgres/scheduled_maintenance.md`, and are not part of the 2026-10-25 acceptance.
+`deploy/postgres/scheduled_maintenance.md`, and are not part of the 2026-10-25 acceptance. C7-P4 (stages A9-A12) is
+recorded in `docs/STATUS.md`: the independent restore of A9-R3 passed on 2026-11-24; A10 (systemd backup and monitoring
+acceptance), A11 (timer activation) and A12 (unattended execution acceptance) are pending, and both production
+maintenance timers remain disabled.
 
 ### 14.1 What is deleted, and what never is
 

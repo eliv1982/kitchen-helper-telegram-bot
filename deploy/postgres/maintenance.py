@@ -2814,6 +2814,49 @@ def _attachment_summary(proof: Mapping[str, Any]) -> str:
     return "0 attachments, 0 bytes; loader sample none (the archive has no attachments)"
 
 
+# The owner the copied dump must carry for the `postgres` OS user, which runs the non-root isolated
+# `pg_restore`, to open it (A9-R2).
+_RESTORE_DUMP_OWNER = "postgres:postgres"
+
+
+def _require_dump_step(done: subprocess.CompletedProcess, operation: str, code: str) -> None:
+    """Refuse unless one dump-preparation command ran and succeeded.
+
+    A Docker/execution failure keeps its infrastructure classification (F3/R2). Only a command that
+    actually ran and refused is `code`, which is an environment failure and no evidence about the
+    archive. Neither refusal carries the tool's stderr: `_refuse_docker_execution` would quote its
+    first line, so that detail is dropped here."""
+    try:
+        _refuse_docker_execution(done, operation)
+    except MaintenanceError as infrastructure:
+        raise MaintenanceError(infrastructure.code, infrastructure.message) from None
+    if done.returncode != 0:
+        raise MaintenanceError(code, f"{operation} failed")
+
+
+def _prepare_restore_dump(tools: ToolContainers, container: str, dump_path: str) -> None:
+    """Make the copied dump readable by the `postgres` OS user that runs the isolated `pg_restore`.
+
+    The copy retains its restrictive mode (0600) but is owned by a different OS user than that
+    process, so `pg_restore` could not open it (A9-R2, exit 1). Ownership is set to
+    `postgres:postgres` by an exact root command, then readability as `postgres` is verified.
+
+    The mode is never touched: `chown` leaves a regular file's permission bits as they are, so the
+    dump stays 0600 and is never made group- or world-readable. The dump's contents are never read.
+
+    Fail closed: if either step fails this raises, and the caller must not reach `pg_restore`."""
+    _require_dump_step(
+        tools.exec(container, ["chown", _RESTORE_DUMP_OWNER, dump_path], user="root"),
+        "the restore dump ownership adjustment",
+        "isolated_dump_owner",
+    )
+    _require_dump_step(
+        tools.exec(container, ["test", "-r", dump_path], user="postgres"),
+        "the restore dump readability check",
+        "isolated_dump_access",
+    )
+
+
 def rehearse(
     tools: ToolContainers,
     *,
@@ -2864,6 +2907,7 @@ def rehearse(
                 "isolated_identity", "the isolated cluster identifier could not be read"
             )
         tools.copy_in(container, work_path / backup.DUMP_NAME, f"/tmp/{backup.DUMP_NAME}")
+        _prepare_restore_dump(tools, container, f"/tmp/{backup.DUMP_NAME}")
         restore_list = _filtered_restore_list(
             tools.pg_restore_list(work_path)
         )

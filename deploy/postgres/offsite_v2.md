@@ -6,8 +6,12 @@ PostgreSQL deployment is the production surface (C1-C6), and
 path is the v2 source. Nothing in the repository installs or enables the unit: activating it
 is the owner's transition step in `deploy/postgres/scheduled_maintenance.md`. No PostgreSQL
 point has been taken or uploaded by a scheduled run until that step is performed, and the
-real external round trip has **not** been executed. This document is the operator procedure
-and the list of gates that remain. It is governed by
+real external round trip has **not** been executed. *[Note 2026-11-24, C7-P4: the restore half
+has since been exercised once from the real offsite folder: an independent recovery of one
+committed PostgreSQL point on a non-production host (A9-R3, operational PASS / CLEAN), recorded in
+`docs/STATUS.md`. It was not the synthetic-data test-prefix procedure of §5, which has not been
+run, and it did not activate any timer or scheduled run: both production maintenance timers stay
+disabled.]* This document is the operator procedure and the list of gates that remain. It is governed by
 `docs/architecture/HH-DB-01_Architecture_Frozen_Specification_v1.0.md` §8 (BAK-15..BAK-17);
 where this text and the specification differ, the specification wins.
 

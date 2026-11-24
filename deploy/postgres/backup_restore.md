@@ -245,6 +245,22 @@ The rehearsal starts a throwaway `postgres:16.15` container with:
 * **no production volume**, **no production credential**, no published port;
 * a fresh `system_identifier`, recorded as provenance, never as a requirement.
 
+The archive's dump is copied into the container and made openable **before** anything
+reads it (C7-P4 H1-FIX-01). The copy keeps its restrictive mode (0600) but is owned by an
+OS user other than the `postgres` process that runs the non-root `pg_restore`, which
+cannot open it. Dump unreadability by the `postgres` user is the strongly supported
+probable cause of the A9-R2 failure. The original `pg_restore` stderr was not preserved,
+so the historical failure cannot be conclusively attributed to this mechanism.
+H1-PROBE-01 demonstrated the mechanism (REPORTED; not verifiable from the repository),
+and A9-R3 successfully completed with H1-FIX-01 (VERIFIED from local evidence outside Git;
+the evidence grades are in `docs/STATUS.md`).
+Straight after the copy, and before the restore list
+is read, the tool runs `chown postgres:postgres <dump>` as root and then `test -r <dump>`
+as `postgres`. `chown` leaves the permission bits alone, so the dump stays 0600 and is
+never made group- or world-readable; neither command reads the dump's contents. If either
+step is refused the rehearsal stops there: `pg_restore` is never reached (`isolated_dump_owner`,
+`isolated_dump_access`, section 6).
+
 Inside it the tool applies `db/roles.sql`, creates a database behind the same
 `ALLOW_CONNECTIONS false` fence, restores with `--role=hh_owner --no-owner
 --no-privileges`, applies `db/schema.sql` and `db/privileges.sql`, and repeats every
@@ -313,6 +329,8 @@ verification of §4.8. It then:
 | `sequence:*_mismatch` | The restored pair differs from the archive. | Do not promote; recreate the restore database. |
 | `restore_verification` | A digest, ownership, ACL, revision or object-contract check failed. | The database is not `verified`. Inspect, do not switch the DSN. |
 | `alembic_check` | The restored schema has drift from the image's models. | Do not serve it. Re-run the migration chain / use a matching image. |
+| `isolated_dump_owner` | The root `chown postgres:postgres` of the copied dump ran and refused (exit 3). `pg_restore` was not reached. | An environment failure, never evidence about the archive: fix the disposable container's environment and re-run. A Docker or execution failure of the same step keeps its `docker_infrastructure` classification (exit 4). `offsite_rehearsal.py` reports it as a failed run (exit 1), never as NOT RESTORABLE (exit 4). The refusal carries no tool output. |
+| `isolated_dump_access` | `test -r` as the `postgres` OS user ran and refused: the dump is still not readable by the process that restores it (exit 3). `pg_restore` was not reached. | As above. A `chown` that reported success but left the dump unreadable is caught here. Never widen the dump's mode to get past it: the fix keeps it 0600 on purpose. |
 | `isolated_*` | The disposable rehearsal failed. | The production cluster was not made `verified`-and-promoted by that run; fix the cause and re-run. |
 
 A failure creates no automatic rollback and no automatic retry. The journal's
