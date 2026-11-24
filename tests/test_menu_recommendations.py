@@ -368,7 +368,7 @@ async def test_a_partial_inventory_reaches_the_model_with_missing_and_unknown_ap
     # only an optional addition is conditional.
     assert "подтверждено, что продукт есть; подтверждено, что его нет" in KITCHEN_SYSTEM_PROMPT
     assert "не считай его ни имеющимся, ни отсутствующим" in KITCHEN_SYSTEM_PROMPT
-    assert "проверьте, есть ли у вас это; купите, если нужно" in KITCHEN_SYSTEM_PROMPT
+    assert "проверь, есть ли у тебя это; купи, если нужно" in KITCHEN_SYSTEM_PROMPT
     assert "«точно купить» — только подтверждённо отсутствующее" in KITCHEN_SYSTEM_PROMPT
     assert "«проверить» — нужное, но с неизвестным наличием" in KITCHEN_SYSTEM_PROMPT
     assert "Необязательное в «точно купить» не попадает" in KITCHEN_SYSTEM_PROMPT
@@ -432,7 +432,7 @@ LIVE_OPT_OUT = (
 LIVE_UNKNOWN = "У меня есть курица и картошка. Больше ничего не проверяла."
 DISH_CHOSEN = "Давай картофельные гнезда с грибами."
 RECIPE_OFFER = (
-    "Выберите понравившееся блюдо, и я дам полный рецепт. "
+    "Выбери понравившееся блюдо, и я дам полный рецепт. "
     "Его можно будет сохранить в избранное"
 )
 
@@ -603,7 +603,7 @@ async def test_confirmed_missing_and_unknown_required_items_go_to_different_sect
     assert "«точно купить» — только подтверждённо отсутствующее" in KITCHEN_SYSTEM_PROMPT
     # Required but unknown: checked, not bought blind, and not called optional.
     assert "«проверить» — нужное, но с неизвестным наличием" in KITCHEN_SYSTEM_PROMPT
-    assert "проверьте, есть ли у вас это; купите, если нужно" in KITCHEN_SYSTEM_PROMPT
+    assert "проверь, есть ли у тебя это; купи, если нужно" in KITCHEN_SYSTEM_PROMPT
     # Optional additions are the only conditional ones.
     assert "«если есть» и «можно добавить» — только для необязательных продуктов" in KITCHEN_SYSTEM_PROMPT
 
@@ -627,15 +627,15 @@ async def test_the_ideas_then_recipe_then_favorites_workflow_is_stated_in_both_c
     assert "после списка добавь" in KITCHEN_SYSTEM_PROMPT
     # Telegram's help: the workflow and its limits (the save button is not always
     # there; editing is only on the site).
-    assert "Если вы не знаете, что приготовить, я предложу идеи блюд" in tc.HELP
-    assert "выберите понравившееся, и я дам полный рецепт" in tc.HELP
-    assert "кнопкой под ответом помощника, когда она есть" in tc.HELP
+    assert "Если ты не знаешь, что приготовить, я предложу идеи блюд" in tc.HELP
+    assert "выбери понравившееся, и я дам полный рецепт" in tc.HELP
+    assert "кнопкой под моим ответом, когда она есть" in tc.HELP
     assert "Редактировать" in tc.HELP and "только на сайте" in tc.HELP
     assert tc.HELP in tc.GREETING
     # Web's help: the same workflow in the empty-conversation hint.
     logic = (Path(ui.STATIC_DIR) / "chat-logic.js").read_text(encoding="utf-8")
-    assert "Помощник может предложить идеи блюд" in logic
-    assert "он даст полный рецепт" in logic
+    assert "Могу предложить идеи блюд" in logic
+    assert "дам полный рецепт" in logic
     assert "который можно сохранить в избранное" in logic
 
 

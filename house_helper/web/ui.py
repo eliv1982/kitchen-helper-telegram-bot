@@ -39,6 +39,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Request, Response
 
+from house_helper.core.assistant_identity import ASSISTANT_NAME
 from house_helper.core.limits import MAX_INPUT_LENGTH
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -89,7 +90,7 @@ router = APIRouter()
 
 _TELEGRAM = """\
     <a id="login-telegram" class="btn btn-primary btn-block" href="/auth/telegram/login">Войти через Telegram</a>
-    <p class="hint">Вы здесь впервые? Откройте ссылку-приглашение, которую вам прислали: она нужна только для первого входа.</p>
+    <p class="hint">Здесь впервые? Открой ссылку-приглашение, которую тебе прислали: она нужна только для первого входа.</p>
 """
 
 _DIVIDER = """\
@@ -112,7 +113,7 @@ _NO_LOGIN = """\
     <p id="login-none" class="notice notice-error">Вход пока не настроен. Обратитесь к тому, кто установил помощника.</p>
 """
 
-_SHELL = """\
+_SHELL = f"""\
 <!doctype html>
 <html lang="ru">
 <head>
@@ -152,7 +153,7 @@ _SHELL = """\
 
   <section id="screen-login" class="card card-center" aria-labelledby="login-title" hidden>
     <h1 id="login-title" tabindex="-1">House Helper</h1>
-    <p class="lead">Помощник по домашней кухне: подскажет, что приготовить из того, что есть дома, и расскажет, как приготовить блюдо.</p>
+    <p class="lead">Привет! Я {ASSISTANT_NAME} — твой помощник по домашней кухне. Подскажу, что приготовить из того, что есть дома, и расскажу, как приготовить блюдо.</p>
     <div id="login-notice" class="notice" role="status" hidden></div>
 @LOGIN@  </section>
 </main>

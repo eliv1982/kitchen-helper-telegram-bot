@@ -64,17 +64,18 @@ def test_the_telegram_provider_layer_uses_the_shared_prompt():
 
 def test_the_prompt_is_russian_and_bounded():
     assert PROMPT == PROMPT.strip()
-    # It is sent with every request: it costs tokens. 9810 characters now (the photo
+    # It is sent with every request: it costs tokens. 10044 characters now (the photo
     # section, KH-F07A's ingredient block and KH-MENU-01A's occasion/budget block,
     # including the three-state availability and scoped-restriction rules the Codex
     # audit required, KH-MENU-01A-FIX-01's optional-inventory, two-section shopping-list
     # and recipe/favorites workflow correction, the Codex-FAIL remediation's removal
-    # of the staple exception and separation of necessity from availability, and
+    # of the staple exception and separation of necessity from availability,
     # KH-MENU-01B's combined affordability/originality and complete ingredient-accounting
-    # rules); 10000 is the ceiling this test allows. The FIX-01 correction added 1089
+    # rules, and HH-BRAND-01's owner-provided persona replacing the old tone clause);
+    # 10200 is the ceiling this test allows. The FIX-01 correction added 1089
     # characters (+15.6%); the Codex-FAIL remediation added 413 (+5.1%); KH-MENU-01B
-    # added 1348 (+15.9%).
-    assert 500 < len(PROMPT) < 10000
+    # added 1348 (+15.9%); HH-BRAND-01 added 234 (+2.39%).
+    assert 500 < len(PROMPT) < 10200
     assert "по-русски" in PROMPT
     cyrillic = sum("а" <= c.lower() <= "я" or c.lower() == "ё" for c in PROMPT)
     assert cyrillic > 0.7 * sum(c.isalpha() for c in PROMPT)
@@ -203,7 +204,7 @@ INGREDIENT_RULES = [
     ),
     (
         "unknown items are checked, not assumed missing",
-        "проверьте, есть ли у вас это; купите, если нужно",
+        "проверь, есть ли у тебя это; купи, если нужно",
     ),
     (
         "necessity and availability are independent",
@@ -457,7 +458,7 @@ MENU_RULES = [
     ),
     (
         "the recipe and favorites offer follows the recommendations",
-        "Выберите понравившееся блюдо, и я дам полный рецепт",
+        "Выбери понравившееся блюдо, и я дам полный рецепт",
     ),
     (
         "the shopping-list follow-up has the two sections",
@@ -514,7 +515,7 @@ def test_the_recipe_choice_and_favorites_offer_is_one_exact_line():
     # KH-MENU-01A-FIX-01's UX correction: after a list of dishes, the assistant invites
     # the person to choose one for a full recipe that can be saved to favorites.
     offer = (
-        "Выберите понравившееся блюдо, и я дам полный рецепт. "
+        "Выбери понравившееся блюдо, и я дам полный рецепт. "
         "Его можно будет сохранить в избранное"
     )
     assert PROMPT.count(offer) == 1

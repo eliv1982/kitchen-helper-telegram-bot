@@ -153,7 +153,7 @@ async def test_dialogs_lists_every_conversation_newest_first_with_moscow_time(tm
             f"ds:{UUID(first).hex}:0",
         ]
         assert all(MOSCOW_LABEL.search(button["text"]) for button in listed)
-        assert "🗂 Ваши диалоги." in call["text"] and "Страница" not in call["text"]
+        assert "🗂 Твои диалоги." in call["text"] and "Страница" not in call["text"]
         assert t.chat.backend.calls == calls_before  # navigation never asks the assistant
 
 
@@ -258,7 +258,7 @@ async def test_choosing_an_older_conversation_restores_its_context_without_repla
         confirmation = await choose(t, older)
 
         assert confirmation["text"].startswith("🗂 Выбран диалог: «Что на обед?».")
-        assert "Продолжайте писать" in confirmation["text"]
+        assert "Продолжай писать — я учту контекст этого разговора." in confirmation["text"]
         assert save_buttons(confirmation) == [
             {"text": tc.DIALOGS_BACK, "callback_data": f"{tc.DIALOGS_LIST_PREFIX}:0"}
         ]

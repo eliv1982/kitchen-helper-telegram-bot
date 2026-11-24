@@ -3335,7 +3335,7 @@
       class: classes,
       "data-id": item.type === "message" ? String(item.id) : false,
     });
-    node.appendChild(h("p", { class: "visually-hidden", text: mine ? "Вы:" : "Помощник:" }));
+    node.appendChild(h("p", { class: "visually-hidden", text: mine ? "Вы:" : "Федя, помощник:" }));
     if (item.photo) {
       // The photo that came with the message. Its address is this site's own route, which the logic checked
       // against a strict pattern (Logic.PHOTO_URL); the server serves it to its owner only.

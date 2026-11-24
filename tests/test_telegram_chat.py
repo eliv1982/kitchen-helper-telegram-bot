@@ -146,7 +146,7 @@ async def test_what_the_bot_says_about_the_copy_the_processing_and_the_retention
 
 @pytest.mark.parametrize(
     ("name", "mirror"),
-    [("HELP", "пересылаю сюда"), ("GREETING", "пересылаю сюда"), ("LINKED", "будут приходить и сюда")],
+    [("HELP", "пересылается сюда"), ("GREETING", "пересылается сюда"), ("LINKED", "будут приходить и сюда")],
 )
 async def test_the_bot_says_that_the_website_is_copied_to_telegram_and_how_to_stop_it(name, mirror):
     text = " ".join(getattr(tc, name).split())

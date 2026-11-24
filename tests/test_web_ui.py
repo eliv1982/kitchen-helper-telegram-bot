@@ -141,7 +141,7 @@ def test_the_first_visit_hint_is_drawn_beside_telegram_and_only_there(telegram, 
     # knows an invitation) and exists only where the Telegram button does.
     html = ui.render_shell(telegram=telegram, email=email)
 
-    hint = "Откройте ссылку-приглашение"
+    hint = "Открой ссылку-приглашение"
     assert (hint in html) is telegram
     assert "/auth/invite" not in html and "invitation" not in html.lower()  # no link, no code, no route
     if telegram:
@@ -362,7 +362,7 @@ def test_the_product_is_house_helper_everywhere_the_page_names_itself_and_the_ki
     assert '<p class="brand">House Helper</p>' in html
     assert "Кухонный помощник" not in html and "Кухонного помощника" not in html and "Kitchen Helper" not in html
     # What the assistant does today is still said: the kitchen is the first module, not the name of the product.
-    assert "Помощник по домашней кухне" in html
+    assert "Привет! Я Федя — твой помощник по домашней кухне." in html
 
 
 def test_the_icon_is_named_for_the_product():

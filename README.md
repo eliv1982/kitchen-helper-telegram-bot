@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/eliv1982/kitchen-helper-telegram-bot/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/eliv1982/kitchen-helper-telegram-bot/actions/workflows/ci.yml)
 
-House Helper is a modular household assistance application that started as a Telegram cooking bot. Its first domain, **Kitchen**, focuses on practical recipe guidance and everyday cooking workflows, with a shared application core designed for multiple interfaces and future household domains.
+House Helper is a modular household assistance application that started as a Telegram cooking bot. Its first domain, **Kitchen**, focuses on practical recipe guidance and everyday cooking workflows, with a shared application core designed for multiple interfaces and future household domains. The assistant's identity is **Fedya** (Федя) — one identity shared by every domain — while House Helper remains the platform brand.
 
 > **Status, 2026-10-31 (reported by the owner; production facts independently verified by Cursor).** House Helper runs at <https://house.elivcloud.org> (image `house-helper:3d09d45f6318`, database schema `0009_message_attachments`). **The owner ACCEPTED the Functional Alpha on 2026-10-31:** two users' accounts are isolated, Telegram authentication works, and cooking workflows, history, favorites and cross-device synchronization passed real use. Telegram sign-in and the Telegram bot with photos are enabled; email sign-in is disabled. It is not a public demo: access is a closed two-user allowlist and there is no public sign-up. Details: [Deployment status](#deployment-status).
 >
@@ -361,7 +361,7 @@ python bot.py
 
 ## Запуск веб-приложения (основа)
 
-Веб-приложение (FastAPI, пакет `house_helper/web/`) — отдельный процесс, не связанный с Telegram-ботом. Оно умеет две вещи: `GET /healthz` отвечает `{"status": "ok"}` (проверка «процесс жив»; базу данных она не трогает), и — если настроено — пускает пользователя через Telegram OIDC или по ссылке из письма (разделы ниже; способы входа включаются независимо друг от друга). Диалоги и сообщения доступны через API веб-чата (раздел «Веб-чат (API)»), а людям — через страницу «Кухонный помощник» на `/` (раздел «Веб-интерфейс (кухня)»). Рецептов как отдельной сущности и настроек в нём нет.
+Веб-приложение (FastAPI, пакет `house_helper/web/`) — отдельный процесс, не связанный с Telegram-ботом. Оно умеет две вещи: `GET /healthz` отвечает `{"status": "ok"}` (проверка «процесс жив»; базу данных она не трогает), и — если настроено — пускает пользователя через Telegram OIDC или по ссылке из письма (разделы ниже; способы входа включаются независимо друг от друга). Диалоги и сообщения доступны через API веб-чата (раздел «Веб-чат (API)»), а людям — через страницу «House Helper» на `/` (раздел «Веб-интерфейс (кухня)»). Рецептов как отдельной сущности и настроек в нём нет.
 
 ```bash
 python -m uvicorn house_helper.web.asgi:app --host 127.0.0.1 --port 8000

@@ -1362,7 +1362,7 @@ scenario("the_composer_says_why_it_is_locked", async () => {
   const sending = await uncertainEnv(hang());
   const sent = await sending.ctl.send("Вопрос");
   await flush();
-  assert.deepEqual([sending.view().composer.locked, sending.view().composer.hint], [true, "Дождитесь ответа помощника."]);
+  assert.deepEqual([sending.view().composer.locked, sending.view().composer.hint], [true, "Дождись ответа помощника."]);
   await sending.timers.advance(90000);
   await sent.done;
 

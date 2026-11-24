@@ -257,11 +257,11 @@ scenario("the_application_lists_conversations_and_shows_the_latest_with_who_said
   assert.equal(items.length, 2);
   assert.deepEqual(items.map((b) => b.getAttribute("aria-current")), ["true", null]);
   assert.match(page.el("chat-title").textContent, /^Разговор от 18 октября, \d\d:\d\d$/);
-  assert.deepEqual(page.articleTexts(), ["Вы:Про суп" + "", "Помощник:Суп так.И так."].map((t, i) => page.articles()[i].textContent));
+  assert.deepEqual(page.articleTexts(), ["Вы:Про суп" + "", "Федя, помощник:Суп так.И так."].map((t, i) => page.articles()[i].textContent));
   const [mine, theirs] = page.articles();
   assert.ok(mine.className.includes("msg-user") && theirs.className.includes("msg-assistant"));
   assert.equal(mine.byClass("visually-hidden")[0].textContent, "Вы:");
-  assert.equal(theirs.byClass("visually-hidden")[0].textContent, "Помощник:");
+  assert.equal(theirs.byClass("visually-hidden")[0].textContent, "Федя, помощник:");
   assert.equal(theirs.byTag("time").length, 1);
   assert.equal(theirs.byTag("time")[0].getAttribute("datetime"), "2026-10-18T11:00:06.000Z");
 });
@@ -392,7 +392,7 @@ scenario("a_message_typed_and_sent_is_one_request_a_pending_bubble_and_then_the_
   assert.equal(page.el("composer-input").value, "", "the text left the box when it was accepted");
   assert.equal(page.el("composer-input").readOnly, true);
   assert.equal(page.el("send").getAttribute("aria-disabled"), "true");
-  assert.ok(page.el("composer-hint").textContent.includes("Дождитесь ответа"));
+  assert.ok(page.el("composer-hint").textContent.includes("Дождись ответа"));
   const pending = page.messages().byClass("msg-pending");
   assert.equal(pending.length, 1);
   assert.ok(pending[0].textContent.includes("Что из яиц?") && /Отправляем|готовит/.test(pending[0].textContent));
