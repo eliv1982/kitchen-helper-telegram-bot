@@ -29,7 +29,7 @@ from house_helper.persistence.models import TelegramLink
 from house_helper.web import telegram_chat as tc
 from house_helper.web.diagnostics import ApiError
 from tests.chat_support import ScriptedBackend, post_headers, reached
-from tests.telegram_support import MOTHER, TelegramHarness, in_line, telegram_app, until
+from tests.telegram_support import MOTHER, TelegramHarness, in_line, sending, telegram_app, until
 from tests.web_support import TIMEOUT
 
 pytestmark = pytest.mark.asyncio
@@ -83,18 +83,6 @@ def interpose(t: TelegramHarness) -> Seam:
     seam = Seam(t.service._database)
     t.service._database = seam
     return seam
-
-
-def sending(t: TelegramHarness, text: str):
-    """True when a sendMessage with exactly this text has reached the (held) Bot API."""
-
-    def reached_bot() -> bool:
-        return any(
-            request.url.path.endswith("/sendMessage") and json.loads(request.content)["text"] == text
-            for request in t.bot.requests
-        )
-
-    return reached_bot
 
 
 def assert_idle(t: TelegramHarness) -> None:

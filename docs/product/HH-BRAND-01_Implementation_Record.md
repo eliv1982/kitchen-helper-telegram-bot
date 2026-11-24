@@ -1,11 +1,14 @@
 # HH-BRAND-01 — Implementation Record
 
-**Status:** IMPLEMENTED / READY FOR INDEPENDENT CODEX REVIEW — the implementation and the
-Scope Amendment 01 test correction (section 7) are complete in the working tree, and the
-local targeted matrix, the Telegram chat suite and the documentation-dependent checks are
-green. This document records local implementation and testing evidence only. It does not
-claim a commit, a push, CI success, independent review acceptance, owner acceptance,
-real-provider behavioural acceptance or deployment.
+**Status:** IMPLEMENTED / INDEPENDENT AUDIT ACCEPTED / READY FOR OWNER ACCEPTANCE — the
+implementation and the Scope Amendment 01 test correction (section 7) were independently
+audited as PASS WITH NON-BLOCKING NOTES and committed as
+`05a2da0a6e58733a94e9063f476c6138b533e533`. CI run `45405832223` then failed on one
+environment-sensitive test-harness timeout; its separate corrective scope,
+HH-BRAND-01-CI-FIX-01, is recorded in section 8 and awaits owner acceptance, commit and CI.
+Sections 1–7 remain the local implementation record written on baseline `93f39f4`. This
+document claims no CI PASS, real-provider behavioural acceptance, owner acceptance or
+production release.
 
 **Date:** 2026-11-24
 
@@ -211,6 +214,11 @@ PostgreSQL tests have **not** been run for this working tree.
 
 ## 6. Git state and gates
 
+*[Updated for HH-BRAND-01-CI-FIX-01: the implementation was subsequently committed as
+`05a2da0a6e58733a94e9063f476c6138b533e533` and the independent Codex audit accepted it as
+PASS WITH NON-BLOCKING NOTES. The state below is the pre-commit state this section
+recorded. The corrective test-harness scope and the current gates are in section 8.]*
+
 - Working tree: only the nineteen allowlisted paths; the twelve pre-existing untracked
   artifacts are untouched; nothing is staged.
 - **Ready for independent Codex review.** The two previously failing tests are corrected
@@ -260,3 +268,121 @@ remains. No production file changed.
 Post-amendment evidence is recorded in section 4.4. PostgreSQL-marked suites remain
 unrun locally (section 4.2); CI's PostgreSQL coverage is confirmed but not executed for
 this working tree.
+
+## 8. HH-BRAND-01-CI-FIX-01 — corrective test-harness scope
+
+**Status:** IMPLEMENTED / INDEPENDENT AUDIT ACCEPTED / READY FOR OWNER ACCEPTANCE — this
+section records a separate corrective scope that follows the committed HH-BRAND-01
+implementation. It does not revise sections 1–7 (the local implementation record on
+baseline `93f39f4`), it does not modify the HH-BRAND-01 Scope Lock and it does not reopen
+KHD-44.
+
+### 8.1 Historical CI evidence (preserved, not rewritten)
+
+Baseline: branch `main`, HEAD `05a2da0a6e58733a94e9063f476c6138b533e533`; previous accepted
+baseline `93f39f4`; failed CI run `45405832223`.
+
+- Python 3.10: **FAILED** — 11,077 passed, 1 failed, 39 skipped, 1,453 deselected.
+- Python 3.12: **CANCELLED** after the sibling leg failed.
+- Failed test: `tests/test_telegram_binding.py::test_unlinking_waits_for_a_send_that_was_already_checked`.
+- The `until()` timeout (`asyncio.wait_for(..., TIMEOUT)`, `TIMEOUT = 10 s`) fired
+  **before** the actual unlink-concurrency assertion it guards.
+- No timeout was increased, no assertion was weakened and no production synchronization
+  was changed. This failed run is not rewritten here as successful.
+
+### 8.2 Root cause and corrective implementation
+
+The defect was an **environment-sensitive test-harness defect**, not a product defect. The
+`sending()` predicate — duplicated in `tests/test_telegram_binding.py` and
+`tests/test_telegram_unlink_race.py` — asked "has this send arrived?" by scanning
+`FakeBot.requests`, the general request journal that the fake transport appends every call
+to, including every `getUpdates` poll. While a turn ran, polling expanded that journal
+continuously; each busy-poll spin of `until()` (`await asyncio.sleep(0)` in a loop)
+re-scanned the whole growing list while the event loop held the GIL. That
+**observation-induced database worker scheduling degradation** starved the worker threads
+that perform the turn's database work and stretched the very turn the test waits for.
+
+Attribution to the CI failure is **high-confidence**. The exact contribution of CI thread
+starvation remains **inferred, not directly measured**: no local Linux/Python 3.10
+reproduction was established.
+
+The corrective implementation is confined to three test files:
+
+- `tests/telegram_support.py` — a dedicated per-instance `FakeBot.send_attempts`
+  collection, appended where the journal records the call but only for `sendMessage`,
+  after the token check and payload decoding (the arrival, not the completion), and one
+  shared `sending()` predicate that reads only that collection and never the journal.
+- `tests/test_telegram_binding.py` — the duplicated request-scanning predicate removed;
+  imports the shared `sending()`; three deterministic regression tests added.
+- `tests/test_telegram_unlink_race.py` — the duplicated request-scanning predicate
+  removed; imports the shared `sending()`.
+
+**CI-FIX-01 Scope Amendment 01** approved the observation boundary now implemented: a
+`sendMessage` counts once it is **correctly addressed** to the bot's token and **decoded**,
+recorded **before** a held send gate delays it or an injected failure answers it; a
+request addressed to **another token** is excluded even though the general journal still
+records it. Every original security assertion, the fake transport's behaviour, `until()`
+and `TIMEOUT` are preserved unchanged. All 27 original test functions across the two
+affected modules are AST-identical to `HEAD`.
+
+The implementation allowlist is exactly
+`tests/telegram_support.py`, `tests/test_telegram_binding.py` and
+`tests/test_telegram_unlink_race.py`; no production file, `until()`, `TIMEOUT` or
+production synchronization was changed. The documentation step added no new file: the
+combined scope is five modified tracked files (the three tests plus
+`docs/product/HH-BRAND-01_Implementation_Record.md` and `docs/STATUS.md`) and the twelve
+pre-existing untracked artifacts are untouched.
+
+### 8.3 Verification evidence
+
+*Implementation evidence (local)*
+
+- The previously failing test: **20/20** on SQLite and **20/20** on PostgreSQL.
+- The affected modules after CI-FIX-01 Scope Amendment 01: **31 passed** on each backend.
+- Neighboring regression suites: **164 passed** on each backend before the amendment.
+- Bounded CPU-load experiments demonstrated a substantial improvement.
+- The PostgreSQL safety preflight and cleanup passed.
+
+*Independent Codex audit evidence*
+
+- SQLite: **31 passed**, zero failures, zero skips.
+- PostgreSQL 16.15: **31 passed**, zero failures, zero skips.
+- All **27** original test functions AST-identical to `HEAD`.
+- The **three** deterministic regression tests were verified.
+- An in-memory substitution of the old predicate correctly triggered the regression
+  assertion.
+- The scoped repository secret scanner passed.
+- The isolated PostgreSQL environment was verified and restored to Exited (0).
+- Repository content hashes were unchanged throughout the audit.
+- `git diff --check` passed.
+
+No local Linux/Python 3.10 reproduction was established.
+
+### 8.4 Accepted non-blocking notes and deferred hardening
+
+Three test-harness residuals are accepted and classified **NON-BLOCKING / DEFERRED
+TEST-HARNESS HARDENING**. No additional implementation is authorized:
+
+1. The shared `until()` still busy-polls with `asyncio.sleep(0)`.
+2. `tests/test_telegram_unlink_race.py` still polls the database synchronously inside the
+   event loop.
+3. The new held-send regression test has no test-local `try/finally` cleanup on assertion
+   failure. Independent fault injection confirmed that the pinned pytest-asyncio 1.4.0
+   teardown cancels and awaits the outstanding task, leaving no gate waiters.
+
+### 8.5 Status and remaining gates
+
+HH-BRAND-01-CI-FIX-01: **IMPLEMENTED / INDEPENDENT AUDIT ACCEPTED / READY FOR OWNER
+ACCEPTANCE.**
+
+Remaining mandatory gates:
+
+- Owner acceptance.
+- Commit and push.
+- Full green CI on Python 3.10 and 3.12, including all existing PostgreSQL and SQLite
+  workflow gates.
+- A separately authorized real-provider behavioural evaluation.
+- A12 operational acceptance.
+- Separate production authorization and release.
+
+No CI PASS and no production release is claimed.

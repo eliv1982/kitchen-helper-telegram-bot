@@ -59,6 +59,13 @@ class FakeBot:
         self.command_calls: list[list[dict[str, Any]]] = []  # every setMyCommands payload
         self.commands: list[dict[str, Any]] = []  # the menu Telegram holds now, last call wins
         self.requests: list[httpx.Request] = []  # every call, URLs included
+        # sendMessage payloads that ARRIVED at this bot: they passed the token check and
+        # payload decoding, and were recorded before the send gate and before an injected
+        # failure. `sent` is the calls that completed; this is what a held (or refused)
+        # send looks like from the test's side. A per-instance, send-only collection whose
+        # growth is independent of polling traffic -- it is deliberately NOT bounded, and
+        # it does not grow with `requests` (HH-BRAND-01-CI-FIX-01; see sending()).
+        self.send_attempts: list[dict[str, Any]] = []
         self.files: dict[str, tuple[str, bytes]] = {}  # file_id -> (file_path, content)
         self.failures: dict[str, list[Any]] = {}  # method -> error codes to answer, one per call
         self.offsets: list[Optional[int]] = []
@@ -146,6 +153,11 @@ class FakeBot:
             return self._error(401, "Unauthorized")
         method = match.group(2)
         body = json.loads(request.content or b"{}")
+        if method == "sendMessage":
+            # The arrival, recorded where the journal records every call: before a held
+            # gate delays it and before an injected failure answers it. `sent`, below,
+            # is the calls that completed.
+            self.send_attempts.append(body)
         queued = self.failures.get(method)
         if queued:
             code = queued.pop(0)
@@ -318,6 +330,27 @@ def in_line(t: "TelegramHarness", account: int, users: int, table: str = "_chat_
     def reached() -> bool:
         entry = getattr(t.service, table).get(account)
         return entry is not None and entry[1] >= users
+
+    return reached
+
+
+def sending(t: "TelegramHarness", text: str):
+    """A predicate: a sendMessage with exactly this text has ARRIVED at this bot.
+
+    The approved observation boundary: the request must have passed the fake's token check
+    and payload decoding; from there it counts whether the send gate still holds it or an
+    injected failure answers it. A request addressed to another token is not an arrival and
+    never satisfies the predicate. The arrival, not the completion: a held or refused call
+    is in `t.bot.send_attempts`, while `t.bot.sent` holds only the calls that completed.
+
+    The predicate reads that per-instance, send-only collection and never the general
+    request journal, which grows with every poll; scanning the journal on each spin of
+    `until` held the GIL for longer and longer while a whole turn ran, starving the worker
+    threads that perform the turn's database work and stretching the very turn the test
+    waits for (HH-BRAND-01-CI-FIX-01)."""
+
+    def reached() -> bool:
+        return any(call["text"] == text for call in t.bot.send_attempts)
 
     return reached
 

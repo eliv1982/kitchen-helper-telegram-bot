@@ -14,9 +14,10 @@ tests/test_telegram_chat.py.
 """
 
 import asyncio
-import json
+from types import SimpleNamespace
 from uuid import UUID
 
+import httpx
 import pytest
 
 from house_helper.persistence import telegram as store
@@ -25,24 +26,23 @@ from house_helper.web import telegram_chat as tc
 from house_helper.web.turn_runner import TurnNotAuthorized
 from tests.chat_support import ScriptedBackend, post_headers
 from tests.photo_support import jpeg
-from tests.telegram_support import MOTHER, SISTER, TelegramHarness, in_line, photo_message, telegram_app, until
+from tests.telegram_support import (
+    BOT_TOKEN,
+    FakeBot,
+    MOTHER,
+    SISTER,
+    TelegramHarness,
+    in_line,
+    photo_message,
+    sending,
+    telegram_app,
+    until,
+)
 from tests.web_support import TIMEOUT
 
 pytestmark = pytest.mark.asyncio
 
 SECRET = "Секрет первой: аллергия на орехи"
-
-
-def sending(t: TelegramHarness, text: str):
-    """True when a sendMessage with exactly this text has reached the (held) Bot API."""
-
-    def reached() -> bool:
-        return any(
-            request.url.path.endswith("/sendMessage") and json.loads(request.content)["text"] == text
-            for request in t.bot.requests
-        )
-
-    return reached
 
 
 def revoke(t: TelegramHarness) -> None:
@@ -65,6 +65,112 @@ def assert_idle(t: TelegramHarness) -> None:
 
 def second_person(t: TelegramHarness):
     return next(iter(t.chat.extra_users.values()))
+
+
+# --- the send predicate, on its own -------------------------------------------------------------
+
+
+class _WriteOnlyJournal(list):
+    """The general request journal, made read-hostile: appends stay allowed (the transport
+    still records every call), but any read fails the test. It is what proves that the send
+    predicate never scans the journal that every poll grows."""
+
+    @staticmethod
+    def _refuse():
+        raise AssertionError("sending() must not read FakeBot.requests")
+
+    def __iter__(self):
+        self._refuse()
+
+    def __len__(self):
+        self._refuse()
+
+    def __getitem__(self, index):
+        self._refuse()
+
+
+async def test_the_send_predicate_sees_arrivals_without_reading_the_poll_journal():
+    """The predicate is the arrival side of a held send, on its own: it sees a send that is
+    still held at the gate (not completed), keeps the exact text match, ignores polling
+    calls, records each arrival once, and never touches the growing journal."""
+    bot = FakeBot()
+    bot.requests = _WriteOnlyJournal(bot.requests)
+    stand_in = SimpleNamespace(bot=bot)
+    gate = bot.hold_sends()
+    transport = bot.transport()
+
+    def call(method: str, **payload):
+        return httpx.Request("POST", f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", json=payload)
+
+    held = asyncio.ensure_future(
+        transport.handle_async_request(call("sendMessage", chat_id=MOTHER, text="Ответ первой"))
+    )
+    await until(sending(stand_in, "Ответ первой"))
+
+    assert not held.done() and bot.sent == []  # arrived, not completed: the gate still holds it
+    assert not sending(stand_in, "Ответ первой!")()  # the match is the whole text, exactly
+    assert not sending(stand_in, "Что приготовить?")()
+
+    # A poll reaches the same transport and is journalled like every call, but it is not a send.
+    await transport.handle_async_request(call("getUpdates"))
+    assert sending(stand_in, "Ответ первой")()  # still the one held send
+    assert list.__len__(bot.requests) == 2  # ... and both calls really are in the journal
+
+    polling_only = FakeBot()
+    polling_only.requests = _WriteOnlyJournal(polling_only.requests)
+    await polling_only.transport().handle_async_request(call("getUpdates"))
+    assert not sending(SimpleNamespace(bot=polling_only), "Ответ первой")()
+
+    other = FakeBot()  # per instance: nothing is shared between scenarios
+    assert not sending(SimpleNamespace(bot=other), "Ответ первой")()
+
+    gate.set()
+    assert (await held).status_code == 200
+    assert bot.sent == [{"chat_id": MOTHER, "text": "Ответ первой"}]
+    assert bot.send_attempts == [{"chat_id": MOTHER, "text": "Ответ первой"}]  # recorded once
+
+    await transport.handle_async_request(call("sendMessage", chat_id=MOTHER, text="Ответ второй"))
+    assert [attempt["text"] for attempt in bot.send_attempts] == ["Ответ первой", "Ответ второй"]
+
+
+async def test_a_send_to_another_bots_token_does_not_satisfy_the_predicate():
+    """The approved boundary: an arrival must pass FakeBot's token check. The call is still
+    in the general journal (the fake records every call) but it is not this bot's send."""
+    bot = FakeBot()
+    stand_in = SimpleNamespace(bot=bot)
+    wrong_token = "999999999:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw"
+    request = httpx.Request(
+        "POST",
+        f"https://api.telegram.org/bot{wrong_token}/sendMessage",
+        json={"chat_id": MOTHER, "text": "Ответ первой"},
+    )
+    response = await bot.transport().handle_async_request(request)
+
+    assert response.status_code == 401 and response.json()["ok"] is False
+    assert bot.requests == [request]  # the journal still records the call, as before
+    assert bot.send_attempts == [] and bot.sent == []
+    assert not sending(stand_in, "Ответ первой")()
+
+
+async def test_a_send_refused_by_an_injected_failure_is_an_arrival_but_not_a_completion():
+    """A correctly addressed send that the fake then refuses is still an arrival: the token
+    check and decoding passed, and the failure comes after the recorded arrival. It is
+    recorded once, and it is never a completed send."""
+    bot = FakeBot()
+    stand_in = SimpleNamespace(bot=bot)
+    bot.fail("sendMessage", 403)  # "bot was blocked by the user"
+    request = httpx.Request(
+        "POST",
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        json={"chat_id": MOTHER, "text": "Ответ первой"},
+    )
+    response = await bot.transport().handle_async_request(request)
+
+    assert response.status_code == 403 and response.json()["ok"] is False
+    assert bot.requests == [request]  # the journal keeps its record too
+    assert bot.send_attempts == [{"chat_id": MOTHER, "text": "Ответ первой"}]  # exactly once
+    assert bot.sent == []  # refused: never a completed send
+    assert sending(stand_in, "Ответ первой")()
 
 
 # --- the person's access is withdrawn while the message waits ---------------------------------------
