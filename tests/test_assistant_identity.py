@@ -11,6 +11,7 @@ import re
 from pathlib import Path
 
 from house_helper.core import assistant_identity, kitchen_prompt
+from house_helper.web import greeting
 from house_helper.web import telegram_chat as tc
 from house_helper.web import ui
 
@@ -26,9 +27,17 @@ PERSONA = (
     "Соблюдай все функциональные требования и правила безопасности независимо "
     "от стиля общения."
 )
-LOGIN_LEAD = (
-    "Привет! Я Федя — твой помощник по домашней кухне. "
-    "Подскажу, что приготовить из того, что есть дома, и расскажу, как приготовить блюдо."
+GREETING_PARTS = (
+    "Привет! Я Федя — твой домашний помощник.",
+    "Помогу придумать, что приготовить, подобрать рецепт, заменить ингредиенты, "
+    "пересчитать порции и составить список покупок по рецепту.",
+    "Расскажи, что тебе нужно, — разберемся вместе.",
+)
+LOGIN_LEAD = " ".join(GREETING_PARTS)
+HELP_BODY = (
+    "Спроси, что приготовить из имеющихся продуктов или как приготовить блюдо. "
+    "Могу предложить идеи блюд: выбери понравившееся — дам полный рецепт, "
+    "который можно сохранить в избранное кнопкой рядом с рецептом."
 )
 
 
@@ -80,11 +89,19 @@ def test_the_persona_is_defined_in_exactly_one_module():
 # --- the shared prompt ---------------------------------------------------------------------
 
 
+def test_the_greeting_module_holds_the_approved_sentences():
+    # The expected values above are independent literals; the module must equal them.
+    assert greeting.GREETING_PARTS == GREETING_PARTS
+    assert greeting.GREETING_TEXT == "\n\n".join(GREETING_PARTS)
+    assert greeting.GREETING_TEXT.count(NAME) == 1
+    assert "ё" not in " ".join(GREETING_PARTS).lower()
+
+
 def test_the_shared_prompt_opens_with_the_name_and_carries_the_persona():
     prompt = kitchen_prompt.KITCHEN_SYSTEM_PROMPT
 
     assert prompt.startswith(
-        "Ты — Федя, помощник по домашней кухне. "
+        "Ты — Федя, домашний помощник. Сейчас помогаешь с кухней и готовкой. "
         "Всегда отвечай по-русски, без лишних вступлений."
     )
     assert prompt.count(NAME) == 1
@@ -97,8 +114,8 @@ def test_the_shared_prompt_opens_with_the_name_and_carries_the_persona():
 # --- Telegram ------------------------------------------------------------------------------
 
 
-def test_the_telegram_greeting_introduces_the_name_once_and_keeps_help():
-    assert tc.GREETING == "Привет! Я Федя — твой помощник в House Helper.\n\n" + tc.HELP
+def test_the_telegram_greeting_is_the_canonical_greeting_and_keeps_help():
+    assert tc.GREETING == "\n\n".join(GREETING_PARTS) + "\n\n" + tc.HELP
     assert tc.GREETING.count(NAME) == 1
     assert tc.HELP in tc.GREETING
     assert "Здравствуйте" not in tc.GREETING
@@ -109,6 +126,8 @@ def test_the_telegram_help_speaks_informationally_and_keeps_every_condition():
     assert "Если ты не знаешь, что приготовить" in tc.HELP
     assert "выбери понравившееся, и я дам полный рецепт" in tc.HELP
     assert "кнопкой под моим ответом, когда она есть" in tc.HELP
+    # FIX-01: lists are edited on the site too, so the sentence says so.
+    assert "Редактировать рецепты, заметки и списки покупок можно только на сайте House Helper." in tc.HELP
     # The relay keeps both conditions: before a selection, everything; after, only it.
     assert (
         "Пока в Telegram не выбран разговор, я отвечаю в самом свежем, и все, что ты "
@@ -164,19 +183,47 @@ def test_the_browser_literals_agree_with_the_approved_contract():
     logic = _static("chat-logic.js")
     app = _static("app.js")
 
-    # The JS source wraps the sentence across string concatenation, so its fragments are
+    # The JS source wraps the sentences across string concatenation, so its fragments are
     # checked as they are written; the same words are checked whole through node tests.
-    assert '"Я Федя. Спроси, что приготовить из имеющихся продуктов или как приготовить блюдо. " +' in logic
+    assert '"Привет! Я Федя — твой домашний помощник.",' in logic
+    assert '"Помогу придумать, что приготовить, подобрать рецепт, заменить ингредиенты, " +' in logic
+    assert '"пересчитать порции и составить список покупок по рецепту.",' in logic
+    assert '"Расскажи, что тебе нужно, — разберемся вместе.",' in logic
+    assert '"Спроси, что приготовить из имеющихся продуктов или как приготовить блюдо. " +' in logic
     assert '"Могу предложить идеи блюд: выбери понравившееся — дам полный рецепт, " +' in logic
     assert '"который можно сохранить в избранное кнопкой рядом с рецептом.";' in logic
     assert 'replied: "Федя ответил."' in logic
     assert 'preparing: "Федя готовит ответ…"' in logic
     assert 'helpTitle: "Как пользоваться помощником"' in logic  # D-5: unchanged
-    assert "emptyThread: HELP_EXPLANATION" in logic and "help: HELP_EXPLANATION" in logic
+    # FIX-01: the empty conversation shows the greeting; the help panel shows the help.
+    assert "emptyThread: GREETING_PARTS" in logic and "help: HELP_BODY" in logic
+    assert "emptyThread: HELP_EXPLANATION" not in logic
+    assert "HELP_EXPLANATION" not in logic
     assert logic.count('hint = "Дождись ответа помощника.";') == 2
     assert 'нажми «В избранное»' in logic and 'нажми «Сохранить» рядом с рецептом' in logic
+    # The first suggestion is the Owner's replacement; the other two are kept.
+    assert '"Что приготовить на ужин?",' in app
+    assert '"Как приготовить борщ?",' in app
+    assert '"Чем заменить сметану в рецепте?",' in app
+    assert "Что приготовить из курицы и риса?" not in app
     assert 'text: mine ? "Вы:" : "Федя, помощник:"' in app
     assert '"Помощник:"' not in app
+
+
+def test_the_greeting_and_the_functional_help_are_separate_texts():
+    logic = _static("chat-logic.js")
+    app = _static("app.js")
+
+    # The help body carries the workflow, not the greeting: no «Привет», no introduction.
+    assert HELP_BODY.startswith("Спроси, что приготовить из имеющихся продуктов")
+    assert "Привет" not in HELP_BODY and "Я Федя" not in HELP_BODY
+    assert "идеи блюд" in HELP_BODY and "полный рецепт" in HELP_BODY and "избранное" in HELP_BODY
+    # The empty conversation draws every greeting part; the help panel draws TEXT.help.
+    assert "Logic.TEXT.emptyThread.forEach" in app
+    assert 'h("p", { class: "lead", text: Logic.TEXT.emptyThread })' not in app
+    assert "els.helpText.textContent = Logic.TEXT.help;" in app
+    # The two strings cannot be the same one any more.
+    assert "help: GREETING_PARTS" not in logic
 
 
 def test_the_accessibility_attribution_is_unchanged_except_for_the_name():

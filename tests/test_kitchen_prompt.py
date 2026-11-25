@@ -64,18 +64,20 @@ def test_the_telegram_provider_layer_uses_the_shared_prompt():
 
 def test_the_prompt_is_russian_and_bounded():
     assert PROMPT == PROMPT.strip()
-    # It is sent with every request: it costs tokens. 10044 characters now (the photo
+    # It is sent with every request: it costs tokens. 10764 characters now (the photo
     # section, KH-F07A's ingredient block and KH-MENU-01A's occasion/budget block,
     # including the three-state availability and scoped-restriction rules the Codex
     # audit required, KH-MENU-01A-FIX-01's optional-inventory, two-section shopping-list
     # and recipe/favorites workflow correction, the Codex-FAIL remediation's removal
     # of the staple exception and separation of necessity from availability,
     # KH-MENU-01B's combined affordability/originality and complete ingredient-accounting
-    # rules, and HH-BRAND-01's owner-provided persona replacing the old tone clause);
-    # 10200 is the ceiling this test allows. The FIX-01 correction added 1089
+    # rules, HH-BRAND-01's owner-provided persona replacing the old tone clause, and
+    # HH-BRAND-01-FIX-01's intent rule, language rule and domestic-assistant opening);
+    # 10800 is the ceiling this test allows. The FIX-01 correction added 1089
     # characters (+15.6%); the Codex-FAIL remediation added 413 (+5.1%); KH-MENU-01B
-    # added 1348 (+15.9%); HH-BRAND-01 added 234 (+2.39%).
-    assert 500 < len(PROMPT) < 10200
+    # added 1348 (+15.9%); HH-BRAND-01 added 234 (+2.39%); HH-BRAND-01-FIX-01 added
+    # 720 (+7.17%).
+    assert 500 < len(PROMPT) < 10800
     assert "по-русски" in PROMPT
     cyrillic = sum("а" <= c.lower() <= "я" or c.lower() == "ё" for c in PROMPT)
     assert cyrillic > 0.7 * sum(c.isalpha() for c in PROMPT)
@@ -539,6 +541,65 @@ def test_the_occasion_block_appears_once_and_is_in_the_one_shared_prompt():
     assert 500 < len(block) < 2750
     assert "2–4 конкретных разных блюда" in block
     assert "никаких текущих цен и точных сумм" in block
+
+
+# --- HH-BRAND-01-FIX-01: the current message decides, and the voice ---------------------------------------
+
+
+FIX_01_RULES = [
+    (
+        "the intent is read from the current message",
+        "Определяй намерение по текущему сообщению",
+    ),
+    ("the history refines references, not replaces the request", "История уточняет отсылки, но не заменяет запрос"),
+    ("a clear typo is read by sense", "Понятные опечатки трактуй по смыслу"),
+    ("an unclear message gets one short question", "при неясности задай короткий вопрос"),
+    ("a greeting or thanks gets no recipe", "На приветствия и благодарности отвечай без рецепта"),
+    ("a full recipe follows a request", "Полный рецепт давай по запросу"),
+    ("an implicit choice of a suggested dish is a request", "включая неявный выбор предложенного блюда"),
+    ("separate questions are answered in substance", "На отдельные вопросы отвечай по существу"),
+    ("the whole recipe is not repeated unnecessarily", "не повторяя весь рецепт без необходимости"),
+    ("natural Russian", "Пиши естественным русским языком"),
+    ("culinary terms are explained when useful", "объясняй кулинарные термины"),
+    ("no calques or bureaucratic wording", "Избегай калек, канцеляризмов"),
+    ("no guesses about the person including gender", "догадок о пользователе, включая его пол"),
+    ("only the available capabilities are described", "Описывай только доступные возможности"),
+    ("no automatic agreement", "Не соглашайся автоматически"),
+]
+
+
+@pytest.mark.parametrize(("rule", "clause"), FIX_01_RULES)
+def test_the_prompt_covers_the_current_message_and_the_voice(rule, clause):
+    assert clause in PROMPT, rule
+
+
+def test_the_intent_rule_appears_once_and_before_the_full_recipe_rule():
+    clause = "Определяй намерение по текущему сообщению"
+    assert PROMPT.count(clause) == 1
+    assert PROMPT.index(clause) < PROMPT.index("- Рецепт давай целиком:")
+    # It is a rule about when to answer, not a new formatting contract.
+    assert "Определяй намерение" not in PROMPT.split("- Рецепт давай целиком:")[1]
+
+
+def test_the_intent_rule_does_not_hardcode_a_typo_mapping():
+    # The observed incident is evaluation evidence, not a lookup table in the prompt.
+    assert "Рответ" not in PROMPT
+    assert "рответ" not in PROMPT.lower()
+    # The only mention of a greeting is the general rule, not an example pair.
+    assert PROMPT.lower().count("привет") == 1
+
+
+def test_the_opening_names_the_domestic_assistant_and_keeps_the_kitchen_scope():
+    assert PROMPT.startswith(
+        "Ты — Федя, домашний помощник. Сейчас помогаешь с кухней и готовкой."
+    )
+
+
+def test_the_language_rule_sits_after_the_persona_and_before_the_help_list():
+    persona = PROMPT.index("Общайся на «ты»")
+    language = PROMPT.index("Пиши естественным русским языком")
+    helps = PROMPT.index("С чем ты помогаешь:")
+    assert persona < language < helps
 
 
 # --- Telegram is unchanged ---------------------------------------------------------------------------------

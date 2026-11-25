@@ -144,11 +144,22 @@
 
   // --- the words ----------------------------------------------------------------------
 
-  // The one explanation of the ideas -> chosen dish -> full recipe -> favorites workflow.
-  // It is the empty-conversation hint, and the help panel reuses it word for word so the
-  // two cannot drift apart.
-  var HELP_EXPLANATION =
-    "Я Федя. Спроси, что приготовить из имеющихся продуктов или как приготовить блюдо. " +
+  // The greeting every surface shows, in the approved words: the empty-conversation hint
+  // here and in app.js, the login lead and the Telegram /start message (both composed from
+  // house_helper/web/greeting.py). It is presentation only: nothing is stored, no message is
+  // created and no request is made. The functional help is a separate text on purpose.
+  var GREETING_PARTS = [
+    "Привет! Я Федя — твой домашний помощник.",
+    "Помогу придумать, что приготовить, подобрать рецепт, заменить ингредиенты, " +
+      "пересчитать порции и составить список покупок по рецепту.",
+    "Расскажи, что тебе нужно, — разберемся вместе.",
+  ];
+
+  // The functional help behind the «Помощь» button: what the assistant does and how the
+  // ideas -> chosen dish -> full recipe -> favorites workflow runs. The help panel shows it
+  // in an active conversation and in an empty one, and it is not the greeting.
+  var HELP_BODY =
+    "Спроси, что приготовить из имеющихся продуктов или как приготовить блюдо. " +
     "Могу предложить идеи блюд: выбери понравившееся — дам полный рецепт, " +
     "который можно сохранить в избранное кнопкой рядом с рецептом.";
 
@@ -243,10 +254,10 @@
     historyUnavailable: "Не удалось загрузить историю разговора, поэтому отправка пока недоступна. Загрузите ее еще раз.",
     failedGeneric: "Не удалось получить ответ. Попробуйте еще раз.",
     correlation: "Номер обращения: {id}",
-    emptyThread: HELP_EXPLANATION,
-    // The help panel: the same explanation, reachable while a conversation is active.
+    emptyThread: GREETING_PARTS,
+    // The help panel: the functional help, separate from the empty-conversation greeting.
     helpTitle: "Как пользоваться помощником",
-    help: HELP_EXPLANATION,
+    help: HELP_BODY,
     // The favorites: the recipes the person kept.
     chatsTab: "Разговоры",
     favoritesTab: "Избранное",

@@ -39,8 +39,8 @@ from typing import Optional
 
 from fastapi import APIRouter, Request, Response
 
-from house_helper.core.assistant_identity import ASSISTANT_NAME
 from house_helper.core.limits import MAX_INPUT_LENGTH
+from house_helper.web.greeting import GREETING_PARTS
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -113,6 +113,10 @@ _NO_LOGIN = """\
     <p id="login-none" class="notice notice-error">Вход пока не настроен. Обратитесь к тому, кто установил помощника.</p>
 """
 
+# The canonical greeting as the login card shows it: the same sentences as the empty
+# conversation and Telegram, in the existing single-paragraph lead mechanism.
+_LOGIN_LEAD = " ".join(GREETING_PARTS)
+
 _SHELL = f"""\
 <!doctype html>
 <html lang="ru">
@@ -153,7 +157,7 @@ _SHELL = f"""\
 
   <section id="screen-login" class="card card-center" aria-labelledby="login-title" hidden>
     <h1 id="login-title" tabindex="-1">House Helper</h1>
-    <p class="lead">Привет! Я {ASSISTANT_NAME} — твой помощник по домашней кухне. Подскажу, что приготовить из того, что есть дома, и расскажу, как приготовить блюдо.</p>
+    <p class="lead">{_LOGIN_LEAD}</p>
     <div id="login-notice" class="notice" role="status" hidden></div>
 @LOGIN@  </section>
 </main>

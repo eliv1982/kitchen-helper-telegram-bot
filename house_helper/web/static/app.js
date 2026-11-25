@@ -3436,7 +3436,7 @@
   });
 
   var SUGGESTIONS = [
-    "Что приготовить из курицы и риса?",
+    "Что приготовить на ужин?",
     "Как приготовить борщ?",
     "Чем заменить сметану в рецепте?",
   ];
@@ -3486,9 +3486,14 @@
         box.appendChild(older);
       }
       if (thread.empty) {
-        var empty = h("div", { class: "empty" }, [
-          h("p", { class: "lead", text: Logic.TEXT.emptyThread }),
-        ]);
+        var empty = h("div", { class: "empty" });
+        // The greeting, in the same words as the login card and Telegram: presentation only,
+        // no message and no request. The first line keeps the lead styling.
+        Logic.TEXT.emptyThread.forEach(function (part, index) {
+          empty.appendChild(
+            index === 0 ? h("p", { class: "lead", text: part }) : h("p", { text: part })
+          );
+        });
         var chips = h("div", { class: "chips" });
         SUGGESTIONS.forEach(function (suggestion) {
           var chip = h("button", { class: "chip", type: "button", text: suggestion });

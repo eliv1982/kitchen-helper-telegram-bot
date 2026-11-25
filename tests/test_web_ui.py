@@ -361,8 +361,10 @@ def test_the_product_is_house_helper_everywhere_the_page_names_itself_and_the_ki
     assert "<title>House Helper</title>" in html
     assert '<p class="brand">House Helper</p>' in html
     assert "Кухонный помощник" not in html and "Кухонного помощника" not in html and "Kitchen Helper" not in html
-    # What the assistant does today is still said: the kitchen is the first module, not the name of the product.
-    assert "Привет! Я Федя — твой помощник по домашней кухне." in html
+    # FIX-01: the login lead is the canonical greeting; the capability list says what the
+    # assistant does today, so the kitchen stays the first module, not the product name.
+    assert "Привет! Я Федя — твой домашний помощник. Помогу придумать, что приготовить" in html
+    assert "составить список покупок по рецепту. Расскажи, что тебе нужно, — разберемся вместе." in html
 
 
 def test_the_icon_is_named_for_the_product():

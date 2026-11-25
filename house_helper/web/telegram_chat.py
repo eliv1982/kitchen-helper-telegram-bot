@@ -283,7 +283,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy.exc import IntegrityError
 
-from house_helper.core.assistant_identity import ASSISTANT_NAME
 from house_helper.core.recipes import MAX_RECIPES_PER_REPLY
 from house_helper.persistence import attachments as photos
 from house_helper.persistence import conversations
@@ -296,6 +295,7 @@ from house_helper.persistence.message_recipes import MessageNotFound, RecipeNotF
 from house_helper.web.chat_api import clean_message_text
 from house_helper.web.database import WebDatabase
 from house_helper.web.diagnostics import ApiError, new_correlation_id
+from house_helper.web.greeting import GREETING_TEXT
 from house_helper.web.settings import BotSettings
 from house_helper.web.telegram_botapi import BotApi, BotApiError, split_text
 from house_helper.web.turn_runner import (
@@ -352,7 +352,8 @@ HELP = (
     "Если ты не знаешь, что приготовить, я предложу идеи блюд — выбери понравившееся, "
     "и я дам полный рецепт. Сохранить рецепт в избранное можно кнопкой под моим ответом, "
     "когда она есть, или на сайте House Helper; открыть сохраненное — командой "
-    "/favorites. Редактировать рецепты и заметки можно только на сайте House Helper.\n\n"
+    "/favorites. Редактировать рецепты, заметки и списки покупок можно только на сайте "
+    "House Helper.\n\n"
     "Разговоры общие с сайтом House Helper. Пока в Telegram не выбран разговор, я отвечаю "
     "в самом свежем, и все, что ты пишешь мне на сайте, вместе с моим ответом пересылается "
     "сюда; после выбора — только из выбранного разговора. Чтобы это прекратить, отключи "
@@ -381,7 +382,7 @@ BOT_COMMANDS = [
     {"command": "help", "description": "ℹ️ Помощь"},
 ]
 
-GREETING = f"Привет! Я {ASSISTANT_NAME} — твой помощник в House Helper.\n\n" + HELP
+GREETING = GREETING_TEXT + "\n\n" + HELP
 
 NOT_LINKED = (
     "Этот помощник работает только для подключенных аккаунтов House Helper.\n\n"

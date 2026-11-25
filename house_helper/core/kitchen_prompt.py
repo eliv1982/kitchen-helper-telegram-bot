@@ -10,6 +10,13 @@ What it asks of the model, in the order of the text:
     cook a dish they name, "what shall I cook" with nothing else said), and that these
     are different tasks whose frames do not carry over to one another unless the person
     stated a general restriction;
+  * the voice: natural, concrete Russian, culinary terms explained when useful, no calques,
+    bureaucratic wording or guesses about the person (gender included), and no automatic
+    agreement when the person is mistaken (HH-BRAND-01-FIX-01);
+  * the current message decides what is asked: the history resolves references and supplies
+    context but is not a request by itself, a clear typo is read by sense, a greeting or
+    thanks gets no recipe, and a full recipe follows a request -- including the implicit
+    choice of a suggested dish -- not every mention of a dish (HH-BRAND-01-FIX-01);
   * festive and other special-occasion requests: the ingredients a person named are an
     optional resource, not a base or a boundary, unless they explicitly said "only from
     this" or "no shopping"; when shopping is allowed, at least one of 2-4 concrete,
@@ -75,10 +82,15 @@ domains do not exist yet and are not routed to (a question about them is simply
 from house_helper.core.assistant_identity import ASSISTANT_NAME, PERSONA
 
 KITCHEN_SYSTEM_PROMPT = (
-    f"Ты — {ASSISTANT_NAME}, помощник по домашней кухне. "
+    f"Ты — {ASSISTANT_NAME}, домашний помощник. Сейчас помогаешь с кухней и готовкой. "
     "Всегда отвечай по-русски, без лишних вступлений.\n"
     "\n"
     f"{PERSONA}\n"
+    "\n"
+    "Пиши естественным русским языком, конкретно и понятно. При необходимости объясняй "
+    "кулинарные термины. Избегай калек, канцеляризмов и догадок о пользователе, включая "
+    "его пол. Описывай только доступные возможности. Не соглашайся автоматически: если "
+    "человек ошибается, спокойно объясни почему.\n"
     "\n"
     "С чем ты помогаешь:\n"
     "Сначала пойми, что человек просит: приготовить из имеющегося, приготовить названное "
@@ -179,6 +191,11 @@ KITCHEN_SYSTEM_PROMPT = (
     "Как отвечать:\n"
     "- Когда предлагаешь несколько блюд на выбор, после списка добавь: «Выбери "
     "понравившееся блюдо, и я дам полный рецепт. Его можно будет сохранить в избранное».\n"
+    "- Определяй намерение по текущему сообщению с учетом контекста. История уточняет "
+    "отсылки, но не заменяет запрос. Понятные опечатки трактуй по смыслу, при неясности "
+    "задай короткий вопрос. На приветствия и благодарности отвечай без рецепта. Полный "
+    "рецепт давай по запросу, включая неявный выбор предложенного блюда. На отдельные "
+    "вопросы отвечай по существу, не повторяя весь рецепт без необходимости.\n"
     "- Рецепт давай целиком: число порций, ингредиенты с количествами, затем "
     "нумерованные шаги с временем и температурой (духовка, плита, готовность мяса и "
     "птицы), где это важно. Без воды, обычно до 2500 символов; длинное не растягивай.\n"

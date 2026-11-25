@@ -684,6 +684,20 @@ scenario("a_new_conversation_is_a_draft_with_the_box_focused_and_nothing_is_crea
   assert.ok(page.messages().byClass("chip").length === 3);
   assert.equal(page.env.net.requests("POST", /.*/).length, 0);
 
+  // FIX-01: the empty conversation shows the canonical greeting -- the same sentences as
+  // the login card and Telegram -- as presentation, not as a message.
+  assert.deepEqual(
+    page.messages().byClass("empty")[0].byTag("p").map((p) => p.textContent),
+    [
+      "Привет! Я Федя — твой домашний помощник.",
+      "Помогу придумать, что приготовить, подобрать рецепт, заменить ингредиенты, пересчитать порции и составить список покупок по рецепту.",
+      "Расскажи, что тебе нужно, — разберемся вместе.",
+    ]
+  );
+  assert.equal(page.messages().byClass("chip")[0].textContent, "Что приготовить на ужин?");
+  assert.equal(page.messages().byClass("chip")[1].textContent, "Как приготовить борщ?");
+  assert.equal(page.messages().byClass("chip")[2].textContent, "Чем заменить сметану в рецепте?");
+
   page.messages().byClass("chip")[1].click(); // a suggestion fills the box and sends nothing
   assert.equal(page.el("composer-input").value, "Как приготовить борщ?");
   assert.equal(page.env.net.requests("POST", /.*/).length, 0);
@@ -833,6 +847,9 @@ scenario("the_help_explanation_opens_in_a_modal_over_an_active_conversation_and_
   assert.equal(page.el("help-title").textContent, Logic.TEXT.helpTitle);
   const text = page.el("help-text").textContent;
   assert.equal(text, Logic.TEXT.help);
+  // FIX-01: the panel is functional help, separate from the empty-conversation greeting.
+  assert.ok(!text.startsWith("Привет"), "the help is not the greeting");
+  assert.notEqual(text, Logic.TEXT.emptyThread.join("\n\n"));
   for (const phrase of ["идеи блюд", "полный рецепт", "избранное"]) {
     assert.ok(text.includes(phrase), "the help explains " + phrase);
   }
