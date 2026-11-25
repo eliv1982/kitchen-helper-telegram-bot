@@ -997,8 +997,18 @@ encrypted offsite readback. C7-P3 (this repository change) prepares the PostgreS
 offsite units; installing them and observing their first PostgreSQL runs are the owner steps in
 `deploy/postgres/scheduled_maintenance.md`, and are not part of the 2026-10-25 acceptance. C7-P4 (stages A9-A12) is
 recorded in `docs/STATUS.md`: the independent restore of A9-R3 passed on 2026-11-24; A10 (systemd backup and monitoring
-acceptance), A11 (timer activation) and A12 (unattended execution acceptance) are pending, and both production
-maintenance timers remain disabled.
+acceptance) and A11 (timer activation) were accepted by the Owner, and A12 (unattended execution acceptance) passed its
+operational and n8n end-to-end verification and is ready for the Owner's final acceptance.
+
+**Current state (2026-11-25).** Both PostgreSQL maintenance timers (`house-helper-purge.timer` and
+`house-helper-offsite-backup.timer`) are enabled and active, and the first regular unattended maintenance cycle
+completed successfully on 2026-11-25: the purge started at 03:33:48Z and the encrypted offsite backup at 04:20:08Z, each
+ended `Result=success` and delivered its monitoring heartbeat, and the n8n end-to-end verification passed. The evidence,
+its grades and the deferred items are in `docs/STATUS.md`. The serving image remains `house-helper:ddca0966bd11`, the
+maintenance image remains `house-helper:d02b34ed369c`, PostgreSQL remains 16.15, and the schema remains
+`0014_user_measure_overrides`. *[Historical: before A11 both production maintenance timers were intentionally disabled —
+that was the state at the 2026-10-25 acceptance and of the C7-P4-A9-CLOSE record, and it is kept here as history, not as
+the current state.]*
 
 ### 14.1 What is deleted, and what never is
 
@@ -1239,6 +1249,14 @@ sudo systemctl restart house-helper-purge.timer
 to the tag that is now running, in the same step. Forgetting it fails closed: an image whose schema is not the database's
 is refused (`schema_not_head`, exit 4) and nothing is deleted; an image older than R4C-D2 has no such command and the run
 fails with a usage error (exit 2).
+
+**The accepted servicing and maintenance image separation (2026-11-25).** The sentence above names the tag the
+maintenance one-shot runs; it does not mean the serving image's tag. In the verified production state the serving image
+(`house-helper:ddca0966bd11`) and the maintenance image (`house-helper:d02b34ed369c`) differ, and
+`/etc/house-helper/purge.env` and `/etc/house-helper/offsite.env` name the maintenance image. A serving release does not by
+itself change those files; change a maintenance tag only as part of its own maintenance step, and never repoint
+`purge.env` at the serving image merely to satisfy the generic rule. The same reading applies where the rule is repeated
+(15.8 carries the reconciled qualifier). This note records the accepted separation; it adds no operational procedure.
 
 **Before an upgrade or a restore, stop the timer, and start it again afterwards.** A migration and a restore need the
 directory to themselves (section 2), so they are refused while a cleanup is running, and the cleanup is refused while they
@@ -1771,7 +1789,9 @@ cleanup, and a migration or a restore (exclusive) is refused while it runs. **Be
 and start them again afterwards** (14.4 has the commands; the same applies to `house-helper-offsite-backup.timer`). After every
 upgrade and every rollback, change `HOUSE_HELPER_IMAGE_TAG` in `/etc/house-helper/purge.env`: both units read it. Forgetting it
 fails closed (a tag whose schema is not the database's is refused, exit 4) and the backups silently stop being made, which is
-why 15.9 asks for an alert.
+why 15.9 asks for an alert. *[Reconciled with the accepted separation of 2026-11-25 (14.4): this tag names the maintenance
+image the purge and offsite-backup units run, not the serving image; the two tags may differ, and a serving release does
+not by itself require changing it.]*
 
 ### 15.9 What is not done: checklist **[OWNER]**
 

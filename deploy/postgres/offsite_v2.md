@@ -6,12 +6,26 @@ PostgreSQL deployment is the production surface (C1-C6), and
 path is the v2 source. Nothing in the repository installs or enables the unit: activating it
 is the owner's transition step in `deploy/postgres/scheduled_maintenance.md`. No PostgreSQL
 point has been taken or uploaded by a scheduled run until that step is performed, and the
-real external round trip has **not** been executed. *[Note 2026-11-24, C7-P4: the restore half
+real external round trip has **not** been executed. *[Updated 2026-11-25: that transition step
+has since been performed — scheduled runs have taken and uploaded PostgreSQL points, and the first
+regular unattended backup completed on 2026-11-25 (details in the note below). The §5
+synthetic-data external rehearsal has still not been executed.]* *[Note 2026-11-24, C7-P4: the restore half
 has since been exercised once from the real offsite folder: an independent recovery of one
 committed PostgreSQL point on a non-production host (A9-R3, operational PASS / CLEAN), recorded in
 `docs/STATUS.md`. It was not the synthetic-data test-prefix procedure of §5, which has not been
-run, and it did not activate any timer or scheduled run: both production maintenance timers stay
-disabled.]* This document is the operator procedure and the list of gates that remain. It is governed by
+run, and at that date both production maintenance timers were disabled (historical).]* *[Updated
+2026-11-25, C7-P4-A12: both maintenance timers (`house-helper-purge.timer`,
+`house-helper-offsite-backup.timer`) are enabled and active, and the first regular unattended cycle
+completed successfully on 2026-11-25. The encrypted offsite backup started at 04:20:08Z and ended
+`Result=success`; its point `house-helper-20261125T042010Z-d4659a83.tar.age` and its commit marker
+were verified by a streamed readback, the remote held 10 committed points with no `.partial`
+object, and the n8n end-to-end verification passed. A12 operational verification passed. The
+maintenance image remains `house-helper:d02b34ed369c`, the serving image remains
+`house-helper:ddca0966bd11`, PostgreSQL remains 16.15, and the schema remains
+`0014_user_measure_overrides`; the evidence and its grades are in `docs/STATUS.md`. No point
+produced by an unattended run has been restored: A9-R3 demonstrated the restore path on an earlier
+point, and the synthetic-data test-prefix procedure of §5 remains unrun.]* This document is the
+operator procedure and the list of gates that remain. It is governed by
 `docs/architecture/HH-DB-01_Architecture_Frozen_Specification_v1.0.md` §8 (BAK-15..BAK-17);
 where this text and the specification differ, the specification wins.
 
@@ -151,7 +165,9 @@ are the existing six: 0, 1, 2, 3, 6, 7.
 installing it, filling in the shared `purge.env`/`offsite.env` values and re-arming the
 timer are the C7-P3 transition in `deploy/postgres/scheduled_maintenance.md`. Do not enable
 a v2 timer until the Owner records the activation approval and the prerequisites of that
-procedure are observed.
+procedure are observed. *[Updated 2026-11-25: the Owner recorded the activation approval in A11,
+the timer is enabled and active, and the first regular unattended backup passed A12 (see the
+status note above). The instruction is kept as the historical gate of the transition.]*
 
 ## 5. The one real external rehearsal (Owner GO required)
 
@@ -197,7 +213,9 @@ in the repository, in a log or in a test.
 * Owner approval to execute the external round trip of §5 (synthetic data, isolated prefix).
 * Owner approval to activate the v2 backup path at all; the scheduled unit already passes
   `--database postgresql`, and installing/re-arming it is the transition in
-  `deploy/postgres/scheduled_maintenance.md`.
+  `deploy/postgres/scheduled_maintenance.md`. *[Closed 2026-11-25: activation was performed in A11
+  and the first regular unattended backup passed A12 (status note above). The §5 synthetic-data
+  test-prefix round trip above is a separate item and remains open.]*
 * PostgreSQL production provisioning, enrollment, cutover and any production credential are
   governed by the C1-C6 cutover record and separately authorized; WP-2E changes none of them.
 * Monitoring and alerting stay as they are (BAK-17): the existing exit codes and journal lines
