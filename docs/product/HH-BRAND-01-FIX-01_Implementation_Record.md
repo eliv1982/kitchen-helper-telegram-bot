@@ -6,6 +6,16 @@ implementation defect, and the audited implementation is preserved unchanged. Th
 a local implementation on baseline `afd83cb65bd7cc6ab1ab6d638187115b05610c63`; it claims no commit,
 push, CI PASS, real-provider behavioural acceptance, owner acceptance, release or deployment.
 
+**Updated 2026-11-25 (behavioral evaluation closure):** the implementation was subsequently
+committed as `77e2bfd2f513e9285e0219d1d0f89538acf58610`; GitHub Actions CI #94 PASS and the
+independent Codex audit PASS WITH NON-BLOCKING NOTES are recorded in the Owner-supplied accepted
+baseline. The separately authorized real-provider behavioral evaluation then ran as
+`owner-approved-2026-11-25-a`: 30/30 requests completed, **24 PASS / 6 FAIL**, behavioral acceptance
+**FAILED**, production release **BLOCKED** and remediation **OPEN**. The authoritative record is
+[`HH-BRAND-01-FIX-01_Behavioral_Evaluation_Record.md`](HH-BRAND-01-FIX-01_Behavioral_Evaluation_Record.md).
+Sections 1–11 below remain the historical implementation record written on baseline `afd83cb`; they
+are not rewritten by that outcome.
+
 **Date:** 2026-11-25
 
 **Scope:** `docs/product/HH-BRAND-01-FIX-01_Scope_Lock.md` and KHD-45–KHD-48 in
@@ -162,7 +172,7 @@ suites (164 tests) were not run locally:** no verified isolated PostgreSQL 16 en
 provisioned, and production connection details were never used. They remain a mandatory CI gate, not
 a passing result.
 
-## 8. Behavioural evaluation contract (design only — execution not authorised)
+## 8. Behavioural evaluation contract (design only at the time of this record — subsequently executed on 2026-11-25)
 
 The **complete** authoritative contract — configuration, the 15-scenario matrix, acceptance and
 stopping rules, and evidence requirements — is recorded in section 7 of the Scope Lock. It is not
@@ -172,6 +182,11 @@ duplicated here; this record states only that it is design only.
 execution authorization currently exists. The contract is not executed in this task, no provider
 credentials are used, and no provider call is made. Raw evidence, when authorised, stays outside the
 repository.
+
+*[Superseded 2026-11-25: the evaluation was subsequently separately authorized and executed as
+`owner-approved-2026-11-25-a`. See section 12 and
+`HH-BRAND-01-FIX-01_Behavioral_Evaluation_Record.md`. The statement above remains the historical
+state at the time of this implementation record.]*
 
 ## 9. Limitations and deferred items
 
@@ -247,3 +262,22 @@ within the accepted 14-file scope. No production code or test file changed.
 `docs/product/HH-BRAND-01-FIX-01_Scope_Lock.md` and this record); the twelve pre-existing untracked
 artifacts are untouched; nothing is staged. Not committed, pushed, released or deployed. Independent
 audit: **PASS WITH NON-BLOCKING NOTES**. Owner code acceptance and commit are the next gates.
+
+## 12. Behavioral evaluation outcome (2026-11-25)
+
+The separately authorized real-provider behavioral evaluation was executed as
+`owner-approved-2026-11-25-a` against commit `77e2bfd2f513e9285e0219d1d0f89538acf58610`. It
+completed all 30 planned requests with no early termination: **24 PASS / 6 FAIL**, zero critical
+safety violations. The six failures are samples 1–2 (intent resolution), 21–22 (recipe fidelity) and
+24–25 (capability accuracy).
+
+Recorded statuses: technical implementation **ACCEPTED**; evaluation execution **COMPLETED**;
+behavioral acceptance **FAILED**; production release **BLOCKED**; remediation **OPEN**.
+HH-BRAND-01-FIX-02 is registered as a pending architectural investigation. No architecture is
+selected, and no deployment of `77e2bfd` is authorized.
+
+The authoritative record, including evidence verification, the failed cases, the supplementary
+language observations and the release gate, is
+[`HH-BRAND-01-FIX-01_Behavioral_Evaluation_Record.md`](HH-BRAND-01-FIX-01_Behavioral_Evaluation_Record.md).
+This section changes no implementation, prompt, test, harness, manifest or rubric; it adds only the
+outcome and the pointer.

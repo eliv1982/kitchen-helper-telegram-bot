@@ -233,6 +233,49 @@ real-provider evaluation, release and deployment remain open.
 - **Budget raised, not quality reduced:** the final clauses were measured against the ceiling; at 10,764 they fit. The Owner's quality-first amendment makes clear that a future conflict would be resolved by a justified budget amendment, not by trimming accepted instructions.
 - **Not decided here:** real-provider evaluation of intent, repetition fidelity and language (a separate mandatory gate); recipe retrieval or caching; Equipment, Budget or any other domain; conversation naming, timestamps and the Full Recipe button (the UX Package).
 
+## Accepted product direction — Fedya identity, capability truth and natural Russian (2026-11-25)
+
+This records the Owner-approved direction that follows the HH-BRAND-01-FIX-01 behavioral
+evaluation of 2026-11-25 (run `owner-approved-2026-11-25-a`). It is a product-direction decision,
+**not an implementation authorization** and **not a release record**. It refines KHD-44 and KHD-45
+without rewriting them; no architecture for the remediation is selected here.
+
+| ID | Decision | Status |
+|---|---|---|
+| **KHD-49** | **Fedya — digital household assistant; kitchen is the current specialization.** (1) **Федя** is the one digital household assistant. Kitchen and cooking are the current specialization, not the permanent identity boundary; a future domain may extend the same assistant without inventing a second identity. (2) Fedya truthfully identifies itself as AI — a bot or assistant — when directly asked, and does not claim to be human. (3) Capability claims must reflect implemented functionality: the shopping-list capability is creation **from a recipe**; standalone shopping lists, ordering, delivery and store integration are not available and must not be implied. (4) User gender must not be assumed without reliable evidence. (5) Conversation uses natural Russian. (6) Greetings must not automatically redirect the person toward recipes. (7) Preferred conversational examples are illustrative, not mandatory scripted responses. | ACCEPTED — Owner-approved direction recorded 2026-11-25; no code, prompt or test change is authorized by this decision alone |
+| **KHD-50** | **HH-BRAND-01-FIX-01 behavioral acceptance and release gate.** Technical implementation is **ACCEPTED** at `77e2bfd2f513e9285e0219d1d0f89538acf58610`; evaluation execution is **COMPLETED** (30/30, no early termination, zero critical safety violations); behavioral acceptance is **FAILED** (24 PASS / 6 FAIL — samples 1, 2, 21, 22, 24, 25); production release is **BLOCKED**; remediation is **OPEN**. **HH-BRAND-01-FIX-02** is registered as a pending architectural investigation covering (1) intent resolution, (2) recipe fidelity, (3) an identity and capability registry, and (4) natural Russian conversation. No architecture is selected; additional classifiers, direct recipe replay, prompt expansion and model changes are investigation options, not preapproved decisions. The successful scenarios are preserved as regression expectations. Before release is reconsidered: architecture approval, an approved Scope Lock, implementation, independent verification and a subsequent approved behavioral evaluation. VPS maintenance takes priority before FIX-02 architectural work. | ACCEPTED — Owner-recorded release gate (2026-11-25); nothing is deployed |
+| **KHD-51** | **Automotive Assistant — future backlog direction only.** Automotive assistance is recorded as a future product direction outside the current scope and outside the Kitchen domain. No design, capability, integration or implementation is approved, and it does not change the current kitchen-only product boundary or KHD-01. | RECORDED — Owner-approved future direction (2026-11-25); not in scope |
+
+### Why / alternatives / boundaries
+
+- **Identity separated from current capability:** the evaluation showed that naming a current domain
+  as the whole identity invites both capability over-claiming and under-claiming. The Owner's
+  direction keeps one assistant and one persona while making the current specialization explicit and
+  temporary. This refines KHD-44/KHD-45's platform/assistant/domain separation; it does not enlarge
+  the implemented Kitchen domain.
+- **Truthful capability language rather than a feature count:** the failure was not that the
+  assistant listed too few capabilities, but that a shopping-list sentence could be read as a
+  standalone shopping service. The direction therefore constrains how capabilities are described,
+  not merely which words are used.
+- **No gender inference:** natural Russian often exposes the speaker's assumed gender through past
+  tense. The direction makes the prompt rule explicit and treats a violation as a language-quality
+  defect, even when the sample otherwise passes its scenario.
+- **Greetings as conversation, not routing:** a greeting is answered as a greeting. This is a
+  product-direction correction; it does not retroactively change the frozen rubric verdicts for the
+  greeting samples that passed.
+- **Failure recorded without rewriting the implementation record:** the technical implementation
+  and audit remain accepted. The behavioral failure is a separate gate. Rewriting the implementation
+  history, the frozen rubric or the case verdicts would destroy the evidence; the alternative
+  chosen is a dated, additive record.
+- **No premature architecture:** the observed defects have different plausible mechanisms. Selecting
+  a classifier, a retrieval/replay path, a prompt-only iteration or a model change now would be an
+  unproven commitment. FIX-02 is therefore an investigation with an explicit approval gate.
+- **VPS maintenance first:** operational maintenance already sequenced by the Owner takes priority
+  over FIX-02 architectural work. This decision does not reorder that work.
+- **Not decided here:** the FIX-02 architecture; any schema, API, prompt, model or provider change;
+  standalone shopping lists (KH-SHOP-02); the Automotive Assistant's scope, design or identifier;
+  deployment of `77e2bfd`; and any reopening of KHD-44–KHD-48's accepted clauses.
+
 ## Change discipline
 
 Add a new decision (date, rationale, alternatives and approval source) only after an actual decision. For a change to an earlier decision, reference its ID and record the replacement instead of silently rewriting history. Link full Stage 2A/2B originals when recovered.

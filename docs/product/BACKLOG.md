@@ -35,8 +35,18 @@ Not part of the accepted baseline and not implemented: voice/STT/TTS, long-term 
 | **KH-F03** | Home Preservation and Contextual Household Settings | P2 (provisional; owner has not ranked) | Proposed | Not built |
 | **KH-F04** | Equipment-aware Cooking | P2 (provisional; owner has not ranked) | Proposed | Not built; retains the README meaning |
 | **KH-F05** | Family Recipe Digitization | P2 (provisional; owner has not ranked) | Proposed | Not built; retains the README meaning |
+| **HH-BRAND-01-FIX-02** | Fedya behavioral remediation — architectural investigation | **P1 — release gate** (after VPS maintenance) | Proposed | Investigation only; four areas; **no architecture selected** |
+| **KH-SHOP-02** | Standalone shopping lists | Future (sixth in the 2026-11-25 product priority order) | Proposed | Not built; only recipe-based shopping lists exist |
+| **— (unassigned)** | Automotive Assistant | Future | Proposed | Direction only; no identifier, design or scope assigned |
 
-ID check: `KH-F06`, `KH-F07` and `HH-ALPHA-01` had **no prior use** in this repository before this document (verified by search on 2026-10-31). `KH-F01`–`KH-F05` remain the planned-feature identifiers already used in the root `README.md`; no identifier is redefined.
+ID check: `KH-F06`, `KH-F07` and `HH-ALPHA-01` had **no prior use** in this repository before this document (verified by search on 2026-10-31). `KH-F01`–`KH-F05` remain the planned-feature identifiers already used in the root `README.md`; no identifier is redefined. `HH-BRAND-01-FIX-02` is the remediation-task identifier introduced by the 2026-11-25 behavioral-evaluation closure. `KH-SHOP-02` is the identifier used in the 2026-11-25 product priority order; this entry records it as the standalone-shopping-list direction and does not define or reopen any earlier `KH-SHOP-*` release. The Automotive Assistant direction deliberately has **no assigned identifier** until it is scoped.
+
+**Behavioral release gate (2026-11-25).** `HH-BRAND-01-FIX-01` was technically accepted at
+`77e2bfd`, and its separately authorized 30-sample real-provider behavioral evaluation completed
+with **24 PASS / 6 FAIL**. Behavioral acceptance is **FAILED**, production release is **BLOCKED**
+and remediation is **OPEN**. The authoritative record is
+[`HH-BRAND-01-FIX-01_Behavioral_Evaluation_Record.md`](HH-BRAND-01-FIX-01_Behavioral_Evaluation_Record.md);
+the gate is KHD-50 in `docs/DECISIONS.md`.
 
 ---
 
@@ -312,6 +322,95 @@ The correction touches `house_helper/core/kitchen_prompt.py`, the Web help entry
 - Depends on KH-F06 structured recipe storage and editing, and on the approved photo/vision path.
 - Requires an explicit decision about image storage and retention; the current photo path is message-scoped and expires after 365 days.
 - Not implemented.
+
+---
+
+## HH-BRAND-01-FIX-02 — Fedya behavioral remediation (architectural investigation)
+
+**Priority:** P1 — release gate. **VPS maintenance takes priority before FIX-02 architectural work.**
+**Status:** Proposed — **architectural investigation only**. No architecture is selected and no
+implementation is authorized.
+**Owner-approved direction?** The Owner registered the investigation on 2026-11-25 (KHD-50). That is
+an authorization to investigate, not an architecture approval, Scope Lock or implementation
+authorization.
+
+**Why this item exists.** The separately authorized behavioral evaluation of HH-BRAND-01-FIX-01
+(`owner-approved-2026-11-25-a`) completed all 30 requests with **24 PASS / 6 FAIL**. Under the
+frozen contract, all 30 must pass, so behavioral acceptance failed and the production release is
+blocked. The evidence is in
+[`HH-BRAND-01-FIX-01_Behavioral_Evaluation_Record.md`](HH-BRAND-01-FIX-01_Behavioral_Evaluation_Record.md).
+
+**Investigation areas**
+
+1. **Intent Resolution.** Cases 1–2: the ambiguous input `Рответ` produced an unsolicited full
+   recipe when a recipe was in the history; the same input without history (case 10) produced a
+   clarification. The causal mechanism is not established. Understandable typos, clear greetings,
+   meaningless input, implicit dish selection and short contextual questions already pass and must
+   be preserved.
+2. **Recipe Fidelity.** Cases 21–22: explicit repetition changed cooking technique, action sequence
+   and individual parameters (including sour-cream fat content in case 21, and broth addition,
+   garlic timing and resting time in case 22). Direct reproduction of a previously stored recipe is
+   a **candidate option for investigation**, not an approved solution.
+3. **Identity and Capability Registry.** Cases 24–25: shopping-list capability was described without
+   the current recipe-based limitation. The registry must state only implemented functionality,
+   truthful AI identity and the recipe-based shopping-list boundary; standalone shopping lists are
+   KH-SHOP-02.
+4. **Natural Russian Conversation.** Supplementary observations include unsupported user-gender
+   assumptions (cases 10, 12, 14), grammatical errors (13, 14, 19, 20), unnatural phrasing (14, 16,
+   28), tautology (15) and mechanical greetings that redirect toward cooking or a recipe (3, 4, 7,
+   9). These are
+   language-quality observations separate from the frozen 24/6 scoring.
+
+**Options for investigation — none preapproved.** Additional classifiers, direct recipe replay,
+prompt expansion and model changes are all options to evaluate. Choosing among them requires the
+investigation and an explicit architecture decision. No option may be treated as an implementation
+instruction by this backlog entry.
+
+**Acceptance gate.** Architecture approval, an approved Scope Lock, implementation, independent
+verification and a subsequent separately authorized and approved behavioral evaluation are required
+before release is reconsidered. The successful scenarios in the evaluation record are preserved as
+regression expectations.
+
+**Not in scope.** Any code, prompt, model, schema or deployment change in this entry; reopening
+KHD-44–KHD-48; standalone shopping lists; automotive assistance; and deployment of `77e2bfd`.
+
+---
+
+## KH-SHOP-02 — Standalone shopping lists
+
+**Priority:** Future — sixth in the 2026-11-25 product priority order.
+**Status:** Proposed. **No acceptance scope, design, schema, UI or retention rule is approved.**
+**Owner-approved direction?** Recorded as future work; not approved for implementation.
+
+**Why this item exists.** The current implemented capability is to create a shopping list **from a
+recipe**. Standalone shopping lists — lists not tied to a recipe — are not implemented, and the
+assistant must not imply them. Ordering, delivery and store integration are also not implemented
+and are not part of this item as recorded.
+
+**Boundary and open design questions (none decided)**
+
+- What a standalone list stores, and how it is separated from a recipe-based list.
+- Ownership, isolation, editing and deletion.
+- Whether a standalone list has its own retention or participates in the 365-day cleanup.
+- Any user-facing management surface, in the Web application and/or Telegram.
+- Whether any provider call is needed (none is assumed).
+
+**Implementation state.** Not built; not designed. The capability-language boundary is recorded in
+KHD-49 and in the HH-BRAND-01-FIX-02 investigation area 3.
+
+---
+
+## Future direction — Automotive Assistant (identifier not assigned)
+
+**Priority:** Future; outside the current scope and outside the Kitchen domain.
+**Status:** Proposed direction only. **No identifier, design, capability, integration or
+implementation is approved.**
+**Owner-approved direction?** Recorded by the Owner on 2026-11-25 (KHD-51).
+
+Automotive assistance is a possible future product direction for the same assistant identity. It is
+outside the current kitchen-only product boundary and does not enlarge KHD-01. Any work would need
+its own scoped proposal, identifier, design, safety boundary and owner authorization. This entry
+records the direction; it approves nothing and changes no current capability claim.
 
 ---
 
