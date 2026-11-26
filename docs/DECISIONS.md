@@ -276,6 +276,30 @@ without rewriting them; no architecture for the remediation is selected here.
   standalone shopping lists (KH-SHOP-02); the Automotive Assistant's scope, design or identifier;
   deployment of `77e2bfd`; and any reopening of KHD-44–KHD-48's accepted clauses.
 
+## Owner decision — KHD-48 prompt-ceiling amendment permission (2026-11-26)
+
+This records the Owner's explicit permission, given during the HH-BRAND-01-FIX-02 AG-01 documentary
+reconciliation, to revise the shared-prompt character ceiling when a quality improvement justifies
+it. It amends **only** KHD-48's numerical ceiling rule. It does not change the current prompt, its
+tests, the current measured value or the current ceiling, and it approves no replacement number.
+
+| ID | Decision | Status |
+|---|---|---|
+| **KHD-52** | **KHD-48 prompt ceiling is amendable on quality grounds.** (1) The Owner permits a future revision of the current strict `< 10,800` character ceiling on `KITCHEN_SYSTEM_PROMPT` when the revision is justified by a demonstrated quality improvement. **Quality First takes precedence over preserving an arbitrary character limit.** (2) No replacement numerical ceiling is approved by this decision. The current prompt, its measured 10,764 characters, the strict `< 10,800` ceiling and the existing tests remain in force until a separate Owner decision approves a specific replacement value. (3) Any proposed replacement must be justified by evidence (for example, a research package's capability or context finding) and recorded as its own decision; it is not inferred from this permission. (4) This decision does not authorize a prompt change, a test change, a provider experiment or an implementation. It does not reopen KHD-44–KHD-47 or any other accepted clause of KHD-48. | ACCEPTED — Owner permission recorded 2026-11-26; no replacement ceiling, prompt change or implementation authorized |
+
+### Why / alternatives / boundaries
+
+- **Permission versus value:** the original KHD-48 ceiling was an engineering bound set when the
+  prompt measured 10,764 characters. The Owner has decided that a quality need may justify raising
+  it; the number itself is still an engineering decision that needs evidence.
+- **Quality First retained:** KHD-48's priority order is unchanged. A justified budget increase
+  remains preferable to suppressing a useful answer, weakening an instruction or dropping a
+  capability.
+- **No silent rewrite:** KHD-48 remains the historical decision. KHD-52 amends its ceiling rule
+  prospectively and does not restate or erase the earlier measurement or rationale.
+- **Not decided here:** the replacement ceiling; any prompt text; any test update; the AG-02
+  package boundary; provider, budget or experiment authorization.
+
 ## Change discipline
 
 Add a new decision (date, rationale, alternatives and approval source) only after an actual decision. For a change to an earlier decision, reference its ID and record the replacement instead of silently rewriting history. Link full Stage 2A/2B originals when recovered.

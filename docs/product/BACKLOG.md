@@ -352,9 +352,10 @@ blocked. The evidence is in
    garlic timing and resting time in case 22). Direct reproduction of a previously stored recipe is
    a **candidate option for investigation**, not an approved solution.
 3. **Identity and Capability Registry.** Cases 24–25: shopping-list capability was described without
-   the current recipe-based limitation. The registry must state only implemented functionality,
-   truthful AI identity and the recipe-based shopping-list boundary; standalone shopping lists are
-   KH-SHOP-02.
+   the current recipe-based limitation. Any capability source — a code-owned block, a prompt
+   statement or a tool-availability representation — must state only implemented functionality,
+   truthful AI identity and the recipe-based shopping-list boundary; no particular mechanism (and
+   no separate registry) is preapproved. Standalone shopping lists are KH-SHOP-02.
 4. **Natural Russian Conversation.** Supplementary observations include unsupported user-gender
    assumptions (cases 10, 12, 14), grammatical errors (13, 14, 19, 20), unnatural phrasing (14, 16,
    28), tautology (15) and mechanical greetings that redirect toward cooking or a recipe (3, 4, 7,
