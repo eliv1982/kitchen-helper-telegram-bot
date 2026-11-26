@@ -300,6 +300,34 @@ tests, the current measured value or the current ceiling, and it approves no rep
 - **Not decided here:** the replacement ceiling; any prompt text; any test update; the AG-02
   package boundary; provider, budget or experiment authorization.
 
+## Owner decision — HH-BRAND-01-FIX-02 / RP-01 AG-02 acceptance and research pause (2026-11-26)
+
+This records the Owner's acceptance of the RP-01 / AG-02 offline design stage with non-blocking
+notes, on the final independent verdict `PASS WITH NON-BLOCKING NOTES — READY FOR AG-02 OWNER
+ACCEPTANCE`. It closes the design stage only. It authorizes no AG-03 or AG-04 execution and no
+product change, and it pauses the intelligence research stream before AG-03 while product delivery
+takes priority.
+
+| ID | Decision | Status |
+|---|---|---|
+| **KHD-53** | **HH-BRAND-01-FIX-02 / RP-01 — AG-02 design acceptance and research pause.** (1) The AG-02 offline design is **CLOSED / OWNER ACCEPT WITH NON-BLOCKING NOTES**; the final independent verdict is `PASS WITH NON-BLOCKING NOTES — READY FOR AG-02 OWNER ACCEPTANCE` and there are no material AG-02 blockers. (2) The Owner accepts `RP-01-A-v1`, `RP-01-B-v3` and `RP-01-C-v3`; the exact S2–S11 wording with S1 retired; the 288-request exploratory plan under a proposed hard cap of 300; the 554-request preliminary confirmatory base before the holdout; the three evaluation units (288 answer reviews, 216 interaction verdicts, 216 interaction-level pairwise comparisons); 14 empty independent holdout slots; zero retries; and zero judge calls — **as accepted design parameters, not as authorization to execute requests**. (3) R-01–R-05 are closed offline; R-06 is deferred to the mandatory AG-03 preflight. L-46 is a non-blocking offline observability limitation: the full reservation is retained with zero dispatch intents, zero transport invocations, zero reconciliations, an interrupted terminal state, exit code 5, no ordinary same-workspace authorization reuse and no erroneous release of the unreconciled reservation; its correction is **mandatory before AG-03** and is not repaired by this decision. (4) **RP-01 / AG-03 is NOT AUTHORIZED / DEFERRED; the intelligence research stream is PAUSED BEFORE AG-03.** The final execution freeze, independently controlled pin custody and monetary authorization remain pending. (5) The **product delivery stream is ACTIVE / PRIMARY PRIORITY**; PP-01 and its independent delivery scope are preserved. (6) No architecture is selected, no FIX-02 implementation is authorized, and the HH-BRAND-01-FIX-01 behavioral baseline remains **24 PASS / 6 FAIL** with production release **BLOCKED**. | **ACCEPTED — Owner-approved AG-02 acceptance with non-blocking notes (2026-11-26); no execution, provider, judge, credential, holdout, production or Git operation authorized** |
+
+### Why / alternatives / boundaries
+
+- **Acceptance is not execution:** AG-02 approves a design to be executed later under a separate
+  authorization. It approves no provider request, spending, credential, holdout use or live run;
+  the AG-03 preflight register in the closure record lists the outstanding prerequisites.
+- **Research paused, product first:** the next research step is the AG-03 preflight, not an
+  experiment. The Owner has made product delivery the active primary priority in the meantime.
+- **L-46 blocks the live stage only:** the reservation and isolation properties are confirmed; only
+  the ambiguity annotation is missing. Because the preflight requires a fully green offline suite,
+  correction is mandatory before AG-03 rather than an AG-02 acceptance condition.
+- **No silent rewrite:** the AG-02-FIX-01, FIX-02 and FIX-03 reports remain historical records; the
+  closure record consolidates them without amending their evidence. The Research Charter v1.0 and
+  Incremental Delivery Strategy v1.0 are unchanged.
+- **Not decided here:** any AG-03 or AG-04 execution; any architecture selection; any prompt, model,
+  schema, API, test or deployment change; any holdout creation; any PP-01 scope change.
+
 ## Change discipline
 
 Add a new decision (date, rationale, alternatives and approval source) only after an actual decision. For a change to an earlier decision, reference its ID and record the replacement instead of silently rewriting history. Link full Stage 2A/2B originals when recovered.

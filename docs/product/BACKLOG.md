@@ -327,12 +327,30 @@ The correction touches `house_helper/core/kitchen_prompt.py`, the Web help entry
 
 ## HH-BRAND-01-FIX-02 — Fedya behavioral remediation (architectural investigation)
 
-**Priority:** P1 — release gate. **VPS maintenance takes priority before FIX-02 architectural work.**
-**Status:** Proposed — **architectural investigation only**. No architecture is selected and no
-implementation is authorized.
-**Owner-approved direction?** The Owner registered the investigation on 2026-11-25 (KHD-50). That is
-an authorization to investigate, not an architecture approval, Scope Lock or implementation
-authorization.
+**Priority:** P1 — release gate. **Product delivery is the active primary priority; the intelligence
+research stream is paused before AG-03.**
+**Status:** Proposed — **architectural investigation only**. The RP-01 / AG-02 offline design stage is
+**CLOSED / OWNER ACCEPT WITH NON-BLOCKING NOTES** (KHD-53, 2026-11-26); **RP-01 / AG-03 is NOT
+AUTHORIZED / DEFERRED**. No architecture is selected and no implementation is authorized.
+**Owner-approved direction?** The Owner registered the investigation on 2026-11-25 (KHD-50) and
+accepted the AG-02 design on 2026-11-26 (KHD-53). That is an authorization to investigate and a
+design acceptance, not an architecture approval, Scope Lock, execution authorization or
+implementation authorization.
+
+**RP-01 / AG-02 closure (2026-11-26).** The first bounded research package, RP-01 Capability Truth &
+Context Authority, completed its offline design stage and was accepted with non-blocking notes on the
+final independent verdict `PASS WITH NON-BLOCKING NOTES — READY FOR AG-02 OWNER ACCEPTANCE`. The
+consolidated record is
+[`docs/architecture/HH-BRAND-01-FIX-02_RP-01_AG-02_Closure_Record.md`](../architecture/HH-BRAND-01-FIX-02_RP-01_AG-02_Closure_Record.md).
+It accepted the A-v1/B-v3/C-v3 candidates, the exact S2–S11 capability wording with S1 retired, the
+288-request exploratory plan under a proposed hard cap of 300, the 554-request preliminary
+confirmatory base before the holdout, 288 answer reviews, 216 interaction verdicts, 216 pairwise
+comparisons, 14 empty holdout slots, zero retries and zero judge calls — as design parameters only.
+R-01–R-05 are closed offline; R-06 and the remaining AG-03 preflight prerequisites are not
+implemented. L-46, a non-blocking offline ambiguity-annotation regression, must be corrected before
+AG-03. No provider or judge call was made and no candidate behavior or superiority is claimed. The
+research stream is paused before AG-03; product delivery (including PP-01) is the active primary
+priority.
 
 **Why this item exists.** The separately authorized behavioral evaluation of HH-BRAND-01-FIX-01
 (`owner-approved-2026-11-25-a`) completed all 30 requests with **24 PASS / 6 FAIL**. Under the
