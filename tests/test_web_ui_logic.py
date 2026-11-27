@@ -297,7 +297,11 @@ def _policy_boundary_texts() -> list[str]:
     start, end, and the code points just outside them, alone, around a ZWJ, and inside
     ordinary text -- plus every tag character after the flag base. The server and the page
     must give the same verdict for all of them, not just the strings the audit named."""
-    from house_helper.core.title_unicode import DEFAULT_IGNORABLE_RANGES, EMOJI_BASE_RANGES
+    from house_helper.core.title_unicode import (
+        DEFAULT_IGNORABLE_RANGES,
+        EMOJI_BASE_RANGES,
+        FORMAT_RANGES,
+    )
 
     def boundary_points(ranges) -> list[int]:
         points = set()
@@ -312,6 +316,9 @@ def _policy_boundary_texts() -> list[str]:
         character = chr(point)
         texts.extend((character, character + "‍" + character, "Борщ " + character))
     for point in boundary_points(DEFAULT_IGNORABLE_RANGES):
+        character = chr(point)
+        texts.extend((character, "Борщ" + character))
+    for point in boundary_points(FORMAT_RANGES):
         character = chr(point)
         texts.extend((character, "Борщ" + character))
     for point in range(0xE0020, 0xE0080):

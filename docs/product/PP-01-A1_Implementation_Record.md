@@ -11,7 +11,7 @@
 | Release candidate intent | **HH-BRAND-01-FIX-01 + PP-01-A1** |
 | Final independent acceptance | **PASS — ALL EIGHT FINDINGS CLOSED** (2026-11-27); **17 PASS / 0 FAIL / 0 SKIP**; A1-01 closed with C1 desktop focus verified |
 | Owner acceptance | **ACCEPT WITH NON-BLOCKING NOTES** (2026-11-27); see [`PP-01-A1_Owner_Acceptance_Closure_Record.md`](PP-01-A1_Owner_Acceptance_Closure_Record.md) |
-| Status | Implemented in the working tree; independently accepted in full and Owner-accepted with non-blocking notes; **not committed, released or deployed**. The intermediate `OPEN` statements in sections 12–16 are chronology, not the final disposition. |
+| Status | Committed as `f55e089cf1397adbb32aedde5c3a4878831c7d79`; independently accepted in full and Owner-accepted with non-blocking notes. The PP-01-A1-CI-FIX-01 correction (§18) is in the working tree and **READY FOR OWNER COMMIT**; the full CI matrix is pending. The intermediate `OPEN` statements in sections 12–16 are chronology, not the final disposition. |
 
 ## 1. Executive summary
 
@@ -701,3 +701,98 @@ FIX-01 remains **24 PASS / 6 FAIL**, behavioural acceptance is FAILED and produc
 **HH-BRAND-01-FIX-01 + PP-01-A1** candidate (KHD-54); no later decision changes it. No commit,
 release, deployment, provider call or Production access was performed by this closure. The
 working tree is **READY FOR OWNER COMMIT**.
+
+## 18. PP-01-A1-CI-FIX-01 — failed CI run 45987365414 (2026-11-27)
+
+PP-01-A1 was committed as `f55e089cf1397adbb32aedde5c3a4878831c7d79`; the push-triggered CI
+run **`45987365414`** for that commit failed. The two defects below account for the failure:
+**F1** is visible only on Python 3.10, and **F2** is deterministic on every Python version.
+Both are corrected in the working tree without a functional change beyond the corrections
+themselves, without a migration, and without reopening the PP-01-A1 acceptance or its
+product decisions.
+
+### 18.1 F1 — the format-character check depended on the Python Unicode version
+
+**Root cause.** The server classified a format character with the running Python's own table
+(`unicodedata.category(character) == "Cf"`), while the page classified it with `\p{Cf}` from
+the frozen block (Node.js 24.14.0 / ICU 78.2 / Unicode 17.0). The tables are not the same:
+Python 3.10 ships Unicode 13.0, Python 3.12 ships Unicode 15.0, and U+0890/U+0891 became `Cf`
+in Unicode 14.0 while U+13439..U+1343F became `Cf` in Unicode 15.0. On Python 3.10 those
+code points are still unassigned (`Cn`), so the server accepted a title containing one while
+the page refused it.
+`tests/test_web_ui_logic.py::test_the_page_validates_a_conversation_title_exactly_as_the_server_does`
+already listed those boundaries and therefore failed on the Python 3.10 job; it passed on
+Python 3.12, which is why the defect was invisible in the local development runs.
+
+**Correction.** `house_helper/core/title_unicode.py` now carries a third frozen table,
+`FORMAT_RANGES` (`General_Category=Cf`, Unicode 17.0 / ICU 78.2, 21 ranges), and an
+`is_format(point)` helper. `persistence.conversations._forbidden_title_character` uses that
+table instead of the runtime category; the generated block adds `TITLE_FORMAT_RANGES`, and
+`chat-logic.js` tests membership in it instead of `\p{Cf}`. The U+200D and tag-character
+exceptions (`_is_emoji_format` / `emojiFormatCharacter`) are unchanged. The parity test now
+derives boundary texts from `FORMAT_RANGES` (each range's start, end and one code point
+outside, alone and inside ordinary text), so the two validators are compared over the whole
+frozen set rather than a hand-listed sample. The module docstring records the provenance and
+the version, and distinguishes the formal `Cc`/`Cs` stability guarantee from the `Zl`/`Zp`
+singleton definitions and the verified cross-runtime agreement.
+
+### 18.2 F2 — user-facing copy contained «ё»
+
+**Root cause.** The PP-01-A1 title-origin explanation in `chat-logic.js` contained «Своё»
+(line 617 at `f55e089`). The product's spelling rule requires the product's own Russian text
+to use «е», and
+`tests/test_orthography.py::test_no_text_the_product_shows_is_written_with_yo` scans every
+source file whose text people can see, including `chat-logic.js`. The literal therefore
+failed the scan on every Python version.
+
+**Correction.** The literal is spelled «Свое». No other wording, markup, behavior or test
+expectation changed.
+
+### 18.3 Developer RED/GREEN evidence (2026-11-27)
+
+- **F1 RED (Python 3.10.22, Unicode 13.0).** A focused standard-library reproduction of the
+  baseline rule in `python:3.10-slim` shows U+0890, U+0891, U+13439 and U+1343F as `Cn`: the
+  baseline server accepted each while the page's frozen `\p{Cf}` refused
+  (`baseline_match=False`); U+13430 is `Cf` in Unicode 13.0, so both refused. With the frozen
+  table, all five are refused on both sides (`fixed_match=True`).
+- **F1 GREEN (Python 3.12.10, Node.js 24.14.0).** The parity test passes, including the new
+  `FORMAT_RANGES` boundaries.
+- **F2 RED.** Applying the scan's `_FORBIDDEN` pattern to
+  `git show f55e089:house_helper/web/static/chat-logic.js` finds exactly one offender, line
+  617 («Своё»). **F2 GREEN.** The same scan over the working tree finds none, and
+  `test_no_text_the_product_shows_is_written_with_yo` passes.
+- **Affected-area runs on the corrected tree** (Windows 11, Python 3.12.10, Node.js 24.14.0):
+  `tests/test_web_ui_logic.py` + `tests/test_orthography.py` — **575 passed**;
+  `tests/test_persistence_conversations.py` — **141 passed**; `tests/test_web_chat_api.py
+  -k title` — **25 passed**; `tests/test_web_ui.py -k title` — **1 passed**. These are
+  affected-area results, not a full-suite or CI run.
+
+### 18.4 Independent review and remaining gates
+
+The independent Codex review returned **PASS WITH NON-BLOCKING NOTES — no material
+defects**; CI-FIX-01 is accepted. Among the accepted non-blocking notes was that the module
+docstring described the four remaining categories as "fixed by the Unicode stability policy"
+without distinguishing the formal `Cc`/`Cs` guarantee from the `Zl`/`Zp` singleton definitions
+and the verified cross-runtime agreement; that is corrected in
+`house_helper/core/title_unicode.py` by this closure. Verification limitations recorded, not waived: the per-job CI output of run
+`45987365414` is not stored in the repository; the Python 3.10 RED evidence is a focused
+standard-library reproduction, not a full Python 3.10 suite in this environment; and no new
+push-triggered run was made.
+
+**Full CI matrix pending.** The next push-triggered run must be green on Python 3.10 and
+Python 3.12, including the existing PostgreSQL and SQLite workflow gates. Until then no CI
+PASS is claimed.
+
+**Changed files for CI-FIX-01:**
+
+- `house_helper/core/title_unicode.py` — frozen `FORMAT_RANGES`, `is_format`, docstring.
+- `house_helper/persistence/conversations.py` — use `title_unicode.is_format`.
+- `house_helper/web/static/chat-logic.js` — frozen `TITLE_FORMAT_RANGES`; «Свое».
+- `tests/test_web_ui_logic.py` — `FORMAT_RANGES` boundary parity.
+- `docs/product/PP-01-A1_Implementation_Record.md` — this section.
+- `docs/STATUS.md` — the CI-FIX-01 entry.
+
+**Status:** **READY FOR OWNER COMMIT.** No migration, provider call, prompt change,
+Production access, deployment or Git mutation was performed. KHD-50 and KHD-54 are unchanged —
+FIX-01 remains **24 PASS / 6 FAIL**, production release remains **BLOCKED**, and the latest
+documented release strategy remains the combined **HH-BRAND-01-FIX-01 + PP-01-A1** candidate.

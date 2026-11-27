@@ -1,16 +1,18 @@
 """The frozen character policy of a manual conversation title (PP-01-A1 D1, A1-04).
 
-Why frozen. The rule "which characters may stand around a ZERO WIDTH JOINER" and "may
-this title contain any visible character at all" must give one answer on the server and
-in the page. Asking each runtime for its own Unicode property table does not: this
-repository runs Python 3.12 (Unicode 15.0) beside whatever Unicode version the browser
-or Node.js ships (Node.js 24.14.0 has Unicode 17.0), and an emoji assigned between the
-two is an emoji on one side and an unassigned symbol on the other. The tables below are
-a frozen copy of two Unicode properties, used by both validators through
-persistence.conversations and the generated block in chat-logic.js (the parity is
-asserted by tests/test_web_ui_logic.py).
+Why frozen. The rule "which characters may stand around a ZERO WIDTH JOINER", "may this
+title contain any visible character at all" and "which format characters are refused"
+must give one answer on the server and in the page. Asking each runtime for its own
+Unicode property table does not: the supported Pythons do not agree with each other or
+with Node.js. Python 3.10 ships Unicode 13.0, Python 3.12 ships Unicode 15.0, and
+Node.js 24.14.0 ships Unicode 17.0 (ICU 78.2). An emoji assigned between two of them is
+an emoji on one side and an unassigned symbol on the other; a format character assigned
+later is refused by the runtime that knows it and accepted by one that does not. The
+tables below are a frozen copy of the properties and the category that the policy uses,
+shared by both validators through persistence.conversations and the generated block in
+chat-logic.js (the parity is asserted by tests/test_web_ui_logic.py).
 
-The two properties and their version:
+The three frozen tables and their version:
 
 - ``Extended_Pictographic`` -- the emoji base a ZWJ may join. General category ``So``
   is NOT the test: U+2605 BLACK STAR is ``So`` and is not an emoji, so ``★``,
@@ -20,22 +22,36 @@ The two properties and their version:
   is blank, and is refused. Inside a meaningful title they are not refused by
   themselves: a variation selector and the ZWJ of a family emoji are legitimate parts
   of a sequence.
+- ``General_Category=Cf`` -- the format characters. Every one is refused except the two
+  kinds an emoji sequence may use (see "Titles" in persistence.conversations); a frozen
+  table is needed because the category changed across the supported Pythons: U+0890 and
+  U+0891 are unassigned in Unicode 13.0 and ``Cf`` from Unicode 14.0, and
+  U+13439..U+1343F are unassigned in Unicode 13.0 and ``Cf`` from Unicode 15.0, so
+  Python 3.10 would otherwise accept titles that Python 3.12 and the page refuse.
 
-Provenance and version. Both tables were generated from the Unicode properties as
-published in Unicode 17.0 and shipped by ICU 78.2 in Node.js 24.14.0, over the whole
-range U+0000..U+10FFFF, by testing ``\\p{Extended_Pictographic}`` and
-``\\p{Default_Ignorable_Code_Point}`` code point by code point and coalescing adjacent
-code points into the ranges below. The exact generation is reproducible with any runtime
-that exposes the same properties; the version is recorded so a future Unicode revision
-is a deliberate review, not a silent change of what a person may name a conversation.
+Provenance and version. The three tables were generated from the Unicode properties and
+category as published in Unicode 17.0 and shipped by ICU 78.2 in Node.js 24.14.0, over
+the whole range U+0000..U+10FFFF, by testing ``\\p{Extended_Pictographic}``,
+``\\p{Default_Ignorable_Code_Point}`` and ``\\p{Cf}`` code point by code point and
+coalescing adjacent code points into the ranges below. The exact generation is
+reproducible with any runtime that exposes the same properties; the version is recorded
+so a future Unicode revision is a deliberate review, not a silent change of what a
+person may name a conversation.
 
-The category checks for control, surrogate, line/paragraph separator and format
-characters (``Cc``, ``Cs``, ``Zl``, ``Zp``, ``Cf``) still come from each runtime's own
-``unicodedata``/``\\p{...}`` table: those categories are stable for the characters that
-matter here, and the rule for each is "forbidden except the two emoji format kinds".
-A new format character assigned in a future revision would be refused by every runtime
-that knows it and allowed by none that does not; that is a narrower difference than the
-emoji-base one this module removes, and is recorded as a limitation of the policy.
+The category checks for control, surrogate and line/paragraph separator characters
+(``Cc``, ``Cs``, ``Zl``, ``Zp``) still come from each runtime's own
+``unicodedata``/``\\p{...}`` table, and the rule for each is simply "forbidden". The two
+kinds of guarantee differ, though. ``Cc`` and ``Cs`` rest on a formal Unicode stability
+guarantee: the control characters (U+0000..U+001F, U+007F..U+009F) and the surrogate
+code points (U+D800..U+DFFF) are permanently assigned to those categories, and their
+sets are closed to new members, so their verdict is fixed. ``Zl`` and ``Zp`` are
+singleton categories with no such guarantee -- ``Zl`` has exactly one member, U+2028
+LINE SEPARATOR, and ``Zp`` exactly one, U+2029 PARAGRAPH SEPARATOR -- so their verdict
+rests on those singleton definitions together with the verified agreement of the three
+supported runtimes on every code point in all four categories (checked over
+U+0000..U+10FFFF for Python 3.10, Python 3.12 and Node.js 24.14.0). A runtime that
+disagrees, or a future revision that gives ``Zl`` or ``Zp`` another member, is a
+deliberate review, like a table revision; this is recorded as a limitation of the policy.
 
 One explicit non-property addition: U+2800 BRAILLE PATTERN BLANK is ``So``, is not
 default-ignorable, and renders as an empty cell; a title of only U+2800 is blank, so it
@@ -46,7 +62,7 @@ from __future__ import annotations
 
 from typing import Iterable
 
-# The Unicode version the two frozen tables below describe.
+# The Unicode version the three frozen tables below describe.
 TITLE_UNICODE_VERSION = "17.0"
 
 # Extended_Pictographic, Unicode 17.0 (ICU 78.2). 156 ranges.
@@ -101,6 +117,19 @@ DEFAULT_IGNORABLE_RANGES: tuple[tuple[int, int], ...] = (
     (0xE0000, 0xE0FFF),
 )
 
+# General_Category=Cf, Unicode 17.0 (ICU 78.2). 21 ranges. U+200D ZERO WIDTH JOINER
+# and the tag characters U+E0020..U+E007F are in this table: they are the two format
+# kinds an emoji sequence may use, and persistence.conversations permits them only
+# where the sequence needs them.
+FORMAT_RANGES: tuple[tuple[int, int], ...] = (
+    (0x00AD, 0x00AD), (0x0600, 0x0605), (0x061C, 0x061C), (0x06DD, 0x06DD),
+    (0x070F, 0x070F), (0x0890, 0x0891), (0x08E2, 0x08E2), (0x180E, 0x180E),
+    (0x200B, 0x200F), (0x202A, 0x202E), (0x2060, 0x2064), (0x2066, 0x206F),
+    (0xFEFF, 0xFEFF), (0xFFF9, 0xFFFB), (0x110BD, 0x110BD), (0x110CD, 0x110CD),
+    (0x13430, 0x1343F), (0x1BCA0, 0x1BCA3), (0x1D173, 0x1D17A), (0xE0001, 0xE0001),
+    (0xE0020, 0xE007F),
+)
+
 # A character that renders as nothing on its own. Beyond the default-ignorable set,
 # U+2800 BRAILLE PATTERN BLANK is an ordinary symbol whose glyph is an empty cell.
 BRAILLE_PATTERN_BLANK = 0x2800
@@ -124,6 +153,11 @@ def is_default_ignorable(point: int) -> bool:
     return _in_ranges(point, DEFAULT_IGNORABLE_RANGES)
 
 
+def is_format(point: int) -> bool:
+    """True for a General_Category=Cf code point, from the frozen Unicode 17.0 table."""
+    return _in_ranges(point, FORMAT_RANGES)
+
+
 def is_blank_looking(point: int) -> bool:
     """True for a code point that contributes nothing visible to a title."""
     return point == BRAILLE_PATTERN_BLANK or is_default_ignorable(point)
@@ -142,10 +176,11 @@ def javascript_policy_block() -> str:
     return (
         "  // BEGIN GENERATED TITLE UNICODE POLICY -- do not edit by hand.\n"
         f"  // Source: house_helper/core/title_unicode.py, Unicode {TITLE_UNICODE_VERSION}\n"
-        "  // (Extended_Pictographic and Default_Ignorable_Code_Point; ICU 78.2 as shipped\n"
-        "  // by Node.js 24.14.0). Both validators use these frozen tables, so the rule does\n"
-        "  // not depend on either runtime's own Unicode version.\n"
+        "  // (Extended_Pictographic, Default_Ignorable_Code_Point and General_Category=Cf;\n"
+        "  // ICU 78.2 as shipped by Node.js 24.14.0). Both validators use these frozen\n"
+        "  // tables, so the rule does not depend on either runtime's own Unicode version.\n"
         f"  var TITLE_EMOJI_BASE_RANGES = [{_javascript_array(EMOJI_BASE_RANGES)}];\n"
         f"  var TITLE_DEFAULT_IGNORABLE_RANGES = [{_javascript_array(DEFAULT_IGNORABLE_RANGES)}];\n"
+        f"  var TITLE_FORMAT_RANGES = [{_javascript_array(FORMAT_RANGES)}];\n"
         "  // END GENERATED TITLE UNICODE POLICY"
     )

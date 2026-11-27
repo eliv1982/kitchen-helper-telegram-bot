@@ -137,11 +137,14 @@ def _is_emoji_format(character: str) -> bool:
 def _forbidden_title_character(character: str) -> bool:
     """A character a title may not hold at all: controls (line breaks and tabs among
     them), unpaired surrogates, the Unicode line/paragraph separators, and every format
-    character except the two kinds an emoji sequence may use."""
+    character except the two kinds an emoji sequence may use. The format set is the
+    frozen Unicode 17.0 table in core.title_unicode, not the runtime's own category, so
+    Python 3.10 and Python 3.12 refuse the same titles."""
+    point = ord(character)
     category = unicodedata.category(character)
     if category in ("Cc", "Cs", "Zl", "Zp"):
         return True
-    if category == "Cf":
+    if title_unicode.is_format(point):
         return not _is_emoji_format(character)
     return False
 
