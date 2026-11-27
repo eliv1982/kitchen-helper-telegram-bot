@@ -11,7 +11,7 @@
 | Release candidate intent | **HH-BRAND-01-FIX-01 + PP-01-A1** |
 | Final independent acceptance | **PASS — ALL EIGHT FINDINGS CLOSED** (2026-11-27); **17 PASS / 0 FAIL / 0 SKIP**; A1-01 closed with C1 desktop focus verified |
 | Owner acceptance | **ACCEPT WITH NON-BLOCKING NOTES** (2026-11-27); see [`PP-01-A1_Owner_Acceptance_Closure_Record.md`](PP-01-A1_Owner_Acceptance_Closure_Record.md) |
-| Status | Committed as `f55e089cf1397adbb32aedde5c3a4878831c7d79`; independently accepted in full and Owner-accepted with non-blocking notes. The PP-01-A1-CI-FIX-01 correction (§18) is in the working tree and **READY FOR OWNER COMMIT**; the full CI matrix is pending. The intermediate `OPEN` statements in sections 12–16 are chronology, not the final disposition. |
+| Status | Committed as `f55e089cf1397adbb32aedde5c3a4878831c7d79`; independently accepted in full and Owner-accepted with non-blocking notes. The PP-01-A1-CI-FIX-01 correction (§18) was committed as `26f6d15`, and push-triggered **CI #101 PASS** is Owner-confirmed; the increment is part of the HH-REL-01 combined candidate (§19). The intermediate `OPEN` statements in sections 12–16 are chronology, not the final disposition. |
 
 ## 1. Executive summary
 
@@ -781,7 +781,9 @@ push-triggered run was made.
 
 **Full CI matrix pending.** The next push-triggered run must be green on Python 3.10 and
 Python 3.12, including the existing PostgreSQL and SQLite workflow gates. Until then no CI
-PASS is claimed.
+PASS is claimed. *[Updated 2026-11-27: CI-FIX-01 was committed as `26f6d15` and the
+push-triggered **CI #101 PASS** (Owner-confirmed) satisfies this gate; the pre-commit
+statement above is preserved as the state at the time of writing.]*
 
 **Changed files for CI-FIX-01:**
 
@@ -796,3 +798,24 @@ PASS is claimed.
 Production access, deployment or Git mutation was performed. KHD-50 and KHD-54 are unchanged —
 FIX-01 remains **24 PASS / 6 FAIL**, production release remains **BLOCKED**, and the latest
 documented release strategy remains the combined **HH-BRAND-01-FIX-01 + PP-01-A1** candidate.
+*[Updated 2026-11-27: this section's pre-commit status is superseded by §19 — CI-FIX-01 was
+committed as `26f6d15` and CI #101 PASS; the historical wording is preserved.]*
+
+## 19. HH-REL-01 documentary reconciliation (2026-11-27)
+
+The PP-01-A1 increment, including CI-FIX-01, is part of the combined **HH-BRAND-01-FIX-01 +
+PP-01-A1 + PP-01-A1-CI-FIX-01** release candidate accepted as **HH-REL-01**. The accepted
+executable baseline is `26f6d1536789f1b9cb54fa2f29ae8d54be181cc6`; PP-01-A1 is
+`f55e089cf1397adbb32aedde5c3a4878831c7d79`, CI-FIX-01 is `26f6d15`, and push-triggered
+**CI #101 PASS** is Owner-confirmed.
+
+The Owner approved **KHD-56**, a narrow, release-specific conditional exception to KHD-50 that
+applies exclusively to that baseline. The FIX-01 behavioral evaluation remains **FAILED — 24 PASS /
+6 FAIL**; nothing in this record is reclassified. Deployment is **not authorized**: the R5
+production preflight, provenance verification, verified backup, isolated restore and rollback
+readiness are pending, and R6 requires separate explicit Owner authorization under KHD-29. The
+consolidated record is [`HH-REL-01_Release_Record.md`](HH-REL-01_Release_Record.md).
+
+This section is documentation only. It changes no code, test, configuration, prompt, migration or
+deployment asset, and no Git, test, provider, Production or database operation was performed to
+write it.

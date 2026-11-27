@@ -5,12 +5,12 @@
 |---|---|
 | Date | 2026-11-27 |
 | Type | Documentary closure — Owner functional acceptance and targeted retest |
-| Baseline | `def03eaf6b2d0902c6bf2a76bd659adc6cedf04e` on `main`, with the complete PP-01-A1 implementation, R1–R5-C5 corrections and Owner UX corrections uncommitted in the working tree |
+| Baseline | `def03eaf6b2d0902c6bf2a76bd659adc6cedf04e` on `main`, with the complete PP-01-A1 implementation, R1–R5-C5 corrections and Owner UX corrections uncommitted in the working tree *[Updated 2026-11-27: the increment was committed as `f55e089`, its CI-FIX-01 correction as `26f6d15`, and it is part of the HH-REL-01 candidate at `26f6d15` (see §10).]* |
 | Scope authority | [`PP-01-A1_Scope_Lock_v1.0.md`](PP-01-A1_Scope_Lock_v1.0.md) (D1–D7, frozen, unchanged) |
 | Architecture authority | [`PP-01-A1-AD-01_Architecture_Lock_v1.0.md`](../architecture/PP-01-A1-AD-01_Architecture_Lock_v1.0.md) (Option B) and its [Erratum 01](../architecture/PP-01-A1-AD-01_Erratum_01.md) |
 | Owner decision | **ACCEPT WITH NON-BLOCKING NOTES** |
-| Status | **OWNER ACCEPTED WITH NON-BLOCKING NOTES — READY FOR OWNER COMMIT.** Working tree only; not committed, released or deployed. |
-| Release boundary | **KHD-50 unchanged: production release BLOCKED**; the latest documented Owner release strategy remains the combined **HH-BRAND-01-FIX-01 + PP-01-A1** candidate (KHD-54) |
+| Status | **OWNER ACCEPTED WITH NON-BLOCKING NOTES — READY FOR OWNER COMMIT.** Working tree only; not committed, released or deployed. *[Updated 2026-11-27: committed as `f55e089` with CI-FIX-01 `26f6d15`; push-triggered CI #101 PASS (Owner-confirmed); part of the HH-REL-01 candidate (see §10). Not released or deployed.]* |
+| Release boundary | **KHD-50 unchanged: production release BLOCKED**; the latest documented Owner release strategy remains the combined **HH-BRAND-01-FIX-01 + PP-01-A1** candidate (KHD-54). *[Updated 2026-11-27: **KHD-56** narrows KHD-50 for the HH-REL-01 candidate at `26f6d15` only; deployment remains unauthorized pending the R5–R8 gates.]* |
 | Preserved technical record | **FINAL INDEPENDENT ACCEPTANCE: PASS — ALL EIGHT FINDINGS CLOSED** (17 PASS / 0 FAIL / 0 SKIP); **A1-01 closed with C1 desktop focus verified**; AD-C1/AD-C2 and R5-C1…R5-C5 closed as recorded (R5-C5 by the final acceptance); FIX-01 **24 PASS / 6 FAIL** |
 
 ## 1. Executive conclusion
@@ -216,6 +216,11 @@ separate selective-release mechanism, neither of which is authorized here. There
 - the combined candidate remains **BLOCKED** for production release;
 - no deployment, Production access or provider call is authorized or performed by this closure.
 
+*[Updated 2026-11-27: all three points remain true as stated for every release other than
+HH-REL-01. **KHD-56** approves a narrow, release-specific conditional exception for the candidate
+at `26f6d15` only; it does not clear KHD-50 generally, and deployment remains unauthorized pending
+the R5–R8 operational gates. See §10.]*
+
 **Commit boundary:** the Owner may commit the candidate and these records. That commit is not a
 release, does not deploy anything and does not amend KHD-50.
 
@@ -343,3 +348,25 @@ closure.
   or deployed.
 
 **Verdict: OWNER ACCEPTED WITH NON-BLOCKING NOTES — READY FOR OWNER COMMIT**
+
+## 10. Post-acceptance documentary reconciliation — HH-REL-01 (2026-11-27)
+
+This section records the later status transition of the same increment. Sections 1–9 above are the
+Owner acceptance and technical history and are not rewritten.
+
+- PP-01-A1 was committed as `f55e089cf1397adbb32aedde5c3a4878831c7d79`; the PP-01-A1-CI-FIX-01
+  correction was committed as `26f6d15`; push-triggered **CI #101 PASS** is Owner-confirmed. The
+  acceptance in this record and the CI-FIX-01 remediation are therefore closed at those commits.
+- The combined **HH-BRAND-01-FIX-01 + PP-01-A1 + PP-01-A1-CI-FIX-01** candidate is accepted as
+  **HH-REL-01** at baseline `26f6d1536789f1b9cb54fa2f29ae8d54be181cc6`, consolidated in
+  [`HH-REL-01_Release_Record.md`](HH-REL-01_Release_Record.md).
+- **KHD-56** is the Owner's narrow, release-specific conditional exception to KHD-50 for that
+  baseline only. The FIX-01 behavioral evaluation remains **FAILED — 24 PASS / 6 FAIL**; no evidence
+  is reclassified, and the accepted residual-risk cases are 1, 2, 21, 22, 24 and 25.
+- Deployment remains **NOT AUTHORIZED**. R5 (Production provenance, PostgreSQL-specific preflight,
+  verified backup, isolated restore, rollback readiness), R6 (separately authorized deployment),
+  R7 (infrastructure, data, Web, iPhone and Telegram verification) and R8 (final documentary
+  closure) remain pending. The R5–R8 record also notes that `deploy/RUNBOOK.md` §9 describes the
+  SQLite upgrade and must not be mechanically applied to the PostgreSQL Production deployment.
+- This section changes no code, test, configuration, prompt, migration or deployment asset; no Git,
+  test, provider or Production operation was performed to write it.
