@@ -653,5 +653,5 @@ async def test_help_names_favorites_and_says_where_editing_is_available():
 async def test_help_documents_dialogs_new_and_unlink_and_the_mirroring_rule():
     assert "/dialogs" in tc.HELP and "/new" in tc.HELP and "/unlink" in tc.HELP
     assert "МСК" in tc.HELP  # the dialogs list's time zone is explained where commands are
-    assert "не меняет" in tc.HELP and "разговор, который открывает сайт" in tc.HELP
-    assert "только из выбранного разговора" in tc.HELP
+    assert "не меняет" in tc.HELP and "диалог, который открывает сайт" in tc.HELP
+    assert "только из выбранного диалога" in tc.HELP

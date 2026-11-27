@@ -52,7 +52,7 @@ from tests.web_support import TIMEOUT
 
 pytestmark = pytest.mark.asyncio
 
-MOSCOW_LABEL = re.compile(r"\d{2}\.\d{2}\.\d{4} \d{2}:\d{2} МСК")
+MOSCOW_LABEL = re.compile(r"\d{2}\.\d{2}\.\d{4}, \d{2}:\d{2} МСК")
 
 
 def dialog_buttons(call) -> list[dict]:
@@ -143,18 +143,53 @@ async def test_dialogs_lists_every_conversation_newest_first_with_moscow_time(tm
 
         listed = dialog_buttons(call)
         assert [button["text"] for button in listed] == [
-            "✓ " + tc._moscow_time(t.chat.conversation(third).updated_at) + " — Третий вопрос",
-            tc._moscow_time(t.chat.conversation(second).updated_at) + " — Второй вопрос",
-            tc._moscow_time(t.chat.conversation(first).updated_at) + " — Первый вопрос",
+            "✓ Третий вопрос",
+            "2. Второй вопрос",
+            "3. Первый вопрос",
         ]
         assert [button["callback_data"] for button in listed] == [
             f"ds:{UUID(third).hex}:0",
             f"ds:{UUID(second).hex}:0",
             f"ds:{UUID(first).hex}:0",
         ]
-        assert all(MOSCOW_LABEL.search(button["text"]) for button in listed)
+        # The dates are in the message, both absolute and explicitly Moscow time; the
+        # latest available message is the activity, not the stored updated_at.
+        newest = t.chat.conversation(third)
+        assert f"✓ Третий вопрос" in call["text"]
+        assert f"Создан: {tc._moscow_time(newest.created_at)}" in call["text"]
+        assert f"Последнее сообщение: {tc._moscow_time(newest.updated_at)}" in call["text"]
+        assert MOSCOW_LABEL.search(call["text"])
         assert "🗂 Твои диалоги." in call["text"] and "Страница" not in call["text"]
         assert t.chat.backend.calls == calls_before  # navigation never asks the assistant
+
+
+async def test_a_web_rename_is_the_same_stored_title_in_the_dialogs_list(tmp_path):
+    async with telegram_app(tmp_path, ScriptedBackend("Готово.")) as t:
+        await t.pair(MOTHER)
+        conversation = await web_turn(t, "Как сварить борщ?", "w-1")
+
+        renamed = await t.chat.client.patch(
+            f"/api/conversations/{conversation}",
+            json={"title": "Мой борщ"},
+            headers=post_headers(),
+        )
+        assert renamed.status_code == 200, renamed.text
+
+        call = await open_dialogs(t)
+        assert "Мой борщ" in call["text"]
+        [button] = dialog_buttons(call)
+        assert button["text"].endswith("Мой борщ")
+
+        reset = await t.chat.client.patch(
+            f"/api/conversations/{conversation}",
+            json={"title": None},
+            headers=post_headers(),
+        )
+        assert reset.status_code == 200 and reset.json()["title"] == "Как сварить борщ?"
+
+        again = await open_dialogs(t)
+        assert "Мой борщ" not in again["text"]
+        assert "Как сварить борщ?" in again["text"]
 
 
 async def test_dialogs_pages_forward_and_back_in_the_same_order(tmp_path):
@@ -238,9 +273,38 @@ async def test_every_conversation_is_reachable_past_the_old_hundred_page_ceiling
 
 async def test_the_moscow_label_is_explicit_and_the_zone_is_not_a_locale_guess():
     assert tc._moscow_time(datetime(2026, 10, 28, 12, 0, tzinfo=timezone.utc)) == (
-        "28.10.2026 15:00 МСК"
+        "28.10.2026, 15:00 МСК"
     )
     assert tc.MOSCOW_LABEL == "МСК"
+
+
+async def test_a_full_page_of_maximum_titles_still_fits_one_telegram_message():
+    from house_helper.persistence.conversations import ConversationSummary
+
+    at = datetime(2026, 10, 28, 12, 0, tzinfo=timezone.utc)
+    item = ConversationSummary(
+        id=UUID("11111111-1111-4111-8111-111111111111"),
+        title="😀" * 200,
+        created_at=at,
+        updated_at=at,
+        last_message_at=at,
+        title_origin="manual",
+        can_reset_title=True,
+    )
+    page = tc._DialogsPage(
+        conversations=[item] * tc.DIALOGS_PAGE_SIZE,
+        page=99,
+        pages=101,
+        total=808,
+        active_id=item.id,
+        selected_deleted=True,
+    )
+
+    text, markup = tc._dialogs_view(page)
+
+    assert len(text.encode("utf-16-le")) // 2 <= 4096  # Telegram's message limit
+    assert len(markup["inline_keyboard"]) == tc.DIALOGS_PAGE_SIZE + 1  # + the page navigation
+    assert text.count("😀" * 200) == tc.DIALOGS_PAGE_SIZE  # every full title is shown in the message
 
 
 # --- choosing ---------------------------------------------------------------------------------
@@ -258,7 +322,7 @@ async def test_choosing_an_older_conversation_restores_its_context_without_repla
         confirmation = await choose(t, older)
 
         assert confirmation["text"].startswith("🗂 Выбран диалог: «Что на обед?».")
-        assert "Продолжай писать — я учту контекст этого разговора." in confirmation["text"]
+        assert "Продолжай писать — я учту контекст этого диалога." in confirmation["text"]
         assert save_buttons(confirmation) == [
             {"text": tc.DIALOGS_BACK, "callback_data": f"{tc.DIALOGS_LIST_PREFIX}:0"}
         ]

@@ -1,10 +1,12 @@
 """The web chat API: conversations and their messages.
 
-Five routes, all under /api, all answering JSON:
+Six routes, all under /api, all answering JSON:
 
   POST   /api/conversations                     a new, empty conversation (body: {})
   GET    /api/conversations                     the user's conversations, newest activity first,
-                                                each named by its first unexpired message
+                                                each named by its stored title or first unexpired message
+  PATCH  /api/conversations/{id}                set ({"title": "..."}) or reset ({"title": null})
+                                                the user's own title for the conversation
   DELETE /api/conversations/{id}                delete the user's conversation and its history
   GET    /api/conversations/{id}/messages       the history (?limit=1..100, ?before=<message id>)
   POST   /api/conversations/{id}/messages       send a message, get the assistant's answer
@@ -67,11 +69,13 @@ Requests. A mutation must be application/json (a cross-site HTML form cannot sen
 at most MAX_BODY bytes, strict UTF-8 JSON without duplicate keys, with exactly the
 fields it names. Its Origin, if the browser sends one, must be this site's (a request
 without one passes, as for logout, unless it says it is cross-site in Sec-Fetch-Site).
-The message text is trimmed, must not be empty, must not exceed MAX_INPUT_LENGTH
-characters, and must not contain a control character other than tab, newline and
-carriage return, or a lone surrogate: those cannot be stored everywhere (NUL cannot be
-in a PostgreSQL text value, a surrogate cannot be encoded as UTF-8). No CORS header is
-sent, ever: the page is served from the same origin as the API.
+The one exception is the conversation-title PATCH: it requires exactly one Origin header,
+matching this site's, because that is what the A1 Scope Lock promises; Fetch Metadata is
+not accepted in its place. The message text is trimmed, must not be empty, must not exceed
+MAX_INPUT_LENGTH characters, and must not contain a control character other than tab,
+newline and carriage return, or a lone surrogate: those cannot be stored everywhere (NUL
+cannot be in a PostgreSQL text value, a surrogate cannot be encoded as UTF-8). No CORS
+header is sent, ever: the page is served from the same origin as the API.
 
 Reading writes nothing: the two GET routes take no write lock and never move a
 conversation's updated_at.
@@ -206,6 +210,23 @@ async def authenticated_mutation(
     return await require_user(request, auth)
 
 
+async def authenticated_title_mutation(
+    request: Request, auth: AuthService = Depends(get_auth_service)
+) -> AuthenticatedSession:
+    """The user of a conversation-title write, which requires the Origin explicitly.
+
+    PP-01-A1's Scope Lock (section 3) says PATCH is refused without the application's
+    Origin, like every other mutation, and the audit reads that as exactly one Origin
+    header equal to this site's. A request with no Origin, repeated Origins, a foreign
+    one or a malformed one is forbidden_origin. Sec-Fetch-Site is never consulted as a
+    substitute: a request that says same-origin there but carries no Origin is refused,
+    unlike the other mutations. Authentication and account isolation are unchanged."""
+    origins = request.headers.getlist("origin")
+    if len(origins) != 1 or origins[0] != auth.settings.origin:
+        raise ApiError("forbidden_origin")
+    return await require_user(request, auth)
+
+
 # --- reading a request ---------------------------------------------------------------
 
 
@@ -316,8 +337,13 @@ def _conversation_json(summary: conversations.ConversationSummary) -> dict[str, 
     return {
         "id": str(summary.id),
         "title": summary.title,
+        "title_origin": summary.title_origin,
+        "can_reset_title": summary.can_reset_title,
         "created_at": _timestamp(summary.created_at),
         "updated_at": _timestamp(summary.updated_at),
+        "last_message_at": (
+            None if summary.last_message_at is None else _timestamp(summary.last_message_at)
+        ),
     }
 
 
@@ -484,6 +510,58 @@ async def delete_conversation(
     except ConversationNotFound:
         raise ApiError("conversation_not_found") from None
     return Response(status_code=204)
+
+
+@router.patch("/conversations/{conversation_id}")
+async def rename_conversation(
+    request: Request,
+    conversation_id: str,
+    current: AuthenticatedSession = Depends(authenticated_title_mutation),
+    database: WebDatabase = Depends(get_database),
+) -> Response:
+    """Set or reset the signed-in person's own title for a conversation.
+
+    Body: {"title": "<text>"} stores a user title; {"title": null} removes it and
+    restores the derived (or missing) one. The answer is the conversation as the list
+    shows it, so the page takes the resulting title and its origin from the server. A
+    title over 200 code points is refused, never truncated. A conversation that is
+    unknown, somebody else's or not a UUID is the same 404. A rename is navigation
+    metadata: it changes no message, no object and no activity time.
+    """
+    wanted = _conversation_id(conversation_id)
+    document = await _read_json_object(request)
+    if set(document) != {"title"}:
+        raise ApiError("invalid_request", category="UnexpectedFields")
+    raw = document["title"]
+    now = request.app.state.clock()
+    if raw is None:
+        def operation(session: Any) -> conversations.ConversationSummary:
+            return conversations.reset_conversation_title(
+                session, current.user_id, wanted, now=now
+            )
+    elif isinstance(raw, str):
+        try:
+            title = conversations.normalize_conversation_title(raw)
+        except conversations.InvalidConversationTitle as exc:
+            raise ApiError(
+                {
+                    "empty": "empty_title",
+                    "too_long": "title_too_long",
+                    "characters": "invalid_title",
+                }[exc.reason]
+            ) from None
+
+        def operation(session: Any) -> conversations.ConversationSummary:
+            return conversations.set_conversation_title(
+                session, current.user_id, wanted, title=title, now=now
+            )
+    else:
+        raise ApiError("invalid_request", category="UnexpectedFields")
+    try:
+        summary = await database.run(operation)
+    except ConversationNotFound:
+        raise ApiError("conversation_not_found") from None
+    return JSONResponse(_conversation_json(summary))
 
 
 @router.get("/conversations/{conversation_id}/messages")

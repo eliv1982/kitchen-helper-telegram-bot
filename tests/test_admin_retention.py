@@ -32,6 +32,7 @@ from house_helper.admin import retention
 from house_helper.admin.retention import Category
 from house_helper.admin.target import open_target
 from house_helper.persistence import authn, email_login, invitations
+from house_helper.persistence import conversations as cv
 from house_helper.persistence.allowlist import allow, allowed_user, revoke
 from house_helper.persistence.base import RETENTION
 from house_helper.persistence.conversations import list_messages
@@ -40,7 +41,7 @@ from house_helper.persistence.database import (
     create_db_engine,
     create_session_factory,
 )
-from house_helper.persistence.models import TELEGRAM_CUTOVER_UPDATE_ID
+from house_helper.persistence.models import TELEGRAM_CUTOVER_UPDATE_ID, Conversation
 from tests.admin_support import db_path, sqlite_db_url as db_url, migrated_template, snapshot  # noqa: F401  (fixtures)
 
 # CI-02/R2-09: SQLite-scoped (the SQLite file, its engine, and its byte snapshots).
@@ -388,6 +389,97 @@ def seed_history(s: Seed):
     kept["turn_requests"].append(theirs_exchange.request)
     kept["conversations"].append(theirs)
     return gone, kept
+
+
+def test_a_manual_title_does_not_keep_an_old_empty_conversation_and_goes_with_it(db_url):
+    def fill(s):
+        conversation = s.conversation(s.user(), created=ago(days=500), updated=ago(days=500))
+        return conversation
+
+    conversation = seeded(db_url, fill)
+
+    # PP-01-A1: a stored user title is metadata on the conversation row, written by the
+    # application itself here. It adds no activity and no message, so it cannot keep an
+    # otherwise eligible conversation, and its row is deleted with the conversation.
+    engine = create_db_engine(db_url)
+    try:
+        with create_session_factory(engine)() as session, session.begin():
+            cv.set_conversation_title(
+                session,
+                conversation.user_id,
+                conversation.id,
+                title="Своё название",
+                now=NOW,
+            )
+        assert read(db_url, "SELECT title FROM conversations") == [("Своё название",)]
+    finally:
+        engine.dispose()
+
+    report = purge(db_url)
+
+    assert report.deleted["conversations"] == 1
+    assert read(db_url, "SELECT title FROM conversations") == []
+    integrity(db_url)
+
+
+def _partial_title_history(s: Seed):
+    """A title-bearing conversation with one expired user message and one live exchange,
+    seeded through the ordinary builders (the title itself is written later, by the
+    application's own `set_conversation_title`)."""
+    conversation = s.conversation(s.user(), created=ago(days=400), updated=ago(days=10))
+    old = s.message(conversation, "user", "старый вопрос", created=ago(days=400))
+    kept_question = s.message(conversation, "user", "свежий вопрос", created=ago(days=10))
+    kept_answer = s.message(
+        conversation,
+        "assistant",
+        "свежий ответ",
+        created=ago(days=10) + timedelta(seconds=5),
+    )
+    return conversation, old, kept_question, kept_answer
+
+
+def test_a_manual_title_survives_a_partial_message_purge_and_reset_uses_the_surviving_text(db_url):
+    """A1-08: the physical purge is exercised, not only the expiry-filtered read. A title
+    written by the application survives while its conversation survives, individual old
+    messages go, and a reset then derives a name from the user text that remains."""
+    conversation, old, kept_question, kept_answer = seeded(db_url, _partial_title_history)
+    kept_ids = {kept_question.id, kept_answer.id}
+    engine = create_db_engine(db_url)
+    try:
+        with create_session_factory(engine)() as session, session.begin():
+            cv.set_conversation_title(
+                session, conversation.user_id, conversation.id, title="Своё", now=NOW
+            )
+    finally:
+        engine.dispose()
+
+    assert read(db_url, "SELECT title FROM conversations") == [("Своё",)]
+
+    report = purge(db_url)
+
+    # The old user message is physically gone; the newer pair and the conversation stay.
+    assert report.deleted["messages"] == 1
+    assert present(db_url, "messages") == kept_ids
+    assert present(db_url, "conversations") == {conversation.id.hex}
+    assert old.id not in present(db_url, "messages")
+    assert read(db_url, "SELECT title FROM conversations") == [("Своё",)]
+
+    # Reset works from the surviving eligible user text, and no title metadata is left.
+    engine = create_db_engine(db_url)
+    try:
+        with create_session_factory(engine)() as session, session.begin():
+            reset = cv.reset_conversation_title(
+                session, conversation.user_id, conversation.id, now=NOW
+            )
+        assert (reset.title, reset.title_origin, reset.can_reset_title) == (
+            "свежий вопрос",
+            "derived",
+            False,
+        )
+    finally:
+        engine.dispose()
+    assert read(db_url, "SELECT title FROM conversations") == [(None,)]
+    integrity(db_url)
 
 
 def test_history_older_than_365_days_is_deleted_and_newer_history_stays(db_url):

@@ -522,18 +522,22 @@ def test_the_latest_conversation_is_the_one_the_website_lists_first(factory, use
         user, other = db.get(User, user_id), db.get(User, other_user_id)
         old = new_conversation(db, user, created_at=NOW, updated_at=NOW)
         newest = new_conversation(db, user, created_at=NOW, updated_at=NOW + timedelta(hours=3))
-        new_conversation(db, other, created_at=NOW, updated_at=NOW + timedelta(days=30))
+        theirs = new_conversation(db, other, created_at=NOW, updated_at=NOW + timedelta(days=30))
+        # The ordering is the latest available message, not updated_at: the two conversations
+        # are told apart by their messages, and the other account's newer one is never the user's.
+        for conversation, at in ((old, NOW), (newest, NOW + timedelta(hours=3)), (theirs, NOW + timedelta(days=30))):
+            new_message(db, conversation, "user", "вопрос", created_at=at, expires_at=at + timedelta(days=1))
         return old.id, newest.id
 
     old, newest = run(factory, make)
 
-    assert run(factory, lambda db: tg.latest_conversation_id(db, user_id)) == newest
-    assert run(factory, lambda db: tg.latest_conversation_id(db, uuid4())) is None
+    assert run(factory, lambda db: tg.latest_conversation_id(db, user_id, now=NOW + timedelta(hours=1))) == newest
+    assert run(factory, lambda db: tg.latest_conversation_id(db, uuid4(), now=NOW)) is None
     assert old != newest
 
 
 def test_a_user_with_no_conversation_has_no_latest(factory, user_id):
-    assert run(factory, lambda db: tg.latest_conversation_id(db, user_id)) is None
+    assert run(factory, lambda db: tg.latest_conversation_id(db, user_id, now=NOW)) is None
 
 
 def test_the_conversation_of_a_request_is_found_through_the_users_own_conversations_only(

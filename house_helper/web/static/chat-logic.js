@@ -114,6 +114,7 @@
   var MAX_EDIT_TEXT = 100000; // the server's MAX_FAVORITE_TEXT_LENGTH
   var MAX_EDIT_NOTES = 2000; // the server's MAX_FAVORITE_NOTES_LENGTH
   var MAX_PROFILE_NAME = 200; // the server's users.display_name width, in code points
+  var MAX_CONVERSATION_TITLE = 200; // the server's conversations.title width, in code points
   var TEXT_SIZE_VALUES = { normal: true, large: true }; // the server's TextSize values
   // The approved personal household-measure ranges and system defaults (D18/D19): the
   // same numbers core.measures holds, repeated in persistence.profile. The profile read is
@@ -174,15 +175,15 @@
     // known (or is not a success): it does not claim the session is closed.
     logoutUnconfirmed:
       "Не удалось подтвердить выход из аккаунта: сессия, возможно, еще открыта. " +
-      "Разговоры скрыты. Нажмите «Выйти еще раз», когда появится связь.",
+      "Диалоги скрыты. Нажмите «Выйти еще раз», когда появится связь.",
     // Said when a sign-out (the first try, or the repeat of an unconfirmed one) finds another person's session in
     // the browser: the server ended nothing. It says neither who signed in nor that the first session is closed
     // (it is not known).
     logoutMismatch:
       "Выход не выполнен: в этом браузере уже вошел другой пользователь, и его вход не затронут. " +
-      "Прежние разговоры скрыты. Нажмите «Повторить», чтобы открыть страницу заново.",
+      "Прежние диалоги скрыты. Нажмите «Повторить», чтобы открыть страницу заново.",
     unverified:
-      "Не удалось проверить, кто сейчас вошел в аккаунт, поэтому разговоры скрыты, пока это не выяснится.",
+      "Не удалось проверить, кто сейчас вошел в аккаунт, поэтому диалоги скрыты, пока это не выяснится.",
     retry: "Повторить",
     logoutAgain: "Выйти еще раз",
     loading: "Загружаем…",
@@ -196,30 +197,76 @@
     emailSent:
       "Если этот адрес есть в списке разрешенных, мы отправили на него письмо со ссылкой для входа. " +
       "Если письма нет, проверьте папку «Спам» или подождите немного и запросите ссылку снова.",
-    listFailed: "Не удалось загрузить список разговоров.",
-    threadFailed: "Не удалось загрузить разговор.",
+    listFailed: "Не удалось загрузить список диалогов.",
+    threadFailed: "Не удалось загрузить диалог.",
     olderFailed: "Не удалось загрузить более ранние сообщения.",
-    conversationGone: "Этот разговор больше недоступен.",
-    createRejected: "Не удалось начать разговор.",
-    deleteNamed: "Удалить разговор",
+    conversationGone: "Этот диалог больше недоступен.",
+    createRejected: "Не удалось начать диалог.",
+    deleteNamed: "Удалить диалог",
     deleteAsk:
-      "Удалить этот разговор? Все его сообщения будут удалены без возможности восстановления. " +
+      "Удалить этот диалог? Все его сообщения будут удалены без возможности восстановления. " +
       "Сохраненные рецепты в избранном останутся.",
     deleteConfirm: "Удалить",
     deleteCancel: "Отмена",
     deleting: "Удаляем…",
-    deleteFailed: "Не удалось удалить разговор. Попробуйте еще раз.",
-    deleted: "Разговор удален.",
+    deleteFailed: "Не удалось удалить диалог. Попробуйте еще раз.",
+    deleted: "Диалог удален.",
+    // PP-01-A1: the conversation title controls. Every label is the product's Russian
+    // wording; the explanations describe the actual mechanism in persistence.conversations.
+    rename: "Переименовать",
+    titleOrigin: "Как создано название",
+    resetTitle: "Сбросить название",
+    titleDialogLabel: "Название диалога",
+    titleSave: "Сохранить",
+    titleCancel: "Отмена",
+    titleSaving: "Сохраняем…",
+    titleRenamed: "Название изменено.",
+    titleReset: "Название сброшено.",
+    titleClose: "Закрыть",
+    titleOriginManual: "Вы сами задали название этого диалога.",
+    titleOriginDerived: "Название взято из начала вашего первого сообщения с текстом.",
+    titleOriginNone: "Название пока не задано: в диалоге нет доступных сообщений.",
+    titleOriginNoText: "В доступных сообщениях нет вашего текста, поэтому название не задано.",
+    // A1-01: the server has not answered a title write within the page's soft timeout.
+    // The request is still out and later writes of this conversation wait behind it; this
+    // says so instead of pretending the write finished. It is not an error yet.
+    titlePending:
+      "Сервер пока не подтвердил изменение названия. Ждем ответа; следующие изменения " +
+      "названия этого диалога будут отправлены только после него.",
+    // A1-01: the outcome is not known. No answer at all, a 4xx that is not one of this
+    // application's pre-commit title refusals, or any 5xx can follow a write the server has
+    // already committed -- the application's own "internal_error" is written after its
+    // database work, and a proxy's answer (408, 429, 5xx) can be written either side of
+    // it. The write may or may not have been stored, and a later write must not be sent
+    // past it (it could then be committed before the earlier one). The page keeps this
+    // conversation's title writes guarded. Reloading shows the current stored title but
+    // does not cancel or roll back the earlier request, and ordering across reloads or
+    // between tabs is not guaranteed and is not claimed here.
+    titleUnconfirmed:
+      "Не удалось подтвердить результат изменения названия. Запрос еще может завершиться " +
+      "на сервере. Обновление страницы позволит проверить текущее название, но не " +
+      "гарантирует, что предыдущая операция уже завершилась.",
+    titleUnconfirmedShort: "Название не подтверждено",
+    titleEmpty: "Название не может быть пустым.",
+    titleTooLong: "Название слишком длинное: максимум 200 символов.",
+    titleCharacters:
+      "В названии есть недопустимые символы: переносы строк и управляющие символы запрещены.",
+    titleRenameFailed: "Не удалось сохранить название. Попробуйте еще раз.",
+    titleResetFailed: "Не удалось сбросить название. Попробуйте еще раз.",
+    createdLabel: "Создан",
+    lastMessageLabel: "Последнее сообщение",
+    noMessages: "Нет сообщений",
+    moscowSuffix: "МСК",
     createUncertain:
-      "Не удалось убедиться, что новый разговор создан. Ваше сообщение осталось в поле ввода, " +
-      "список разговоров обновлен: проверьте, нет ли в нем нового разговора. " +
+      "Не удалось убедиться, что новый диалог создан. Ваше сообщение осталось в поле ввода, " +
+      "список диалогов обновлен: проверьте, нет ли в нем нового диалога. " +
       "Если нет — нажмите «Отправить» еще раз.",
     replied: "Федя ответил.",
     preparing: "Федя готовит ответ…",
     sending: "Отправляем…",
     slow: "Ответ готовится дольше обычного. Подождите еще немного.",
     slower: "Все еще готовится. Ответ может занять до минуты.",
-    waitingBusy: "В этом разговоре еще готовится предыдущий ответ. Подождите — отправим сообщение сами.",
+    waitingBusy: "В этом диалоге еще готовится предыдущий ответ. Подождите — отправим сообщение сами.",
     waitingOwn: "Ответ на это сообщение еще готовится. Подождите немного.",
     checking: "Проверяем, дошло ли сообщение…",
     stalled: "Ответ все еще не готов. Нажмите «Повторить» — сообщение не будет отправлено дважды.",
@@ -243,15 +290,15 @@
       "Нажмите «Повторить», чтобы убедиться в этом — оно не будет отправлено дважды.",
     hintUncertain:
       "Сначала нажмите «Повторить» у сообщения выше: пока сервер не подтвердил, что с ним, " +
-      "новое сообщение в этом разговоре отправить нельзя.",
+      "новое сообщение в этом диалоге отправить нельзя.",
     notSaved:
       "Браузер не сохраняет это сообщение. Если закрыть или перезагрузить страницу, сначала посмотрите " +
-      "историю разговора и только потом отправляйте его заново.",
+      "историю диалога и только потом отправляйте его заново.",
     expiredRecords:
       "Неподтвержденное сообщение старше 6 часов удалено из памяти страницы. " +
-      "Проверьте историю разговора: возможно, оно дошло.",
-    historyLoading: "Загружаем историю разговора. Отправка станет доступна, когда она загрузится.",
-    historyUnavailable: "Не удалось загрузить историю разговора, поэтому отправка пока недоступна. Загрузите ее еще раз.",
+      "Проверьте историю диалога: возможно, оно дошло.",
+    historyLoading: "Загружаем историю диалога. Отправка станет доступна, когда она загрузится.",
+    historyUnavailable: "Не удалось загрузить историю диалога, поэтому отправка пока недоступна. Загрузите ее еще раз.",
     failedGeneric: "Не удалось получить ответ. Попробуйте еще раз.",
     correlation: "Номер обращения: {id}",
     emptyThread: GREETING_PARTS,
@@ -259,7 +306,7 @@
     helpTitle: "Как пользоваться помощником",
     help: HELP_BODY,
     // The favorites: the recipes the person kept.
-    chatsTab: "Разговоры",
+    chatsTab: "Диалоги",
     favoritesTab: "Избранное",
     favoritesLoading: "Загружаем избранное…",
     favoritesFailed: "Не удалось загрузить избранное.",
@@ -520,7 +567,7 @@
     profileTab: "Профиль",
     profileLoading: "Загружаем профиль…",
     profileFailed: "Не удалось загрузить профиль.",
-    profileOthersWork: "Остальные разделы работают: разговоры, избранное и покупки доступны.",
+    profileOthersWork: "Остальные разделы работают: диалоги, избранное и покупки доступны.",
     profileNameLabel: "Отображаемое имя",
     profileNameNotSet: "Имя не задано",
     profileNameHint: "От 1 до 200 символов. Невидимые и управляющие символы не допускаются.",
@@ -556,20 +603,27 @@
     profileDataTitle: "Ваши данные",
     profileDataMessages:
       "Сообщения и фотографии к ним хранятся 365 дней с момента создания, после чего " +
-      "автоматическая очистка удаляет их. Разговор не удаляется только из-за возраста: " +
-      "старый разговор, в котором есть более новые сообщения, остается. Очистка удаляет " +
-      "разговор, только когда в нем не осталось сообщений и им не пользовались 365 дней.",
+      "автоматическая очистка удаляет их. Диалог не удаляется только из-за возраста: " +
+      "старый диалог, в котором есть более новые сообщения, остается. Очистка удаляет " +
+      "диалог, только когда в нем не осталось сообщений и им не пользовались 365 дней.",
     profileDataRecipes:
       "Ответы помощника с рецептами — это сообщения: каждый хранится 365 дней с момента " +
-      "создания и удаляется автоматически, даже если сам разговор остается. " +
+      "создания и удаляется автоматически, даже если сам диалог остается. " +
       "Рецепты, сохраненные в избранное, хранятся, пока вы сами их не удалите.",
+    profileDataTitles:
+      "У диалога может быть автоматическое название — начало первого доступного сообщения " +
+      "пользователя — или ваше собственное. В меню рядом с названием диалог можно " +
+      "переименовать, там же объясняется, как создано текущее название, и его можно сбросить. " +
+      "Своё название хранится, пока вы его не сбросите или не удалите диалог; истечение " +
+      "отдельных сообщений его не удаляет. Переименование не продлевает срок хранения " +
+      "сообщений или диалога. При удалении диалога его название удаляется вместе с ним.",
     profileDataShopping:
       "Списки покупок автоматически не удаляются: они хранятся, пока вы сами их не удалите.",
     profileDataOpenAI:
-      "Чтобы ответить, помощник отправляет в OpenAI сообщения текущего разговора и фотографии к ним. " +
+      "Чтобы ответить, помощник отправляет в OpenAI сообщения текущего диалога и фотографии к ним. " +
       "Профиль, избранное и списки покупок в OpenAI не отправляются.",
     profileDataDelete:
-      "Разговор можно удалить в меню рядом с его названием, рецепт — в избранном, " +
+      "Диалог можно удалить в меню рядом с его названием, рецепт — в избранном, " +
       "список покупок — в разделе «Покупки». Удаленное восстановить нельзя.",
     profileDataProfile:
       "Имя и размер текста хранятся на сервере в вашем профиле.",
@@ -591,6 +645,10 @@
       "Не удалось отправить сообщение: ключ запроса некорректен. Обновите страницу и попробуйте еще раз.",
     empty_message: "Сообщение не должно быть пустым.",
     invalid_message_text: "В сообщении есть недопустимые символы.",
+    empty_title: "Название не может быть пустым.",
+    title_too_long: "Название слишком длинное: максимум 200 символов.",
+    invalid_title:
+      "В названии есть недопустимые символы: переносы строк и управляющие символы запрещены.",
     message_too_long: "Сообщение слишком длинное (максимум {max_length} символов). Сократите его и отправьте снова.",
     invalid_query: "Параметры запроса указаны неверно.",
     invalid_display_name:
@@ -600,7 +658,7 @@
       "Укажите объем целым числом в миллилитрах: стакан — от 50 до 1000, " +
       "чайная ложка — от 1 до 20, столовая ложка — от 5 до 50.",
     not_authenticated: "Войдите в аккаунт, чтобы продолжить.",
-    conversation_not_found: "Разговор не найден.",
+    conversation_not_found: "Диалог не найден.",
     message_not_found: "Этот ответ не найден: возможно, он уже удален.",
     favorite_not_found: "Этого рецепта нет в избранном.",
     recipe_not_found: "В этом ответе нет такого рецепта.",
@@ -617,10 +675,10 @@
       "Этот ключ запроса уже использован для другого списка покупок. Сохраните список заново.",
     shopping_list_deleted: "Этот список покупок уже удален. Сохраните новый список.",
     idempotency_key_reused: "Этот ключ запроса уже использован для другого сообщения. Отправьте сообщение заново.",
-    conversation_busy: "В этом разговоре еще готовится предыдущий ответ. Подождите немного и повторите.",
+    conversation_busy: "В этом диалоге еще готовится предыдущий ответ. Подождите немного и повторите.",
     turn_in_progress: "Ответ на это сообщение еще готовится. Подождите немного.",
     turn_superseded:
-      "Это сообщение уже нельзя повторить: в разговоре появились новые. Отправьте его заново как новое.",
+      "Это сообщение уже нельзя повторить: в диалоге появились новые. Отправьте его заново как новое.",
     idempotency_key_unusable: "Этот запрос больше нельзя повторить. Отправьте сообщение заново.",
     provider_rate_limited: "Сейчас слишком много запросов к помощнику. Подождите немного и попробуйте снова.",
     provider_unreachable: "Не удалось связаться с помощником. Попробуйте еще раз чуть позже.",
@@ -817,7 +875,155 @@
     return { ok: true, text: text, count: count };
   }
 
-  // --- household measures: the form's values and how a fraction is called -----------------------
+  // The conversation title's checks, as the server makes them (persistence.conversations.
+  // normalize_conversation_title): trimmed, not empty, at most 200 code points, visibly
+  // non-blank, and no control, surrogate or line/paragraph separator character. Forbidden
+  // characters are checked before trimming, so a trailing newline or a leading U+2028 is
+  // refused rather than silently removed by the trim. A title whose every remaining
+  // character is invisible (default-ignorable, or the blank braille cell U+2800) is
+  // refused. The emoji format characters are allowed only where a sequence needs them:
+  // ZWJ between two emoji bases, and lowercase tag letters (a-z) inside a U+1F3F4
+  // subdivision-flag sequence. "Emoji base" is the frozen Extended_Pictographic table
+  // below, not the runtime's category So: U+2605 BLACK STAR is So and is not an emoji.
+  // Both validators use the same frozen tables, so the rule does not depend on the
+  // runtime's Unicode version (Python 3.12 has 15.0; Node.js 24 has 17.0). The server
+  // stays the authority; this words the refusal at once and keeps the page and the API
+  // in step (tests/test_web_ui_logic.py compares the two over generated titles).
+  var TITLE_FORBIDDEN_CATEGORY = /[\p{Cc}\p{Cs}\p{Zl}\p{Zp}]/u;
+  var TITLE_FORMAT_CATEGORY = /\p{Cf}/u;
+  var TITLE_TAG_LETTER_FIRST = 0xe0061;
+  var TITLE_TAG_LETTER_LAST = 0xe007a;
+  var TITLE_TAG_FIRST = 0xe0020;
+  var TITLE_TAG_LAST = 0xe007f;
+  var TITLE_FLAG_BASE = 0x1f3f4;
+  var TITLE_BRAILLE_BLANK = 0x2800;
+
+  // BEGIN GENERATED TITLE UNICODE POLICY -- do not edit by hand.
+  // Source: house_helper/core/title_unicode.py, Unicode 17.0
+  // (Extended_Pictographic and Default_Ignorable_Code_Point; ICU 78.2 as shipped
+  // by Node.js 24.14.0). Both validators use these frozen tables, so the rule does
+  // not depend on either runtime's own Unicode version.
+  var TITLE_EMOJI_BASE_RANGES = [[0x00A9, 0x00A9], [0x00AE, 0x00AE], [0x203C, 0x203C], [0x2049, 0x2049], [0x2122, 0x2122], [0x2139, 0x2139], [0x2194, 0x2199], [0x21A9, 0x21AA], [0x231A, 0x231B], [0x2328, 0x2328], [0x23CF, 0x23CF], [0x23E9, 0x23F3], [0x23F8, 0x23FA], [0x24C2, 0x24C2], [0x25AA, 0x25AB], [0x25B6, 0x25B6], [0x25C0, 0x25C0], [0x25FB, 0x25FE], [0x2600, 0x2604], [0x260E, 0x260E], [0x2611, 0x2611], [0x2614, 0x2615], [0x2618, 0x2618], [0x261D, 0x261D], [0x2620, 0x2620], [0x2622, 0x2623], [0x2626, 0x2626], [0x262A, 0x262A], [0x262E, 0x262F], [0x2638, 0x263A], [0x2640, 0x2640], [0x2642, 0x2642], [0x2648, 0x2653], [0x265F, 0x2660], [0x2663, 0x2663], [0x2665, 0x2666], [0x2668, 0x2668], [0x267B, 0x267B], [0x267E, 0x267F], [0x2692, 0x2697], [0x2699, 0x2699], [0x269B, 0x269C], [0x26A0, 0x26A1], [0x26A7, 0x26A7], [0x26AA, 0x26AB], [0x26B0, 0x26B1], [0x26BD, 0x26BE], [0x26C4, 0x26C5], [0x26C8, 0x26C8], [0x26CE, 0x26CF], [0x26D1, 0x26D1], [0x26D3, 0x26D4], [0x26E9, 0x26EA], [0x26F0, 0x26F5], [0x26F7, 0x26FA], [0x26FD, 0x26FD], [0x2702, 0x2702], [0x2705, 0x2705], [0x2708, 0x270D], [0x270F, 0x270F], [0x2712, 0x2712], [0x2714, 0x2714], [0x2716, 0x2716], [0x271D, 0x271D], [0x2721, 0x2721], [0x2728, 0x2728], [0x2733, 0x2734], [0x2744, 0x2744], [0x2747, 0x2747], [0x274C, 0x274C], [0x274E, 0x274E], [0x2753, 0x2755], [0x2757, 0x2757], [0x2763, 0x2764], [0x2795, 0x2797], [0x27A1, 0x27A1], [0x27B0, 0x27B0], [0x27BF, 0x27BF], [0x2934, 0x2935], [0x2B05, 0x2B07], [0x2B1B, 0x2B1C], [0x2B50, 0x2B50], [0x2B55, 0x2B55], [0x3030, 0x3030], [0x303D, 0x303D], [0x3297, 0x3297], [0x3299, 0x3299], [0x1F004, 0x1F004], [0x1F02C, 0x1F02F], [0x1F094, 0x1F09F], [0x1F0AF, 0x1F0B0], [0x1F0C0, 0x1F0C0], [0x1F0CF, 0x1F0D0], [0x1F0F6, 0x1F0FF], [0x1F170, 0x1F171], [0x1F17E, 0x1F17F], [0x1F18E, 0x1F18E], [0x1F191, 0x1F19A], [0x1F1AE, 0x1F1E5], [0x1F201, 0x1F20F], [0x1F21A, 0x1F21A], [0x1F22F, 0x1F22F], [0x1F232, 0x1F23A], [0x1F23C, 0x1F23F], [0x1F249, 0x1F25F], [0x1F266, 0x1F321], [0x1F324, 0x1F393], [0x1F396, 0x1F397], [0x1F399, 0x1F39B], [0x1F39E, 0x1F3F0], [0x1F3F3, 0x1F3F5], [0x1F3F7, 0x1F3FA], [0x1F400, 0x1F4FD], [0x1F4FF, 0x1F53D], [0x1F549, 0x1F54E], [0x1F550, 0x1F567], [0x1F56F, 0x1F570], [0x1F573, 0x1F57A], [0x1F587, 0x1F587], [0x1F58A, 0x1F58D], [0x1F590, 0x1F590], [0x1F595, 0x1F596], [0x1F5A4, 0x1F5A5], [0x1F5A8, 0x1F5A8], [0x1F5B1, 0x1F5B2], [0x1F5BC, 0x1F5BC], [0x1F5C2, 0x1F5C4], [0x1F5D1, 0x1F5D3], [0x1F5DC, 0x1F5DE], [0x1F5E1, 0x1F5E1], [0x1F5E3, 0x1F5E3], [0x1F5E8, 0x1F5E8], [0x1F5EF, 0x1F5EF], [0x1F5F3, 0x1F5F3], [0x1F5FA, 0x1F64F], [0x1F680, 0x1F6C5], [0x1F6CB, 0x1F6D2], [0x1F6D5, 0x1F6E5], [0x1F6E9, 0x1F6E9], [0x1F6EB, 0x1F6F0], [0x1F6F3, 0x1F6FF], [0x1F7DA, 0x1F7FF], [0x1F80C, 0x1F80F], [0x1F848, 0x1F84F], [0x1F85A, 0x1F85F], [0x1F888, 0x1F88F], [0x1F8AE, 0x1F8AF], [0x1F8BC, 0x1F8BF], [0x1F8C2, 0x1F8CF], [0x1F8D9, 0x1F8FF], [0x1F90C, 0x1F93A], [0x1F93C, 0x1F945], [0x1F947, 0x1F9FF], [0x1FA58, 0x1FA5F], [0x1FA6E, 0x1FAFF], [0x1FC00, 0x1FFFD]];
+  var TITLE_DEFAULT_IGNORABLE_RANGES = [[0x00AD, 0x00AD], [0x034F, 0x034F], [0x061C, 0x061C], [0x115F, 0x1160], [0x17B4, 0x17B5], [0x180B, 0x180F], [0x200B, 0x200F], [0x202A, 0x202E], [0x2060, 0x206F], [0x3164, 0x3164], [0xFE00, 0xFE0F], [0xFEFF, 0xFEFF], [0xFFA0, 0xFFA0], [0xFFF0, 0xFFF8], [0x1BCA0, 0x1BCA3], [0x1D173, 0x1D17A], [0xE0000, 0xE0FFF]];
+  // END GENERATED TITLE UNICODE POLICY
+
+  function inTitleRanges(point, ranges) {
+    for (var i = 0; i < ranges.length; i++) {
+      if (point < ranges[i][0]) {
+        return false;
+      }
+      if (point <= ranges[i][1]) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function titleEmojiBase(point) {
+    return inTitleRanges(point, TITLE_EMOJI_BASE_RANGES);
+  }
+
+  function titleBlankLooking(point) {
+    return point === TITLE_BRAILLE_BLANK || inTitleRanges(point, TITLE_DEFAULT_IGNORABLE_RANGES);
+  }
+
+  function emojiFormatCharacter(point) {
+    return point === 0x200d || (point >= TITLE_TAG_FIRST && point <= TITLE_TAG_LAST);
+  }
+
+  function forbiddenTitleCharacter(character) {
+    if (TITLE_FORBIDDEN_CATEGORY.test(character)) {
+      return true;
+    }
+    if (TITLE_FORMAT_CATEGORY.test(character)) {
+      return !emojiFormatCharacter(character.codePointAt(0));
+    }
+    return false;
+  }
+
+  function joinerLeftSkip(point) {
+    return point === 0xfe0e || point === 0xfe0f || (point >= 0x1f3fb && point <= 0x1f3ff);
+  }
+
+  // The emoji base a ZWJ joins on its left, skipping the variation selector and skin
+  // tone modifiers that may stand between them; null when the joiner is misplaced.
+  function emojiBaseBefore(points, index) {
+    var position = index - 1;
+    while (position >= 0 && joinerLeftSkip(points[position])) {
+      position--;
+    }
+    return position >= 0 && titleEmojiBase(points[position]) ? points[position] : null;
+  }
+
+  // Mirrors the server's _format_characters_are_well_placed: a standalone joiner or tag
+  // character, a tag character outside a subdivision flag sequence, a tag character that
+  // is not a lowercase letter and a tag sequence without its end are refused. A bare
+  // U+1F3F4 with no tag sequence is ordinary emoji text.
+  function formatCharactersWellPlaced(points) {
+    var index = 0;
+    while (index < points.length) {
+      var point = points[index];
+      if (point >= TITLE_TAG_FIRST && point <= TITLE_TAG_LAST) {
+        return false;
+      }
+      if (
+        point === TITLE_FLAG_BASE &&
+        index + 1 < points.length &&
+        points[index + 1] >= TITLE_TAG_LETTER_FIRST &&
+        points[index + 1] <= TITLE_TAG_LETTER_LAST
+      ) {
+        var position = index + 1;
+        while (
+          position < points.length &&
+          points[position] >= TITLE_TAG_LETTER_FIRST &&
+          points[position] <= TITLE_TAG_LETTER_LAST
+        ) {
+          position++;
+        }
+        if (position >= points.length || points[position] !== TITLE_TAG_LAST) {
+          return false;
+        }
+        index = position + 1;
+        continue;
+      }
+      if (point === 0x200d) {
+        var right = index + 1 < points.length ? points[index + 1] : null;
+        if (emojiBaseBefore(points, index) === null || right === null || !titleEmojiBase(right)) {
+          return false;
+        }
+      }
+      index++;
+    }
+    return true;
+  }
+
+  function prepareConversationTitle(raw) {
+    var value = typeof raw === "string" ? raw : "";
+    var rawPoints = Array.from(value);
+    for (var r = 0; r < rawPoints.length; r++) {
+      if (forbiddenTitleCharacter(rawPoints[r])) {
+        return { ok: false, reason: "characters", message: TEXT.titleCharacters, count: countCodePoints(value) };
+      }
+    }
+    var text = trimLikeServer(value);
+    var count = countCodePoints(text);
+    if (!text) {
+      return { ok: false, reason: "empty", message: TEXT.titleEmpty, count: count };
+    }
+    if (count > MAX_CONVERSATION_TITLE) {
+      return { ok: false, reason: "too_long", message: TEXT.titleTooLong, count: count };
+    }
+    var points = Array.from(text, function (character) {
+      return character.codePointAt(0);
+    });
+    if (points.every(titleBlankLooking)) {
+      return { ok: false, reason: "characters", message: TEXT.titleCharacters, count: count };
+    }
+    if (!formatCharactersWellPlaced(points)) {
+      return { ok: false, reason: "characters", message: TEXT.titleCharacters, count: count };
+    }
+    return { ok: true, text: text, count: count };
+  }
 
   function greatestCommonDivisor(left, right) {
     var a = Math.abs(left);
@@ -1003,36 +1209,89 @@
 
   // --- time -----------------------------------------------------------------------------------
 
-  // An ISO 8601 timestamp as milliseconds since the epoch, or null. One with no offset is UTC
-  // (the server's times are), whichever way the browser's own parser would read it.
-  function parseTimestamp(value) {
+  // The timestamp spellings this page accepts: a date, a clock, optional fractional seconds
+  // and an optional zone (T or a space between date and clock; the same in reads and in a
+  // mutation answer). Every group is validated before any conversion, so a date the server
+  // could not have serialized is never normalized into a different one by Date's rollover.
+  var TIMESTAMP_PATTERN =
+    /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}(?::?\d{2})?)?$/;
+
+  function isLeapYear(year) {
+    return (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+  }
+
+  function daysInMonth(year, month) {
+    var lengths = [31, isLeapYear(year) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    return lengths[month - 1];
+  }
+
+  // `strict` adds the calendar and clock checks a mutation answer must pass: a real Gregorian
+  // day (month lengths and leap years), a year datetime.isoformat() can write (0001-9999,
+  // never 0000), a second below 60 and an offset whose own fields cannot roll over. The
+  // compatibility parser used for reads keeps its historical, looser range so no read is
+  // rejected by a rule the server never promised.
+  function parseTimestampIn(value, strict) {
     if (typeof value !== "string") {
       return null;
     }
-    var found = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}(?::?\d{2})?)?$/.exec(
-      value
-    );
+    var found = TIMESTAMP_PATTERN.exec(value);
     if (found === null) {
       return null;
     }
+    var year = Number(found[1]);
     var month = Number(found[2]);
     var day = Number(found[3]);
     var hour = Number(found[4]);
     var minute = Number(found[5]);
     var second = Number(found[6]);
-    if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 60) {
+    if (month < 1 || month > 12 || day < 1 || hour > 23 || minute > 59) {
       return null;
     }
-    var millis = found[7] ? Math.floor(Number("0." + found[7]) * 1000) : 0;
-    var time = Date.UTC(Number(found[1]), month - 1, day, hour, minute, second, millis);
+    if (strict) {
+      if (second > 59 || year < 1 || day > daysInMonth(year, month)) {
+        return null;
+      }
+    } else if (day > 31 || second > 60) {
+      return null;
+    }
     var offset = found[8];
+    var offsetMinutes = 0;
     if (offset && offset !== "Z") {
       var sign = offset.charAt(0) === "-" ? -1 : 1;
       var digits = offset.slice(1).replace(":", "");
-      var minutes = Number(digits.slice(0, 2)) * 60 + Number(digits.slice(2) || "0");
-      time -= sign * minutes * 60000;
+      var offsetHours = Number(digits.slice(0, 2));
+      var offsetRest = Number(digits.slice(2) || "0");
+      if (strict && (offsetHours > 23 || offsetRest > 59)) {
+        return null;
+      }
+      offsetMinutes = sign * (offsetHours * 60 + offsetRest);
     }
+    var millis = found[7] ? Math.floor(Number("0." + found[7]) * 1000) : 0;
+    var time;
+    if (strict) {
+      // Date.UTC maps the years 0-99 to 1900-1999; setUTCFullYear keeps the year the text
+      // names, so a mutation answer with 0099 is the year 99 and not the year 1999.
+      var date = new Date(0);
+      date.setUTCFullYear(year, month - 1, day);
+      date.setUTCHours(hour, minute, second, millis);
+      time = date.getTime();
+    } else {
+      time = Date.UTC(year, month - 1, day, hour, minute, second, millis);
+    }
+    time -= offsetMinutes * 60000;
     return isNaN(time) ? null : time;
+  }
+
+  // An ISO 8601 timestamp as milliseconds since the epoch, or null. One with no offset is UTC
+  // (the server's times are), whichever way the browser's own parser would read it.
+  function parseTimestamp(value) {
+    return parseTimestampIn(value, false);
+  }
+
+  // The same, for the raw timestamps of a mutation answer: a calendar date the server could
+  // not have serialized is not a plausible answer and never confirms a write (OD-2, C4).
+  function parseTimestampStrict(value) {
+    return parseTimestampIn(value, true);
   }
 
   function pad2(number) {
@@ -1069,21 +1328,123 @@
     return label + ", " + clock(date);
   }
 
-  // The name of a conversation in the list. The server stores no title (and the page invents
-  // none that it keeps): a conversation with none is named after when it began.
+  // PP-01-A1: conversation navigation is shown in the product's Moscow time, never in the
+  // browser's or the server host's zone. Europe/Moscow has been UTC+3 with no daylight
+  // saving since 2014; Intl also gets a historical instant right, which a fixed offset
+  // would not. The formatter is cached and asked for Latin digits, so the output does not
+  // depend on the viewer's locale either.
+  var MOSCOW_ZONE = "Europe/Moscow";
+  var moscowFormatter = null;
+
+  function moscowParts(time) {
+    if (typeof time !== "number" || !isFinite(time)) {
+      return null;
+    }
+    var date = new Date(time);
+    if (isNaN(date.getTime())) {
+      return null;
+    }
+    if (moscowFormatter === null && typeof Intl !== "undefined" && Intl.DateTimeFormat) {
+      try {
+        moscowFormatter = new Intl.DateTimeFormat("en-GB", {
+          timeZone: MOSCOW_ZONE,
+          year: "numeric",
+          month: "2-digit",
+          day: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit",
+          hourCycle: "h23",
+          numberingSystem: "latn",
+        });
+      } catch (ignored) {
+        moscowFormatter = false;
+      }
+    }
+    var parts;
+    try {
+      parts = moscowFormatter ? moscowFormatter.formatToParts(date) : null;
+    } catch (ignored) {
+      parts = null;
+    }
+    if (!parts) {
+      // Europe/Moscow has been UTC+3 with no daylight saving since 2014: a runtime without
+      // the IANA database still gets the right wall time for every instant this product
+      // shows, rather than no time at all.
+      var shifted = new Date(time + 3 * 3600000);
+      return {
+        year: shifted.getUTCFullYear(),
+        month: shifted.getUTCMonth() + 1,
+        day: shifted.getUTCDate(),
+        hour: shifted.getUTCHours(),
+        minute: shifted.getUTCMinutes(),
+      };
+    }
+    var found = {};
+    parts.forEach(function (part) {
+      if (part.type !== "literal") {
+        found[part.type] = part.value;
+      }
+    });
+    if (!found.year || !found.month || !found.day || !found.hour || !found.minute) {
+      return null;
+    }
+    return {
+      year: Number(found.year),
+      month: Number(found.month),
+      day: Number(found.day),
+      hour: Number(found.hour) % 24,
+      minute: Number(found.minute),
+    };
+  }
+
+  // "ДД.ММ.ГГГГ" in Moscow time ("" when the value is not an instant).
+  function moscowDate(time) {
+    var parts = moscowParts(time);
+    if (parts === null) {
+      return "";
+    }
+    return pad2(parts.day) + "." + pad2(parts.month) + "." + String(parts.year).padStart(4, "0");
+  }
+
+  // "ЧЧ:ММ" in Moscow time.
+  function moscowClock(time) {
+    var parts = moscowParts(time);
+    if (parts === null) {
+      return "";
+    }
+    return pad2(parts.hour) + ":" + pad2(parts.minute);
+  }
+
+  // "ДД.ММ.ГГГГ, ЧЧ:ММ МСК": the absolute Moscow-time instant, with the zone said in words.
+  function moscowMoment(time) {
+    var parts = moscowParts(time);
+    if (parts === null) {
+      return "";
+    }
+    return moscowDate(time) + ", " + moscowClock(time) + " " + TEXT.moscowSuffix;
+  }
+
+  // A stable key of the Moscow calendar day, for separators: two instants on the same
+  // displayed day have the same key. null for a value that is not an instant.
+  function moscowDayKey(time) {
+    var parts = moscowParts(time);
+    if (parts === null) {
+      return null;
+    }
+    return parts.year + "-" + pad2(parts.month) + "-" + pad2(parts.day);
+  }
+
+  // The name of a conversation in the list. A stored title wins; otherwise the server's
+  // derived title; with neither, the fallback is when the conversation began, in Moscow
+  // time with the explicit МСК label (never a relative word like "сегодня").
   function conversationLabel(conversation, nowTime) {
     if (typeof conversation.title === "string" && trimLikeServer(conversation.title)) {
       return conversation.title;
     }
     if (typeof conversation.createdAt !== "number") {
-      return "Разговор";
+      return "Диалог";
     }
-    var date = new Date(conversation.createdAt);
-    var label = "Разговор от " + date.getDate() + " " + MONTHS[date.getMonth()];
-    if (typeof nowTime === "number" && date.getFullYear() !== new Date(nowTime).getFullYear()) {
-      label += " " + date.getFullYear();
-    }
-    return label + ", " + clock(date);
+    return "Диалог от " + moscowMoment(conversation.createdAt);
   }
 
   // --- reading what the server answered --------------------------------------------------------
@@ -1265,6 +1626,14 @@
     return { type: "uncertain", text: unavailableText(response, error), correlationId: error ? error.correlationId : null };
   }
 
+  var TITLE_ORIGINS = { manual: true, derived: true, none: true };
+
+  function hasOwn(object, key) {
+    return Object.prototype.hasOwnProperty.call(object, key);
+  }
+
+  // A conversation in a list read. The older shape (a title with no origin, an origin with
+  // no reset flag) is still answered here: compatibility inference is confined to reads.
   function normalizeConversation(item) {
     if (!isObject(item) || typeof item.id !== "string" || !UUID_PATTERN.test(item.id)) {
       return null;
@@ -1272,12 +1641,224 @@
     if (item.title !== null && item.title !== undefined && typeof item.title !== "string") {
       return null;
     }
+    var origin = item.title_origin;
+    if (origin === undefined) {
+      // Older shapes named only the title: a non-empty one was the server's derived name.
+      origin = typeof item.title === "string" && item.title ? "derived" : "none";
+    }
+    if (typeof origin !== "string" || TITLE_ORIGINS[origin] !== true) {
+      return null;
+    }
+    var canReset = item.can_reset_title;
+    if (canReset !== undefined && typeof canReset !== "boolean") {
+      return null;
+    }
     return {
       id: item.id.toLowerCase(),
       title: typeof item.title === "string" ? item.title : null,
+      titleOrigin: origin,
+      canReset: canReset === true || origin === "manual",
       createdAt: parseTimestamp(item.created_at),
       updatedAt: parseTimestamp(item.updated_at),
+      lastMessageAt: parseTimestamp(item.last_message_at),
     };
+  }
+
+  // The answer to PATCH /api/conversations/{id} is validated against the contract the route
+  // actually answers (_conversation_json): every summary field is present with its type and
+  // the title state is internally consistent. No compatibility inference is applied here --
+  // an older title shape is a read convenience (normalizeConversation), never evidence that
+  // a mutation succeeded. A body that fails any check is not a confirmed success; the caller
+  // classifies it as indeterminate (the write may have committed even though its answer
+  // does not prove it).
+  function normalizeTitleMutationResponse(item) {
+    if (!isObject(item) || typeof item.id !== "string" || !UUID_PATTERN.test(item.id)) {
+      return null;
+    }
+    if (!hasOwn(item, "title")) {
+      return null;
+    }
+    if (item.title !== null && typeof item.title !== "string") {
+      return null;
+    }
+    if (!hasOwn(item, "title_origin")) {
+      return null;
+    }
+    var origin = item.title_origin;
+    if (origin !== "manual" && origin !== "derived" && origin !== "none") {
+      return null;
+    }
+    if (!hasOwn(item, "can_reset_title") || typeof item.can_reset_title !== "boolean") {
+      return null;
+    }
+    var canReset = item.can_reset_title;
+    // Cross-field consistency: these combinations cannot come from the server.
+    var hasText = typeof item.title === "string" && item.title.length > 0;
+    if (origin === "manual") {
+      if (!hasText || canReset !== true) {
+        return null;
+      }
+    } else if (origin === "derived") {
+      if (!hasText || canReset !== false) {
+        return null;
+      }
+    } else if (item.title !== null || canReset !== false) {
+      return null;
+    }
+    // A mutation answer's timestamps are held to the calendar: 31 April or 29 February in a
+    // common year is not something the server can have written, so it is not a confirmed
+    // success (the compatibility parser used for reads is deliberately left as it was).
+    var createdAt = parseTimestampStrict(item.created_at);
+    var updatedAt = parseTimestampStrict(item.updated_at);
+    if (createdAt === null || updatedAt === null) {
+      return null;
+    }
+    if (!hasOwn(item, "last_message_at")) {
+      return null;
+    }
+    var lastMessageAt = item.last_message_at === null ? null : parseTimestampStrict(item.last_message_at);
+    if (item.last_message_at !== null && lastMessageAt === null) {
+      return null;
+    }
+    return {
+      id: item.id.toLowerCase(),
+      title: item.title,
+      titleOrigin: origin,
+      canReset: canReset,
+      createdAt: createdAt,
+      updatedAt: updatedAt,
+      lastMessageAt: lastMessageAt,
+    };
+  }
+
+  // The closed set of this application's title-PATCH refusals that prove the requested
+  // mutation cannot have been committed, each with the status its catalogue entry fixes.
+  // Every one of them is raised by the route before its database work begins
+  // (chat_api.rename_conversation and the request checks before it): the Origin, the media
+  // type, the body's size or shape, and the title's own validation. None can be answered
+  // after a commit -- the route's only failures after `database.run` returned are the route
+  // wrapper's 5xx, which are indeterminate below. A 4xx that is not exactly one of these
+  // pairs (a proxy's 408/429, an application body whose code or status this build does not
+  // know) proves nothing and is classified as indeterminate.
+  var TITLE_REFUSAL_STATUSES = {
+    invalid_request: 400,
+    unsupported_media_type: 415,
+    request_too_large: 413,
+    forbidden_origin: 403,
+    empty_title: 400,
+    title_too_long: 400,
+    invalid_title: 400,
+  };
+
+  // The closed set of title-mutation outcomes (AD-01 OD-8). Every answer maps to exactly
+  // one; no other type is invented:
+  //
+  //   confirmed          the requested conversation, obeying the requested operation
+  //   refused            a definitive pre-write application refusal (nothing was stored)
+  //   absent             the application says the conversation does not exist
+  //   indeterminate      the write may or may not have been stored
+  //   auth_refused       the application's pre-write 401 not_authenticated (session over)
+  //   auth_indeterminate a 401 that does not match that contract: outcome unknown; the
+  //                      session must be verified by the session lifecycle (AD-C2)
+  //
+  // A "confirmed" answer requires the strict contract of normalizeTitleMutationResponse,
+  // the requested conversation id, and the operation's own semantics (isExpectedTitleState).
+  // A success status alone is not enough: a proxy's 200, another conversation's summary, a
+  // summary that does not carry the requested manual title, or a rename answered as derived
+  // (a reset answered as manual) leave the server's outcome unknown and are indeterminate.
+  //
+  // "indeterminate" is a write whose outcome is not known and may still commit: no answer at
+  // all (a transport failure, a timeout the page stopped waiting for, an aborted fetch), a
+  // success status whose body is not this application's conversation or is not the one asked
+  // about, ANY 5xx, and any 4xx that is not in TITLE_REFUSAL_STATUSES. The application's own
+  // 5xx is not proof of a rollback: the route wrapper answers "internal_error" after the
+  // database work has committed, so a failure while the answer was being built follows a
+  // stored write; a proxy's 5xx can be written before or after the upstream committed. Only
+  // a refusal raised before the write is definitive.
+  function classifyConversationUpdate(response, id, request) {
+    if (response.kind === "network") {
+      if (response.partial === true && response.status === 401) {
+        // The headers arrived but the body could not be read: the 401 alone, without this
+        // application's not_authenticated body, proves nothing about the write (AD-C2). Keep
+        // it in the network category for every other classifier and ask the session lifecycle
+        // to verify who is signed in now. A partial 200/404/5xx stays indeterminate; a failure
+        // before the headers carries no status at all.
+        return { type: "auth_indeterminate" };
+      }
+      return { type: "indeterminate", timedOut: Boolean(response.timedOut) };
+    }
+    if (response.status === 401) {
+      var authError = readApiError(response);
+      if (authError && authError.code === "not_authenticated") {
+        // The route's session dependency answers this before any database work: the
+        // application itself refused the request, so nothing was written (AD-C2).
+        return { type: "auth_refused" };
+      }
+      // A status-only, malformed or unrecognized 401 (a proxy's, or a body this build does
+      // not know) does not prove that the write was not committed. The outcome is unknown;
+      // the session lifecycle must verify who is signed in (AD-C2).
+      return { type: "auth_indeterminate" };
+    }
+    if ((response.status === 200 || response.status === 201) && response.jsonOk) {
+      var conversation = normalizeTitleMutationResponse(response.json);
+      if (conversation !== null && conversation.id === id.toLowerCase()) {
+        if (isExpectedTitleState(conversation, request)) {
+          return { type: "confirmed", conversation: conversation };
+        }
+      }
+      // A success status whose body is not this application's conversation, is about
+      // another conversation, or contradicts the write that was asked for: the server's
+      // outcome is not known. Guard, do not assume and do not apply the body.
+      return { type: "indeterminate", unexpected: true };
+    }
+    if (response.status === 200 || response.status === 201) {
+      return { type: "indeterminate", unexpected: true };
+    }
+    var error = readApiError(response);
+    if (response.status === 404 && error && error.code === "conversation_not_found") {
+      return { type: "absent" };
+    }
+    if (
+      error &&
+      response.status >= 400 &&
+      response.status < 500 &&
+      TITLE_REFUSAL_STATUSES[error.code] === response.status
+    ) {
+      return { type: "refused", text: error.message || TEXT.unexpected, correlationId: error.correlationId };
+    }
+    if (response.status >= 500) {
+      // ANY 5xx is indeterminate. The application's own error body does not prove a
+      // rollback: the title has already been committed when the answer is built, so an
+      // "internal_error" can follow a stored write. A proxy's 5xx is the same for a
+      // different reason. Only a 4xx refusal is a definitive "not done".
+      return { type: "indeterminate", proxy: !error, text: unavailableText(response, error) };
+    }
+    // Any other 4xx (a proxy's 408, 429, an application body this build does not know) or
+    // an answer outside the contract: the status alone does not prove a refusal, so it is
+    // indeterminate. Nothing is retried automatically.
+    return { type: "indeterminate", unexpected: true, text: unavailableText(response, error) };
+  }
+
+  // Does the conversation in a title PATCH's answer obey the operation that was asked for?
+  // A rename must come back as the requested manual title (`title` equals the normalized
+  // text this page sent, origin manual, resettable). A reset must come back with no stored
+  // title: the derived (or absent) one, not resettable. The derived text itself is the
+  // server's and may legitimately differ from what this page last showed.
+  function isExpectedTitleState(conversation, request) {
+    if (!isObject(request)) {
+      return false;
+    }
+    if (request.title === null) {
+      return conversation.titleOrigin !== "manual" && conversation.canReset === false;
+    }
+    if (typeof request.title !== "string") {
+      return false;
+    }
+    return (
+      conversation.title === request.title &&
+      conversation.titleOrigin === "manual" &&
+      conversation.canReset === true
+    );
   }
 
   function normalizeConversationList(body) {
@@ -3253,9 +3834,18 @@
     var store = createPendingStore(deps.storage || null, nowFn);
 
     var epoch = 0; // bumped when the session ends: answers that arrive after it are ignored
-    // Bumped when a deletion is confirmed: a list read that began before it is of a list that
-    // still had the conversation, and its answer must not put it back.
+    // AD-C1: the first applicable authoritative confirmation that a conversation no longer
+    // exists advances this generation, so a list read that began before it is of a list that
+    // still had the conversation and its answer must not put it back. A read that begins
+    // after it is authoritative and applies normally.
     var listEpoch = 0;
+    // AD-C1: the bounded, page-lifetime absence markers -- conversation id -> the generation
+    // of the first applicable confirmation. One entry per conversation confirmed absent on
+    // this page; memory only; cleared when the page starts over; revoked only if an
+    // authoritative read begun after the marker lists the conversation again. Its purpose is
+    // idempotence: a repeated notification of the same already-reconciled disappearance must
+    // not advance the generation or invalidate a legitimate later list refill.
+    var goneMarks = {};
     // Counts the beginnings of list reads: an answer to an older read never replaces the answer
     // of a newer one (a deletion starts a fresh read, which a reload may in turn overtake).
     var listRead = 0;
@@ -3275,6 +3865,56 @@
     // being allowed to overlap the first, and every write -- its reconciliation included --
     // ends here, whatever its answer was.
     var shoppingMutations = {};
+    // PP-01-A1's title writes, per conversation. `titleSeq` and `titleApplied` are the
+    // mutation's identity: a response may change what is shown only if no response for a
+    // newer mutation of that conversation has already been applied (a delayed answer can
+    // never put back a title a newer answer replaced).
+    //
+    // `titleQueues` is the conversation lifetime: one record per conversation, holding the
+    // per-conversation queue tail (`tail`), a count of the title writes issued into it and
+    // not settled (`queued`), a count of the explicit DELETEs issued and not settled
+    // (`deletes`), the AD-C1 generation that retired it (`retiredGeneration`, null while
+    // live) and whether its one post-deletion list refill has been decided (`refillOwned`).
+    // A write (or a DELETE) captures the record when it is issued; applicability is always
+    // decided from the captured record, never from whatever the slot holds when the answer
+    // arrives. The slot is detached by an authoritative removal -- a conversation the server
+    // lists again begins a fresh lifetime -- and the old record is kept alive only by the
+    // completions that still carry it, so no removed conversation's queue can send anything.
+    // (This replaces the bare promise the queue slot used to hold: deleting a slot then left
+    // its chained callbacks runnable, and a delayed answer could still reach the server.)
+    var titleSeq = {};
+    var titleApplied = {};
+    var titleQueues = {};
+    // The write of one conversation that is out, by id: the operation object
+    // {token, sequence, kind, slow}. A write past the page's soft timeout is still out
+    // (`slow`: the request was not aborted); the queue stays behind it until the underlying
+    // request settles, so a newer write is never sent past a request whose outcome is still
+    // unknown. The record is cleared only by the operation that owns it (object identity),
+    // never by a stale completion: a later operation with the same per-session sequence
+    // number is still a different record.
+    var titleOps = {};
+    // AD-01 I2: a never-reused operation token. The structural identity check is object
+    // identity; this counter only makes the identity legible and is never reset, not even
+    // when the page starts over.
+    var titleOpCount = 0;
+    // Conversations whose title write ended without a definitive answer (no answer, or
+    // any 5xx: the server may or may not have committed). Later title writes of that
+    // conversation are refused, not sent, until the page is reloaded; see TEXT.titleUnconfirmed.
+    var titleBlocked = {};
+    // The titles this page has confirmed, by conversation: {title, titleOrigin, canReset,
+    // mark}. This is deliberately independent of `state.list.items`: a conversation can
+    // leave the page (beyond the 50-item list) while its write is confirmed and return in
+    // an older read, so the confirmation must outlive its list item. One entry per
+    // conversation -- a newer confirmation replaces an older one -- and the entry is
+    // dropped when a list read that began after the confirmation applies the server's
+    // title (the server is authoritative again) or when the conversation is forgotten.
+    var titleConfirmed = {};
+    // Counts the title confirmations applied. A list read records the counter when it
+    // begins; an entry whose mark is above that value was confirmed while the read was
+    // out, so the read's snapshot may predate it and must not restore the old title
+    // fields. Everything else in the answered list (membership, order, dates, deletion,
+    // other metadata, other conversations) is applied as the server sent it.
+    var titleMutationCount = 0;
     // A deletion was confirmed while the page was held back (the server's answer to who is
     // signed in was still out): the list is read as soon as the same person is let through.
     var listRefreshOnUnlock = false;
@@ -3290,6 +3930,16 @@
     var logoutPrincipal = null;
     var generation = 0; // counts the beginnings (start) of a page: a draft the page holds back is only given back within one
     var verifyingEpoch = null; // the epoch of the /auth/me question that is out, if any
+    // Counts the beginnings of /auth/me questions. A response may decide who is signed in
+    // only if no newer question has been asked since: a restoration's fresh verification
+    // supersedes one that was already out, and the older answer can neither let the old
+    // page through nor clear the newer question's state. (The epoch covers an account that
+    // the page starts over for; this counter covers two questions about the same page.)
+    var verifySeq = 0;
+    // Work that must not go to the server until it is known who is signed in (a queued
+    // title write across a restoration's verification). Released when the gate opens or
+    // the page starts over; each waiter re-checks the epoch and the gate itself.
+    var gateWaiters = [];
     var expiredRecords = 0; // stored records found too old when the page was opened
     var state = freshState("loading");
 
@@ -3451,6 +4101,11 @@
         // The conversation whose deletion is being asked about or is under way:
         // { id, phase: "asking" | "deleting" | "error", error }.
         deleting: null,
+        // PP-01-A1: the title controls of the open conversation. `titleEdit` is null while
+        // the form is closed; otherwise { draft, error, saving, notice }. `titleInfoOpen`
+        // says whether the truthful explanation of the current title's origin is shown.
+        titleEdit: null,
+        titleInfoOpen: false,
         currentId: null,
         threads: {},
         pending: {},
@@ -3526,13 +4181,35 @@
       }
       var timedOut = false;
       var timer = null;
-      if (AbortCtor && options.timeoutMs) {
-        var aborter = new AbortCtor();
-        init.signal = aborter.signal;
-        timer = scheduleFn(function () {
-          timedOut = true;
-          aborter.abort();
-        }, options.timeoutMs);
+      if (options.timeoutMs) {
+        if (options.softTimeout) {
+          // The page stops waiting for display purposes, but the request is not aborted:
+          // aborting a fetch is not proof that the server stopped working on it, and a
+          // later write must not be sent past a request whose outcome is still unknown.
+          // onTimeout is how the caller says "this is taking long"; the returned promise
+          // settles only when the underlying request really does. The timeout is therefore
+          // an intermediate pending state, not a terminal outcome: the transport may still
+          // deliver a definitive answer afterwards, and "indeterminate" is reserved for a
+          // request that has settled without evidence either way.
+          timer = scheduleFn(function () {
+            timedOut = true;
+            timer = null;
+            if (options.onTimeout) {
+              try {
+                options.onTimeout();
+              } catch (ignored) {
+                // a display callback must not break the request it reports on
+              }
+            }
+          }, options.timeoutMs);
+        } else if (AbortCtor) {
+          var aborter = new AbortCtor();
+          init.signal = aborter.signal;
+          timer = scheduleFn(function () {
+            timedOut = true;
+            aborter.abort();
+          }, options.timeoutMs);
+        }
       }
       function finish() {
         if (timer !== null) {
@@ -3551,9 +4228,12 @@
       try {
         text = await response.text();
       } catch (ignored) {
-        // The headers arrived and the body did not: the outcome of a POST is unknown.
+        // The headers arrived and the body did not: the outcome of a POST is unknown. The
+        // status itself is kept: a partial answer is still classified in the network category
+        // (it is not a complete HTTP answer), but a caller whose contract is status-specific
+        // can tell a 401 from everything else. A failure before the headers has no status.
         finish();
-        return { kind: "network", timedOut: timedOut, partial: true };
+        return { kind: "network", timedOut: timedOut, partial: true, status: response.status };
       }
       finish();
       var parsed = parseJson(text);
@@ -3623,8 +4303,17 @@
       // which must not grow from one account to the next (an answer still on its way is
       // stale by the epoch as well).
       state = freshState(screen);
+      releaseGateWaiters(); // (a queued write waiting for a verification sees the new epoch)
       listRefreshOnUnlock = false;
       shoppingMutations = {};
+      titleSeq = {};
+      titleApplied = {};
+      titleQueues = {};
+      titleOps = {};
+      titleBlocked = {};
+      titleConfirmed = {};
+      titleMutationCount = 0;
+      goneMarks = {}; // (AD-C1 markers belong to the page of one account)
     }
 
     // --- the stored record of unresolved turns -----------------------------------------------
@@ -3718,14 +4407,17 @@
     // can bring it back (the epoch); the record of unresolved turns stays, to be resolved
     // after signing in again -- with the same keys, so a message that may have run is not
     // sent as a new one.
-    function handleAuthLost() {
+    // `notice` is what the sign-in screen says: the session ending while the page is in use is
+    // said as expired; a page restored from the back/forward cache that the server no longer
+    // knows is a plain sign-in (nothing of a live session was ended in front of the person).
+    function handleAuthLost(notice) {
       epoch++;
       principal = null;
       logoutPrincipal = null;
       sessionEndsAt = null;
       cancelAllTimers();
       resetData();
-      showLogin({ kind: "error", text: TEXT.authExpired });
+      showLogin(notice === undefined ? { kind: "error", text: TEXT.authExpired } : notice);
     }
 
     // Is the session still open by the clock? The deadline is absolute (/auth/me), so a page
@@ -3753,11 +4445,30 @@
       emit();
     }
 
+    // Work that must not reach the server while it is not known who is signed in waits here.
+    // The promise is released when the gate opens (the same person) or when the page starts
+    // over (the epoch changes); the waiter re-checks both, so a release can never send a
+    // private write into an unverified or a changed authenticated context.
+    function gateBarrier() {
+      return new Promise(function (resolve) {
+        gateWaiters.push(resolve);
+      });
+    }
+
+    function releaseGateWaiters() {
+      var waiting = gateWaiters;
+      gateWaiters = [];
+      waiting.forEach(function (resolve) {
+        resolve();
+      });
+    }
+
     // The server says the same person is still signed in: the conversations come back as they
     // were (unresolved messages included, with their keys), and what was waiting for the clock
     // or for a look at the history goes on.
     function letThrough() {
       state.gate = null;
+      releaseGateWaiters(); // (the same person is signed in: a queued private write may go)
       if (listRefreshOnUnlock) {
         listRefreshOnUnlock = false;
         track(loadList()); // (a deletion was confirmed while the page was held back)
@@ -3799,20 +4510,29 @@
     // through. Another person starts the page over, as if it had just been opened: nothing of the
     // last person is kept, and an answer still on its way for them changes nothing (epoch). An
     // answer that cannot say keeps the page held back and says so, without claiming anything.
-    async function verifySession() {
-      if (state.screen !== "app" || verifyingEpoch === epoch) {
+    //
+    // `force` begins a fresh verification even if one is out. A same-document restoration
+    // asks it: an answer to a question asked before the restoration belongs to the page as
+    // it was then and must not say who is signed in now, so it is superseded (verifySeq) and
+    // decides nothing -- not letting the old page through, not clearing the newer question.
+    async function verifySession(authNotice, force) {
+      if (state.screen !== "app") {
+        return;
+      }
+      if (!force && verifyingEpoch === epoch) {
         return;
       }
       var mine = epoch;
+      var seq = ++verifySeq;
       verifyingEpoch = mine;
       try {
         var response = await http("GET", "/auth/me", { timeoutMs: READ_TIMEOUT_MS });
-        if (mine !== epoch) {
-          return;
+        if (mine !== epoch || seq !== verifySeq) {
+          return; // (another person, another page, or a newer question is the authority now)
         }
         var found = classifyMe(response, nowFn());
         if (found.type === "auth") {
-          handleAuthLost();
+          handleAuthLost(authNotice);
         } else if (found.type === "ok") {
           if (principal === null || found.userId !== principal) {
             track(start());
@@ -3828,7 +4548,7 @@
           emit();
         }
       } finally {
-        if (verifyingEpoch === mine) {
+        if (seq === verifySeq && verifyingEpoch === mine) {
           verifyingEpoch = null;
         }
       }
@@ -4127,6 +4847,484 @@
       }
     }
 
+    // --- PP-01-A1: the conversation title ---------------------------------------------------------
+
+    function currentListItem() {
+      if (state.currentId === null) {
+        return null;
+      }
+      for (var i = 0; i < state.list.items.length; i++) {
+        if (state.list.items[i].id === state.currentId) {
+          return state.list.items[i];
+        }
+      }
+      return null;
+    }
+
+    function titleExplanation(item) {
+      if (item === null) {
+        return "";
+      }
+      if (item.titleOrigin === "manual" || item.canReset) {
+        return TEXT.titleOriginManual;
+      }
+      if (item.titleOrigin === "derived") {
+        return TEXT.titleOriginDerived;
+      }
+      // No title at all: last_message_at is the authoritative fact that separates an empty
+      // conversation from one whose retained messages simply carry no user text to derive
+      // a name from (an assistant-only history, or a photo without a caption).
+      if (item.lastMessageAt !== null && item.lastMessageAt !== undefined) {
+        return TEXT.titleOriginNoText;
+      }
+      return TEXT.titleOriginNone;
+    }
+
+    // Open the rename form on the conversation that is open. It is refused for a
+    // conversation the list does not hold (the controls are not shown for one anyway).
+    function beginTitleEdit() {
+      var item = currentListItem();
+      if (item === null || state.titleEdit !== null) {
+        return;
+      }
+      state.titleEdit = {
+        draft: typeof item.title === "string" ? item.title : "",
+        // An unconfirmed earlier write still guards this conversation: the form opens with
+        // the explanation, and saving it is refused until the page is reloaded.
+        error: titleBlocked[item.id] ? { text: TEXT.titleUnconfirmed, correlationId: null } : null,
+        saving: false,
+        notice: null,
+      };
+      state.titleInfoOpen = false;
+      emit();
+    }
+
+    function cancelTitleEdit() {
+      if (state.titleEdit !== null && !state.titleEdit.saving) {
+        state.titleEdit = null;
+        emit();
+      }
+    }
+
+    function syncTitleDraft(raw) {
+      if (state.titleEdit !== null) {
+        state.titleEdit.draft = typeof raw === "string" ? raw : "";
+        emit();
+      }
+    }
+
+    function showTitleOrigin() {
+      var item = currentListItem();
+      if (item === null) {
+        return;
+      }
+      state.titleInfoOpen = true;
+      state.titleEdit = null;
+      emit();
+    }
+
+    function closeTitleOrigin() {
+      if (state.titleInfoOpen) {
+        state.titleInfoOpen = false;
+        emit();
+      }
+    }
+
+    // AD-01 I5/I6 (OD-4): a title confirmation refreshes only the three title-specific
+    // fields of a conversation the list still holds. Membership, order, creation and
+    // activity timestamps and every unrelated field belong to the list/message authorities
+    // and are never taken from a mutation answer -- a delayed rename whose answer carries a
+    // snapshot older than the page's own activity cannot move or re-date the conversation.
+    function mergeTitleFields(id, conversation) {
+      for (var i = 0; i < state.list.items.length; i++) {
+        if (state.list.items[i].id === id) {
+          state.list.items[i].title = conversation.title;
+          state.list.items[i].titleOrigin = conversation.titleOrigin;
+          state.list.items[i].canReset = conversation.canReset;
+          return;
+        }
+      }
+    }
+
+    // The identity of a title write for one conversation. Every write is numbered in the
+    // page's issue order; a response may change what is shown only when no response to a
+    // newer write of that conversation has already been applied.
+    function issueTitleMutation(id) {
+      var sequence = (titleSeq[id] || 0) + 1;
+      titleSeq[id] = sequence;
+      return sequence;
+    }
+
+    // The lifetime of one conversation's title writes: the record its queue slot holds. A
+    // write, and an explicit DELETE, capture it when they are issued -- before any
+    // asynchronous boundary -- so an answer is judged against the lifetime that issued it,
+    // never against a newer one that happens to share the conversation id.
+    function newTitleLifetime(id) {
+      return {
+        id: id,
+        tail: Promise.resolve(), // the per-conversation FIFO of title writes
+        queued: 0, // title writes issued into this lifetime and not settled
+        deletes: 0, // explicit DELETEs issued in this lifetime and not settled
+        retiredGeneration: null, // the AD-C1 generation that retired it, or null while live
+        refillOwned: false, // the one post-deletion list refill has been decided
+      };
+    }
+
+    function titleLifetimeFor(id) {
+      var record = titleQueues[id];
+      if (record === undefined) {
+        record = newTitleLifetime(id);
+        titleQueues[id] = record;
+      }
+      return record;
+    }
+
+    // A lifetime is applicable until an authoritative absence retires it. After that its
+    // already-sent requests still settle, but nothing queued into it may reach the server and
+    // no completion of it may apply anything (except the idempotent acknowledgement of the
+    // very removal that retired it, decided in decideTitleTransition).
+    function titleLifetimeApplicable(lifetime) {
+      return lifetime === undefined || lifetime.retiredGeneration === null;
+    }
+
+    // A record is released when nothing of it is out and its slot still belongs to it; a
+    // retired record is never in a slot (the removal detached it) and is collected with the
+    // completions that still carry it. This never removes a newer record of the same id.
+    function releaseTitleLifetime(id, lifetime) {
+      if (
+        lifetime.retiredGeneration === null &&
+        lifetime.queued === 0 &&
+        lifetime.deletes === 0 &&
+        titleQueues[id] === lifetime
+      ) {
+        delete titleQueues[id];
+      }
+    }
+
+    // The operation token of one title write: a fresh object, so its identity cannot be
+    // reused by a later write -- not even a later write of the same conversation after the
+    // page starts over with the same sequence numbers. `token` only makes that identity
+    // legible; the structural check is object identity (titleOps[id] === op).
+    function newTitleOperation(sequence, kind, lifetime) {
+      return { token: ++titleOpCount, sequence: sequence, kind: kind, slow: false, lifetime: lifetime };
+    }
+
+    // AD-01 I2: only the operation that owns the record may clear it.
+    function clearTitleOperation(id, op) {
+      if (titleOps[id] === op) {
+        delete titleOps[id];
+      }
+    }
+
+    // AD-01 stage 3, read-only: choose the permitted transition from the classified answer,
+    // the operation's identity and the page's ordering. An operation the page invalidated
+    // (the conversation was forgotten, or the page started over) is inapplicable -- with the
+    // one exception of the application's own authoritative absence, which is already
+    // reconciled and idempotent -- and an answer a newer applied answer overtook is
+    // inapplicable too. Neither is confused with a mutation whose execution outcome is
+    // unknown. The session epoch is checked separately and first: nothing from an earlier
+    // session may reach any of these outcomes.
+    function decideTitleTransition(id, op, outcome, operative) {
+      if (!operative) {
+        return titleAbsenceIsCurrent(id, op) && outcome.type === "absent"
+          ? outcome
+          : { type: "superseded" };
+      }
+      if (titleMutationSuperseded(id, op.sequence)) {
+        return { type: "superseded" };
+      }
+      return outcome;
+    }
+
+    // AD-C1: is this operation's answer an acknowledgement of the very absence its lifetime
+    // was retired by? The recorded generation must still be the live marker: an authoritative
+    // re-listing revokes the marker, so the old write's late 404 then describes a lifetime the
+    // server no longer lists and is stale, never a second removal of the fresh one.
+    function titleAbsenceIsCurrent(id, op) {
+      return (
+        op.lifetime !== undefined &&
+        op.lifetime.retiredGeneration !== null &&
+        goneMarks[id] === op.lifetime.retiredGeneration
+      );
+    }
+
+    // AD-01 stage 4: the guard left by any outcome that does not prove the write did not
+    // commit. The draft and the editor are preserved; nothing is released or retried.
+    function markTitleUnconfirmed(id, edit) {
+      titleBlocked[id] = true;
+      if (state.currentId === id) {
+        state.banner = { kind: "error", text: TEXT.titleUnconfirmed, correlationId: null };
+      }
+      if (edit !== null && state.titleEdit === edit) {
+        edit.saving = false;
+        edit.error = { text: TEXT.titleUnconfirmed, correlationId: null };
+      }
+      emit();
+    }
+
+    // AD-01 stage 4: a confirmed title. The confirmed-title store outlives the list page
+    // (A1-01a); only the three title fields of a present item are refreshed.
+    function applyConfirmedTitle(id, conversation, edit, kind) {
+      titleConfirmed[id] = {
+        title: conversation.title,
+        titleOrigin: conversation.titleOrigin,
+        canReset: conversation.canReset,
+        mark: ++titleMutationCount,
+      };
+      mergeTitleFields(id, conversation);
+      if (state.currentId === id && edit !== null && state.titleEdit === edit) {
+        state.titleEdit = null;
+        state.titleInfoOpen = false;
+      }
+      if (state.currentId === id) {
+        var done = kind === "reset" ? TEXT.titleReset : TEXT.titleRenamed;
+        state.banner = { kind: "info", text: done, correlationId: null };
+        announce(done);
+      }
+      emit();
+    }
+
+    // AD-01 stage 4: a definitive refusal belongs to the editor that sent it, and only
+    // while that editor is still the open one: a stale error is never shown on another
+    // conversation. Returns whether it was shown.
+    function applyTitleRefusal(outcome, id, edit, kind) {
+      if (kind === "reset") {
+        if (state.currentId !== id) {
+          return false;
+        }
+        state.banner = {
+          kind: "error",
+          text: outcome.text || TEXT.titleResetFailed,
+          correlationId: outcome.correlationId || null,
+        };
+      } else {
+        if (state.currentId !== id || state.titleEdit !== edit) {
+          return false;
+        }
+        edit.saving = false;
+        edit.error = {
+          text: outcome.text || TEXT.titleRenameFailed,
+          correlationId: outcome.correlationId || null,
+        };
+      }
+      emit();
+      return true;
+    }
+
+    // One title write per conversation at a time: the next waits for the previous one to
+    // settle, whatever its answer. An answer that is not definitive (the transport failed
+    // without saying whether the server committed) settles the request but blocks the
+    // conversation's later title writes: sending one past it could be committed before it.
+    function queueTitleMutation(id, lifetime, work) {
+      lifetime.queued++;
+      var settled = lifetime.tail.then(work, work);
+      lifetime.tail = settled.then(function () {}, function () {});
+      var release = function () {
+        lifetime.queued--;
+        releaseTitleLifetime(id, lifetime);
+      };
+      settled.then(release, release);
+      return settled;
+    }
+
+    // True when a response belongs to a write a newer one has already overtaken: it must
+    // change neither the list item nor any editor.
+    function titleMutationSuperseded(id, sequence) {
+      return (titleApplied[id] || 0) > sequence;
+    }
+
+    // The conversation's title writes are guarded (an earlier write's outcome is unknown),
+    // and a later write must not be sent. Say so where the person is, without dropping the
+    // draft: an editor keeps its text and gets the reason; a reset says it in the banner.
+    function reportTitleBlocked(id, edit, kind) {
+      if (kind === "reset") {
+        if (state.currentId === id) {
+          state.banner = { kind: "error", text: TEXT.titleUnconfirmed, correlationId: null };
+        }
+      } else if (edit !== null && state.titleEdit === edit) {
+        edit.saving = false;
+        edit.error = { text: TEXT.titleUnconfirmed, correlationId: null };
+      }
+      emit();
+      return { ok: false, reason: "unconfirmed" };
+    }
+
+    // The processing boundary of one title write's answer (AD-01 §7): validate identity,
+    // validate the raw contract, decide the transition, then apply. The first three stages
+    // write no shared state; the completion clears only its own operation record.
+    async function sendTitleMutation(mine, id, op, edit, body, kind) {
+      var sequence = op.sequence;
+      // Applicability is read before dispatch, never inferred from the slot afterwards: a
+      // write queued into a lifetime an authoritative removal has retired sends nothing, not
+      // even after it is woken from the session gate below.
+      if (mine !== epoch || !titleLifetimeApplicable(op.lifetime)) {
+        return { ok: false, reason: "stale" };
+      }
+      if (titleBlocked[id]) {
+        return reportTitleBlocked(id, edit, kind);
+      }
+      // A restoration or another recheck may be asking who is signed in. A queued private
+      // write waits for that answer: if the same person is let through it goes (in the
+      // page's order), and if the page starts over meanwhile the epoch changes and it is
+      // dropped. It is never sent into an unverified or a changed authenticated context.
+      while (state.gate && mine === epoch) {
+        await gateBarrier();
+      }
+      // After every gate wait: the session may have started over and the conversation may
+      // have been authoritatively removed while this write was held back.
+      if (mine !== epoch || !titleLifetimeApplicable(op.lifetime)) {
+        return { ok: false, reason: "stale" };
+      }
+      if (titleBlocked[id]) {
+        return reportTitleBlocked(id, edit, kind);
+      }
+      titleOps[id] = op;
+      var response = await http("PATCH", "/api/conversations/" + id, {
+        json: body,
+        // A soft timeout: the request is NOT aborted, and the queue stays behind it until
+        // the underlying request actually settles. A fetch that is aborted is not proof
+        // that the server stopped working on it, so aborting here would release a newer
+        // write past an earlier one that can still commit (the audited inversion).
+        timeoutMs: READ_TIMEOUT_MS,
+        softTimeout: true,
+        onTimeout: function () {
+          // A stale session, an invalidated operation or a retired lifetime cannot speak
+          // for this page.
+          if (mine !== epoch || titleOps[id] !== op || !titleLifetimeApplicable(op.lifetime)) {
+            return;
+          }
+          op.slow = true;
+          if (state.currentId === id) {
+            // Visible pending feedback: the write is still out, so it is not hidden.
+            state.banner = { kind: "info", text: TEXT.titlePending, correlationId: null };
+          }
+          emit();
+        },
+      });
+      // Stage 1 -- session and operation identity, before anything else. Nothing from an
+      // earlier session may clear, modify or report anything; the operation record is read
+      // but not written, so a record this operation does not own is never touched.
+      if (mine !== epoch) {
+        return { ok: false, reason: "stale" };
+      }
+      // An operation that owns the record of a lifetime the page has not retired is
+      // applicable; one whose lifetime was retired by an authoritative removal cannot apply
+      // anything, however its answer looks (the one absence acknowledgement is honoured in
+      // stage 3).
+      var operative = titleOps[id] === op && titleLifetimeApplicable(op.lifetime);
+      // Stage 2 -- strict validation of the raw answer. No compatibility inference.
+      var outcome = classifyConversationUpdate(response, id, body);
+      // Stage 3 -- the closed transition, still without shared-state writes.
+      var transition = decideTitleTransition(id, op, outcome, operative);
+      // Stage 4 -- apply only what the transition permits, beginning with this operation's
+      // own record. No other operation's record can be cleared here.
+      if (operative) {
+        clearTitleOperation(id, op);
+      }
+      if (transition.type === "superseded") {
+        return { ok: false, reason: "stale" };
+      }
+      if (transition.type === "auth_refused") {
+        // The application itself refused the request before any write: the session
+        // lifecycle owns this transition (AD-C2).
+        handleAuthLost();
+        return { ok: false, reason: "auth" };
+      }
+      if (transition.type === "auth_indeterminate") {
+        // AD-C2: a 401 that does not match the pre-write not_authenticated contract does
+        // not prove the write was not committed. Keep the draft and the guard, release and
+        // retry nothing, and ask the session lifecycle who is signed in now. The answer of
+        // that verification is not evidence that this mutation completed.
+        markTitleUnconfirmed(id, edit);
+        // (No notice argument: a session that is found ended while the page was in use is
+        // said to have expired, unlike a restored page the server no longer knows.)
+        recheck(undefined, true);
+        return { ok: false, reason: "auth_unconfirmed" };
+      }
+      if (transition.type === "indeterminate") {
+        // The server may or may not have committed. Nothing is marked applied; the
+        // conversation's later title writes are refused (not queued and released) until
+        // the page is reloaded. See TEXT.titleUnconfirmed for what the person is told.
+        markTitleUnconfirmed(id, edit);
+        return { ok: false, reason: "indeterminate" };
+      }
+      if (transition.type === "absent") {
+        // An idempotent authoritative absence: applying it deletes this conversation's
+        // ordering state with the rest of its state. A write that still owns its lifetime
+        // saw the conversation disappear now, so it may close the current view. A retired
+        // write only acknowledges the removal that retired it: it must not close a
+        // temporary view of the same conversation, which closes on its own history answer.
+        applyConversationAbsence(id, {
+          kind: "error",
+          text: TEXT.conversationGone,
+          announce: null,
+          closeCurrent: operative,
+          lifetime: op.lifetime,
+        });
+        return { ok: false, reason: "gone" };
+      }
+      titleApplied[id] = sequence;
+      if (transition.type === "confirmed") {
+        // The confirmation is kept whether or not the conversation is on the page now:
+        // the list item may be gone while a later, older read still carries its title.
+        // A rename is not activity, so the item keeps its place and its dates.
+        applyConfirmedTitle(id, transition.conversation, edit, kind);
+        return { ok: true };
+      }
+      // A definitive refusal: a 4xx says this application decided not to do the write, so
+      // nothing was stored and the conversation's write order is known again; progress
+      // continues. (No 5xx reaches here: it is indeterminate, whatever its body says.)
+      return applyTitleRefusal(transition, id, edit, kind)
+        ? { ok: false, reason: "failed" }
+        : { ok: false, reason: "stale" };
+    }
+
+    async function saveTitle() {
+      var edit = state.titleEdit;
+      var item = currentListItem();
+      if (edit === null || item === null || edit.saving) {
+        return { ok: false, reason: "not_editing" };
+      }
+      if (titleBlocked[item.id]) {
+        return reportTitleBlocked(item.id, edit, "save");
+      }
+      var prepared = prepareConversationTitle(edit.draft);
+      if (!prepared.ok) {
+        edit.error = { text: prepared.message, correlationId: null };
+        emit();
+        return { ok: false, reason: prepared.reason };
+      }
+      var mine = epoch;
+      var id = item.id;
+      var lifetime = titleLifetimeFor(id);
+      var op = newTitleOperation(issueTitleMutation(id), "save", lifetime);
+      edit.saving = true;
+      edit.error = null;
+      emit();
+      return queueTitleMutation(id, lifetime, function () {
+        return sendTitleMutation(mine, id, op, edit, { title: prepared.text }, "save");
+      });
+    }
+
+    async function resetTitle() {
+      var item = currentListItem();
+      if (item === null || !item.canReset || (state.titleEdit !== null && state.titleEdit.saving)) {
+        return { ok: false, reason: "not_resettable" };
+      }
+      if (titleBlocked[item.id]) {
+        return reportTitleBlocked(item.id, null, "reset");
+      }
+      var mine = epoch;
+      var id = item.id;
+      var lifetime = titleLifetimeFor(id);
+      var op = newTitleOperation(issueTitleMutation(id), "reset", lifetime);
+      state.titleInfoOpen = false;
+      emit();
+      return queueTitleMutation(id, lifetime, function () {
+        return sendTitleMutation(mine, id, op, null, { title: null }, "reset");
+      });
+    }
+
     function chooseInitialConversation() {
       var newest = null;
       Object.keys(state.pending).forEach(function (id) {
@@ -4142,6 +5340,72 @@
 
     // --- the list ------------------------------------------------------------------------------
 
+    // The server's list answer, with the confirmed titles this page still knows better.
+    //
+    // A read that was out when a title write of one of its conversations was confirmed may
+    // have been answered from a snapshot taken before that write. Applying it unchanged
+    // would put the old title back on screen (the audited stale-GET defect). The three
+    // title fields therefore come from `titleConfirmed`, which is kept independently of
+    // the list: the conversation may have been absent from the list when the write was
+    // confirmed (the audited 50-item transition) and return in this answer, so the item
+    // already shown cannot be the source. Every other field -- membership, order,
+    // created/activity times and any unrelated metadata -- is the server's, and nothing
+    // is inserted or resurrected: only conversations in the answer are returned.
+    //
+    // A read that begins after the confirmation records a mark at or after the entry's,
+    // so it applies the server's title and drops the entry: a change made by another tab
+    // or channel is not suppressed for good, and the metadata does not accumulate.
+    function keepConfirmedTitles(items, titleMarkMine) {
+      return items.map(function (incoming) {
+        var confirmed = titleConfirmed[incoming.id];
+        if (confirmed === undefined) {
+          return incoming;
+        }
+        if (confirmed.mark <= titleMarkMine) {
+          // This read began after the confirmation: its snapshot is authoritative.
+          delete titleConfirmed[incoming.id];
+          return incoming;
+        }
+        var kept = {};
+        Object.keys(incoming).forEach(function (key) {
+          kept[key] = incoming[key];
+        });
+        kept.title = confirmed.title;
+        kept.titleOrigin = confirmed.titleOrigin;
+        kept.canReset = confirmed.canReset;
+        return kept;
+      });
+    }
+
+    // AD-C1 applicability: is there anything this page holds of the conversation? An
+    // authoritative "it is gone" is applied only when it is about state that exists here
+    // (the open conversation, a thread, an unresolved turn, a title operation or guard, a
+    // confirmed title, a list item, or an existing marker). A delayed answer about a
+    // conversation this page never held changes nothing.
+    function conversationStillRelevant(id) {
+      if (state.currentId === id || state.pending[id] !== undefined || state.threads[id] !== undefined) {
+        return true;
+      }
+      if (goneMarks[id] !== undefined) {
+        return true;
+      }
+      if (titleSeq[id] !== undefined || titleApplied[id] !== undefined) {
+        return true;
+      }
+      if (titleQueues[id] !== undefined || titleOps[id] !== undefined) {
+        return true;
+      }
+      if (titleBlocked[id] === true || titleConfirmed[id] !== undefined) {
+        return true;
+      }
+      for (var i = 0; i < state.list.items.length; i++) {
+        if (state.list.items[i].id === id) {
+          return true;
+        }
+      }
+      return false;
+    }
+
     async function loadList() {
       if (state.gate) {
         return false; // held back: nothing is asked for the conversations until it is known who is signed in
@@ -4149,20 +5413,46 @@
       var mine = epoch;
       var listMine = listEpoch;
       var readMine = ++listRead;
+      // A title confirmed after this counter's value may have been written after the
+      // server took this read's snapshot: the answer must not restore that old title.
+      var titleMarkMine = titleMutationCount;
       state.list.status = "loading";
       state.list.error = null;
       emit();
       var response = await http("GET", "/api/conversations?limit=" + PAGE_SIZE, { timeoutMs: READ_TIMEOUT_MS });
       if (mine !== epoch || listMine !== listEpoch || readMine !== listRead) {
+        if (mine === epoch && listMine !== listEpoch && readMine === listRead && state.list.status === "loading") {
+          // This read was invalidated by an authoritative "it no longer exists" (a
+          // deletion or a conversation_not_found), not superseded by a newer read. What
+          // this page holds is that answer's result, so the list is not still loading
+          // (and no request is made for the conversations on a page that was held back).
+          state.list.status = "ready";
+          state.list.error = null;
+          emit();
+        }
         return false;
       }
       var found = classifyRead(response);
       if (found.type === "ok") {
         var list = normalizeConversationList(found.body);
         if (list !== null) {
-          state.list.items = list.items;
+          state.list.items = keepConfirmedTitles(list.items, titleMarkMine);
           state.list.hasMore = list.hasMore;
           state.list.status = "ready";
+          // AD-C1: an authoritative read begun after a disappearance is the server's current
+          // list; a conversation it lists again revokes that one marker. Every other marker
+          // stays -- bounded by the conversations confirmed absent on this page -- so a
+          // repeated late notification cannot invalidate this refill.
+          Object.keys(goneMarks).forEach(function (gone) {
+            if (
+              goneMarks[gone] <= listMine &&
+              list.items.some(function (item) {
+                return item.id === gone;
+              })
+            ) {
+              delete goneMarks[gone];
+            }
+          });
           if (state.deleting && !list.items.some(function (item) { return item.id === state.deleting.id; })) {
             state.deleting = null; // the question was about a conversation the server no longer lists
           }
@@ -4188,6 +5478,7 @@
           var item = items.splice(i, 1)[0];
           if (typeof time === "number") {
             item.updatedAt = time;
+            item.lastMessageAt = time; // a new message is the activity the list orders by
           }
           items.unshift(item);
           return;
@@ -4204,6 +5495,10 @@
       if (state.deleting && state.deleting.phase !== "deleting") {
         state.deleting = null; // opening something else calls off a question about what was there
       }
+      // The title controls belong to the conversation that was open: another one (or the
+      // new draft) gets its own, and no half-written title is carried over.
+      state.titleEdit = null;
+      state.titleInfoOpen = false;
       state.section = "chats";
       state.currentId = id;
       state.banner = null;
@@ -4217,7 +5512,9 @@
       await loadLatest(id);
     }
 
-    function loadLatest(id) {
+    // `recovering` marks the one fresh read a stale temporary-history settlement asks for
+    // (R5-C4): it is still an ordinary read, but it is not itself allowed to ask for another.
+    function loadLatest(id, recovering) {
       var thread = ensureThread(id);
       if (thread.latest) {
         return thread.latest;
@@ -4225,9 +5522,20 @@
       if (state.gate) {
         return Promise.resolve(false); // held back (see loadList); letThrough reads it when it is known
       }
-      var run = fetchLatest(id).then(
+      var run = fetchLatest(id, recovering === true).then(
         function (value) {
           thread.latest = null;
+          // A temporary-history answer that settled as stale changed nothing and started no
+          // read of its own. If this conversation is still the one the page shows, it now
+          // deserves one fresh applicable read. An already-running read (thread.latest) is
+          // joined by loadLatest instead of being duplicated; a page held back recovers
+          // through letThrough; a view the person has left is read again when they return.
+          if (thread.needsRecovery) {
+            thread.needsRecovery = false;
+            if (!state.gate && state.currentId === id && state.threads[id] === thread && !thread.synced) {
+              track(loadLatest(id, true));
+            }
+          }
           return value;
         },
         function (problem) {
@@ -4239,9 +5547,15 @@
       return thread.latest;
     }
 
-    async function fetchLatest(id) {
+    async function fetchLatest(id, recovering) {
       var mine = epoch;
       var thread = ensureThread(id);
+      // The absence generation this read speaks against, captured when it is issued. A
+      // temporary view is one opened for a conversation this page has already confirmed
+      // absent; its own 404 closes it only while that marker is still the live one. If an
+      // authoritative re-listing revokes the marker, the read describes a lifetime the page
+      // no longer holds and must not act on the re-listed conversation (R5-C3).
+      var absenceGeneration = goneMarks[id];
       if (thread.messages.length === 0) {
         thread.status = "loading";
       }
@@ -4275,7 +5589,23 @@
         return false;
       }
       if (found.type === "not_found") {
-        conversationGone(id);
+        var outcome = conversationGone(id, { thread: thread, absenceGeneration: absenceGeneration });
+        if (outcome && outcome.applicable === false) {
+          // The answer speaks about a lifetime the page no longer holds, so it applied
+          // nothing and started no read. Leaving the view in its loading state would offer
+          // no way out; instead the one fresh applicable read is asked for. A recovery read
+          // that is stale too does not ask again: it takes the recoverable history-error
+          // state, whose retry is the person's own (R5-C4).
+          if (recovering === true) {
+            thread.error = { text: TEXT.historyUnavailable, correlationId: null };
+            if (thread.messages.length === 0) {
+              thread.status = "error";
+            }
+            emit();
+          } else {
+            thread.needsRecovery = true;
+          }
+        }
         return false;
       }
       thread.error = { text: found.text || TEXT.threadFailed, correlationId: found.correlationId || null };
@@ -4300,16 +5630,165 @@
       if (state.deleting && state.deleting.id === id) {
         state.deleting = null;
       }
+      // Nothing of the conversation's title ordering survives it. The lifetime record itself
+      // is retired (and its slot detached) by applyConversationAbsence before this runs: a
+      // queued write still carrying it sees a retired lifetime and sends nothing, and no
+      // unconfirmed guard blocks anything else. The slot is never deleted here -- doing that
+      // left the chained callbacks runnable (the R5 review's first defect).
+      delete titleSeq[id];
+      delete titleApplied[id];
+      delete titleOps[id];
+      delete titleBlocked[id];
+      delete titleConfirmed[id];
+      // The title controls belong to whatever is open. A conversation that disappears
+      // while another one is open (a delayed 404 for the one switched away from) must not
+      // close the other's editor or drop its draft.
+      if (state.currentId === id && (state.titleEdit !== null || state.titleInfoOpen)) {
+        state.titleEdit = null;
+        state.titleInfoOpen = false;
+      }
     }
 
-    function conversationGone(id) {
+    // AD-C1/C2 ownership: may this confirmation act on the state the page holds now? Every
+    // absence caller captures the context it belongs to and passes it here:
+    //
+    // - a history read passes the thread object it read, and applies only while the page
+    //   still holds that very thread (a conversation removed and listed again, or a fresh
+    //   view opened afterwards, is a different object). A read issued for a temporary view
+    //   (a conversation this page had confirmed absent) also passes the absence generation
+    //   it was issued against: while that marker is revoked by an authoritative re-listing,
+    //   the thread is merely still attached to a conversation the server lists again, and
+    //   the read speaks about a lifetime the page no longer holds (R5-C3);
+    // - an unresolved turn passes its own turn record, and applies only while that record is
+    //   still the conversation's pending turn (the page removes it when the conversation
+    //   goes, so a delayed answer for the retired turn is stale);
+    // - a title write or DELETE passes the conversation lifetime it captured when issued. A
+    //   live lifetime may still apply a first removal; a retired one may only acknowledge
+    //   the marker that retired it. A retired lifetime whose marker was revoked by an
+    //   authoritative re-listing speaks about a lifetime the server no longer lists: it is
+    //   stale and must not remove the fresh one, close a replacement view, clear a draft or
+    //   guard, or invalidate a legitimate newer list read.
+    function absenceIsOwned(id, notice) {
+      if (notice.lifetime !== undefined) {
+        if (notice.lifetime.retiredGeneration === null) {
+          return true;
+        }
+        return goneMarks[id] === notice.lifetime.retiredGeneration;
+      }
+      if (notice.thread !== undefined) {
+        if (notice.absenceGeneration !== undefined && goneMarks[id] !== notice.absenceGeneration) {
+          return false;
+        }
+        return state.threads[id] === notice.thread;
+      }
+      if (notice.turn !== undefined) {
+        return state.pending[id] === notice.turn;
+      }
+      return true;
+    }
+
+    // AD-C1 (OD-5): one authoritative-absence reconciliation, shared by every path that can
+    // learn a conversation does not exist -- a read's 404, a title write's 404, a confirmed
+    // DELETE. The first applicable confirmation owns the page-wide consequences: it advances
+    // the list generation (so a read begun before it cannot put the conversation back),
+    // retires the conversation's title lifetime and, when an explicit DELETE is outstanding
+    // in that lifetime, owns its one list refill -- whether the DELETE itself or an earlier
+    // read/title answer is what confirmed the removal.
+    //
+    // A later confirmation of the same disappearance (a marker already exists) repeats none
+    // of those effects, so it never invalidates a legitimate read begun after the first:
+    // it only drops what the page currently holds of the conversation. A temporary view
+    // opened after the removal therefore closes on its own 404 without global effects.
+    //
+    // `notice` is what this caller says when it removed the open conversation, and
+    // `closeCurrent` says whether a duplicate acknowledgement may touch the current view at
+    // all (a duplicate DELETE leaves alone a fresh attempt that deserves its own answer).
+    // `force` is the DELETE path's own applicability: the page issued that request for a
+    // conversation it held, so its confirmed deletion is authoritative even if a meanwhile
+    // re-listed page has already dropped the item (the list must still be filled back up).
+    //
+    // Ownership is decided before anything is read or written (see absenceIsOwned): a
+    // confirmation only speaks for the state it was issued against. A detached thread or a
+    // retired lifetime whose marker the server revoked describes a lifetime the page no
+    // longer holds, so it is stale: it changes nothing, announces nothing and starts no read.
+    function applyConversationAbsence(id, notice) {
+      if (!absenceIsOwned(id, notice)) {
+        return { first: false, refill: false, applicable: false };
+      }
       var wasCurrent = state.currentId === id;
-      forgetConversation(id);
-      if (wasCurrent) {
-        state.currentId = null;
-        state.banner = { kind: "error", text: TEXT.conversationGone, correlationId: null };
+      var first = false;
+      var refill = false;
+      if (goneMarks[id] === undefined && (notice.force === true || conversationStillRelevant(id))) {
+        first = true;
+        goneMarks[id] = ++listEpoch;
+        var lifetime = titleQueues[id];
+        if (lifetime !== undefined) {
+          lifetime.retiredGeneration = goneMarks[id];
+          delete titleQueues[id]; // a conversation the server lists again begins a fresh lifetime
+          if (lifetime.deletes > 0 && !lifetime.refillOwned) {
+            lifetime.refillOwned = true;
+            refill = true;
+          }
+        }
+      }
+      if (first || notice.closeCurrent) {
+        forgetConversation(id);
+        if (wasCurrent) {
+          state.currentId = null;
+          state.banner = { kind: notice.kind || "error", text: notice.text, correlationId: null };
+        }
+      }
+      if (notice.announce) {
+        announce(notice.announce);
+      }
+      if (refill) {
+        // The page held the list one conversation short (and perhaps with an older one still
+        // beyond its edge): read it again so it is full to its limit. A read begun before the
+        // removal is ignored (listEpoch); while the page is held back nothing may be asked
+        // for the conversations, so the one refill waits for letThrough.
+        if (state.gate) {
+          listRefreshOnUnlock = true;
+        } else {
+          track(loadList());
+        }
       }
       emit();
+      return { first: first, refill: refill, applicable: true };
+    }
+
+    // The application says a conversation does not exist (a 404 from a read or a title
+    // write): that is authoritative when this page still holds the state the answer is about
+    // (AD-C1). A list read begun before this answer may have been taken while the
+    // conversation still existed and must not put it back; a read that begins afterwards is
+    // the server's current list and applies normally. A marked conversation this page opens
+    // again gets a temporary view whose own 404 closes it without repeating the global
+    // reconciliation.
+    //
+    // `evidence` is the caller's ownership context (see absenceIsOwned): the thread a read
+    // read, or the turn it answered for. A caller with no such context (the title path, which
+    // passes the captured lifetime directly) omits it.
+    function conversationGone(id, evidence) {
+      var notice = {
+        kind: "error",
+        text: TEXT.conversationGone,
+        announce: null,
+        closeCurrent: true,
+      };
+      if (evidence !== undefined && evidence !== null) {
+        if (evidence.thread !== undefined) {
+          notice.thread = evidence.thread;
+        }
+        // A read of a temporary view carries the absence generation it was issued against.
+        // (An ordinary read of a live conversation has none; its thread identity is enough,
+        // because an authoritative removal always detaches that thread.)
+        if (evidence.absenceGeneration !== undefined) {
+          notice.absenceGeneration = evidence.absenceGeneration;
+        }
+        if (evidence.turn !== undefined) {
+          notice.turn = evidence.turn;
+        }
+      }
+      return applyConversationAbsence(id, notice);
     }
 
     // Deleting is asked first, for one conversation, and done only on the second click.
@@ -4323,6 +5802,9 @@
       if (state.deleting && state.deleting.phase === "deleting") {
         return;
       }
+      // One thing at a time in the header: the deletion question puts the title controls away.
+      state.titleEdit = null;
+      state.titleInfoOpen = false;
       state.deleting = { id: id, phase: "asking", error: null };
       emit();
     }
@@ -4346,44 +5828,68 @@
       }
       var mine = epoch;
       var id = asked.id;
+      // The lifetime that issues this DELETE. The deletion runs independently of the title
+      // queue, but an earlier read or title answer may learn of the same removal first; the
+      // outstanding-DELETE count on this record is what lets that first confirmation own the
+      // one refill the deletion requires, and this settlement avoid a second.
+      var lifetime = titleLifetimeFor(id);
+      lifetime.deletes++;
       asked.phase = "deleting";
       asked.error = null;
       emit();
       var response = await http("DELETE", "/api/conversations/" + id, { timeoutMs: READ_TIMEOUT_MS });
       if (mine !== epoch) {
+        lifetime.deletes--;
+        releaseTitleLifetime(id, lifetime);
         return { ok: false, reason: "stale" };
       }
       var outcome = classifyConversationDelete(response);
       if (outcome.type === "auth") {
+        lifetime.deletes--;
+        releaseTitleLifetime(id, lifetime);
         handleAuthLost();
         return { ok: false, reason: "auth" };
       }
       if (outcome.type === "deleted" || outcome.type === "gone") {
         var wasCurrent = state.currentId === id;
-        listEpoch++; // a list read begun before this answer has the conversation and is not waited for
-        forgetConversation(id);
-        if (wasCurrent) {
-          state.currentId = null; // a new empty draft: the next message makes its conversation
-          state.banner = { kind: "info", text: TEXT.deleted, correlationId: null };
-        }
+        // Does this completion still belong to the delete question the page shows? It does
+        // only while that question is the page's own record and the conversation it asked
+        // about is still the open one. A delayed or duplicate answer for a question another
+        // reconciliation already settled (or for a conversation the person has left) must
+        // not move the keyboard or give current-view feedback.
+        var ownedQuestion = state.deleting === asked;
+        // A deletion this page confirmed is an authoritative absence (AD-C1). The shared
+        // reconciliation applies it once: a duplicate acknowledgement (an earlier read or
+        // title 404 already reconciled this removal) leaves the current view and any newer
+        // delete question alone and starts no further list read. The captured lifetime is
+        // the ownership evidence: a lifetime retired by an earlier confirmation, whose
+        // marker a re-listing revoked, is stale and changes nothing.
+        var removed = applyConversationAbsence(id, {
+          kind: "info",
+          text: TEXT.deleted,
+          announce: TEXT.deleted,
+          closeCurrent: false,
+          force: true,
+          lifetime: lifetime,
+        });
         if (state.deleting === asked) {
+          // (the question's own record settles whatever the reconciliation did)
           state.deleting = null;
+          emit();
         }
-        announce(TEXT.deleted);
-        emit();
-        // The page held the list as it was before this deletion, one conversation short (and
-        // perhaps with an older one still beyond its edge): read the list again from the server,
-        // which fills it back up to its limit. A read begun before the deletion is ignored
-        // (listEpoch); a failed read leaves the list in its error state, with its retry, and
-        // still without the conversation that is confirmed gone. While the page is held back
-        // nothing may be asked for the conversations, so the read waits for letThrough.
-        if (state.gate) {
-          listRefreshOnUnlock = true;
-        } else {
-          track(loadList());
-        }
-        return { ok: true, wasCurrent: wasCurrent };
+        // (the count stays above zero through the reconciliation above: it is what lets a
+        // first confirmation own the one refill, whether the DELETE or an earlier answer is
+        // the confirmation)
+        lifetime.deletes--;
+        releaseTitleLifetime(id, lifetime);
+        // What the caller is told was "the open conversation is now a new empty draft" only
+        // when this call actually closed it. `wasCurrent` keeps that meaning; `interaction`
+        // separately says whether this completion still owns the delete question the page
+        // shows, which is the only case in which it may move the keyboard.
+        return { ok: true, wasCurrent: removed.first && wasCurrent, interaction: ownedQuestion && wasCurrent };
       }
+      lifetime.deletes--;
+      releaseTitleLifetime(id, lifetime);
       if (state.deleting === asked) {
         asked.phase = "error";
         asked.error = { text: outcome.text || TEXT.deleteFailed, correlationId: outcome.correlationId || null };
@@ -4399,6 +5905,9 @@
       if (state.gate || !thread || !thread.hasMore || thread.nextBefore === null || thread.loadingOlder) {
         return;
       }
+      // See fetchLatest: an older read of a temporary view belongs to the absence
+      // generation it was issued against, not to whatever the page holds when it settles.
+      var absenceGeneration = goneMarks[id];
       thread.loadingOlder = true;
       thread.olderError = null;
       emit();
@@ -4428,7 +5937,7 @@
         return;
       }
       if (found.type === "not_found") {
-        conversationGone(id);
+        conversationGone(id, { thread: thread, absenceGeneration: absenceGeneration });
         return;
       }
       thread.olderError = { text: found.text || TEXT.olderFailed, correlationId: found.correlationId || null };
@@ -4566,7 +6075,7 @@
           handleAuthLost();
           return;
         case "not_found":
-          conversationGone(id);
+          conversationGone(id, { turn: turn });
           return;
         case "busy":
           turn.waitCode = outcome.code;
@@ -4611,16 +6120,25 @@
         return item.id === id;
       });
       if (!known) {
-        state.list.items.unshift({ id: id, title: null, createdAt: turn.user.createdAt, updatedAt: turn.assistant.createdAt });
+        state.list.items.unshift({
+          id: id,
+          title: null,
+          titleOrigin: "none",
+          canReset: false,
+          createdAt: turn.user.createdAt,
+          updatedAt: turn.assistant.createdAt,
+          lastMessageAt: turn.assistant.createdAt,
+        });
       }
       // A conversation that has no name yet is named by its first message, as the server will name it
       // when the list is read again. Only when the first message is known to be in memory: not when an
       // older page is still to be read.
       state.list.items.forEach(function (item) {
-        if (item.id === id && !item.title && !thread.hasMore) {
+        if (item.id === id && !item.title && !item.canReset && !thread.hasMore) {
           for (var i = 0; i < thread.messages.length; i++) {
             if (thread.messages[i].role === "user") {
               item.title = deriveTitle(thread.messages[i].text);
+              item.titleOrigin = "derived";
               return;
             }
           }
@@ -4638,9 +6156,12 @@
       turn.checking = true;
       emit();
       await loadLatest(id);
-      var again = state.pending[id];
-      if (again) {
-        again.checking = false;
+      // Only the turn this reconciliation began with may have its check cleared. A
+      // replacement turn (the same conversation id, a different record) owns its own
+      // checking state; looking the pending turn up again by id would let this delayed
+      // completion clear a check that is still visibly in progress (R5-C3).
+      if (state.pending[id] === turn) {
+        turn.checking = false;
         emit();
       }
     }
@@ -7602,14 +9123,34 @@
     // work goes on (letThrough: the turns left unclear are read again, a reply being prepared is
     // watched again); another person gets a page started over; a 401 is the end of the session;
     // no answer leaves the page held back, with a button to ask again.
-    function recheck() {
+    function recheck(authNotice, force) {
       if (!checkSession() || state.screen !== "app") {
         return;
       }
       if (!state.gate || state.gate.phase !== "checking") {
         holdBack();
       }
-      track(verifySession());
+      track(verifySession(authNotice, force));
+    }
+
+    // The browser restored this document from its back/forward cache (a persisted
+    // pageshow): this is the same page, not a new load. Its title-write queue and the
+    // guard of an unconfirmed write are memory of this same document, so they are kept --
+    // a restoration must not release a newer write past an earlier one that can still
+    // commit. Who is signed in is asked a fresh time, even if an earlier question is still
+    // out (verifySession): the answer to a question asked before the restoration describes
+    // the page as it was then and must not open it now. A different person starts the page
+    // over (verifySession -> start), a definite 401 ends it, and both discard the previous
+    // account's title state. A page on any other screen has nothing of a signed-in page to
+    // keep and begins as before.
+    function restore() {
+      if (state.screen === "app") {
+        // null: a restored page the server no longer knows shows the plain sign-in, not the
+        // "session expired" complaint of a session that ended in front of the person.
+        recheck(null, true);
+        return Promise.resolve();
+      }
+      return start();
     }
 
     // The button of the screens that say something could not be done: ask who is signed in
@@ -7680,7 +9221,7 @@
         type: "pending",
         role: "user",
         text: turn.text,
-        time: formatMoment(turn.sentAt, now),
+        time: moscowClock(turn.sentAt),
         iso: isoTime(turn.sentAt),
         phase: turn.phase,
         note: "",
@@ -8012,8 +9553,29 @@
       };
     }
 
+    // A calendar-day separator in the thread, in Moscow time: absolute, never "сегодня"
+    // or "вчера". One is added whenever the displayed Moscow day changes from the last
+    // dated entry, the first day included, and only from an authoritative timestamp -- a
+    // message with none gets no invented date. Because the timeline is derived from the
+    // whole loaded history on every render, loading older messages recalculates the
+    // separators instead of duplicating them.
+    function pushTimelineItem(items, day, time, item) {
+      var key = moscowDayKey(time);
+      if (key !== null && key !== day.key) {
+        items.push({
+          type: "day",
+          key: key,
+          label: moscowDate(time),
+          zone: TEXT.moscowSuffix,
+        });
+        day.key = key;
+      }
+      items.push(item);
+    }
+
     function buildTimeline(thread, turn, now) {
       var items = [];
+      var day = { key: null };
       var messages = thread ? thread.messages : [];
       var last = messages.length - 1;
       // A turn restored from the storage is shown only once the history of its conversation has
@@ -8033,7 +9595,7 @@
           role: message.role,
           text: message.text,
           photo: message.photo || null,
-          time: formatMoment(message.createdAt, now),
+          time: moscowClock(message.createdAt),
           iso: isoTime(message.createdAt),
           status: message.status,
           note: "",
@@ -8065,10 +9627,11 @@
           item.correlationId = (message.key !== null && thread.correlations[message.key]) || null;
           item.canRetry = i === last && message.key !== null && !turn;
         }
-        items.push(item);
+        pushTimelineItem(items, day, message.createdAt, item);
       }
       if (turn) {
-        items.push(describePending(turn, now, thread));
+        var pending = describePending(turn, now, thread);
+        pushTimelineItem(items, day, turn.sentAt, pending);
       }
       return items;
     }
@@ -8116,6 +9679,23 @@
         busy: false,
         maxLength: maxLength,
         chatTitle: "",
+        title: {
+          canAct: false,
+          canReset: false,
+          origin: "none",
+          explanation: "",
+          infoOpen: false,
+          editing: false,
+          draft: "",
+          saving: false,
+          error: null,
+          notice: null,
+          pending: false,
+          slow: false,
+          blocked: false,
+          blockedText: null,
+          maxLength: MAX_CONVERSATION_TITLE,
+        },
         list: { status: "idle", error: null, hasMore: false, draftCurrent: false, deleting: null, items: [] },
         thread: {
           id: null,
@@ -8161,27 +9741,75 @@
         deleting: state.deleting,
         items: state.list.items.map(function (item) {
           var turn = state.pending[item.id];
-          var meta = item.updatedAt === null ? "" : formatMoment(item.updatedAt, now);
+          var activity = "";
           if (turn) {
-            meta = turn.phase === "sending" || turn.phase === "waiting" ? "готовится ответ…" : "ждет решения";
+            activity = turn.phase === "sending" || turn.phase === "waiting" ? "готовится ответ…" : "ждет решения";
           }
+          var last = item.lastMessageAt === null || item.lastMessageAt === undefined
+            ? TEXT.noMessages
+            : moscowMoment(item.lastMessageAt);
+          var titleOp = titleOps[item.id] || null;
+          var titleIsBlocked = titleBlocked[item.id] === true;
           return {
             id: item.id,
             label: conversationLabel(item, now),
-            meta: meta,
+            createdText: TEXT.createdLabel + ": " + moscowMoment(item.createdAt),
+            lastText: TEXT.lastMessageLabel + ": " + last,
+            // Kept for the parts of the page that said one line; the two above are the
+            // truthful pair this increment shows.
+            meta: activity || (item.lastMessageAt ? moscowMoment(item.lastMessageAt) : TEXT.noMessages),
+            activity: activity,
+            titleOrigin: item.titleOrigin,
+            // A1-01: a title write that is still out (past the soft timeout: `slow`) or
+            // unconfirmed (the connection failed) is visible on its conversation even
+            // when another one is open, so it is never a hidden pending operation.
+            titlePending: titleOp !== null,
+            titlePendingText: titleOp === null ? "" : titleOp.slow ? TEXT.titlePending : TEXT.titleSaving,
+            titleBlocked: titleIsBlocked,
+            titleBlockedText: titleIsBlocked ? TEXT.titleUnconfirmedShort : "",
             current: item.id === current,
           };
         }),
       };
-      view.chatTitle = "Новый разговор";
+      view.chatTitle = "Новый диалог";
       view.list.items.forEach(function (item) {
         if (item.current) {
           view.chatTitle = item.label;
         }
       });
-      if (current !== null && view.chatTitle === "Новый разговор") {
-        view.chatTitle = "Разговор"; // not in the list (older than the list shows)
+      if (current !== null && view.chatTitle === "Новый диалог") {
+        view.chatTitle = "Диалог"; // not in the list (older than the list shows)
       }
+      var titleItem = null;
+      if (current !== null) {
+        for (var t = 0; t < state.list.items.length; t++) {
+          if (state.list.items[t].id === current) {
+            titleItem = state.list.items[t];
+            break;
+          }
+        }
+      }
+      var titleOp = current === null ? null : titleOps[current] || null;
+      var titleIsBlocked = current !== null && titleBlocked[current] === true;
+      view.title = {
+        canAct: titleItem !== null,
+        canReset: Boolean(titleItem && titleItem.canReset),
+        origin: titleItem === null ? "none" : titleItem.titleOrigin,
+        explanation: titleExplanation(titleItem),
+        infoOpen: state.titleInfoOpen && titleItem !== null,
+        editing: state.titleEdit !== null && titleItem !== null,
+        draft: state.titleEdit === null ? "" : state.titleEdit.draft,
+        saving: state.titleEdit !== null && state.titleEdit.saving,
+        error: state.titleEdit === null ? null : state.titleEdit.error,
+        notice: state.titleEdit === null ? null : state.titleEdit.notice,
+        // A1-01: the open conversation's title write that is still out (past the soft
+        // timeout: `slow`) and the guard left by an outcome that could not be confirmed.
+        pending: titleOp !== null,
+        slow: Boolean(titleOp && titleOp.slow),
+        blocked: titleIsBlocked,
+        blockedText: titleIsBlocked ? TEXT.titleUnconfirmed : null,
+        maxLength: MAX_CONVERSATION_TITLE,
+      };
       var thread = current === null ? null : state.threads[current] || null;
       var turn = current === null ? null : state.pending[current] || null;
       var timeline = buildTimeline(thread, turn, now);
@@ -8235,6 +9863,7 @@
 
     return {
       start: start,
+      restore: restore,
       selectConversation: selectConversation,
       startDraft: function () {
         return selectConversation(null);
@@ -8255,6 +9884,17 @@
       cancelDeleteConversation: cancelDeleteConversation,
       deleteConversation: function () {
         return track(deleteConversation());
+      },
+      beginTitleEdit: beginTitleEdit,
+      cancelTitleEdit: cancelTitleEdit,
+      syncTitleDraft: syncTitleDraft,
+      showTitleOrigin: showTitleOrigin,
+      closeTitleOrigin: closeTitleOrigin,
+      saveTitle: function () {
+        return track(saveTitle());
+      },
+      resetTitle: function () {
+        return track(resetTitle());
       },
       showSection: showSection,
       openFavorite: function (id) {
@@ -8397,13 +10037,13 @@
   var TELEGRAM_TEXT = {
     loading: "Проверяем Telegram…",
     unlinked:
-      "Подключите Telegram, чтобы писать помощнику с телефона. Разговоры будут общими с сайтом: " +
+      "Подключите Telegram, чтобы писать помощнику с телефона. Диалоги будут общими с сайтом: " +
       "начатое здесь можно продолжить там и наоборот.",
     // Always under the panel: what connecting does with what the person writes, and what happens to it.
     privacy:
       "После подключения все, что вы пишете помощнику на сайте, вместе с его ответами дублируется в этот " +
       "Telegram-чат (отдельно это не отключается: только отключением Telegram). Текст сообщений и фотографии " +
-      "передаются в OpenAI для подготовки ответа. История разговоров хранится 365 дней и затем удаляется; " +
+      "передаются в OpenAI для подготовки ответа. История диалогов хранится 365 дней и затем удаляется; " +
       "рецепты, сохраненные в избранное, остаются, пока вы сами их не уберете.",
     unavailable:
       "Бот Telegram сейчас не отвечает: подключить его и получать сообщения в Telegram пока нельзя. " +
@@ -8786,6 +10426,7 @@
   return {
     MAX_MESSAGE_LENGTH: MAX_MESSAGE_LENGTH,
     MAX_PROFILE_NAME: MAX_PROFILE_NAME,
+    MAX_CONVERSATION_TITLE: MAX_CONVERSATION_TITLE,
     MEASURE_LIMITS: MEASURE_LIMITS,
     MEASURE_KEYS: MEASURE_KEYS,
     formatFraction: formatFraction,
@@ -8804,10 +10445,17 @@
     hasUnstorableCharacters: hasUnstorableCharacters,
     prepareMessage: prepareMessage,
     prepareProfileName: prepareProfileName,
+    prepareConversationTitle: prepareConversationTitle,
     isValidIdempotencyKey: isValidIdempotencyKey,
     newIdempotencyKey: newIdempotencyKey,
     parseTimestamp: parseTimestamp,
+    parseTimestampStrict: parseTimestampStrict,
     formatMoment: formatMoment,
+    moscowParts: moscowParts,
+    moscowDate: moscowDate,
+    moscowClock: moscowClock,
+    moscowMoment: moscowMoment,
+    moscowDayKey: moscowDayKey,
     conversationLabel: conversationLabel,
     deriveTitle: deriveTitle,
     TITLE_LENGTH: TITLE_LENGTH,
@@ -8823,6 +10471,7 @@
     classifyMe: classifyMe,
     classifyRead: classifyRead,
     classifyCreate: classifyCreate,
+    classifyConversationUpdate: classifyConversationUpdate,
     classifyMessageSend: classifyMessageSend,
     createPendingStore: createPendingStore,
     createController: createController,

@@ -14,7 +14,7 @@ const vm = require("node:vm");
 const H = require("./harness.js");
 const { parseShell } = require("./fake_dom.js");
 
-const { Logic, CONV_A, CONV_B, CONV_C, flush, json, text, fail, conversation, listBody, message, historyBody, turnBody, apiError, me, notAuthenticated } = H;
+const { Logic, CONV_A, CONV_B, CONV_C, flush, json, text, fail, conversation, listBody, message, historyBody, turnBody, apiError, me, notAuthenticated, iso } = H;
 
 const STATIC = path.join(__dirname, "..", "..", "house_helper", "web", "static");
 const APP_SOURCE = fs.readFileSync(path.join(STATIC, "app.js"), "utf8");
@@ -256,7 +256,7 @@ scenario("the_application_lists_conversations_and_shows_the_latest_with_who_said
   const items = page.el("conversation-list").byClass("conv-item");
   assert.equal(items.length, 2);
   assert.deepEqual(items.map((b) => b.getAttribute("aria-current")), ["true", null]);
-  assert.match(page.el("chat-title").textContent, /^Разговор от 18 октября, \d\d:\d\d$/);
+  assert.match(page.el("chat-title").textContent, /^Диалог от 18\.10\.2026, \d\d:\d\d МСК$/);
   assert.deepEqual(page.articleTexts(), ["Вы:Про суп" + "", "Федя, помощник:Суп так.И так."].map((t, i) => page.articles()[i].textContent));
   const [mine, theirs] = page.articles();
   assert.ok(mine.className.includes("msg-user") && theirs.className.includes("msg-assistant"));
@@ -398,7 +398,8 @@ scenario("a_message_typed_and_sent_is_one_request_a_pending_bubble_and_then_the_
   assert.ok(pending[0].textContent.includes("Что из яиц?") && /Отправляем|готовит/.test(pending[0].textContent));
   assert.equal(pending[0].byClass("spinner").length, 1);
   // The time here is the one thing that is about the clock: the page reads the scenario's, not the day of the run.
-  assert.deepEqual([pending[0].byTag("time")[0].textContent, pending[0].byTag("time")[0].getAttribute("datetime")], ["12:00", "2026-10-18T12:00:00.000Z"]);
+  // Conversation navigation is Moscow time (UTC+3), so 12:00 UTC is drawn as 15:00.
+  assert.deepEqual([pending[0].byTag("time")[0].textContent, pending[0].byTag("time")[0].getAttribute("datetime")], ["15:00", "2026-10-18T12:00:00.000Z"]);
 
   gate.resolve();
   await page.settle();
@@ -567,7 +568,7 @@ scenario("a_session_that_ends_takes_every_trace_of_the_conversation_off_the_page
   assert.equal(page.visible("screen-login"), true);
   assert.equal(page.visible("screen-app"), false);
   assert.equal(page.el("login-notice").textContent, Logic.TEXT.authExpired);
-  const gone = ["Старый вопрос", "Старый ответ", "Секретный вопрос", "недописанное", "Разговор от"];
+  const gone = ["Старый вопрос", "Старый ответ", "Секретный вопрос", "недописанное", "Диалог от"];
   for (const words of gone) assert.ok(!page.root().includes(words), "still in the page: " + words);
   assert.equal(page.el("composer-input").value, "");
   assert.equal(page.el("chat-title").textContent, "");
@@ -677,7 +678,7 @@ scenario("a_new_conversation_is_a_draft_with_the_box_focused_and_nothing_is_crea
   page.el("new-conversation").click();
   await page.settle();
 
-  assert.equal(page.el("chat-title").textContent, "Новый разговор");
+  assert.equal(page.el("chat-title").textContent, "Новый диалог");
   assert.equal(page.el("new-conversation").getAttribute("aria-current"), "true");
   assert.equal(page.doc.activeElement, page.el("composer-input"));
   assert.equal(page.articles().length, 0);
@@ -722,16 +723,22 @@ scenario("the_actions_menu_is_offered_only_for_the_saved_conversation_that_is_op
   assert.equal(toggle.getAttribute("aria-haspopup"), "menu");
   assert.equal(toggle.getAttribute("aria-controls"), "chat-actions-menu");
   assert.equal(toggle.getAttribute("aria-expanded"), "false");
-  assert.equal(toggle.getAttribute("aria-label"), "Действия с разговором");
+  assert.equal(toggle.getAttribute("aria-label"), "Действия с диалогом");
   assert.equal(page.visible("chat-actions-menu"), false, "the menu is closed until it is asked for");
 
   const menu = openActions(page);
   assert.equal(toggle.getAttribute("aria-expanded"), "true");
   assert.equal(page.visible("chat-actions-menu"), true);
   assert.equal(menu.getAttribute("role"), "menu");
-  assert.equal(menu.getAttribute("aria-label"), "Действия с разговором");
+  assert.equal(menu.getAttribute("aria-label"), "Действия с диалогом");
   const items = menu.byTag("button");
-  assert.deepEqual(items.map((button) => button.textContent), [Logic.TEXT.deleteNamed]);
+  assert.deepEqual(items.map((button) => button.textContent), [
+    Logic.TEXT.rename,
+    Logic.TEXT.titleOrigin,
+    Logic.TEXT.resetTitle,
+    Logic.TEXT.deleteNamed,
+  ]);
+  assert.equal(items[2].hidden, true, "«Сбросить название» needs a stored user title");
   assert.equal(items[0].getAttribute("role"), "menuitem");
   assert.equal(items[0].getAttribute("tabindex"), "-1");
   assert.equal(page.doc.activeElement, items[0], "the first action is focused when the menu opens");
@@ -997,35 +1004,126 @@ scenario("the_actions_menu_is_operable_from_the_keyboard_and_dismissed_by_an_out
   toggle.fire("keydown", { key: "ArrowDown" });
   assert.equal(page.visible("chat-actions-menu"), true);
   assert.equal(toggle.getAttribute("aria-expanded"), "true");
-  const item = menu.byTag("button")[0];
-  assert.equal(page.doc.activeElement, item, "ArrowDown opens the menu on its first action");
+  const items = menu.byTag("button");
+  const first = items[0]; // «Переименовать»
+  const second = items[1]; // «Как создано название»
+  const deleteItem = items[3]; // «Сбросить название» (items[2]) is hidden without a stored title
+  assert.equal(page.doc.activeElement, first, "ArrowDown opens the menu on its first action");
 
-  item.fire("keydown", { key: "ArrowDown" });
-  assert.equal(page.doc.activeElement, item, "the last action wraps to the first (there is one)");
-  item.fire("keydown", { key: "ArrowUp" });
-  assert.equal(page.doc.activeElement, item);
-  item.fire("keydown", { key: "Home" });
-  assert.equal(page.doc.activeElement, item);
-  item.fire("keydown", { key: "End" });
-  assert.equal(page.doc.activeElement, item);
-  item.fire("keydown", { key: "Escape" });
+  first.fire("keydown", { key: "ArrowDown" });
+  assert.equal(page.doc.activeElement, second, "the next visible action takes the focus");
+  second.fire("keydown", { key: "ArrowDown" });
+  assert.equal(page.doc.activeElement, deleteItem, "a hidden action is skipped");
+  deleteItem.fire("keydown", { key: "ArrowDown" });
+  assert.equal(page.doc.activeElement, first, "the last visible action wraps to the first");
+  first.fire("keydown", { key: "ArrowUp" });
+  assert.equal(page.doc.activeElement, deleteItem);
+  first.fire("keydown", { key: "Home" });
+  assert.equal(page.doc.activeElement, first);
+  first.fire("keydown", { key: "End" });
+  assert.equal(page.doc.activeElement, deleteItem);
+  deleteItem.fire("keydown", { key: "Escape" });
   assert.equal(page.visible("chat-actions-menu"), false);
   assert.equal(toggle.getAttribute("aria-expanded"), "false");
   assert.equal(page.doc.activeElement, toggle, "Escape gives the focus back to the actions button");
 
   toggle.click();
-  assert.equal(page.doc.activeElement, item);
+  assert.equal(page.doc.activeElement, first);
   page.doc.fire("click", { target: page.el("messages") });
   assert.equal(page.visible("chat-actions-menu"), false, "a click elsewhere calls the menu off");
   assert.equal(toggle.getAttribute("aria-expanded"), "false");
 
   toggle.click();
-  item.fire("keydown", { key: "Tab" });
+  first.fire("keydown", { key: "Tab" });
   assert.equal(page.visible("chat-actions-menu"), false, "Tab leaves the menu and closes it");
 
   toggle.click();
   page.el("chat-actions").fire("focusout", { relatedTarget: page.el("messages") });
   assert.equal(page.visible("chat-actions-menu"), false, "the focus moving out closes it");
+});
+
+scenario("the_title_menu_explains_the_origin_and_renames_and_resets_the_conversation", async () => {
+  const page = await open(signedInWith([conversation(CONV_A, 0, "Старый вопрос")], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Старый вопрос"), message(2, "assistant", "Старый ответ")]),
+  }));
+  await page.settle();
+  const expectedDerived = "Старый вопрос";
+
+  // «Как создано название»: a visible status block, not a hover hint.
+  openActions(page);
+  page.el("chat-actions-menu").buttons(Logic.TEXT.titleOrigin)[0].click();
+  await page.settle();
+  assert.equal(page.visible("chat-title-info"), true);
+  assert.ok(page.el("chat-title-info").textContent.includes(Logic.TEXT.titleOriginDerived));
+  page.el("chat-title-info").buttons(Logic.TEXT.titleClose)[0].click();
+  await page.settle();
+  assert.equal(page.visible("chat-title-info"), false);
+
+  // «Переименовать»: the form opens on the current title and refuses an empty one without
+  // sending anything.
+  openActions(page);
+  page.el("chat-actions-menu").buttons(Logic.TEXT.rename)[0].click();
+  await page.settle();
+  assert.equal(page.visible("chat-title-edit"), true);
+  const input = page.el("chat-title-input");
+  assert.equal(input.value, expectedDerived);
+  assert.equal(page.doc.activeElement, input);
+  page.editField(input, "   ");
+  page.el("chat-title-edit").buttons(Logic.TEXT.titleSave)[0].click();
+  await page.settle();
+  assert.equal(page.visible("chat-title-edit"), true);
+  assert.ok(page.el("chat-title-edit").textContent.includes(Logic.TEXT.titleEmpty));
+  assert.equal(page.env.net.requests("PATCH", /.*/).length, 0, "a refused title is not sent");
+
+  // A valid title is sent, and the server's answer is what is drawn.
+  page.env.net.route(
+    "PATCH",
+    `/api/conversations/${CONV_A}`,
+    json(200, conversation(CONV_A, 0, "Мой разговор", {
+      title_origin: "manual",
+      can_reset_title: true,
+      last_message_at: new Date(Date.UTC(2026, 9, 18, 11, 0, 2)).toISOString().replace("Z", "+00:00"),
+    }))
+  );
+  page.editField(input, "Мой разговор");
+  page.el("chat-title-edit").buttons(Logic.TEXT.titleSave)[0].click();
+  await page.settle();
+  assert.equal(page.el("chat-title").textContent, "Мой разговор");
+  assert.equal(page.visible("chat-title-edit"), false);
+  assert.deepEqual(page.env.net.requests("PATCH", /.*/)[0].body, { title: "Мой разговор" });
+
+  // The reset entry exists only while a stored title does; it sends null and the derived
+  // name comes back from the server.
+  openActions(page);
+  assert.equal(page.el("chat-actions-menu").buttons(Logic.TEXT.resetTitle)[0].hidden, false);
+  page.env.net.route(
+    "PATCH",
+    `/api/conversations/${CONV_A}`,
+    json(200, conversation(CONV_A, 0, expectedDerived, {
+      last_message_at: new Date(Date.UTC(2026, 9, 18, 11, 0, 2)).toISOString().replace("Z", "+00:00"),
+    }))
+  );
+  page.el("chat-actions-menu").buttons(Logic.TEXT.resetTitle)[0].click();
+  await page.settle();
+  assert.equal(page.el("chat-title").textContent, expectedDerived);
+  assert.deepEqual(page.env.net.requests("PATCH", /.*/)[1].body, { title: null });
+  openActions(page);
+  assert.equal(page.el("chat-actions-menu").buttons(Logic.TEXT.resetTitle)[0].hidden, true);
+});
+
+scenario("the_history_draws_absolute_moscow_day_separators_and_message_times", async () => {
+  const before = new Date(Date.UTC(2026, 9, 18, 20, 59)).toISOString().replace("Z", "+00:00");
+  const after = new Date(Date.UTC(2026, 9, 18, 21, 0)).toISOString().replace("Z", "+00:00");
+  const page = await open(signedInWith([conversation(CONV_A, 0, "Борщ")], {
+    [CONV_A]: historyBody(CONV_A, [
+      message(1, "user", "До полуночи", { created_at: before }),
+      message(2, "assistant", "После полуночи", { created_at: after }),
+    ]),
+  }));
+
+  const separators = page.el("messages").byClass("day-sep");
+  assert.deepEqual(separators.map((node) => node.textContent), ["18.10.2026МСК", "19.10.2026МСК"]);
+  assert.deepEqual(page.articles().map((article) => article.byTag("time")[0].textContent), ["23:59", "00:00"]);
 });
 
 scenario("deleting_the_open_conversation_asks_first_and_returns_to_a_new_empty_one", async () => {
@@ -1065,8 +1163,8 @@ scenario("deleting_the_open_conversation_asks_first_and_returns_to_a_new_empty_o
   assert.equal(page.env.net.requests("DELETE", /.*/).length, 1);
   assert.equal(page.env.net.requests("GET", "/api/conversations").length, 2, "the list is read again");
   assert.equal(page.el("conversation-list").childNodes.length, 0);
-  assert.equal(page.el("list-status").textContent, "Разговоров пока нет. Начните новый.");
-  assert.equal(page.el("chat-title").textContent, "Новый разговор");
+  assert.equal(page.el("list-status").textContent, "Диалогов пока нет. Начните новый.");
+  assert.equal(page.el("chat-title").textContent, "Новый диалог");
   assert.equal(page.el("screen-app").getAttribute("data-drawer"), "closed", "the drawer closes on the new draft");
   assert.ok(page.doc.activeElement === page.el("chat-title"));
   assert.equal(page.articles().length, 0);
@@ -1099,9 +1197,12 @@ scenario("the_actions_menu_deletes_the_open_conversation_and_the_list_keeps_the_
   assert.equal(page.env.net.requests("DELETE", new RegExp(CONV_A)).length, 0, "nothing but the open conversation was asked for");
   assert.deepEqual(list.byTag("button").map((button) => button.textContent.includes("Борщ")), [true]);
   assert.ok(list.textContent.includes("Борщ"));
-  assert.equal(page.el("chat-title").textContent, "Новый разговор");
+  assert.equal(page.el("chat-title").textContent, "Новый диалог");
   assert.equal(page.visible("chat-actions"), false, "the new draft has no actions");
-  assert.ok(page.doc.activeElement === page.el("chat-title"));
+  assert.ok(
+    page.doc.activeElement === page.el("composer-input"),
+    "ordinary desktop deletion leaves the new draft ready to be written in"
+  );
 
   list.byTag("button")[0].click();
   await page.settle();
@@ -1137,7 +1238,7 @@ scenario("a_failed_deletion_keeps_the_conversation_and_offers_a_retry", async ()
   page.el("chat-delete").byClass("confirm")[0].buttons(Logic.TEXT.retry)[0].click();
   await page.settle();
   assert.equal(page.env.net.requests("DELETE", /.*/).length, 2);
-  assert.equal(page.el("chat-title").textContent, "Новый разговор");
+  assert.equal(page.el("chat-title").textContent, "Новый диалог");
   assert.equal(page.el("banner-text").textContent, Logic.TEXT.deleted);
 });
 
@@ -1160,7 +1261,7 @@ scenario("a_failed_list_refresh_after_a_deletion_offers_its_retry_and_keeps_it_d
   page.el("list-retry").click();
   await page.settle();
   assert.equal(page.visible("list-retry"), false);
-  assert.equal(page.el("list-status").textContent, "Разговоров пока нет. Начните новый.");
+  assert.equal(page.el("list-status").textContent, "Диалогов пока нет. Начните новый.");
   assert.equal(list.childNodes.length, 0);
   assert.equal(page.env.net.requests("GET", "/api/conversations").length, 3);
 });
@@ -1189,9 +1290,368 @@ scenario("the_actions_menu_works_on_a_narrow_screen_after_the_drawer_closes", as
   await page.settle();
 
   assert.equal(page.el("screen-app").getAttribute("data-drawer"), "closed");
-  assert.equal(page.el("chat-title").textContent, "Новый разговор");
+  assert.equal(page.el("chat-title").textContent, "Новый диалог");
   assert.equal(page.visible("chat-actions"), false);
   assert.ok(page.doc.activeElement === page.el("chat-title"));
+});
+
+// R5-C2: the delayed completion of a DELETE whose question another absence answer already
+// settled must not move the keyboard or disturb what the person is doing in another view.
+scenario("a_delayed_duplicate_delete_does_not_take_focus_from_another_conversation", async () => {
+  const page = await open(
+    signedInWith([conversation(CONV_A, 30, "Борщ"), conversation(CONV_B, 0, "Суп")], {
+      [CONV_A]: historyBody(CONV_A, [message(1, "user", "Про борщ"), message(2, "assistant", "Борщ так")]),
+      [CONV_B]: historyBody(CONV_B, [message(5, "user", "Про суп"), message(6, "assistant", "Суп так")]),
+    })
+  );
+  assert.equal(page.el("chat-title").textContent, "Борщ", "the newest conversation is open");
+
+  const heldDelete = deferred();
+  page.env.net.route("DELETE", `/api/conversations/${CONV_A}`, async () => {
+    await heldDelete.promise;
+    return H.removedBody();
+  });
+  // A history read will confirm the removal first; the refill then lists only the other one.
+  page.env.net.route(
+    "GET",
+    new RegExp("/api/conversations/" + CONV_A + "/messages(\\?|$)"),
+    apiError(404, "conversation_not_found")
+  );
+  page.env.net.route("GET", "/api/conversations", listBody([conversation(CONV_B, 0, "Суп")]));
+
+  chooseDelete(page);
+  await page.settle();
+  page.el("chat-delete").byClass("confirm")[0].buttons(Logic.TEXT.deleteConfirm)[0].click();
+  await page.settle();
+  assert.equal(page.env.net.requests("DELETE", /.*/).length, 1, "the deletion is out and held");
+
+  // Re-opening the same conversation reads its history, which reconciles the removal while
+  // the DELETE is still out. The question is settled by that answer, not by the DELETE.
+  page.el("conversation-list").byTag("button")[0].click();
+  await page.settle();
+  await page.settle();
+  assert.equal(page.el("conversation-list").childNodes.length, 1, "the deleted conversation is gone from the list");
+  assert.ok(page.el("conversation-list").textContent.includes("Суп"));
+
+  // The person moves to the other conversation and starts writing.
+  page.el("conversation-list").byTag("button")[0].click();
+  await page.settle();
+  assert.equal(page.el("chat-title").textContent, "Суп", "the other conversation is open");
+  page.el("composer-input").focus();
+  page.type("незаконченная мысль");
+  assert.equal(page.doc.activeElement, page.el("composer-input"));
+
+  // The delayed duplicate DELETE settles.
+  heldDelete.resolve();
+  await page.settle();
+  await page.settle();
+
+  assert.equal(page.doc.activeElement, page.el("composer-input"), "the delayed answer does not take the keyboard");
+  assert.equal(page.el("composer-input").value, "незаконченная мысль", "the draft is undisturbed");
+  assert.equal(page.el("chat-title").textContent, "Суп", "the other conversation stays open");
+  assert.equal(page.visible("banner"), false, "no obsolete current-view feedback");
+});
+
+// R5-C3: a DELETE that is still applicable (removal and refill) is not still the person's
+// interaction. Once they reopen the drawer, its navigation owns the keyboard and the drawer
+// state; the delayed completion must not close either.
+scenario("a_delayed_delete_does_not_close_a_reopened_drawer_or_take_its_focus", async () => {
+  const page = await open(
+    signedInWith([conversation(CONV_A, 30, "Борщ"), conversation(CONV_B, 0, "Суп")], {
+      [CONV_A]: historyBody(CONV_A, [message(1, "user", "Про борщ"), message(2, "assistant", "Борщ так")]),
+      [CONV_B]: historyBody(CONV_B, [message(5, "user", "Про суп"), message(6, "assistant", "Суп так")]),
+    }),
+    { narrow: true }
+  );
+  assert.equal(page.el("chat-title").textContent, "Борщ", "the newest conversation is open");
+
+  const heldDelete = deferred();
+  page.env.net.route("DELETE", `/api/conversations/${CONV_A}`, async () => {
+    await heldDelete.promise;
+    return H.removedBody();
+  });
+  page.env.net.route("GET", "/api/conversations", listBody([conversation(CONV_B, 0, "Суп")]));
+
+  chooseDelete(page);
+  await page.settle();
+  page.el("chat-delete").byClass("confirm")[0].buttons(Logic.TEXT.deleteConfirm)[0].click();
+  await page.settle();
+  assert.equal(page.env.net.requests("DELETE", /.*/).length, 1, "the deletion is out and held");
+  assert.equal(page.el("screen-app").getAttribute("data-drawer"), "closed");
+
+  // The person reopens the drawer; its navigation takes the keyboard.
+  page.el("drawer-toggle").click();
+  assert.equal(page.el("screen-app").getAttribute("data-drawer"), "open");
+  assert.ok(page.doc.activeElement === page.el("tab-chats"), "the drawer's navigation is focused");
+
+  // The delayed DELETE settles: removal and refill happen; the drawer and focus do not move.
+  heldDelete.resolve();
+  await page.settle();
+  await page.settle();
+
+  const list = page.el("conversation-list");
+  assert.equal(list.childNodes.length, 1, "the deleted conversation is gone from the list");
+  assert.ok(list.textContent.includes("Суп"), "and the refill lists the remaining one");
+  assert.equal(page.el("screen-app").getAttribute("data-drawer"), "open", "the reopened drawer stays open");
+  assert.ok(page.doc.activeElement === page.el("tab-chats"), "and keeps its focus");
+});
+
+// R5-C3: a section chosen while the DELETE is out is a newer interaction too; its completion
+// must not drag the keyboard back into the conversation the person left.
+scenario("a_delayed_delete_does_not_interrupt_a_newer_section_choice", async () => {
+  const page = await open(
+    signedInWith([conversation(CONV_A, 30, "Борщ"), conversation(CONV_B, 0, "Суп")], {
+      [CONV_A]: historyBody(CONV_A, [message(1, "user", "Про борщ"), message(2, "assistant", "Борщ так")]),
+      [CONV_B]: historyBody(CONV_B, [message(5, "user", "Про суп"), message(6, "assistant", "Суп так")]),
+    })
+  );
+  const heldDelete = deferred();
+  page.env.net.route("DELETE", `/api/conversations/${CONV_A}`, async () => {
+    await heldDelete.promise;
+    return H.removedBody();
+  });
+  page.env.net.route("GET", "/api/conversations", listBody([conversation(CONV_B, 0, "Суп")]));
+
+  chooseDelete(page);
+  await page.settle();
+  page.el("chat-delete").byClass("confirm")[0].buttons(Logic.TEXT.deleteConfirm)[0].click();
+  await page.settle();
+  assert.equal(page.env.net.requests("DELETE", /.*/).length, 1, "the deletion is out and held");
+
+  // The person moves to the favorites while the DELETE is out.
+  page.el("tab-favorites").click();
+  page.el("tab-favorites").focus();
+  await page.settle();
+  assert.equal(page.el("tab-favorites").getAttribute("aria-pressed"), "true");
+  assert.ok(page.doc.activeElement === page.el("tab-favorites"));
+
+  heldDelete.resolve();
+  await page.settle();
+  await page.settle();
+
+  assert.equal(page.el("tab-favorites").getAttribute("aria-pressed"), "true", "the section stays chosen");
+  assert.ok(page.doc.activeElement === page.el("tab-favorites"), "its focus is undisturbed");
+  assert.equal(page.visible("chat"), false, "the conversation is not brought back in front");
+  assert.ok(page.env.net.requests("GET", "/api/conversations").length >= 2, "the deletion still refilled the list");
+});
+
+// R5-C4: a list update rebuilds every row. When the row the person's keyboard is on survives
+// the update, the rebuilt row takes the keyboard back -- after the removal and after the refill.
+scenario("a_surviving_conversation_row_keeps_the_keyboard_across_a_delete_and_refill", async () => {
+  const page = await open(
+    signedInWith([conversation(CONV_A, 30, "Борщ"), conversation(CONV_B, 0, "Суп")], {
+      [CONV_A]: historyBody(CONV_A, [message(1, "user", "Про борщ"), message(2, "assistant", "Борщ так")]),
+      [CONV_B]: historyBody(CONV_B, [message(5, "user", "Про суп"), message(6, "assistant", "Суп так")]),
+    }),
+    { narrow: true }
+  );
+  const heldDelete = deferred();
+  page.env.net.route("DELETE", `/api/conversations/${CONV_A}`, async () => {
+    await heldDelete.promise;
+    return H.removedBody();
+  });
+  const heldRefill = deferred();
+  page.env.net.route("GET", "/api/conversations", async () => {
+    await heldRefill.promise;
+    return listBody([conversation(CONV_B, 0, "Суп")]);
+  });
+
+  chooseDelete(page);
+  await page.settle();
+  page.el("chat-delete").byClass("confirm")[0].buttons(Logic.TEXT.deleteConfirm)[0].click();
+  await page.settle();
+  assert.equal(page.env.net.requests("DELETE", /.*/).length, 1, "the deletion is out and held");
+
+  // The person reopens the drawer and puts the keyboard on the surviving conversation.
+  page.el("drawer-toggle").click();
+  assert.equal(page.el("screen-app").getAttribute("data-drawer"), "open");
+  const rowFor = (label) =>
+    page.el("conversation-list").byTag("button").find((button) => button.textContent.includes(label));
+  const survivingBefore = rowFor("Суп");
+  survivingBefore.focus();
+  assert.ok(page.doc.activeElement === survivingBefore);
+  const readsBefore = page.env.net.requests("GET", "/api/conversations").length;
+
+  // The removal rebuilds the list: the deleted row is gone, the surviving row is a new control
+  // and still holds the keyboard.
+  heldDelete.resolve();
+  await page.settle();
+  await page.settle();
+  assert.equal(
+    page.env.net.requests("GET", "/api/conversations").length,
+    readsBefore + 1,
+    "exactly one required refill"
+  );
+  assert.equal(page.el("conversation-list").childNodes.length, 1, "the deleted conversation is gone");
+  const survivingAfterRemoval = rowFor("Суп");
+  assert.notEqual(survivingAfterRemoval, survivingBefore, "the list was rebuilt");
+  assert.ok(
+    page.doc.activeElement === survivingAfterRemoval,
+    "the surviving row keeps the keyboard after the removal"
+  );
+
+  // The refill rebuilds it again; the keyboard follows the same conversation.
+  heldRefill.resolve();
+  await page.settle();
+  await page.settle();
+  const survivingAfterRefill = rowFor("Суп");
+  assert.notEqual(survivingAfterRefill, survivingAfterRemoval, "the refill rebuilt the list again");
+  assert.ok(
+    page.doc.activeElement === survivingAfterRefill,
+    "and the surviving row keeps the keyboard after the refill"
+  );
+  assert.equal(page.el("screen-app").getAttribute("data-drawer"), "open", "the drawer stays open");
+});
+
+// R5-C5: the same redraw on a wide screen, where the conversation list is always beside the
+// chat. The person's keyboard is on the surviving row when the held DELETE settles; the
+// completion must not pull it back to the chat title just because the deleted conversation
+// was the one that had been open.
+scenario("a_surviving_conversation_row_keeps_the_keyboard_across_a_delete_and_refill_on_a_wide_screen", async () => {
+  const page = await open(
+    signedInWith([conversation(CONV_A, 30, "Борщ"), conversation(CONV_B, 0, "Суп")], {
+      [CONV_A]: historyBody(CONV_A, [message(1, "user", "Про борщ"), message(2, "assistant", "Борщ так")]),
+      [CONV_B]: historyBody(CONV_B, [message(5, "user", "Про суп"), message(6, "assistant", "Суп так")]),
+    })
+  );
+  assert.equal(page.el("chat-title").textContent, "Борщ", "the newest conversation is open");
+
+  const heldDelete = deferred();
+  page.env.net.route("DELETE", `/api/conversations/${CONV_A}`, async () => {
+    await heldDelete.promise;
+    return H.removedBody();
+  });
+  const heldRefill = deferred();
+  page.env.net.route("GET", "/api/conversations", async () => {
+    await heldRefill.promise;
+    return listBody([conversation(CONV_B, 0, "Суп")]);
+  });
+
+  chooseDelete(page);
+  await page.settle();
+  page.el("chat-delete").byClass("confirm")[0].buttons(Logic.TEXT.deleteConfirm)[0].click();
+  await page.settle();
+  assert.equal(page.env.net.requests("DELETE", /.*/).length, 1, "the deletion is out and held");
+
+  // The wide screen keeps the list beside the chat. Without activating the row or touching
+  // the drawer or a section, the person puts the keyboard on the surviving conversation.
+  const rowFor = (label) =>
+    page.el("conversation-list").byTag("button").find((button) => button.textContent.includes(label));
+  const survivingBefore = rowFor("Суп");
+  survivingBefore.focus();
+  assert.ok(page.doc.activeElement === survivingBefore, "the surviving row holds the keyboard");
+  assert.equal(page.el("chat-title").textContent, "Борщ", "and nothing was activated");
+  const readsBefore = page.env.net.requests("GET", "/api/conversations").length;
+
+  // The removal rebuilds the list: the deleted row is gone, the surviving row is a new
+  // control holding the keyboard, and the completion must leave it there.
+  heldDelete.resolve();
+  await page.settle();
+  await page.settle();
+  assert.equal(
+    page.env.net.requests("GET", "/api/conversations").length,
+    readsBefore + 1,
+    "exactly one required refill"
+  );
+  assert.equal(page.el("conversation-list").childNodes.length, 1, "the deleted conversation is gone");
+  assert.ok(!page.el("conversation-list").textContent.includes("Борщ"));
+  const survivingAfterRemoval = rowFor("Суп");
+  assert.notEqual(survivingAfterRemoval, survivingBefore, "the list was rebuilt");
+  assert.ok(
+    page.doc.activeElement === survivingAfterRemoval,
+    "the surviving row keeps the keyboard after the removal"
+  );
+
+  // The refill rebuilds it again; the keyboard stays with the same conversation.
+  heldRefill.resolve();
+  await page.settle();
+  await page.settle();
+  const survivingAfterRefill = rowFor("Суп");
+  assert.notEqual(survivingAfterRefill, survivingAfterRemoval, "the refill rebuilt the list again");
+  assert.ok(
+    page.doc.activeElement === survivingAfterRefill,
+    "and the surviving row keeps the keyboard after the refill"
+  );
+  assert.equal(
+    page.env.net.requests("GET", "/api/conversations").length,
+    readsBefore + 1,
+    "and the held refill was the one required list read"
+  );
+  assert.equal(
+    page.el("chat-title").textContent,
+    "Новый диалог",
+    "the removal still returned to a new draft"
+  );
+});
+
+// R5-C4: entering a shopping draft from the conversation and cancelling it are user
+// interactions newer than a DELETE that is still out. Their completion may not take the
+// keyboard back from the composer when the deletion settles.
+scenario("leaving_a_shopping_draft_is_a_newer_interaction_than_a_delayed_delete", async () => {
+  const page = await open(
+    (env) => {
+      env.signedIn([conversation(CONV_A, 30, "Борщ"), conversation(CONV_B, 0, "Суп")], {
+        [CONV_A]: historyBody(CONV_A, [
+          message(1, "user", "Приготовь борщ"),
+          message(2, "assistant", "Борщ: свекла, мясо.", { recipes: [{ position: 0, title: "Борщ" }] }),
+        ]),
+        [CONV_B]: historyBody(CONV_B, [message(5, "user", "Про суп"), message(6, "assistant", "Суп так")]),
+      });
+      env.net.route(
+        "GET",
+        CHAT_RECIPE_URL,
+        H.recipeBody(2, 0, "Борщ", "4 порции", SHOP_INGREDIENTS, ["Сварите бульон."])
+      );
+    },
+    { structured: true }
+  );
+
+  const heldDelete = deferred();
+  page.env.net.route("DELETE", `/api/conversations/${CONV_A}`, async () => {
+    await heldDelete.promise;
+    return H.removedBody();
+  });
+  const heldRefill = deferred();
+  page.env.net.route("GET", "/api/conversations", async () => {
+    await heldRefill.promise;
+    return listBody([conversation(CONV_B, 0, "Суп")]);
+  });
+
+  chooseDelete(page);
+  await page.settle();
+  page.el("chat-delete").byClass("confirm")[0].buttons(Logic.TEXT.deleteConfirm)[0].click();
+  await page.settle();
+  assert.equal(page.env.net.requests("DELETE", /.*/).length, 1, "the deletion is out and held");
+  const readsBefore = page.env.net.requests("GET", "/api/conversations").length;
+
+  // The person enters a shopping draft from the conversation's recipe and leaves it again.
+  page.articles()[1].buttons("Что купить?")[0].click();
+  await page.settle();
+  assert.equal(page.el("tab-shopping").getAttribute("aria-pressed"), "true", "the draft is open");
+  page.el("shopping-body").buttons("Отмена")[0].click();
+  await page.settle();
+  assert.equal(page.el("tab-chats").getAttribute("aria-pressed"), "true", "the draft is cancelled back to the chat");
+  page.el("composer-input").focus();
+  assert.ok(page.doc.activeElement === page.el("composer-input"));
+
+  // The delayed DELETE settles: the removal and its one refill are theirs, the keyboard is not.
+  heldDelete.resolve();
+  await page.settle();
+  await page.settle();
+  assert.ok(!page.el("conversation-list").textContent.includes("Борщ"), "the requested removal occurs");
+  assert.equal(
+    page.env.net.requests("GET", "/api/conversations").length,
+    readsBefore + 1,
+    "exactly one refill"
+  );
+  assert.ok(page.doc.activeElement === page.el("composer-input"), "the composer keeps the keyboard");
+  assert.equal(page.el("composer-input").readOnly, false, "and stays usable for the new draft");
+
+  heldRefill.resolve();
+  await page.settle();
+  await page.settle();
+  assert.ok(page.doc.activeElement === page.el("composer-input"), "the refill does not take it either");
+  assert.equal(page.el("tab-chats").getAttribute("aria-pressed"), "true", "the chat section stays chosen");
 });
 
 scenario("signing_out_leaves_nothing_of_the_conversation_on_screen_or_in_storage", async () => {
@@ -1250,6 +1710,125 @@ scenario("a_page_restored_from_the_back_forward_cache_asks_again_who_is_signed_i
   assert.equal(page.el("login-notice").hidden, true, "a definite 401 on asking again is a plain sign-in, not an 'expired' complaint");
 });
 
+scenario("a_page_restored_from_the_back_forward_cache_keeps_an_unconfirmed_title_write_guarded", async () => {
+  // A1-01b: a persisted pageshow restores the same document, not a fresh page. The guard
+  // left by a title write whose outcome could not be confirmed belongs to that document
+  // and must survive the restoration, or a newer rename could be sent past the earlier
+  // request that can still commit.
+  const page = await open(signedInWith([conversation(CONV_A, 0, "Своё", {
+    title_origin: "manual",
+    can_reset_title: true,
+  })], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Старый вопрос"), message(2, "assistant", "Старый ответ")]),
+  }));
+  await page.settle();
+
+  const held = deferred();
+  page.env.net.route("PATCH", `/api/conversations/${CONV_A}`, async () => {
+    await held.promise;
+    throw new TypeError("Failed to fetch");
+  });
+  openActions(page);
+  page.el("chat-actions-menu").buttons(Logic.TEXT.resetTitle)[0].click();
+  await page.settle();
+  assert.equal(page.env.net.requests("PATCH", /.*/).length, 1);
+  held.resolve();
+  await page.settle();
+  await page.settle();
+  assert.ok(page.root().includes(Logic.TEXT.titleUnconfirmedShort), "the conversation is guarded");
+
+  const listReads = page.env.net.requests("GET", "/api/conversations").length;
+  page.fireWindow("pageshow", { persisted: true });
+  await page.settle();
+  await page.settle();
+
+  assert.equal(page.visible("screen-app"), true, "the same document is kept, not started over");
+  assert.equal(page.env.net.requests("GET", "/auth/me").length, 2, "who is signed in is asked again");
+  assert.equal(
+    page.env.net.requests("GET", "/api/conversations").length,
+    listReads,
+    "a restoration is not a fresh page (no list reload)"
+  );
+  assert.ok(page.root().includes(Logic.TEXT.titleUnconfirmedShort), "the guard survives the restoration");
+
+  // A rename is refused without a request, and the draft stays in the form.
+  openActions(page);
+  page.el("chat-actions-menu").buttons(Logic.TEXT.rename)[0].click();
+  await page.settle();
+  const input = page.el("chat-title-input");
+  page.editField(input, "Новое имя");
+  page.el("chat-title-edit").buttons(Logic.TEXT.titleSave)[0].click();
+  await page.settle();
+  assert.equal(page.env.net.requests("PATCH", /.*/).length, 1, "no conflicting write while the guard is active");
+  assert.ok(page.el("chat-title-edit").textContent.includes(Logic.TEXT.titleUnconfirmed));
+  assert.equal(page.el("chat-title-input").value, "Новое имя", "the draft is kept");
+});
+
+scenario("a_page_restored_from_the_back_forward_cache_keeps_a_pending_title_write_in_order", async () => {
+  // The write that is out is not aborted or forgotten by a restoration: the rename stays
+  // queued behind it and the server sees the page's order.
+  const page = await open(signedInWith([conversation(CONV_A, 0, "Своё", {
+    title_origin: "manual",
+    can_reset_title: true,
+  })], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Старый вопрос"), message(2, "assistant", "Старый ответ")]),
+  }));
+  await page.settle();
+
+  const held = deferred();
+  page.env.net.route(
+    "PATCH",
+    `/api/conversations/${CONV_A}`,
+    async () => {
+      await held.promise;
+      return json(200, conversation(CONV_A, 0, "Старый вопрос", { last_message_at: iso(2) }));
+    },
+    json(200, conversation(CONV_A, 0, "Новое имя", {
+      title_origin: "manual",
+      can_reset_title: true,
+      last_message_at: iso(2),
+    }))
+  );
+  openActions(page);
+  page.el("chat-actions-menu").buttons(Logic.TEXT.resetTitle)[0].click();
+  await page.settle();
+  assert.equal(page.env.net.requests("PATCH", /.*/).length, 1);
+  assert.equal(page.env.net.requests("PATCH", /.*/)[0].signal, undefined, "the soft timeout never aborts it");
+
+  const listReads = page.env.net.requests("GET", "/api/conversations").length;
+  page.fireWindow("pageshow", { persisted: true });
+  await page.settle();
+  await page.settle();
+  assert.equal(page.env.net.requests("PATCH", /.*/).length, 1, "the restoration sends nothing");
+  assert.equal(page.env.net.requests("GET", "/api/conversations").length, listReads);
+  assert.equal(page.el("chat-title").textContent, "Своё", "nothing claims the write happened");
+
+  // The page's soft timeout is preserved: the write is shown as still out.
+  await page.env.timers.advance(20000);
+  await page.settle();
+  assert.ok(page.root().includes(Logic.TEXT.titlePending));
+
+  // The rename waits behind the write that is out, even across the restoration.
+  openActions(page);
+  page.el("chat-actions-menu").buttons(Logic.TEXT.rename)[0].click();
+  await page.settle();
+  page.editField(page.el("chat-title-input"), "Новое имя");
+  page.el("chat-title-edit").buttons(Logic.TEXT.titleSave)[0].click();
+  await page.settle();
+  assert.equal(page.env.net.requests("PATCH", /.*/).length, 1, "the newer write stays queued");
+
+  held.resolve();
+  await page.settle();
+  await page.settle();
+  await page.settle();
+  assert.deepEqual(
+    page.env.net.requests("PATCH", /.*/).map((request) => request.body),
+    [{ title: null }, { title: "Новое имя" }],
+    "the server receives the writes in the page's order"
+  );
+  assert.equal(page.el("chat-title").textContent, "Новое имя");
+});
+
 scenario("a_sign_out_whose_answer_is_lost_leaves_the_conversation_and_says_it_is_not_sure_and_offers_to_try_again", async () => {
   const reply = deferred();
   const page = await open(oneConversation());
@@ -1274,7 +1853,7 @@ scenario("a_sign_out_whose_answer_is_lost_leaves_the_conversation_and_says_it_is
   assert.equal(page.el("unavailable-text").textContent, Logic.TEXT.logoutUnconfirmed);
   assert.equal(page.el("unavailable-retry").textContent, Logic.TEXT.logoutAgain);
   assert.ok(!page.root().includes("Вы вышли"), "it does not claim the session is closed");
-  const gone = ["Старый вопрос", "Старый ответ", "Секретный вопрос", "недописанное", "Разговор от"];
+  const gone = ["Старый вопрос", "Старый ответ", "Секретный вопрос", "недописанное", "Диалог от"];
   for (const words of gone) assert.ok(!page.root().includes(words), "still in the page: " + words);
   assert.equal(page.el("composer-input").value, "");
   assert.equal(page.env.storage.record, null);
@@ -1320,7 +1899,7 @@ scenario("a_repeated_sign_out_that_finds_somebody_else_signed_in_says_so_and_lea
   assert.equal(page.el("unavailable-text").textContent, Logic.TEXT.logoutMismatch);
   assert.equal(page.el("unavailable-retry").textContent, Logic.TEXT.retry, "it does not offer to leave again");
   assert.ok(!page.root().includes("Вы вышли"), "it does not claim that anything was closed");
-  for (const words of ["Старый вопрос", "Старый ответ", "недописанное", "Разговор от", "Про суп Бориса"]) {
+  for (const words of ["Старый вопрос", "Старый ответ", "недописанное", "Диалог от", "Про суп Бориса"]) {
     assert.ok(!page.root().includes(words), "on the page: " + words);
   }
   assert.equal(page.env.storage.record, null);
@@ -1368,7 +1947,7 @@ scenario("a_tab_that_comes_back_is_held_back_until_the_server_says_who_is_there_
   assert.equal(page.visible("screen-app"), false, "hidden at once, before any answer");
   assert.equal(page.visible("screen-loading"), true);
   assert.equal(page.el("loading-text").textContent, Logic.TEXT.verifying);
-  for (const words of ["Старый вопрос", "Старый ответ", "недописанное", "Разговор от"]) {
+  for (const words of ["Старый вопрос", "Старый ответ", "недописанное", "Диалог от"]) {
     assert.ok(!page.root().includes(words), "in the page while asking: " + words);
   }
   assert.equal(page.el("composer-input").value, "");
@@ -1420,7 +1999,7 @@ scenario("a_tab_that_cannot_find_out_who_is_there_stays_hidden_says_so_and_asks_
   assert.ok(page.el("unavailable-text").textContent.startsWith(Logic.TEXT.unverified));
   assert.equal(page.el("unavailable-retry").textContent, Logic.TEXT.retry);
   assert.equal(page.visible("screen-login"), false, "it does not say anyone is signed out");
-  for (const words of ["Старый вопрос", "Старый ответ", "недописанное", "Разговор от"]) {
+  for (const words of ["Старый вопрос", "Старый ответ", "недописанное", "Диалог от"]) {
     assert.ok(!page.root().includes(words), "in the page: " + words);
   }
 
@@ -1506,7 +2085,7 @@ scenario("the_script_never_sets_a_handler_a_style_a_link_or_an_address_on_anythi
   for (const name of names) {
     assert.ok(!/^on/i.test(name) && !["style", "href", "src", "srcdoc", "action", "formaction", "target"].includes(name), name);
   }
-  assert.deepEqual([...names].sort().filter((n) => !["aria-busy", "aria-current", "aria-describedby", "aria-disabled", "aria-hidden", "aria-invalid", "aria-expanded", "aria-label", "aria-live", "aria-pressed", "autocapitalize", "autocomplete", "autocorrect", "data-drawer", "data-focus", "data-id", "datetime", "for", "id", "name", "novalidate", "role", "spellcheck", "tabindex", "type", "value"].includes(n)), []);
+  assert.deepEqual([...names].sort().filter((n) => !["aria-busy", "aria-current", "aria-describedby", "aria-disabled", "aria-hidden", "aria-invalid", "aria-expanded", "aria-label", "aria-live", "aria-pressed", "autocapitalize", "autocomplete", "autocorrect", "data-conversation", "data-drawer", "data-focus", "data-id", "datetime", "for", "id", "name", "novalidate", "role", "spellcheck", "tabindex", "type", "value"].includes(n)), []);
   assert.deepEqual(page.doc.root.byTag("script").length, 2);
 });
 

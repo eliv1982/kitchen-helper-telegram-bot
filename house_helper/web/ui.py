@@ -169,14 +169,14 @@ _SHELL = f"""\
     <button id="logout" class="btn btn-onblue" type="button">Выйти</button>
   </header>
   <div class="workspace">
-    <nav id="sidebar" class="sidebar" aria-label="Разговоры, избранное, покупки и профиль">
+    <nav id="sidebar" class="sidebar" aria-label="Диалоги, избранное, покупки и профиль">
       <div class="tabs" role="group" aria-label="Раздел">
-        <button id="tab-chats" class="tab" type="button" aria-pressed="true">Разговоры</button>
+        <button id="tab-chats" class="tab" type="button" aria-pressed="true">Диалоги</button>
         <button id="tab-favorites" class="tab" type="button" aria-pressed="false">Избранное</button>
         <button id="tab-shopping" class="tab" type="button" aria-pressed="false">Покупки</button>
       </div>
       <div id="panel-chats" class="panel">
-        <button id="new-conversation" class="btn btn-secondary btn-block" type="button">Новый разговор</button>
+        <button id="new-conversation" class="btn btn-secondary btn-block" type="button">Новый диалог</button>
         <p id="list-status" class="hint" role="status"></p>
         <button id="list-retry" class="btn btn-quiet btn-block" type="button" hidden>Обновить список</button>
         <ul id="conversation-list" class="conv-list"></ul>
@@ -220,17 +220,19 @@ _SHELL = f"""\
         <div id="chat-actions" class="chat-actions" hidden>
           <button id="chat-actions-toggle" class="btn btn-quiet chat-actions-toggle" type="button"
                   aria-haspopup="menu" aria-expanded="false" aria-controls="chat-actions-menu"
-                  aria-label="Действия с разговором"><span aria-hidden="true">⋯</span></button>
+                  aria-label="Действия с диалогом"><span aria-hidden="true">⋯</span></button>
           <div id="chat-actions-menu" class="chat-actions-menu" role="menu"
-               aria-label="Действия с разговором" hidden></div>
+               aria-label="Действия с диалогом" hidden></div>
         </div>
       </div>
+      <div id="chat-title-info" class="chat-title-info" hidden></div>
+      <div id="chat-title-edit" class="chat-title-edit" hidden></div>
       <div id="chat-delete" class="chat-delete" hidden></div>
       <div id="banner" class="banner" hidden>
         <p id="banner-text"></p>
         <button id="banner-close" class="btn btn-quiet" type="button">Закрыть</button>
       </div>
-      <div id="messages" class="messages" role="log" aria-live="off" aria-label="Сообщения разговора" tabindex="0"></div>
+      <div id="messages" class="messages" role="log" aria-live="off" aria-label="Сообщения диалога" tabindex="0"></div>
       <form id="composer" class="composer" novalidate>
         <label class="visually-hidden" for="composer-input">Ваше сообщение</label>
         <div class="composer-row">

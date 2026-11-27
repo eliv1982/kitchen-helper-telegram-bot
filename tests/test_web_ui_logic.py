@@ -116,7 +116,7 @@ def test_the_client_strips_exactly_the_characters_the_server_strips():
 
 
 SAMPLES = [
-    "", "a", "я", "😀", "😀😀", "a😀b", "é", "́", "👨‍👩‍👧", "\ud83d", "\ude00", "a\ud83db", "\ud83d\ud83d", "\ude00\ud83d",
+    "", "a", "я", "😀", "😀😀", "a😀b", "e\u0301", "\u0301", "\U0001f468\u200d\U0001f469\u200d👧", "\ud83d", "\ude00", "a\ud83db", "\ud83d\ud83d", "\ude00\ud83d",
     "x" * 2000, "😀" * 2000, "😀" * 2001, "я" * 1999 + "😀", "\U0010ffff" * 3, "\u0000", "a\u0000b",
 ]
 
@@ -135,8 +135,8 @@ def _generated_texts() -> list[str]:
     generator = random.Random(20261018)
     spaces = [chr(code) for code in range(0x110000) if chr(code).isspace()]
     controls = [chr(code) for code in list(range(0, 32)) + list(range(0x7F, 0xA0))]
-    odd = ["﻿", "​", "᠎", "⁠", "\ud800", "\udbff", "\udc00", "\udfff", "�"]
-    letters = ["a", "Z", "я", "Ё", "7", "!", "😀", "🍲", "\U0001f468", "́", "‍", "é"]
+    odd = ["\ufeff", "\u200b", "᠎", "⁠", "\ud800", "\udbff", "\udc00", "\udfff", "�"]
+    letters = ["a", "Z", "я", "Ё", "7", "!", "😀", "🍲", "\U0001f468", "\u0301", "\u200d", "é"]
     pool = spaces * 2 + controls + odd + letters * 4
     texts = []
     for _ in range(900):
@@ -144,7 +144,7 @@ def _generated_texts() -> list[str]:
     for length in (1998, 1999, 2000, 2001, 2002):
         for _ in range(40):
             body = "".join(generator.choice(letters[:9]) for _ in range(length))
-            texts.append(generator.choice(["", " ", "\n", "　", "\u0085", "\u001f"]) + body + generator.choice(["", " ", "\r\n", " ", " "]))
+            texts.append(generator.choice(["", " ", "\n", "\u3000", "\u0085", "\u001f"]) + body + generator.choice(["", " ", "\r\n", "\u2028", "\u00a0"]))
     for _ in range(60):
         padding = "".join(generator.choice(spaces) for _ in range(generator.randint(1, 300)))
         texts.append(padding + "😀" * 2000 + padding)
@@ -183,7 +183,7 @@ def _titled_texts() -> list[str]:
     stored = [text for verdict, text in map(_server_verdict, _generated_texts()) if verdict == "ok"]
     generator = random.Random(20261027)
     spaces = [chr(code) for code in range(0x110000) if chr(code).isspace()]
-    pieces = ["слово", "а", "борщ", "🍲", "😀😀", "x" * 7, "é", "́"]
+    pieces = ["слово", "а", "борщ", "🍲", "😀😀", "x" * 7, "é", "\u0301"]
     for _ in range(1500):
         text = ""
         for _ in range(generator.randint(1, 30)):
@@ -213,6 +213,155 @@ def test_the_page_names_a_conversation_exactly_as_the_server_does():
     # ... and what is not a name is not one on either side
     blanks = ["", " ", "\n\t ", "\u3000", "\u0085\u001f"]
     assert _crosscheck("title", texts=blanks)["titles"] == [conversation_title(text) for text in blanks] == [None] * 5
+
+
+def _title_texts() -> list[str]:
+    """The shapes a conversation title can take: every kind of whitespace at the ends,
+    ordinary letters and punctuation, emoji sequences that need format characters, and
+    the characters that must be refused (controls, line separators, bidi marks, the BOM,
+    unpaired surrogates) -- single and inside a title, lengths around 200."""
+    bodies = [
+        "", "a", "я", "Борщ", "Borscht", "Борщ 🍲", "Семья \U0001f468\u200d\U0001f469\u200d👧",
+        "\U0001f469\U0001f3fd\u200d\U0001f373", "❤️", "1️⃣", "🇷🇺", "\U0001f3f4\U000e0067\U000e0062\U000e0065\U000e006e\U000e0067\U000e007f",
+        "e\u0301", "a\u200db", "a\u200cb", "a\u200bb", "a\ufeffb", "a\u00adb",
+        "a\nb", "a\rb", "a\tb", "a\u0000b", "a\u001fb", "a\u007fb", "a\u0085b",
+        "a\u2028b", "a\u2029b", "a\u202ab", "a\u2066b", "a\ud800b", "a\ude00b",
+        " x ", "  ", "\u00a0\u2003",
+        # A1-04: a forbidden line separator or control at an end must be refused before
+        # trimming; whitespace that is not forbidden is still trimmed.
+        "\u0411\u043e\u0440\u0449\n", "\n\u0411\u043e\u0440\u0449", "\u0411\u043e\u0440\u0449\r", "\r\u0411\u043e\u0440\u0449", "\u2028\u0411\u043e\u0440\u0449", "\u0411\u043e\u0440\u0449\u2028", "\u0411\u043e\u0440\u0449\u2029",
+        "\u00a0\u0411\u043e\u0440\u0449\u3000",
+        # The emoji format characters are allowed only inside the sequence that needs them.
+        "\u200d", "\u200d\U0001f468", "\U0001f468\u200d", "\U0001f468\u200d\u200d\U0001f469",
+        "\U000e0067\U000e0062\U000e007f", "\U000e0067", "a\U000e0067b",
+        "\U0001f3f4\U000e0067\U000e0062", "\U0001f3f4\U000e007f", "\u0411\u043e\u0440\u0449 \U0001f3f4",
+        "\u041f\u043e\u0432\u0430\u0440 \U0001f469\U0001f3fd\u200d\U0001f373", "\u0412\u0440\u0430\u0447 \U0001f468\u200d\u2695\ufe0f", "\u0421\u0435\u0440\u0434\u0446\u0435 \u2764\ufe0f\u200d\U0001f525",
+        # A1-04: the independent audit's counterexamples. Each must be refused by BOTH
+        # validators, from the same frozen character policy (core.title_unicode).
+        "\ufe0f",  # standalone variation selector
+        "\u034f",  # combining grapheme joiner
+        "\u3164",  # Hangul filler
+        "\u2605\u200d\u2605",  # So is not an emoji base
+        "\U0001f3f4\U000e0020\U000e007f",  # tag space is not a flag letter
+        "\U0001fae9",  # an emoji base newer than Python 3.12's Unicode 15.0
+        "\U0001fae9\u200d\U0001fae9",  # and the same on both sides of a joiner
+        # Blank-looking classes and the tag alphabet's edges.
+        "\u2800", "\ufe0f\ufe0e", "\u115f\u1160", "\uffa0",
+        "\U0001f3f4\U000e0031\U000e007f",  # digit tag
+        "\U0001f3f4\U000e0061\U000e007f",  # one-letter subdivision flag (valid)
+        "\U0001f3f4\U000e0061\U000e007a\U000e007f",  # a-z tags (valid)
+        "\u0411\u043e\u0440\u0449 \u3164",  # a filler inside meaningful text is not blank
+    ]
+    for length in (199, 200, 201):
+        body = "я" * length
+        bodies.append(body)
+        bodies.append("  " + body + "  ")
+        bodies.append(body[:-1] + "\U0001f468\u200d\U0001f469\u200d👧")  # 200+ code points: the joiner counts
+    # The start and end of every Unicode format (Cf) range, alone and in a title: these are
+    # the characters the rule must treat one by one, not a blanket category.
+    for start, end in (
+        (0xAD, 0xAD), (0x600, 0x605), (0x61C, 0x61C), (0x6DD, 0x6DD), (0x70F, 0x70F),
+        (0x890, 0x891), (0x8E2, 0x8E2), (0x180E, 0x180E), (0x200B, 0x200F),
+        (0x202A, 0x202E), (0x2060, 0x2064), (0x2066, 0x206F), (0xFEFF, 0xFEFF),
+        (0xFFF9, 0xFFFB), (0x110BD, 0x110BD), (0x110CD, 0x110CD), (0x13430, 0x1343F),
+        (0x1BCA0, 0x1BCA3), (0x1D173, 0x1D17A), (0xE0001, 0xE0001), (0xE0020, 0xE007F),
+    ):
+        for point in (start, end):
+            character = chr(point)
+            bodies.extend([character, "a" + character + "b"])
+    return bodies
+
+
+def test_the_page_validates_a_conversation_title_exactly_as_the_server_does():
+    from house_helper.persistence.conversations import (
+        InvalidConversationTitle,
+        normalize_conversation_title,
+    )
+
+    texts = _title_texts()
+    results = _crosscheck("conversation_title", texts=texts)["results"]
+
+    assert len(results) == len(texts)
+    for text, result in zip(texts, results):
+        try:
+            stored = normalize_conversation_title(text)
+            expected = ("ok", None, stored)
+        except InvalidConversationTitle as error:
+            expected = ("error", error.reason, None)
+        actual = ("ok", None, result["text"]) if result["ok"] else ("error", result["reason"], None)
+        assert actual == expected, repr(text[:40])
+
+
+def _policy_boundary_texts() -> list[str]:
+    """Titles built from every boundary of the frozen character policy: each range's
+    start, end, and the code points just outside them, alone, around a ZWJ, and inside
+    ordinary text -- plus every tag character after the flag base. The server and the page
+    must give the same verdict for all of them, not just the strings the audit named."""
+    from house_helper.core.title_unicode import DEFAULT_IGNORABLE_RANGES, EMOJI_BASE_RANGES
+
+    def boundary_points(ranges) -> list[int]:
+        points = set()
+        for start, end in ranges:
+            for point in (start - 1, start, end, end + 1):
+                if 0 <= point <= 0x10FFFF and not 0xD800 <= point <= 0xDFFF:
+                    points.add(point)
+        return sorted(points)
+
+    texts: list[str] = []
+    for point in boundary_points(EMOJI_BASE_RANGES):
+        character = chr(point)
+        texts.extend((character, character + "‍" + character, "Борщ " + character))
+    for point in boundary_points(DEFAULT_IGNORABLE_RANGES):
+        character = chr(point)
+        texts.extend((character, "Борщ" + character))
+    for point in range(0xE0020, 0xE0080):
+        texts.append("\U0001f3f4" + chr(point) + "\U000e007f")
+    return texts
+
+
+def test_the_pages_emoji_and_blank_policy_agrees_with_the_server_at_every_frozen_boundary():
+    from house_helper.persistence.conversations import (
+        InvalidConversationTitle,
+        normalize_conversation_title,
+    )
+
+    texts = _policy_boundary_texts()
+    results = _crosscheck("conversation_title", texts=texts)["results"]
+
+    assert len(results) == len(texts) > 1000
+    for text, result in zip(texts, results):
+        try:
+            stored = normalize_conversation_title(text)
+            expected = ("ok", None, stored)
+        except InvalidConversationTitle as error:
+            expected = ("error", error.reason, None)
+        actual = ("ok", None, result["text"]) if result["ok"] else ("error", result["reason"], None)
+        assert actual == expected, repr(text)
+
+
+def test_the_pages_frozen_title_character_tables_are_the_servers():
+    """A1-04: the page embeds the same Unicode policy data the server uses. The block is
+    generated from house_helper/core/title_unicode.py; if either copy is edited alone,
+    this fails rather than letting the two validators drift."""
+    from house_helper.core.title_unicode import TITLE_UNICODE_VERSION, javascript_policy_block
+
+    source = (Path(__file__).parent.parent / "house_helper" / "web" / "static" / "chat-logic.js").read_text(
+        encoding="utf-8"
+    )
+    assert javascript_policy_block() in source
+    assert f"Unicode {TITLE_UNICODE_VERSION}" in source
+    # The equality is over the whole frozen table, not a sample.
+    assert source.count("BEGIN GENERATED TITLE UNICODE POLICY") == 1
+    assert source.count("END GENERATED TITLE UNICODE POLICY") == 1
+
+
+def test_the_pages_title_error_words_are_the_servers():
+    words = _crosscheck("texts")["TEXT"]
+    from house_helper.web.diagnostics import CATALOGUE
+
+    assert words["titleEmpty"] == CATALOGUE["empty_title"].message
+    assert words["titleTooLong"] == CATALOGUE["title_too_long"].message
+    assert words["titleCharacters"] == CATALOGUE["invalid_title"].message
 
 
 def test_the_pages_limits_are_the_servers():
@@ -343,7 +492,11 @@ def test_the_profile_data_note_explains_the_retention_the_purge_applies():
     from house_helper.persistence.base import RETENTION_DAYS
 
     text = _crosscheck("texts")["TEXT"]
-    messages, recipes = text["profileDataMessages"], text["profileDataRecipes"]
+    messages, recipes, titles = (
+        text["profileDataMessages"],
+        text["profileDataRecipes"],
+        text["profileDataTitles"],
+    )
 
     # tests/test_admin_retention.py verifies the lifecycle these sentences describe: messages
     # and their photos expire one by one RETENTION_DAYS after their own creation, an old
@@ -351,14 +504,22 @@ def test_the_profile_data_note_explains_the_retention_the_purge_applies():
     # is empty and has seen no activity for RETENTION_DAYS.
     day = f"{RETENTION_DAYS} дней"
     assert f"Сообщения и фотографии к ним хранятся {day} с момента создания" in messages
-    assert "Разговор не удаляется только из-за возраста" in messages
+    assert "Диалог не удаляется только из-за возраста" in messages
     assert "есть более новые сообщения, остается" in messages
     assert f"не осталось сообщений и им не пользовались {day}" in messages
-    assert not messages.startswith("Разговоры,"), "the old claim that conversations expire by age"
+    assert not messages.startswith("Диалоги,"), "the old claim that conversations expire by age"
 
     # A recipe reply is an assistant message: it goes on the message's own deadline while the
     # conversation may stay. A favorite is a copy with no deadline.
     assert "с рецептами — это сообщения" in recipes
     assert f"каждый хранится {day} с момента создания" in recipes
-    assert "даже если сам разговор остается" in recipes
+    assert "даже если сам диалог остается" in recipes
     assert "Рецепты, сохраненные в избранное, хранятся, пока вы сами их не удалите." in recipes
+
+    # PP-01-A1 (A1-08): a stored title is navigation metadata; it survives individual
+    # message expiry, does not extend retention and is deleted with its conversation.
+    assert "автоматическое название" in titles and "или ваше собственное" in titles
+    assert "переименовать" in titles and "сбросить" in titles
+    assert "истечение отдельных сообщений его не удаляет" in titles
+    assert "Переименование не продлевает срок хранения" in titles
+    assert "При удалении диалога его название удаляется вместе с ним" in titles

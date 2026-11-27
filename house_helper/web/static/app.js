@@ -50,6 +50,8 @@
     chatActionsToggle: byId("chat-actions-toggle"),
     chatActionsMenu: byId("chat-actions-menu"),
     chatDelete: byId("chat-delete"),
+    chatTitleInfo: byId("chat-title-info"),
+    chatTitleEdit: byId("chat-title-edit"),
     drawerToggle: byId("drawer-toggle"),
     sidebar: byId("sidebar"),
     backdrop: byId("backdrop"),
@@ -334,6 +336,7 @@
       });
       region("chatActions", {
         canAct: canAct,
+        canReset: view.title.canReset,
         currentId: view.currentId,
         section: view.section,
         deleting: view.list.deleting,
@@ -343,6 +346,25 @@
         section: view.section,
         deleting: view.list.deleting,
       }, drawChatDelete);
+      region("chatTitleInfo", {
+        section: view.section,
+        currentId: view.currentId,
+        canAct: view.title.canAct,
+        open: view.title.infoOpen,
+        explanation: view.title.explanation,
+        source: view.title.origin,
+      }, drawChatTitleInfo);
+      region("chatTitleEdit", {
+        section: view.section,
+        currentId: view.currentId,
+        canAct: view.title.canAct,
+        editing: view.title.editing,
+        saving: view.title.saving,
+        error: view.title.error,
+        pending: view.title.pending,
+        slow: view.title.slow,
+        maxLength: view.title.maxLength,
+      }, drawChatTitleEdit);
       region("title", view.chatTitle, function (title) {
         els.chatTitle.textContent = title;
       });
@@ -424,6 +446,17 @@
   // what it wanted is not there, nothing is focused, and nothing is focused later.
   var wantFocus = null;
   var focusNodes = {};
+
+  // Counts the person's explicit navigation interactions (opening the drawer, choosing a
+  // section, a conversation or a draft). A completion that means to move the keyboard --
+  // the post-delete focus restoration -- captures this when it is issued and applies only
+  // while no newer interaction has taken over. The controller's own `interaction` result
+  // says whether the completion still owns the delete question and the open conversation;
+  // it cannot know about a drawer the person reopened while the request was out (R5-C3).
+  var interactionSeq = 0;
+  function noteInteraction() {
+    interactionSeq++;
+  }
 
   function applyWantedFocus() {
     var wanted = wantFocus;
@@ -592,7 +625,7 @@
       return;
     }
     els.banner.hidden = false;
-    els.banner.className = "banner" + (banner.kind === "error" ? " banner-error" : "");
+    els.banner.className = "banner" + (banner.kind === "error" ? " banner-error" : " banner-info");
     els.bannerText.textContent = banner.text;
     if (banner.correlationId) {
       els.bannerText.appendChild(document.createElement("br"));
@@ -609,32 +642,77 @@
 
   // The list of conversations ---------------------------------------------------------------------
 
+  // One timestamp of a conversation row: its label and its absolute Moscow date. The date
+  // and its «МСК» label are one unbreakable run, so the zone never wraps onto a line alone;
+  // the line may still break between the label and the date.
+  function conversationTime(text) {
+    var cut = text.indexOf(": ");
+    if (cut < 0) {
+      return h("span", { class: "conv-meta", text: text });
+    }
+    return h("span", { class: "conv-meta" }, [
+      document.createTextNode(text.slice(0, cut) + ":"),
+      h("span", { class: "conv-when", text: " " + text.slice(cut + 2) }),
+    ]);
+  }
+
   function drawList(list) {
+    // Rebuilding the list detaches every row. When the person's keyboard is on a conversation
+    // row that survives the update, the rebuilt row of the same conversation takes it back
+    // (R5-C4). A row the update removes is not restored, and focus that is anywhere else is
+    // left to whatever owns it: this never pulls the keyboard into the list.
+    var focusedConversation = null;
+    if (document.activeElement && within(document.activeElement, els.list)) {
+      focusedConversation = document.activeElement.getAttribute("data-conversation");
+    }
     var status = "";
     els.listRetry.hidden = true;
     if (list.status === "loading" && list.items.length === 0) {
-      status = "Загружаем разговоры…";
+      status = "Загружаем диалоги…";
     } else if (list.status === "error") {
       status = list.error ? list.error.text : Logic.TEXT.listFailed;
       els.listRetry.hidden = false;
     } else if (list.status === "ready" && list.items.length === 0) {
-      status = "Разговоров пока нет. Начните новый.";
+      status = "Диалогов пока нет. Начните новый.";
     } else if (list.hasMore) {
-      status = "Показаны последние " + Logic.PAGE_SIZE + " разговоров.";
+      status = "Показаны последние " + Logic.PAGE_SIZE + " диалогов.";
     }
     els.listStatus.textContent = status;
     els.newConversation.setAttribute("aria-current", list.draftCurrent ? "true" : "false");
     clear(els.list);
+    var rebuilt = {};
     list.items.forEach(function (item) {
-      var button = h("button", { class: "conv-item", type: "button", "aria-current": item.current ? "true" : false }, [
+      var rows = [
         h("span", { class: "conv-label", text: item.label }),
-        h("span", { class: "conv-meta", text: item.meta }),
-      ]);
+        conversationTime(item.createdText),
+        conversationTime(item.lastText),
+      ];
+      if (item.activity) {
+        rows.push(h("span", { class: "conv-meta conv-activity", text: item.activity }));
+      }
+      // A title write of this conversation that is still out, or whose outcome could not
+      // be confirmed, is said on the conversation itself even while another one is open.
+      if (item.titlePending) {
+        rows.push(h("span", { class: "conv-meta conv-activity", role: "status", text: item.titlePendingText }));
+      }
+      if (item.titleBlocked) {
+        rows.push(h("span", { class: "conv-meta conv-activity", role: "status", text: item.titleBlockedText }));
+      }
+      var button = h("button", {
+        class: "conv-item",
+        type: "button",
+        "data-conversation": item.id,
+        "aria-current": item.current ? "true" : false,
+      }, rows);
       button.addEventListener("click", function () {
         selectConversation(item.id);
       });
+      rebuilt[item.id] = button;
       els.list.appendChild(h("li", null, [button]));
     });
+    if (focusedConversation !== null && rebuilt[focusedConversation]) {
+      rebuilt[focusedConversation].focus();
+    }
   }
 
   // The actions of the open conversation ---------------------------------------------------------
@@ -644,6 +722,39 @@
   // header; the menu itself is built from it once, and an entry acts on the id it is given.
   function conversationActions() {
     return [
+      {
+        label: Logic.TEXT.rename,
+        run: function (id) {
+          if (id === null || !lastView || lastView.currentId !== id) {
+            return;
+          }
+          wantFocus = "title-edit-input";
+          controller.beginTitleEdit();
+        },
+      },
+      {
+        label: Logic.TEXT.titleOrigin,
+        run: function (id) {
+          if (id === null || !lastView || lastView.currentId !== id) {
+            return;
+          }
+          wantFocus = "title-info-close";
+          controller.showTitleOrigin();
+        },
+      },
+      {
+        label: Logic.TEXT.resetTitle,
+        resetOnly: true,
+        run: function (id) {
+          if (id === null || !lastView || lastView.currentId !== id) {
+            return;
+          }
+          if (!lastView.title || !lastView.title.canReset) {
+            return; // the entry is hidden unless a stored user title exists
+          }
+          controller.resetTitle();
+        },
+      },
       {
         label: Logic.TEXT.deleteNamed,
         danger: true,
@@ -679,7 +790,7 @@
       });
       actionNode.addEventListener("keydown", onMenuItemKey);
       els.chatActionsMenu.appendChild(actionNode);
-      return actionNode;
+      return { entry: entry, node: actionNode };
     });
   }
 
@@ -692,7 +803,7 @@
     els.chatActionsMenu.hidden = false;
     els.chatActionsToggle.setAttribute("aria-expanded", "true");
     if (conversationMenu.length) {
-      conversationMenu[0].focus();
+      conversationMenu[0].node.focus();
     }
   }
 
@@ -718,8 +829,20 @@
   }
 
   function onMenuItemKey(event) {
-    var index = conversationMenu.indexOf(this);
-    var count = conversationMenu.length;
+    var visible = conversationMenu.filter(function (member) {
+      return !member.node.hidden;
+    });
+    var count = visible.length;
+    if (count === 0) {
+      return;
+    }
+    var index = -1;
+    for (var v = 0; v < visible.length; v++) {
+      if (visible[v].node === this) {
+        index = v;
+        break;
+      }
+    }
     if (event.key === "Escape") {
       event.preventDefault();
       closeChatMenu(true);
@@ -741,7 +864,7 @@
     }
     if (next !== null) {
       event.preventDefault();
-      conversationMenu[next].focus();
+      visible[next].node.focus();
     }
   }
 
@@ -760,7 +883,12 @@
         openChatMenu();
       }
       if (menuOpen && conversationMenu.length) {
-        conversationMenu[event.key === "ArrowUp" ? conversationMenu.length - 1 : 0].focus();
+        var visibleNow = conversationMenu.filter(function (member) {
+          return !member.node.hidden;
+        });
+        if (visibleNow.length) {
+          visibleNow[event.key === "ArrowUp" ? visibleNow.length - 1 : 0].node.focus();
+        }
       }
     } else if (event.key === "Escape" && menuOpen) {
       event.preventDefault();
@@ -881,8 +1009,139 @@
     var busy = Boolean(data.deleting && data.deleting.id === data.currentId && data.deleting.phase === "deleting");
     els.chatActions.hidden = !canAct;
     els.chatActionsToggle.setAttribute("aria-disabled", busy ? "true" : "false");
+    // «Сбросить название» exists only while a stored user title does. The menu is built
+    // once; the entry is shown or hidden here, and its own action double-checks.
+    conversationMenu.forEach(function (member) {
+      if (member.entry.resetOnly) {
+        member.node.hidden = !data.canReset;
+      }
+    });
     if (!canAct || busy || (menuOpen && menuForId !== data.currentId)) {
       closeChatMenu(false);
+    }
+  }
+
+  // PP-01-A1: the truthful explanation of how the open conversation's title was made.
+  // It says only what the server's title_origin says, and is a visible labelled region (not
+  // a hover-only hint) so touch and keyboard users reach the same words.
+  function drawChatTitleInfo(data) {
+    var relevant = data.section === "chats" && data.canAct && data.open;
+    if (!relevant) {
+      if (!els.chatTitleInfo.hidden) {
+        els.chatTitleInfo.hidden = true;
+        clear(els.chatTitleInfo);
+      }
+      return;
+    }
+    els.chatTitleInfo.hidden = false;
+    clear(els.chatTitleInfo);
+    var box = h("div", {
+      class: "chat-title-info-box",
+      role: "region",
+      "aria-label": Logic.TEXT.titleOrigin,
+    }, [
+      h("p", { class: "chat-title-info-text", text: data.explanation }),
+    ]);
+    var close = action(Logic.TEXT.titleClose, "btn-quiet", function () {
+      controller.closeTitleOrigin();
+      els.chatActionsToggle.focus();
+    });
+    focusNodes["title-info-close"] = close;
+    var buttons = h("div", { class: "msg-actions" }, [close]);
+    box.appendChild(buttons);
+    els.chatTitleInfo.appendChild(box);
+  }
+
+  // The rename form, between the header and the messages. It validates with the same rule
+  // as the server and sends the title to the API; the answer (the conversation as the list
+  // shows it) is what the page displays. Escape or «Отмена» closes it without writing.
+  function drawChatTitleEdit(data) {
+    var relevant = data.section === "chats" && data.canAct && data.editing;
+    if (!relevant) {
+      if (!els.chatTitleEdit.hidden) {
+        els.chatTitleEdit.hidden = true;
+        clear(els.chatTitleEdit);
+      }
+      return;
+    }
+    els.chatTitleEdit.hidden = false;
+    clear(els.chatTitleEdit);
+    var draft = lastView && lastView.title ? lastView.title.draft : "";
+    var form = h("form", {
+      class: "chat-title-form",
+      novalidate: true,
+      "aria-label": Logic.TEXT.titleDialogLabel,
+    });
+    var inputId = "chat-title-input";
+    var input = h("input", {
+      id: inputId,
+      class: "chat-title-input",
+      type: "text",
+      value: draft,
+      autocomplete: "off",
+      spellcheck: "false",
+      "aria-describedby": "chat-title-error",
+      disabled: data.saving,
+    });
+    input.addEventListener("input", function () {
+      controller.syncTitleDraft(input.value);
+    });
+    input.addEventListener("keydown", function (event) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        controller.cancelTitleEdit();
+        els.chatActionsToggle.focus();
+      }
+    });
+    focusNodes["title-edit-input"] = input;
+    var error = h("p", {
+      id: "chat-title-error",
+      class: "field-error",
+      role: "alert",
+      text: data.error ? data.error.text : "",
+      hidden: !data.error,
+    });
+    if (data.error && data.error.correlationId) {
+      error.textContent += " " + Logic.TEXT.correlation.replace("{id}", data.error.correlationId);
+    }
+    var save = h("button", {
+      class: "btn btn-primary",
+      type: "submit",
+      text: data.saving ? Logic.TEXT.titleSaving : Logic.TEXT.titleSave,
+      disabled: data.saving,
+    });
+    var cancel = action(Logic.TEXT.titleCancel, "btn-quiet", function () {
+      controller.cancelTitleEdit();
+      els.chatActionsToggle.focus();
+    });
+    cancel.disabled = data.saving;
+    var buttons = h("div", { class: "msg-actions" }, [save, cancel]);
+    form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      if (!data.saving) {
+        controller.saveTitle();
+      }
+    });
+    form.appendChild(h("label", {
+      for: inputId,
+      text: Logic.TEXT.titleDialogLabel + " (не более " + data.maxLength + " символов)",
+    }));
+    form.appendChild(input);
+    form.appendChild(error);
+    // The write is still out past the page's soft timeout: say so, and say that later
+    // title changes wait behind it, instead of letting the form look stalled.
+    if (data.pending && !data.error) {
+      form.appendChild(h("p", {
+        class: "hint",
+        role: "status",
+        text: data.slow ? Logic.TEXT.titlePending : Logic.TEXT.titleSaving,
+      }));
+    }
+    form.appendChild(buttons);
+    els.chatTitleEdit.appendChild(form);
+    if (data.error) {
+      alertText(data.error.text);
+      input.focus(); // the redrawn form keeps the keyboard where the person was working
     }
   }
 
@@ -925,16 +1184,50 @@
     }
     var buttons = h("div", { class: "msg-actions" });
     var decide = action(problem ? Logic.TEXT.retry : Logic.TEXT.deleteConfirm, "btn-danger", function () {
+      var interaction = interactionSeq;
       controller.deleteConversation().then(function (result) {
         if (!result || !result.ok) {
+          return;
+        }
+        // Only the completion of the delete question this page still shows may move the
+        // keyboard. A delayed or duplicate DELETE (its question already settled by another
+        // absence answer, or the person has moved to another conversation or draft) leaves
+        // the current focus and draft alone.
+        if (!result.interaction) {
+          return;
+        }
+        // The person has started a newer interaction (the drawer is open again, another
+        // section or conversation was chosen) while the DELETE was out: the removal and
+        // its refill are theirs, but the keyboard and the drawer belong to that interaction.
+        if (interactionSeq !== interaction) {
           return;
         }
         // The conversation that asked is gone: what was open is now a new empty draft (its
         // title, and the drawer that held the list closes to show it), or the list itself is
         // the thing to be back in.
         if (result.wasCurrent) {
+          // The removal's list redraw has already given the keyboard back to a surviving
+          // conversation row (R5-C4). On a wide screen that list stays beside the chat, so
+          // that row is where the person is working now: leave the keyboard and the drawer
+          // to it instead of pulling both back to the chat (R5-C5). With no surviving row
+          // focused, the ordinary restoration below still applies.
+          if (
+            document.activeElement &&
+            within(document.activeElement, els.list) &&
+            document.activeElement.getAttribute("data-conversation") !== null
+          ) {
+            return;
+          }
           setDrawer(false, false);
-          els.chatTitle.focus();
+          if (narrow !== null && narrow.matches) {
+            // A narrow screen keeps the ordinary restoration: the new draft's title takes
+            // the keyboard. Focusing the composer there would open the software keyboard
+            // on its own.
+            els.chatTitle.focus();
+          } else {
+            // Ordinary desktop deletion: the new empty draft is ready to be written in.
+            els.input.focus();
+          }
         } else {
           els.newConversation.focus();
         }
@@ -1271,6 +1564,9 @@
     if (!result || !result.ok) {
       return;
     }
+    // Cancelling the draft is the person's own navigation back to the conversation. It is
+    // newer than any DELETE still out, whose completion may not take the keyboard (R5-C4).
+    noteInteraction();
     if (result.origin === "favorites") {
       els.recipeTitle.focus();
     } else {
@@ -2171,6 +2467,7 @@
     [
       Logic.TEXT.profileDataMessages,
       Logic.TEXT.profileDataRecipes,
+      Logic.TEXT.profileDataTitles,
       Logic.TEXT.profileDataShopping,
       Logic.TEXT.profileDataOpenAI,
       Logic.TEXT.profileDataDelete,
@@ -2182,6 +2479,7 @@
   }
 
   els.profileOpen.addEventListener("click", function () {
+    noteInteraction();
     setDrawer(false, false);
     wantFocus = "profile";
     controller.showSection("profile");
@@ -2205,6 +2503,7 @@
     if (!leaveShoppingDraft()) {
       return;
     }
+    noteInteraction();
     setDrawer(false, false); // the navigation was accepted: the drawer gives way to the list
     controller.openShoppingList(id).then(function (result) {
       if (result && result.ok) {
@@ -2229,6 +2528,7 @@
       ]);
       if (data.count > 0) {
         var choose = action("Выбрать рецепт", "btn-primary only-narrow", function () {
+          noteInteraction();
           setDrawer(true, false);
         });
         empty.appendChild(choose);
@@ -3172,6 +3472,7 @@
     if (!leaveEditor()) {
       return;
     }
+    noteInteraction();
     setDrawer(false, false);
     wantFocus = "recipe";
     controller.openFavorite(id);
@@ -3281,6 +3582,10 @@
         if (!leaveShoppingDraft()) {
           return;
         }
+        // Entering the draft is the person's own navigation away from the conversation: it
+        // is newer than any DELETE still out, whose completion may not take the keyboard
+        // back when it settles (R5-C4).
+        noteInteraction();
         controller
           .beginShoppingDraftFromRecipe(conversationId, messageId, recipe.position)
           .then(function (result) {
@@ -3451,7 +3756,7 @@
 
     if (thread.status === "loading") {
       box.appendChild(
-        h("p", { class: "loading" }, [h("span", { class: "spinner", "aria-hidden": "true" }), document.createTextNode("Загружаем разговор…")])
+        h("p", { class: "loading" }, [h("span", { class: "spinner", "aria-hidden": "true" }), document.createTextNode("Загружаем диалог…")])
       );
     } else if (thread.status === "error") {
       box.appendChild(
@@ -3509,6 +3814,17 @@
         box.appendChild(empty);
       }
       thread.items.forEach(function (item) {
+        if (item.type === "day") {
+          // An absolute Moscow-time calendar day, never "сегодня"/"вчера". The zone is
+          // said in the separator itself, so every message time under it is unambiguous.
+          box.appendChild(
+            h("div", { class: "day-sep", role: "separator", "aria-label": item.label + ", " + item.zone }, [
+              h("span", { class: "day-sep-date", text: item.label }),
+              h("span", { class: "day-sep-zone", text: item.zone }),
+            ])
+          );
+          return;
+        }
         box.appendChild(messageNode(item, conversationId));
       });
       if (thread.error) {
@@ -3550,10 +3866,18 @@
     }
     lastPendingNote = note;
 
-    // Where to be scrolled to afterwards.
-    var firstId = thread.items.length ? String(thread.items[0].id) : null;
+    // Where to be scrolled to afterwards. Separators are skipped: the anchor is the first
+    // and last real entry of the thread.
+    var firstId = null;
+    for (var anchor = 0; anchor < thread.items.length; anchor++) {
+      var candidate = thread.items[anchor];
+      if (candidate.type !== "day") {
+        firstId = candidate.type === "pending" ? "pending" : String(candidate.id);
+        break;
+      }
+    }
     var lastItem = thread.items.length ? thread.items[thread.items.length - 1] : null;
-    var lastKey = lastItem ? (lastItem.type === "pending" ? "pending" : String(lastItem.id)) : null;
+    var lastKey = lastItem ? (lastItem.type === "pending" ? "pending" : lastItem.type === "day" ? null : String(lastItem.id)) : null;
     if (changedConversation || thread.status !== "ready") {
       box.scrollTop = box.scrollHeight;
     } else if (firstId !== lastThread.first && lastKey === lastThread.last) {
@@ -3573,7 +3897,7 @@
     els.input.readOnly = composer.locked;
     els.send.setAttribute("aria-disabled", composer.locked ? "true" : "false");
     els.send.className = "btn btn-primary btn-send" + (composer.locked ? " is-disabled" : "");
-    els.send.textContent = composer.creating ? "Создаем разговор…" : "Отправить";
+    els.send.textContent = composer.creating ? "Создаем диалог…" : "Отправить";
     els.composerHint.textContent = composer.hint || "";
     els.composerError.hidden = !composer.error;
     els.composerError.textContent = composer.error || "";
@@ -3695,13 +4019,16 @@
   }
 
   els.drawerToggle.addEventListener("click", function () {
+    noteInteraction();
     setDrawer(els.app.getAttribute("data-drawer") !== "open", true);
   });
   els.backdrop.addEventListener("click", function () {
+    noteInteraction();
     setDrawer(false, true);
   });
   document.addEventListener("keydown", function (event) {
     if (event.key === "Escape" && els.app.getAttribute("data-drawer") === "open") {
+      noteInteraction();
       setDrawer(false, true);
     }
   });
@@ -3712,6 +4039,7 @@
   }
 
   function selectConversation(id) {
+    noteInteraction();
     setDrawer(false, false);
     closeChatMenu(false);
     controller.selectConversation(id);
@@ -3719,6 +4047,7 @@
   }
 
   els.newConversation.addEventListener("click", function () {
+    noteInteraction();
     setDrawer(false, false);
     closeChatMenu(false);
     controller.startDraft();
@@ -3728,12 +4057,15 @@
     controller.reloadList();
   });
   els.tabChats.addEventListener("click", function () {
+    noteInteraction();
     controller.showSection("chats");
   });
   els.tabFavorites.addEventListener("click", function () {
+    noteInteraction();
     controller.showSection("favorites");
   });
   els.tabShopping.addEventListener("click", function () {
+    noteInteraction();
     controller.showSection("shopping");
   });
   els.favoritesRetry.addEventListener("click", function () {
@@ -3833,11 +4165,14 @@
       event.returnValue = "";
     }
   });
-  // A page restored from the browser's back/forward cache is as it was when it was left, which may be
-  // the page of somebody who has signed out since: ask who is signed in again.
+  // A page restored from the browser's back/forward cache is the same document as it was when it
+  // was left, which may be the page of somebody who has signed out since: ask who is signed in
+  // again. The restoration keeps what belongs to this same page -- an unresolved title write and
+  // its guard included -- so a newer title write is never released past an earlier one that can
+  // still commit. Another person's page is started over by the answer itself.
   window.addEventListener("pageshow", function (event) {
     if (event.persisted) {
-      controller.start();
+      controller.restore();
     }
   });
   // A tab that comes back (or is thawed after being frozen) first checks the deadline, then asks the server.

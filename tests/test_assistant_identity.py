@@ -130,14 +130,14 @@ def test_the_telegram_help_speaks_informationally_and_keeps_every_condition():
     assert "Редактировать рецепты, заметки и списки покупок можно только на сайте House Helper." in tc.HELP
     # The relay keeps both conditions: before a selection, everything; after, only it.
     assert (
-        "Пока в Telegram не выбран разговор, я отвечаю в самом свежем, и все, что ты "
+        "Пока в Telegram не выбран диалог, я отвечаю в самом свежем, и все, что ты "
         "пишешь мне на сайте, вместе с моим ответом пересылается сюда; после выбора — "
-        "только из выбранного разговора."
+        "только из выбранного диалога."
     ) in tc.HELP
-    assert "/dialogs показывает все твои разговоры" in tc.HELP
+    assert "/dialogs показывает все твои диалоги" in tc.HELP
     # The command list and the privacy appendix are untouched and still composed in.
     assert tc.HELP.endswith(tc.PRIVACY)
-    for command in ("/dialogs — выбрать разговор", "/new — начать новый разговор",
+    for command in ("/dialogs — выбрать диалог", "/new — начать новый диалог",
                     "/favorites — избранное", "/unlink — отключить Telegram от аккаунта",
                     "/help — эта подсказка"):
         assert command in tc.HELP
@@ -159,7 +159,7 @@ def test_the_telegram_recipe_and_dialog_copy_match_the_approved_words():
         "Нажми на диалог, чтобы продолжить его в Telegram. "
         "Время — последнего сообщения, по Москве (МСК)."
     )
-    sentence = "Продолжай писать — я учту контекст этого разговора."
+    sentence = "Продолжай писать — я учту контекст этого диалога."
     assert tc.DIALOG_SELECTED.endswith(sentence)
     assert tc.DIALOG_SELECTED_UNTITLED.endswith(sentence)
     assert "Продолжайте" not in tc.DIALOG_SELECTED + tc.DIALOG_SELECTED_UNTITLED

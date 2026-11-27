@@ -301,9 +301,12 @@ textarea[aria-invalid="true"] {
 }
 
 .notice-ok {
+  padding: 0.45rem 0.7rem;
   border-color: var(--green);
   background: var(--green-pale);
   color: var(--green-dark);
+  font-size: 0.9rem;
+  line-height: 1.35;
 }
 
 .loading {
@@ -509,7 +512,7 @@ textarea[aria-invalid="true"] {
   display: flex;
   flex: 1 1 0;
   flex-direction: column;
-  gap: 0.45rem;
+  gap: 0.35rem;
   min-height: 0;
   margin: 0.4rem -0.4rem 0;
   padding: 0.4rem;
@@ -524,11 +527,11 @@ textarea[aria-invalid="true"] {
 .conv-item {
   display: flex;
   flex-direction: column;
-  gap: 0.1rem;
+  gap: 0.05rem;
   width: 100%;
   min-width: 0;
   min-height: 3rem;
-  padding: 0.55rem 0.8rem;
+  padding: 0.5rem 0.75rem;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: var(--surface);
@@ -554,8 +557,15 @@ textarea[aria-invalid="true"] {
 
 .conv-meta {
   color: var(--muted);
-  font-size: 0.85rem;
+  font-size: 0.78rem;
   font-weight: 400;
+  line-height: 1.35;
+}
+
+/* The date and its zone label are one run: «МСК» never becomes an orphaned last line.
+   The line may still break between the label and the date. */
+.conv-when {
+  white-space: nowrap;
 }
 
 /* The three parts of the sidebar, side by side and equal in width. A label is never broken
@@ -727,8 +737,9 @@ textarea[aria-invalid="true"] {
   top: calc(100% + 0.25rem);
   right: 0;
   z-index: 40;
-  min-width: 13rem;
-  max-width: min(18rem, calc(100vw - 2.5rem));
+  width: max-content;
+  min-width: min(15.5rem, calc(100vw - 2.5rem));
+  max-width: calc(100vw - 2.5rem);
   padding: 0.3rem;
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -748,6 +759,7 @@ textarea[aria-invalid="true"] {
   color: var(--text);
   font: inherit;
   text-align: left;
+  white-space: nowrap;
   cursor: pointer;
 }
 
@@ -759,8 +771,18 @@ textarea[aria-invalid="true"] {
   color: var(--red-dark);
 }
 
+/* On the narrowest screens the menu may be narrower than a long command; let it wrap
+   there instead of overflowing the viewport. */
+@media (max-width: 30rem) {
+  .chat-menu-item {
+    white-space: normal;
+  }
+}
+
 /* The question "delete this conversation?" and its failure, between the header and the messages. */
-.chat-delete {
+.chat-delete,
+.chat-title-info,
+.chat-title-edit {
   flex: none;
   padding: 0.75rem var(--gutter);
   border-bottom: 1px solid var(--line);
@@ -773,6 +795,87 @@ textarea[aria-invalid="true"] {
 
 .chat-delete-confirm .msg-actions {
   margin-top: 0.55rem;
+}
+
+/* PP-01-A1: the title's explanation and rename form. Both are ordinary blocks under the
+   header, reachable by touch and keyboard; the input keeps the existing field styling.
+   The explanation is information, not a warning: it uses the neutral informational tone,
+   while the delete question keeps the red confirmation styling. */
+.chat-title-info-box {
+  padding: 0.65rem 0.85rem;
+  border: 1px solid var(--pale-strong);
+  border-radius: var(--radius);
+  background: var(--pale);
+  color: var(--text);
+}
+
+.chat-title-info-box .chat-title-info-text {
+  margin: 0;
+  font-weight: 400;
+}
+
+.chat-title-info-box .msg-actions {
+  margin-top: 0.55rem;
+}
+
+.chat-title-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  max-width: 34rem;
+}
+
+.chat-title-form label {
+  font-weight: 600;
+}
+
+.chat-title-input {
+  width: 100%;
+  min-height: 2.75rem;
+  padding: 0.5rem 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+}
+
+.chat-title-input:focus-visible {
+  outline: 3px solid var(--blue);
+  outline-offset: 1px;
+}
+
+.chat-title-form .msg-actions {
+  margin-top: 0.1rem;
+}
+
+.conv-activity {
+  color: var(--blue);
+}
+
+/* PP-01-A1: a calendar day in the history, in Moscow time (the zone is written beside the
+   date). Absolute, so it reads the same tomorrow and never claims "сегодня". */
+.day-sep {
+  display: flex;
+  align-self: center;
+  align-items: baseline;
+  gap: 0.35rem;
+  margin: 0.35rem 0;
+  padding: 0.2rem 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.day-sep-date {
+  font-weight: 600;
+}
+
+.day-sep-zone {
+  font-size: 0.75rem;
+  letter-spacing: 0.03em;
 }
 
 .banner {
@@ -793,6 +896,21 @@ textarea[aria-invalid="true"] {
   background: var(--red-pale);
   color: var(--red-dark);
   border-bottom-color: var(--red);
+}
+
+/* A successful action needs visible but unobtrusive acknowledgement: a slim strip that
+   does not push the conversation down like an error would. Errors keep the full banner. */
+.banner-info {
+  padding-top: 0.3rem;
+  padding-bottom: 0.3rem;
+  background: var(--bg);
+  border-bottom-color: var(--line);
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.banner-info p {
+  line-height: 1.35;
 }
 
 /* `position: relative`: the visually-hidden labels in the messages are positioned, and their

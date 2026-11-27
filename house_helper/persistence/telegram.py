@@ -105,6 +105,7 @@ from sqlalchemy.orm import Session as OrmSession
 from house_helper.persistence.authn import hash_secret
 from house_helper.persistence.conversations import (
     ConversationSummary,
+    activity_at,
     conversation_summary,
     create_conversation,
     owns_conversation,
@@ -461,13 +462,16 @@ class ConversationResolution:
     created: bool = False
 
 
-def latest_conversation_id(session: OrmSession, user_id: UUID) -> Optional[UUID]:
+def latest_conversation_id(
+    session: OrmSession, user_id: UUID, *, now: datetime
+) -> Optional[UUID]:
     """The user's most recently active conversation: first in the order the website lists
-    them (newest activity first, ties by id), or None if they have none."""
+    them (latest available message first, the creation time while there is none, ties by
+    id), or None if they have none."""
     return session.scalar(
         sa.select(Conversation.id)
         .where(Conversation.user_id == user_id)
-        .order_by(Conversation.updated_at.desc(), Conversation.id.desc())
+        .order_by(activity_at(now).desc(), Conversation.id.desc())
         .limit(1)
     )
 
@@ -663,7 +667,7 @@ def conversation_for_message(
         created = create_conversation(session, user_id, now=now).id
         _write_selection(session, user_id, created, now=now)
         return ConversationResolution(created, admitted=False, created=True)
-    latest = latest_conversation_id(session, user_id)
+    latest = latest_conversation_id(session, user_id, now=now)
     if latest is not None:
         return ConversationResolution(latest, admitted=False)
     created = create_conversation(session, user_id, now=now).id
@@ -691,7 +695,7 @@ def start_conversation(session: OrmSession, user_id: UUID, *, now: datetime) -> 
         created = create_conversation(session, user_id, now=now).id
         _write_selection(session, user_id, created, now=now)
         return created
-    latest = latest_conversation_id(session, user_id)
+    latest = latest_conversation_id(session, user_id, now=now)
     if latest is not None and not _holds_something(session, latest, now):
         _write_selection(session, user_id, latest, now=now)
         return latest

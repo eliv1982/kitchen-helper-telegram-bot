@@ -85,8 +85,10 @@ is called. A recipe longer than one message is sent in pieces, with the way back
 last piece.
 
 Choosing the conversation. `/dialogs` shows the person's conversations as buttons, the same
-list the website shows (newest activity first, each named by its first unexpired user
-message) with its timestamps in Moscow time, explicitly labelled МСК. Eight fit a page,
+list the website shows (latest available message first, the creation time while there is
+none) with each conversation's title, creation date and last-message date in Moscow time,
+explicitly labelled МСК. A user title set on the website is the same stored title here.
+Eight fit a page,
 and the pages reach every conversation the person has: a page is judged against the list
 actually read, so a stale or made-up page number opens the last page rather than a fixed
 ceiling. The conversation a message would go to is marked,
@@ -342,7 +344,7 @@ UNLINK_ATTEMPTS = 3
 
 PRIVACY = (
     "Обратите внимание: текст ваших сообщений и фотографии передаются во внешний сервис OpenAI "
-    "для обработки и подготовки ответа. История разговоров хранится 365 дней и затем удаляется; "
+    "для обработки и подготовки ответа. История диалогов хранится 365 дней и затем удаляется; "
     "рецепты, сохраненные в избранное, остаются, пока вы сами их не уберете."
 )
 
@@ -354,16 +356,16 @@ HELP = (
     "когда она есть, или на сайте House Helper; открыть сохраненное — командой "
     "/favorites. Редактировать рецепты, заметки и списки покупок можно только на сайте "
     "House Helper.\n\n"
-    "Разговоры общие с сайтом House Helper. Пока в Telegram не выбран разговор, я отвечаю "
+    "Диалоги общие с сайтом House Helper. Пока в Telegram не выбран диалог, я отвечаю "
     "в самом свежем, и все, что ты пишешь мне на сайте, вместе с моим ответом пересылается "
-    "сюда; после выбора — только из выбранного разговора. Чтобы это прекратить, отключи "
+    "сюда; после выбора — только из выбранного диалога. Чтобы это прекратить, отключи "
     "Telegram командой /unlink или на сайте.\n\n"
-    "Команда /dialogs показывает все твои разговоры (время — по Москве, МСК) и позволяет "
+    "Команда /dialogs показывает все твои диалоги (время — по Москве, МСК) и позволяет "
     "продолжить любой из них здесь; /new начинает новый. Выбор в Telegram не меняет "
-    "разговор, который открывает сайт.\n\n"
+    "диалог, который открывает сайт.\n\n"
     "Команды:\n"
-    "/dialogs — выбрать разговор\n"
-    "/new — начать новый разговор\n"
+    "/dialogs — выбрать диалог\n"
+    "/new — начать новый диалог\n"
     "/favorites — избранное\n"
     "/unlink — отключить Telegram от аккаунта\n"
     "/help — эта подсказка\n\n" + PRIVACY
@@ -392,9 +394,9 @@ NOT_LINKED = (
 
 LINKED = (
     "Готово! Telegram подключен к вашему аккаунту House Helper.\n\n"
-    "Пишите мне сюда: разговор общий с сайтом. Пока в Telegram не выбран разговор, все, что "
+    "Пишите мне сюда: диалог общий с сайтом. Пока в Telegram не выбран диалог, все, что "
     "вы пишете помощнику на сайте, и его ответы будут приходить и сюда; после выбора — только "
-    "из выбранного разговора. Подсказка — /help.\n\n" + PRIVACY
+    "из выбранного диалога. Подсказка — /help.\n\n" + PRIVACY
 )
 ALREADY_LINKED = "Этот Telegram уже подключен к вашему аккаунту. Можно писать, подсказка — /help."
 BAD_CODE = (
@@ -412,7 +414,7 @@ UNLINKED = (
     "Telegram отключен от аккаунта. Чтобы подключить снова, "
     "нажмите «Подключить Telegram» на сайте."
 )
-NEW_CONVERSATION = "Начинаем новый разговор. О чем поговорим?"
+NEW_CONVERSATION = "Начинаем новый диалог. О чем поговорим?"
 UNKNOWN_COMMAND = "Не знаю такой команды. Подсказка — /help."
 UNSUPPORTED = "Пока я понимаю текст и фотографии. Напиши, что хочешь приготовить, или пришли фото."
 PHOTO_TOO_BIG = "Фото слишком большое. Пришлите, пожалуйста, обычное фото (до 5 МБ)."
@@ -677,16 +679,17 @@ DIALOGS_HINT = (
     "Время — последнего сообщения, по Москве (МСК)."
 )
 DIALOGS_EMPTY = "Диалогов пока нет. Напиши сообщение, и я начну первый."
+DIALOGS_NO_MESSAGES = "Нет сообщений"
 DIALOGS_DELETED_NOTE = "Выбранный диалог был удален. Следующее сообщение начнет новый."
 DIALOGS_UNAVAILABLE = "Не удалось открыть список диалогов. Попробуйте еще раз чуть позже."
 DIALOG_UNAVAILABLE = "Этот диалог больше недоступен. Откройте /dialogs и выберите другой."
 DIALOG_SELECT_FAILED = "Не удалось выбрать диалог. Попробуйте еще раз чуть позже."
 DIALOG_SELECTED = (
     "🗂 Выбран диалог: «{title}».\n\n"
-    "Продолжай писать — я учту контекст этого разговора."
+    "Продолжай писать — я учту контекст этого диалога."
 )
 DIALOG_SELECTED_UNTITLED = (
-    "🗂 Диалог выбран.\n\nПродолжай писать — я учту контекст этого разговора."
+    "🗂 Диалог выбран.\n\nПродолжай писать — я учту контекст этого диалога."
 )
 DIALOG_DELETED = (
     "Этот диалог был удален, поэтому ответ сохранить не удалось. "
@@ -713,7 +716,7 @@ def _moscow_time(moment: datetime) -> str:
     """The instant as the dialogs list shows it: date, time and the explicit МСК label."""
     if moment.tzinfo is None:  # (the database's timestamps are timezone-aware UTC)
         moment = moment.replace(tzinfo=timezone.utc)
-    return moment.astimezone(_MOSCOW).strftime("%d.%m.%Y %H:%M") + " " + MOSCOW_LABEL
+    return moment.astimezone(_MOSCOW).strftime("%d.%m.%Y, %H:%M") + " " + MOSCOW_LABEL
 
 
 def _dialog_page(data: Any) -> Optional[int]:
@@ -759,23 +762,53 @@ class _DialogsPage:
     selected_deleted: bool  # the explicit selection points at a conversation that is gone
 
 
-def _dialog_label(item: conversations.ConversationSummary, *, active: bool) -> str:
-    """One conversation's button: the product's Moscow time, then the derived title, with
-    a check mark for the conversation the chat is working in. The label is bounded the way
-    every button of this bot is; the bound cuts the title, never the time."""
-    title = " ".join(item.title.split()) if item.title else DIALOG_UNTITLED
-    prefix = "✓ " if active else ""
-    return _bounded_label(f"{prefix}{_moscow_time(item.updated_at)} — {title}")
+def _dialog_title(item: conversations.ConversationSummary) -> str:
+    """The title on one line, for a button (which cannot hold a newline)."""
+    return " ".join(item.title.split()) if item.title else DIALOG_UNTITLED
+
+
+def _dialog_title_text(item: conversations.ConversationSummary) -> str:
+    """The stored or derived title exactly as the list holds it: the message text is not
+    a button and has room for the full legal title (at most 200 code points, and eight of
+    them plus their dates still fit one Telegram message)."""
+    return item.title if item.title else DIALOG_UNTITLED
+
+
+def _dialog_label(item: conversations.ConversationSummary, *, active: bool, position: int) -> str:
+    """One conversation's button: its number (a check mark for the conversation the chat
+    is working in) and its title. The dates cannot fit in a button and are shown, with
+    the same title, in the message text above the keyboard (_dialog_lines)."""
+    prefix = "✓ " if active else f"{position + 1}. "
+    return _bounded_label(f"{prefix}{_dialog_title(item)}")
+
+
+def _dialog_lines(item: conversations.ConversationSummary, *, active: bool, position: int) -> list[str]:
+    """The dates of one conversation, named truthfully: its creation instant and the
+    instant of its latest still-available message, both in the product's Moscow time.
+    An empty conversation says so rather than borrowing an unrelated updated_at."""
+    marker = "✓ " if active else f"{position + 1}. "
+    last = (
+        _moscow_time(item.last_message_at)
+        if item.last_message_at is not None
+        else DIALOGS_NO_MESSAGES
+    )
+    return [
+        f"{marker}{_dialog_title_text(item)}",
+        f"Создан: {_moscow_time(item.created_at)}",
+        f"Последнее сообщение: {last}",
+    ]
 
 
 def _dialogs_view(page: _DialogsPage) -> tuple[str, Optional[dict[str, Any]]]:
     """The message and keyboard for one page of the user's conversations.
 
-    The order is the one list_conversations returns (newest activity first, ties by id):
-    the page is a window on that list, so the same list always gives the same buttons in
-    the same order. An empty list is the friendly empty state with no keyboard; a
-    selection whose conversation was deleted is said in words, and no button pretends to
-    be that conversation."""
+    The order is the one list_conversations returns (latest available message first, the
+    creation time while there is none, ties by id): the page is a window on that list, so
+    the same list always gives the same entries in the same order. Each conversation's
+    title and its two absolute Moscow-time dates are in the message; its button carries
+    the number and the title. An empty list is the friendly empty state with no keyboard;
+    a selection whose conversation was deleted is said in words, and no button pretends
+    to be that conversation."""
     if page.total == 0:
         text = DIALOGS_EMPTY
         if page.selected_deleted:
@@ -786,15 +819,18 @@ def _dialogs_view(page: _DialogsPage) -> tuple[str, Optional[dict[str, Any]]]:
         lines.append(f"Страница {page.page + 1} из {page.pages}.")
     if page.selected_deleted:
         lines.append(DIALOGS_DELETED_NOTE)
-    lines.extend(["", DIALOGS_HINT])
+    lines.extend(["", DIALOGS_HINT, ""])
+    for position, item in enumerate(page.conversations):
+        lines.extend(_dialog_lines(item, active=item.id == page.active_id, position=position))
+        lines.append("")
     rows = [
         [
             {
-                "text": _dialog_label(item, active=item.id == page.active_id),
+                "text": _dialog_label(item, active=item.id == page.active_id, position=position),
                 "callback_data": f"{DIALOGS_SELECT_PREFIX}:{item.id.hex}:{page.page}",
             }
         ]
-        for item in page.conversations
+        for position, item in enumerate(page.conversations)
     ]
     navigation = []
     if page.page > 0:
@@ -807,7 +843,7 @@ def _dialogs_view(page: _DialogsPage) -> tuple[str, Optional[dict[str, Any]]]:
         )
     if navigation:
         rows.append(navigation)
-    return "\n".join(lines), {"inline_keyboard": rows}
+    return "\n".join(lines).rstrip(), {"inline_keyboard": rows}
 
 
 def _dialogs_back(page: int) -> dict[str, Any]:
@@ -1465,7 +1501,7 @@ class TelegramChat:
             )
             selection = store.active_conversation(session, user_id)
             if selection is None:
-                active = store.latest_conversation_id(session, user_id)
+                active = store.latest_conversation_id(session, user_id, now=now)
                 deleted = False
             else:
                 active = selection.conversation_id

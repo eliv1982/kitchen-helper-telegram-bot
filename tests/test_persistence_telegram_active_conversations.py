@@ -221,8 +221,12 @@ def test_deleting_the_user_deletes_the_selection(factory, user_id):
 
 
 def test_a_message_without_a_selection_follows_the_latest_and_makes_no_selection(factory, user_id):
-    old = make_conversation(factory, user_id, updated=NOW)
-    latest = make_conversation(factory, user_id, updated=NOW + timedelta(hours=1))
+    old = make_conversation(factory, user_id, created=NOW, updated=NOW)
+    # Empty conversations are ordered by their creation time (PP-01-A1); updated_at alone
+    # is not the list's activity key.
+    latest = make_conversation(
+        factory, user_id, created=NOW + timedelta(hours=1), updated=NOW + timedelta(hours=1)
+    )
 
     found = run(factory, lambda db: tg.conversation_for_message(db, user_id, "tg-1", now=NOW))
 
@@ -357,8 +361,10 @@ def test_new_creates_and_selects_a_conversation_when_the_selected_one_is_not_emp
 
 
 def test_new_without_a_selection_reuses_an_empty_latest_and_selects_it(factory, user_id):
-    older = make_conversation(factory, user_id, updated=NOW)
-    latest = make_conversation(factory, user_id, updated=NOW + timedelta(hours=1))
+    older = make_conversation(factory, user_id, created=NOW, updated=NOW)
+    latest = make_conversation(
+        factory, user_id, created=NOW + timedelta(hours=1), updated=NOW + timedelta(hours=1)
+    )
 
     created = run(factory, lambda db: tg.start_conversation(db, user_id, now=NOW + timedelta(minutes=1)))
 

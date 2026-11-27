@@ -105,8 +105,10 @@ function page(base, cookie, { storage = new Storage() } = {}) {
   const view = () => ctl.getView();
   return {
     ctl, net, storage, view,
-    items: () => view().thread.items,
-    texts: () => view().thread.items.map((item) => item.text),
+    // PP-01-A1 adds a calendar-day separator before each Moscow day; these helpers speak
+    // of the messages and the pending turn, as the journeys always have.
+    items: () => view().thread.items.filter((item) => item.type !== "day"),
+    texts: () => view().thread.items.filter((item) => item.type !== "day").map((item) => item.text),
     pending: () => view().thread.items.find((item) => item.type === "pending"),
     async boot() {
       await ctl.start();
@@ -658,7 +660,7 @@ journeys.deleting_a_conversation_keeps_its_favorite_and_returns_to_a_new_draft =
   let view = first.view();
   assert.deepEqual([result.ok, result.wasCurrent], [true, true]);
   assert.deepEqual([view.currentId, view.list.items.length, view.thread.items.length], [null, 0, 0]);
-  assert.equal(view.chatTitle, "Новый разговор");
+  assert.equal(view.chatTitle, "Новый диалог");
   assert.deepEqual(view.banner, { kind: "info", text: Logic.TEXT.deleted, correlationId: null });
   assert.deepEqual(view.favorites.items.map((item) => item.id), [favoriteId], "the copy is not the history");
 

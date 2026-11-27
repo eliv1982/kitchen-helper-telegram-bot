@@ -716,9 +716,11 @@ class IdentityInvitation(Base):
 
 
 class Conversation(Base):
-    """One conversation of one user. A user has any number of them; updated_at
-    is the time of the last activity (whoever adds a message touches it) and
-    orders the user's list."""
+    """One conversation of one user. A user has any number of them; updated_at is the
+    time of the last write that added a message (whoever adds one touches it). The list
+    is ordered by the latest available message, falling back to created_at (see
+    persistence.conversations.activity_at), so a title rename, which assigns updated_at
+    to itself, neither reorders the list nor counts as activity."""
 
     __tablename__ = "conversations"
     __table_args__ = (sa.Index(None, "user_id", "updated_at"), _max_length("title", 200))

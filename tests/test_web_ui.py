@@ -246,8 +246,8 @@ def test_the_conversation_actions_menu_is_a_menu_button_that_starts_closed():
     assert toggle["aria-haspopup"] == "menu"
     assert toggle["aria-expanded"] == "false"
     assert toggle["aria-controls"] == "chat-actions-menu"
-    assert toggle["aria-label"] == "Действия с разговором"
-    assert menu["role"] == "menu" and menu["aria-label"] == "Действия с разговором"
+    assert toggle["aria-label"] == "Действия с диалогом"
+    assert menu["role"] == "menu" and menu["aria-label"] == "Действия с диалогом"
 
 
 def test_the_shopping_tab_is_a_third_section_with_its_own_panel_and_pane():
@@ -281,7 +281,7 @@ def test_the_shopping_tab_is_a_third_section_with_its_own_panel_and_pane():
         html.index('id="shopping"'),
     ]
     assert order == sorted(order)
-    assert page.by_id("sidebar")["aria-label"] == "Разговоры, избранное, покупки и профиль"
+    assert page.by_id("sidebar")["aria-label"] == "Диалоги, избранное, покупки и профиль"
     # The heading the destination shows is «Мои покупки»; the script draws it from its own
     # words (tests/test_web_ui_logic.py checks those).
 
@@ -698,7 +698,15 @@ async def test_the_journey_of_the_page_create_send_list_read(tmp_path):
 
     assert empty.json() == {"conversations": [], "has_more": False}
     assert created.status_code == 201
-    assert set(created.json()) == {"id", "title", "created_at", "updated_at"} and created.json()["title"] is None
+    assert set(created.json()) == {
+        "id",
+        "title",
+        "title_origin",
+        "can_reset_title",
+        "created_at",
+        "updated_at",
+        "last_message_at",
+    } and created.json()["title"] is None
     assert sent.status_code == 201
     body = sent.json()
     assert set(body) == {"conversation_id", "user_message", "assistant_message", "truncated", "replayed"}

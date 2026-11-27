@@ -7,6 +7,7 @@
  *   count             countCodePoints of each text
  *   prepare           prepareMessage of each text: {ok, reason, text}
  *   title             deriveTitle of each text: the name the page gives a conversation
+ *   title_mutation    the strict PATCH-response contract applied to real answers
  *   texts             the page's own words and constants
  */
 
@@ -45,11 +46,33 @@ process.stdin.on("end", () => {
     case "title":
       answer = { titles: request.texts.map((text) => Logic.deriveTitle(text)) };
       break;
+    case "conversation_title":
+      answer = {
+        results: request.texts.map((text) => {
+          const result = Logic.prepareConversationTitle(text);
+          return { ok: result.ok, reason: result.reason || null, text: result.ok ? result.text : null };
+        }),
+      };
+      break;
     case "fractions":
       answer = {
         formatted: request.values.map(([numerator, denominator, unit]) =>
           Logic.formatMeasure(numerator, denominator, unit)
         ),
+      };
+      break;
+    case "title_mutation":
+      // AD-01 OD-2: the strict client contract, applied to real server answers. Each case is
+      // {status, body, request, id}; the answer is the closed outcome type only.
+      answer = {
+        outcomes: request.cases.map(({ status, body, request: asked, id }) => {
+          const outcome = Logic.classifyConversationUpdate(
+            { kind: "http", status, jsonOk: true, json: body },
+            id,
+            asked
+          );
+          return { type: outcome.type };
+        }),
       };
       break;
     case "texts":

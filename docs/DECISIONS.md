@@ -120,7 +120,7 @@ These decisions record what the owner ACCEPTED with the History & Favorites impl
 
 | ID | Decision | Status |
 |---|---|---|
-| **KHD-34** | (1) A conversation's title is **derived on reading** from its first unexpired user message (60 code points, then "…"); no title is stored, so the title expires with its message and retention (KHD-30) is unchanged. (2) Favorites are **independent of conversation retention**: a favorite is a copy of the answer, with no foreign key to the history and no expiry, and `purge-expired` does not know the table. (3) At most **100 favorites per user**. (4) **Any assistant response** can be saved, not only a detected recipe; the text is copied from the database, never taken from the request. (5) The topbar toggle is labelled "Меню". No further product change was approved. | ACCEPTED — owner, 2026-10-27; code RELEASED and DEPLOYED (REPORTED, 2026-10-31) |
+| **KHD-34** | (1) A conversation's title is **derived on reading** from its first unexpired user message (60 code points, then "…"); no title is stored, so the title expires with its message and retention (KHD-30) is unchanged. (2) Favorites are **independent of conversation retention**: a favorite is a copy of the answer, with no foreign key to the history and no expiry, and `purge-expired` does not know the table. (3) At most **100 favorites per user**. (4) **Any assistant response** can be saved, not only a detected recipe; the text is copied from the database, never taken from the request. (5) The topbar toggle is labelled "Меню". No further product change was approved. | ACCEPTED — owner, 2026-10-27; code RELEASED and DEPLOYED (REPORTED, 2026-10-31) *[Updated 2026-11-26: PP-01-A1 (KHD-54) adds an optional stored user title in the existing nullable `conversations.title` column, which wins over the derived title and lives until reset or conversation deletion. The derived-title rule, the message-level 365-day retention, the favourite independence/cap and the other clauses above are unchanged; a stored title adds no message, no activity and no retention eligibility.]* |
 
 ### Why / alternatives / boundaries
 
@@ -327,6 +327,73 @@ takes priority.
   Incremental Delivery Strategy v1.0 are unchanged.
 - **Not decided here:** any AG-03 or AG-04 execution; any architecture selection; any prompt, model,
   schema, API, test or deployment change; any holdout creation; any PP-01 scope change.
+
+## Owner decision — PP-01-A1 Conversation Navigation scope lock (2026-11-26)
+
+The Owner approved the PP-01-A1 Conversation Navigation increment (D1–D7), authorized
+local implementation, documentation and offline testing, and preserved the combined
+release strategy **HH-BRAND-01-FIX-01 + PP-01-A1**. This decision authorizes no Git
+operation, migration, provider call, prompt change, production change or release.
+
+| ID | Decision | Status |
+|---|---|---|
+| **KHD-54** | **PP-01-A1 Conversation Navigation — Owner-approved scope lock.** (1) Manual conversation titles use the existing `conversations.title` column: at most 200 Unicode code points, trimmed, non-empty, no line breaks/controls, emoji joiners and tag characters allowed, duplicates allowed, no silent truncation, authoritative backend validation mirrored by the page, Russian errors. (2) The Web header menu offers «Переименовать», «Как создано название» and, only while a stored user title exists, «Сбросить название»; the origin explanation states the actual mechanism (stored user title, first available user message, or no messages) and reset restores the current derived/fallback title without fabricating an archived one. (3) A stored title is explicit navigation metadata kept until reset or conversation deletion; it adds no message or activity, does not extend retention eligibility, does not prevent purge, and is deleted with its conversation. (4) The list exposes absolute creation and latest-available-message times and orders by the latest available message, with creation time as the empty fallback and id as the total tie-break; rename/reset do not change chronology. (5) Conversation navigation is presented in Europe/Moscow as `ДД.ММ.ГГГГ, ЧЧ:ММ` with an explicit МСК label, independent of browser/host zone; UTC storage is unchanged and no timezone preference is added. (6) Web history gains absolute Moscow calendar-day separators and `ЧЧ:ММ` message times, with no duplicated separators when older history loads and no fabricated timestamps. (7) Telegram displays the same stored/derived titles, ordering and both dates; Telegram rename/reset/explanation commands are deferred; both channels use the shared persistence layer. **No database migration was required or added.** The intended future candidate is **HH-BRAND-01-FIX-01 + PP-01-A1**; the FIX-01 release block (24 PASS / 6 FAIL) remains in force, PP-01.1A and full PP-01.1D remain open, and nothing is committed, audited, accepted, released or deployed by this decision. | **ACCEPTED — Owner-approved scope lock and implementation authorization (2026-11-26); local implementation, documentation and offline testing only** |
+
+### Why / alternatives / boundaries
+
+- **Reuse, not redesign:** the schema already had the nullable 200-code-point title
+  column from migration `0001`, and the read path already derived a title from the first
+  available user message. Persisting the override there required no migration and kept
+  the derived/fallback title available for reset.
+- **Truthfulness over a false "original":** no original semantic title can be recovered
+  retroactively, so reset restores the current derived or fallback title and the
+  explanation says so. Full PP-01.1D and PP-01.1A remain future work.
+- **Latest message, not `updated_at`:** the stored `updated_at` can outlive the messages
+  that set it (retention removes messages one by one). Ordering and display by the latest
+  available message is the only truthful reading; the rename path explicitly preserves
+  `updated_at` so navigation metadata cannot masquerade as activity.
+- **One clock for both channels:** a shared `activity_at` expression and the Web's
+  explicit `Europe/Moscow` conversion remove the previous difference between the Web
+  (viewer zone, `updated_at`) and Telegram (Moscow, `updated_at`).
+- **No retention amendment:** KHD-34's derived-title rule and the 365-day message
+  retention are unchanged. A manual title is a separate explicit user artifact with its
+  own approved lifecycle.
+- **Not decided here:** semantic automatic title generation, an archived original title,
+  Telegram title commands, a user timezone preference, or any PP-01.3–PP-01.5 recipe
+  work.
+
+## Owner decision — PP-01-A1 Owner functional acceptance and documentary closure (2026-11-27)
+
+The Owner completed functional acceptance and targeted retesting of PP-01-A1 and accepted the
+increment with non-blocking notes. This decision records the acceptance, its limitations and its
+release boundary. It does not reopen any technical audit, authorize an additional correction,
+start A2 or FIX-02, or release anything.
+
+| ID | Decision | Status |
+|---|---|---|
+| **KHD-55** | **PP-01-A1 Conversation Navigation — Owner acceptance with non-blocking notes.** (1) The Owner **ACCEPTS** PP-01-A1 with non-blocking notes after functional acceptance and targeted retesting. UX-01…UX-07 are accepted. UX-08 (conversation-list keyboard navigation) is accepted as a **non-blocking limitation**: the developer confirmed Tab traversal, focus ring, focused-row scrolling and native activation in Chrome, but the Owner did not reproduce it in Edge; Owner verification is recorded as **NOT PASS / NOT REPRODUCED**, not as a pass, and arrow-key navigation is not required. UX-09 is accepted with `Cache-Control: no-store` preserved; BFCache is intentionally unavailable and actual BFCache restoration remains unverified. Title reset per Scope Lock D2 is accepted; semantic/original-title restoration remains PP-01.1A/full PP-01.1D. Actual iPhone acceptance is deferred to Production post-deployment verification; offline Web/Telegram parity is accepted while live Telegram-client verification remains pending. The UX-06 strings supersede only the exact D2 explanation **wording**; D2's mechanism and reset semantics are unchanged. (2) This is **code/product acceptance only**. It authorizes no release, deployment, provider call, Production access, technical re-audit or additional correction. (3) The final independent technical acceptance is recorded: the final Codex acceptance of PP-01-A1-R5-C5 returned **PASS — ALL EIGHT FINDINGS CLOSED / READY FOR OWNER FUNCTIONAL ACCEPTANCE**, with **A1-01 — Asynchronous Web consistency — Closed with C1 desktop focus verified** and **17 PASS / 0 FAIL / 0 SKIP**. A1-02…A1-08 and AD-C1/AD-C2 remain independently closed as recorded; R5-C1…R5-C4 were independently closed, and R5-C5 was RED/GREEN verified and closed by the final acceptance. The earlier `A1-01 OPEN` statements are preserved as the historically accurate intermediate chronology, not as the final disposition. The Codex acceptance covers the R5-C5 technical baseline; the UX-01…UX-09 corrections are the subsequent Owner acceptance layer and are not part of that Codex audit. (4) **KHD-50 is unchanged**: FIX-01 remains **24 PASS / 6 FAIL**, behavioural acceptance remains FAILED and production release remains **BLOCKED**. The latest documented release strategy remains KHD-54's combined **HH-BRAND-01-FIX-01 + PP-01-A1** candidate; no PP-01-A1-only deployment excluding FIX-01 is authorized. (5) The Owner may commit the candidate; a commit is not a release or deployment. (6) The local acceptance environment remains available until the Owner authorizes cleanup. | **ACCEPTED — Owner-approved functional acceptance with non-blocking notes (2026-11-27), following the final independent acceptance of all eight findings; READY FOR OWNER COMMIT; no release or deployment** |
+
+### Why / alternatives / boundaries
+
+- **Three separate layers, not one rewritten history:** the final independent technical
+  acceptance (all eight findings closed, including A1-01), the subsequent Owner acceptance
+  corrections (UX-01…UX-09) and the final Owner functional acceptance are recorded as distinct
+  layers. The intermediate A1-01 OPEN findings and the R5-C5 "READY FOR INDEPENDENT CLOSURE"
+  verdict remain as chronology. Rewriting those records would destroy the evidence of what was
+  independently verified at each stage, so this decision is additive.
+- **UX-08 is not a pass:** the developer's Chrome evidence and the Owner's Edge observation
+  disagree. Recording it as a non-blocking limitation preserves both facts; recording a pass
+  would overstate Owner verification.
+- **No-store is a product-security choice:** BFCache restoration is sacrificed for privacy and
+  session protection. Treating the DevTools message as a defect would invite weakening that
+  protection, so the policy is preserved and the limitation is accepted.
+- **Reset is D2-conformant:** no original semantic title exists to restore. The accepted
+  behavior is the current derived/fallback title; a persisted original title is future scope.
+- **Acceptance is not release:** KHD-50 is a behavioural gate on FIX-01, and the combined
+  candidate includes FIX-01. PP-01-A1 acceptance therefore cannot clear KHD-50.
+- **Not decided here:** any release or deployment; any change to KHD-50; a PP-01-A1-only
+  release baseline; semantic/original-title restoration; arrow-key navigation; BFCache
+  restoration; any technical re-audit or additional correction; A2 or FIX-02.
 
 ## Change discipline
 

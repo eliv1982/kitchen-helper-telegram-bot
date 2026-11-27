@@ -240,9 +240,18 @@ function iso(seconds) {
   return new Date(START - 3600_000 + seconds * 1000).toISOString().replace("Z", "+00:00");
 }
 
-function conversation(id, minutes = 0, title = null) {
+function conversation(id, minutes = 0, title = null, extra = {}) {
   const at = new Date(START - 7200_000 + minutes * 60_000).toISOString().replace("Z", "+00:00");
-  return { id, title, created_at: at, updated_at: at };
+  return {
+    id,
+    title,
+    title_origin: title ? "derived" : "none",
+    can_reset_title: false,
+    created_at: at,
+    updated_at: at,
+    last_message_at: null,
+    ...extra,
+  };
 }
 
 const listBody = (conversations, hasMore = false) => json(200, { conversations, has_more: hasMore });

@@ -10,8 +10,8 @@
 const assert = require("node:assert/strict");
 const H = require("./harness.js");
 
-const { Logic, CONV_A, CONV_B, CONV_C, START, flush, makeEnv, json, text, fail, hang, dropBody } = H;
-const { conversation, listBody, message, historyBody, turnBody, apiError, busy, me, notAuthenticated } = H;
+const { Logic, CONV_A, CONV_B, CONV_C, START, flush, makeEnv, json, iso, text, fail, hang, dropBody } = H;
+const { conversation, listBody, message, historyBody, turnBody, apiError, busy, me, notAuthenticated, removedBody } = H;
 const { Storage, USER_A, USER_B } = H;
 
 const scenarios = {};
@@ -33,7 +33,12 @@ async function withConversation(options = {}) {
 }
 
 const last = (array) => array[array.length - 1];
-const timeline = (env) => env.view().thread.items;
+// PP-01-A1 adds a calendar-day separator before the first message of each Moscow day;
+// `timeline` is what these scenarios have always meant by the thread (the entries that
+// are messages or the pending turn). `calendarSeparators` reads the new items themselves.
+const calendarSeparators = (env) => env.view().thread.items.filter((i) => i.type === "day");
+const timeline = (env) => env.view().thread.items.filter((i) => i.type !== "day");
+const messageItems = timeline;
 const userTexts = (env) => timeline(env).filter((i) => i.role === "user").map((i) => i.text);
 const pendingItem = (env) => timeline(env).find((i) => i.type === "pending");
 const gets = (env, pattern) => env.net.requests("GET", pattern).length;
@@ -58,7 +63,7 @@ scenario("boot_opens_the_most_recent_conversation", async () => {
 
   assert.equal(view.screen, "app");
   assert.equal(view.currentId, CONV_B);
-  assert.deepEqual(view.thread.items.map((i) => i.text), ["Про суп", "Суп так"]);
+  assert.deepEqual(messageItems(env).map((i) => i.text), ["Про суп", "Суп так"]);
   assert.deepEqual(env.net.log.map((r) => `${r.method} ${r.url}`), [
     "GET /auth/me",
     "GET /api/conversations?limit=50",
@@ -77,7 +82,7 @@ scenario("boot_without_conversations_is_a_draft_and_creates_nothing", async () =
   assert.equal(view.screen, "app");
   assert.equal(view.currentId, null);
   assert.equal(view.thread.empty, true);
-  assert.equal(view.chatTitle, "Новый разговор");
+  assert.equal(view.chatTitle, "Новый диалог");
   assert.equal(env.net.requests("POST", /.*/).length, 0);
 });
 
@@ -272,8 +277,10 @@ scenario("time_a_conversation_without_a_title_is_named_by_its_date_and_nothing_i
   const view = await env.boot();
 
   const zone = process.env.TZ || "UTC";
-  const clock = { UTC: "10:30", "Europe/Moscow": "13:30", "America/New_York": "06:30", "Asia/Kolkata": "16:00" }[zone];
-  assert.equal(view.list.items[0].label, `Разговор от 18 октября, ${clock}`); // 10:30 UTC: 2h before START (12:00) + 30 min
+  const clock = { UTC: "13:30", "Europe/Moscow": "13:30", "America/New_York": "13:30", "Asia/Kolkata": "13:30" }[zone];
+  assert.equal(view.list.items[0].label, `Диалог от 18.10.2026, ${clock} МСК`); // Moscow time, whatever the viewer's zone
+  assert.equal(view.list.items[0].createdText, "Создан: 18.10.2026, 13:30 МСК");
+  assert.equal(view.list.items[0].lastText, "Последнее сообщение: Нет сообщений");
   assert.equal(view.list.items[1].label, "Борщ");
   assert.ok(env.net.log.every((r) => r.method === "GET"), "naming must not write anything");
 });
@@ -300,7 +307,7 @@ scenario("a_new_conversation_is_created_lazily_by_the_first_message", async () =
   assert.equal(view.currentId, CONV_C);
   assert.equal(view.list.items[0].current, true);
   assert.equal(view.list.items.length, 2);
-  assert.deepEqual(view.thread.items.map((i) => i.text), ["Что из яиц?", "Омлет."]);
+  assert.deepEqual(messageItems(env).map((i) => i.text), ["Что из яиц?", "Омлет."]);
 });
 
 scenario("a_refused_creation_keeps_the_text_and_is_not_repeated", async () => {
@@ -369,7 +376,7 @@ scenario("a_conversation_made_for_a_message_that_was_refused_is_reused", async (
   const again = await env.ctl.send(taken);
   await again.done;
   assert.equal(env.net.requests("POST", "/api/conversations").length, 1, "no second conversation");
-  assert.equal(env.view().thread.items.length, 2);
+  assert.equal(messageItems(env).length, 2);
 });
 
 scenario("select_a_conversation_and_continue_it", async () => {
@@ -414,7 +421,7 @@ scenario("older_pages_are_prepended_without_duplicates", async () => {
   await env.settle();
 
   assert.equal(env.net.log.at(-1).url, `${URL_A}?limit=50&before=51`);
-  const ids = timeline(env).map((i) => i.id);
+  const ids = messageItems(env).map((i) => i.id);
   assert.deepEqual(ids, range(1, 100).map((m) => m.id));
   assert.equal(new Set(ids).size, 100);
   assert.equal(env.view().thread.hasMore, false);
@@ -1602,7 +1609,7 @@ scenario("time_a_server_timestamp_is_read_as_the_instant_it_names", async () => 
 // 11:30 UTC on 18 October 2026 as the clock of each zone shows it (New York is still on summer time).
 const EXPECTED_HOUR = { UTC: 11, "Europe/Moscow": 14, "America/New_York": 7, "Asia/Kolkata": 17 };
 
-scenario("time_names_and_moments_are_in_the_viewers_time", async () => {
+scenario("time_names_are_in_moscow_time_and_moments_in_the_viewers_time", async () => {
   const zone = process.env.TZ || "UTC";
   assert.ok(zone in EXPECTED_HOUR, "unexpected zone " + zone);
   const hour = EXPECTED_HOUR[zone];
@@ -1611,15 +1618,2545 @@ scenario("time_names_and_moments_are_in_the_viewers_time", async () => {
   const created = Date.UTC(2026, 9, 18, 11, 30, 0);
   const now = Date.UTC(2026, 9, 18, 12, 0, 0);
 
-  assert.equal(Logic.conversationLabel({ title: null, createdAt: created }, now), `Разговор от 18 октября, ${clock}`);
-  assert.equal(Logic.conversationLabel({ title: "  ", createdAt: created }, now), `Разговор от 18 октября, ${clock}`);
+  // Conversation navigation is the product's Moscow time in every viewer's zone.
+  assert.equal(Logic.conversationLabel({ title: null, createdAt: created }, now), "Диалог от 18.10.2026, 14:30 МСК");
+  assert.equal(Logic.conversationLabel({ title: "  ", createdAt: created }, now), "Диалог от 18.10.2026, 14:30 МСК");
   assert.equal(Logic.conversationLabel({ title: "Борщ", createdAt: created }, now), "Борщ");
-  assert.equal(Logic.conversationLabel({ title: null, createdAt: null }, now), "Разговор");
+  assert.equal(Logic.conversationLabel({ title: null, createdAt: null }, now), "Диалог");
+  assert.equal(Logic.moscowMoment(created), "18.10.2026, 14:30 МСК");
+  assert.equal(Logic.moscowDate(created), "18.10.2026");
+  assert.equal(Logic.moscowClock(created), "14:30");
+  assert.equal(Logic.moscowMoment(null), "");
+  // A Moscow calendar day begins at 21:00 UTC, not at the viewer's midnight.
+  assert.equal(Logic.moscowDayKey(Date.UTC(2026, 9, 18, 20, 59)), "2026-10-18");
+  assert.equal(Logic.moscowDayKey(Date.UTC(2026, 9, 18, 21, 0)), "2026-10-19");
+  assert.equal(Logic.moscowMoment(Date.UTC(2026, 9, 18, 21, 0)), "19.10.2026, 00:00 МСК");
+  // Moments elsewhere (favorites, profile) keep the viewer's own time.
   assert.equal(Logic.formatMoment(created, now), clock);
   assert.equal(Logic.formatMoment(created - 86400000, now), `вчера, ${clock}`);
   assert.equal(Logic.formatMoment(created - 3 * 86400000, now), `15 октября, ${clock}`);
   assert.equal(Logic.formatMoment(created - 400 * 86400000, now), `13 сентября 2025, ${clock}`); // another year: the year is named
   assert.equal(Logic.formatMoment(null, now), "");
+});
+
+// ============================================================================================
+// PP-01-A1: the conversation title, its two dates and the message chronology
+// ============================================================================================
+
+const PATCH_A = `/api/conversations/${CONV_A}`;
+
+scenario("the_list_shows_the_creation_and_the_latest_message_in_moscow_time", async () => {
+  const created = new Date(Date.UTC(2026, 9, 18, 21, 0)).toISOString().replace("Z", "+00:00");
+  const last = new Date(Date.UTC(2026, 9, 19, 20, 59)).toISOString().replace("Z", "+00:00");
+  const env = makeEnv().signedIn([
+    conversation(CONV_A, 0, "Борщ", { created_at: created, updated_at: created, last_message_at: last }),
+    conversation(CONV_B, 30, null),
+  ]);
+  const view = await env.boot();
+
+  assert.equal(view.list.items[0].createdText, "Создан: 19.10.2026, 00:00 МСК");
+  assert.equal(view.list.items[0].lastText, "Последнее сообщение: 19.10.2026, 23:59 МСК");
+  // An empty conversation says so, and its fallback label is a Moscow-time date.
+  assert.equal(view.list.items[1].lastText, "Последнее сообщение: Нет сообщений");
+  assert.equal(view.list.items[1].label, "Диалог от 18.10.2026, 13:30 МСК");
+});
+
+scenario("a_manual_title_is_validated_saved_and_reset_with_server_state", async () => {
+  const env = makeEnv().signedIn([conversation(CONV_A, 0, "Борщ"), conversation(CONV_B, 30, "Суп")], {
+    [CONV_A]: historyBody(CONV_A, [message(1, "user", "Борщ"), message(2, "assistant", "Готов.")]),
+  });
+  await env.boot();
+  const itemById = (id) => env.view().list.items.find((item) => item.id === id);
+  assert.equal(itemById(CONV_A).label, "Борщ");
+  assert.equal(env.view().title.canReset, false);
+  assert.equal(env.view().title.explanation, Logic.TEXT.titleOriginDerived);
+
+  env.ctl.beginTitleEdit();
+  assert.equal(env.view().title.editing, true);
+  assert.equal(env.view().title.draft, "Борщ");
+
+  env.ctl.syncTitleDraft("   ");
+  const empty = await env.ctl.saveTitle();
+  assert.deepEqual([empty.ok, empty.reason], [false, "empty"]);
+  assert.equal(env.view().title.error.text, Logic.TEXT.titleEmpty);
+  assert.equal(env.net.requests("PATCH", /.*/).length, 0, "a refused title is not sent");
+
+  env.ctl.syncTitleDraft("Мой борщ");
+  // A definitive refusal (4xx) leaves the form and the conversation's name as they were,
+  // and the same conversation can be saved again afterwards.
+  env.net.route("PATCH", PATCH_A, apiError(400, "invalid_title"));
+  const failed = await env.ctl.saveTitle();
+  assert.equal(failed.ok, false);
+  assert.equal(env.view().title.editing, true);
+  assert.ok(env.view().title.error.text.length > 0);
+  assert.equal(env.view().list.items.find((item) => item.id === CONV_A).label, "Борщ");
+
+  env.net.route("PATCH", PATCH_A, json(200, conversation(CONV_A, 0, "Мой борщ", {
+    title_origin: "manual",
+    can_reset_title: true,
+    last_message_at: iso(2),
+  })));
+  const saved = await env.ctl.saveTitle();
+  assert.equal(saved.ok, true);
+  assert.equal(env.view().title.editing, false);
+  assert.equal(itemById(CONV_A).label, "Мой борщ"); // in place: a rename is not activity
+  assert.equal(env.view().title.canReset, true);
+  assert.equal(env.view().title.explanation, Logic.TEXT.titleOriginManual);
+  assert.deepEqual(last(env.net.requests("PATCH", PATCH_A)).body, { title: "Мой борщ" });
+
+  env.net.route("PATCH", PATCH_A, json(200, conversation(CONV_A, 0, "Борщ", {
+    last_message_at: iso(2),
+  })));
+  const reset = await env.ctl.resetTitle();
+  assert.equal(reset.ok, true);
+  assert.equal(itemById(CONV_A).label, "Борщ"); // the derived title is back
+  assert.equal(env.view().title.canReset, false);
+  assert.deepEqual(last(env.net.requests("PATCH", PATCH_A)).body, { title: null });
+
+  assert.equal(Logic.prepareConversationTitle("x".repeat(201)).reason, "too_long");
+  assert.equal(Logic.prepareConversationTitle("Борщ 🍲").ok, true);
+});
+
+scenario("resetting_is_refused_when_there_is_no_stored_title", async () => {
+  const env = makeEnv().signedIn([conversation(CONV_A, 0, "Борщ")]);
+  await env.boot();
+
+  const outcome = await env.ctl.resetTitle();
+
+  assert.deepEqual([outcome.ok, outcome.reason], [false, "not_resettable"]);
+  assert.equal(env.net.requests("PATCH", /.*/).length, 0);
+});
+
+scenario("the_title_origin_distinguishes_an_empty_conversation_from_one_without_user_text", async () => {
+  // A1-05: last_message_at is the authoritative fact. A conversation with messages but no
+  // eligible user text (an assistant-only history, an uncaptioned photo) is not empty.
+  const env = makeEnv().signedIn([
+    conversation(CONV_A, 30, null, { last_message_at: iso(1) }),
+    conversation(CONV_B, 0, null),
+  ]);
+  await env.boot();
+  assert.equal(env.view().currentId, CONV_A);
+  assert.equal(env.view().title.origin, "none");
+  assert.equal(env.view().title.explanation, Logic.TEXT.titleOriginNoText);
+
+  await env.ctl.selectConversation(CONV_B);
+  assert.equal(env.view().title.origin, "none");
+  assert.equal(env.view().title.explanation, Logic.TEXT.titleOriginNone);
+});
+
+// --- PP-01-A1-R1 (A1-01): a delayed title answer belongs to its own conversation --------
+
+const PATCH_B = `/api/conversations/${CONV_B}`;
+
+function twoConversations(idA = CONV_A, idB = CONV_B) {
+  return makeEnv().signedIn(
+    [conversation(idA, 30, "Первый"), conversation(idB, 0, "Второй")],
+    {
+      [idA]: historyBody(idA, [message(1, "user", "Первый"), message(2, "assistant", "Да")]),
+      [idB]: historyBody(idB, [message(3, "user", "Второй"), message(4, "assistant", "Да")]),
+    }
+  );
+}
+
+scenario("a_delayed_404_for_one_conversation_does_not_clear_another_conversations_draft", async () => {
+  // The audit's scenario A: hold a rename of A, switch to B, write a draft for B, then
+  // release A's 404. B's editor and its unsaved text must survive.
+  const env = twoConversations();
+  await env.boot();
+  assert.equal(env.view().currentId, CONV_A);
+
+  const held = deferred();
+  env.net.route("PATCH", PATCH_A, async () => {
+    await held.promise;
+    return apiError(404, "conversation_not_found");
+  });
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Черновик A");
+  const saving = env.ctl.saveTitle();
+  await flush();
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1);
+
+  await env.ctl.selectConversation(CONV_B);
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Черновик B");
+  await flush();
+  assert.equal(env.view().title.draft, "Черновик B");
+
+  held.resolve();
+  await saving;
+  await env.settle();
+
+  // A is gone from the list, but the conversation that is open is untouched.
+  assert.ok(!env.view().list.items.some((item) => item.id === CONV_A));
+  assert.equal(env.view().currentId, CONV_B);
+  assert.equal(env.view().title.editing, true);
+  assert.equal(env.view().title.draft, "Черновик B");
+  assert.equal(env.view().title.error, null);
+});
+
+scenario("a_delayed_reset_cannot_replace_a_newer_rename_or_close_its_editor", async () => {
+  // The audit's scenario B: a reset of A is held; the person returns to A and starts a
+  // newer rename. Title writes of one conversation are serialized, so the reset settles
+  // first and the rename then wins: the older answer never puts back the title it
+  // replaced, and it never closes the newer editor.
+  const env = makeEnv().signedIn(
+    [
+      conversation(CONV_A, 30, "Борщ", { title_origin: "manual", can_reset_title: true }),
+      conversation(CONV_B, 0, "Второй"),
+    ],
+    {
+      [CONV_A]: historyBody(CONV_A, [message(1, "user", "Борщ"), message(2, "assistant", "Да")]),
+      [CONV_B]: historyBody(CONV_B, [message(3, "user", "Второй"), message(4, "assistant", "Да")]),
+    }
+  );
+  await env.boot();
+  assert.equal(env.view().currentId, CONV_A);
+
+  const held = deferred();
+  env.net.route("PATCH", PATCH_A, async () => {
+    await held.promise;
+    return json(200, conversation(CONV_A, 0, "Борщ", { last_message_at: iso(2) }));
+  });
+  const resetting = env.ctl.resetTitle();
+  await flush();
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1);
+
+  await env.ctl.selectConversation(CONV_B);
+  await env.ctl.selectConversation(CONV_A);
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+  env.net.route(
+    "PATCH",
+    PATCH_A,
+    json(200, conversation(CONV_A, 0, "Новое имя", {
+      title_origin: "manual",
+      can_reset_title: true,
+      last_message_at: iso(2),
+    }))
+  );
+  const renaming = env.ctl.saveTitle();
+  await flush();
+  // One title write per conversation at a time: the rename waits for the reset to settle.
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1, "the second write is serialized");
+  assert.equal(env.view().title.draft, "Новое имя");
+
+  held.resolve();
+  await resetting;
+  await renaming;
+  await env.settle();
+
+  const item = env.view().list.items.find((entry) => entry.id === CONV_A);
+  assert.equal(item.label, "Новое имя");
+  assert.equal(item.titleOrigin, "manual");
+  assert.equal(env.view().title.canReset, true);
+  assert.equal(env.view().title.editing, false);
+  assert.equal(env.view().banner.text, Logic.TEXT.titleRenamed);
+  assert.deepEqual(env.net.requests("PATCH", PATCH_A).map((request) => request.body), [
+    { title: null },
+    { title: "Новое имя" },
+  ]);
+});
+
+scenario("a_delayed_rename_updates_its_own_list_item_without_touching_another_conversation", async () => {
+  const env = twoConversations();
+  await env.boot();
+
+  const held = deferred();
+  env.net.route("PATCH", PATCH_A, async () => {
+    await held.promise;
+    return json(200, conversation(CONV_A, 0, "Переименован", {
+      title_origin: "manual",
+      can_reset_title: true,
+      last_message_at: iso(2),
+    }));
+  });
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Переименован");
+  const saving = env.ctl.saveTitle();
+  await flush();
+
+  await env.ctl.selectConversation(CONV_B);
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Черновик B");
+  await flush();
+
+  held.resolve();
+  await saving;
+  await env.settle();
+
+  // The inactive conversation's own sidebar metadata is refreshed from the answer.
+  const renamed = env.view().list.items.find((item) => item.id === CONV_A);
+  assert.equal(renamed.label, "Переименован");
+  assert.equal(renamed.titleOrigin, "manual");
+  // The conversation that is open keeps its editor, its draft and no stale banner.
+  assert.equal(env.view().currentId, CONV_B);
+  assert.equal(env.view().title.editing, true);
+  assert.equal(env.view().title.draft, "Черновик B");
+  assert.equal(env.view().title.error, null);
+  assert.equal(env.view().banner, null);
+});
+
+scenario("a_delayed_failure_for_one_conversation_is_not_shown_on_another", async () => {
+  const env = twoConversations();
+  await env.boot();
+
+  const held = deferred();
+  env.net.route("PATCH", PATCH_A, async () => {
+    await held.promise;
+    return apiError(503, "service_unavailable");
+  });
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя A");
+  const saving = env.ctl.saveTitle();
+  await flush();
+
+  await env.ctl.selectConversation(CONV_B);
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Черновик B");
+  await flush();
+
+  held.resolve();
+  await saving;
+  await env.settle();
+
+  // The error belongs to the editor that sent it (A), not to the one that is open (B).
+  assert.equal(env.view().currentId, CONV_B);
+  assert.equal(env.view().title.editing, true);
+  assert.equal(env.view().title.draft, "Черновик B");
+  assert.equal(env.view().title.error, null);
+  assert.equal(env.view().banner, null);
+  assert.equal(env.view().list.items.find((item) => item.id === CONV_A).label, "Первый");
+});
+
+// --- PP-01-A1-R2 (A1-01): stale list reads, soft timeouts and guards ---------------------
+
+const itemOf = (env, id) => env.view().list.items.find((item) => item.id === id);
+
+// A list answer `seconds` minutes before the boot list, for the stale-read scenarios.
+function staleList(items) {
+  return listBody(items);
+}
+
+scenario("a_stale_list_read_cannot_restore_a_title_a_confirmed_rename_replaced", async () => {
+  // The audit's stale-GET defect: a list read is out; a title write is confirmed; the old
+  // list answer arrives afterwards with the old title. The confirmed title must survive,
+  // while the rest of the server's answer (order, another conversation's title that
+  // changed elsewhere) is still applied.
+  const env = makeEnv().signedIn(
+    [
+      conversation(CONV_A, 30, "Первый"),
+      conversation(CONV_B, 0, "Второй"),
+      conversation(CONV_C, -10, "Третий"),
+    ],
+    {
+      [CONV_A]: historyBody(CONV_A, [message(1, "user", "Первый"), message(2, "assistant", "Да")]),
+      [CONV_B]: historyBody(CONV_B, [message(3, "user", "Второй"), message(4, "assistant", "Да")]),
+      [CONV_C]: historyBody(CONV_C, [message(5, "user", "Третий"), message(6, "assistant", "Да")]),
+    }
+  );
+  await env.boot();
+  assert.equal(env.view().currentId, CONV_A);
+
+  const held = deferred();
+  env.net.route("GET", "/api/conversations", async () => {
+    await held.promise;
+    // The snapshot the server took before the rename; B's title came from another channel.
+    // C is not in it: the server no longer lists it (deleted elsewhere).
+    return staleList([
+      conversation(CONV_B, 0, "Второй (из другого канала)"),
+      conversation(CONV_A, 30, "Первый"),
+    ]);
+  });
+  const reading = env.ctl.reloadList();
+  await flush();
+  assert.equal(gets(env, "/api/conversations"), 2);
+
+  env.net.route(
+    "PATCH",
+    PATCH_A,
+    json(200, conversation(CONV_A, 30, "Новое имя", {
+      title_origin: "manual",
+      can_reset_title: true,
+      last_message_at: iso(2),
+    }))
+  );
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+  const renamed = await env.ctl.saveTitle();
+  assert.equal(renamed.ok, true);
+  assert.equal(itemOf(env, CONV_A).label, "Новое имя");
+
+  held.resolve();
+  await reading;
+  await env.settle();
+
+  const a = itemOf(env, CONV_A);
+  assert.equal(a.label, "Новое имя", "the older snapshot does not restore the old title");
+  assert.equal(a.titleOrigin, "manual");
+  assert.equal(env.view().title.canReset, true);
+  // The answer is otherwise the server's: its order and the other conversation's title.
+  assert.deepEqual(env.view().list.items.map((item) => item.id), [CONV_B, CONV_A]);
+  assert.equal(itemOf(env, CONV_B).label, "Второй (из другого канала)");
+  // A conversation the server no longer lists is gone: title preservation never resurrects it.
+  assert.ok(!env.view().list.items.some((item) => item.id === CONV_C));
+});
+
+scenario("a_stale_list_read_cannot_restore_a_title_a_confirmed_reset_removed", async () => {
+  const env = makeEnv().signedIn(
+    [conversation(CONV_A, 30, "Своё", { title_origin: "manual", can_reset_title: true })],
+    {
+      [CONV_A]: historyBody(CONV_A, [message(1, "user", "Первый"), message(2, "assistant", "Да")]),
+    }
+  );
+  await env.boot();
+
+  const held = deferred();
+  env.net.route("GET", "/api/conversations", async () => {
+    await held.promise;
+    return staleList([conversation(CONV_A, 30, "Своё", { title_origin: "manual", can_reset_title: true })]);
+  });
+  const reading = env.ctl.reloadList();
+  await flush();
+
+  env.net.route(
+    "PATCH",
+    PATCH_A,
+    json(200, conversation(CONV_A, 30, "Первый", { last_message_at: iso(2) }))
+  );
+  const reset = await env.ctl.resetTitle();
+  assert.equal(reset.ok, true);
+  assert.equal(itemOf(env, CONV_A).label, "Первый");
+  assert.equal(itemOf(env, CONV_A).titleOrigin, "derived");
+
+  held.resolve();
+  await reading;
+  await env.settle();
+
+  const a = itemOf(env, CONV_A);
+  assert.equal(a.label, "Первый", "the older snapshot does not restore the reset title");
+  assert.equal(a.titleOrigin, "derived");
+  assert.equal(env.view().title.canReset, false);
+});
+
+scenario("overlapping_list_reads_never_restore_a_confirmed_title_and_a_later_read_agrees", async () => {
+  // Two reads are out when a rename is confirmed. The older answer is superseded; the
+  // newer one began before the rename too, so its old title is not applied either. A read
+  // that begins after the confirmation applies the server's title again, and a change
+  // made by another tab is not suppressed for good.
+  const env = makeEnv().signedIn(
+    [conversation(CONV_A, 30, "Первый"), conversation(CONV_B, 0, "Второй")],
+    {
+      [CONV_A]: historyBody(CONV_A, [message(1, "user", "Первый"), message(2, "assistant", "Да")]),
+      [CONV_B]: historyBody(CONV_B, [message(3, "user", "Второй"), message(4, "assistant", "Да")]),
+    }
+  );
+  await env.boot();
+
+  const first = deferred();
+  const second = deferred();
+  env.net.route(
+    "GET",
+    "/api/conversations",
+    async () => {
+      await first.promise;
+      return staleList([
+        conversation(CONV_A, 30, "Первый"),
+        conversation(CONV_B, 0, "Второй (старый)"),
+      ]);
+    },
+    async () => {
+      await second.promise;
+      return staleList([
+        conversation(CONV_A, 30, "Первый"),
+        conversation(CONV_B, 0, "Второй (новый)"),
+      ]);
+    }
+  );
+  const readingOne = env.ctl.reloadList();
+  await flush();
+  const readingTwo = env.ctl.reloadList();
+  await flush();
+  assert.equal(gets(env, "/api/conversations"), 3);
+
+  env.net.route(
+    "PATCH",
+    PATCH_A,
+    json(200, conversation(CONV_A, 30, "Новое имя", {
+      title_origin: "manual",
+      can_reset_title: true,
+      last_message_at: iso(2),
+    }))
+  );
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+  await env.ctl.saveTitle();
+
+  first.resolve();
+  await readingOne;
+  second.resolve();
+  await readingTwo;
+  await env.settle();
+
+  assert.equal(itemOf(env, CONV_A).label, "Новое имя");
+  assert.equal(itemOf(env, CONV_B).label, "Второй (новый)", "the newest answer is the one applied");
+
+  // A later read begins after the confirmation: the server is authoritative again, so a
+  // title changed by another tab or channel is shown, not suppressed.
+  env.net.route("GET", "/api/conversations", listBody([
+    conversation(CONV_A, 30, "Из другой вкладки", { title_origin: "manual", can_reset_title: true }),
+    conversation(CONV_B, 0, "Второй (новый)"),
+  ]));
+  await env.ctl.reloadList();
+  await env.settle();
+  assert.equal(itemOf(env, CONV_A).label, "Из другой вкладки");
+});
+
+scenario("a_stale_list_read_cannot_restore_an_inactive_conversations_old_title", async () => {
+  const env = twoConversations();
+  await env.boot();
+
+  const held = deferred();
+  env.net.route("GET", "/api/conversations", async () => {
+    await held.promise;
+    return staleList([conversation(CONV_A, 30, "Первый"), conversation(CONV_B, 0, "Второй")]);
+  });
+  const reading = env.ctl.reloadList();
+  await flush();
+
+  // Rename B while it is the open conversation, then go back to A before the list answers.
+  await env.ctl.selectConversation(CONV_B);
+  env.net.route("PATCH", PATCH_B, json(200, conversation(CONV_B, 0, "Новое имя B", {
+    title_origin: "manual",
+    can_reset_title: true,
+    last_message_at: iso(4),
+  })));
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя B");
+  await env.ctl.saveTitle();
+  await env.ctl.selectConversation(CONV_A);
+  assert.equal(itemOf(env, CONV_B).label, "Новое имя B");
+
+  held.resolve();
+  await reading;
+  await env.settle();
+
+  assert.equal(itemOf(env, CONV_B).label, "Новое имя B", "an inactive conversation keeps its confirmed title");
+  assert.equal(itemOf(env, CONV_A).label, "Первый");
+});
+
+scenario("a_definitive_failure_lets_the_next_queued_title_write_proceed", async () => {
+  const env = makeEnv().signedIn(
+    [conversation(CONV_A, 30, "Своё", { title_origin: "manual", can_reset_title: true })],
+    {
+      [CONV_A]: historyBody(CONV_A, [message(1, "user", "Первый"), message(2, "assistant", "Да")]),
+    }
+  );
+  await env.boot();
+
+  const held = deferred();
+  env.net.route(
+    "PATCH",
+    PATCH_A,
+    async () => {
+      await held.promise;
+      return apiError(400, "invalid_request"); // a 4xx refusal: definitively not done
+    },
+    json(200, conversation(CONV_A, 30, "Новое имя", {
+      title_origin: "manual",
+      can_reset_title: true,
+      last_message_at: iso(2),
+    }))
+  );
+  const resetting = env.ctl.resetTitle();
+  await flush();
+  await env.ctl.selectConversation(CONV_A);
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+  const renaming = env.ctl.saveTitle();
+  await flush();
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1, "the rename waits for the reset");
+
+  held.resolve();
+  const resetOutcome = await resetting;
+  const renameOutcome = await renaming;
+  await env.settle();
+
+  assert.deepEqual([resetOutcome.ok, resetOutcome.reason], [false, "failed"]);
+  assert.equal(renameOutcome.ok, true);
+  assert.deepEqual(env.net.requests("PATCH", PATCH_A).map((request) => request.body), [
+    { title: null },
+    { title: "Новое имя" },
+  ]);
+  assert.equal(itemOf(env, CONV_A).label, "Новое имя");
+});
+
+// The page's READ_TIMEOUT_MS, as the soft-timeout scenarios move the test clock past it.
+const SOFT_TIMEOUT = 20000;
+
+scenario("a_soft_timeout_keeps_the_request_alive_and_the_next_write_queued", async () => {
+  // The audited commit inversion: an earlier reset outlives the page's timeout while a
+  // newer rename is requested. The page must not treat the timeout as the end of the
+  // reset: the request is not aborted and the rename waits for its real answer, so the
+  // server sees (and commits) reset then rename.
+  const env = makeEnv().signedIn(
+    [conversation(CONV_A, 30, "Своё", { title_origin: "manual", can_reset_title: true })],
+    {
+      [CONV_A]: historyBody(CONV_A, [message(1, "user", "Первый"), message(2, "assistant", "Да")]),
+    }
+  );
+  await env.boot();
+
+  const held = deferred();
+  env.net.route(
+    "PATCH",
+    PATCH_A,
+    async () => {
+      await held.promise;
+      return json(200, conversation(CONV_A, 30, "Борщ", { last_message_at: iso(2) }));
+    },
+    json(200, conversation(CONV_A, 30, "Новое имя", {
+      title_origin: "manual",
+      can_reset_title: true,
+      last_message_at: iso(2),
+    }))
+  );
+  const resetting = env.ctl.resetTitle();
+  await flush();
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1);
+  // The title write attaches no abort signal: the page's soft timeout never cancels it.
+  assert.equal(env.net.requests("PATCH", PATCH_A)[0].signal, undefined);
+
+  await env.timers.advance(SOFT_TIMEOUT);
+  await flush();
+  // Truthful pending feedback, and the request was not aborted.
+  assert.equal(env.view().title.pending, true);
+  assert.equal(env.view().title.slow, true);
+  assert.equal(env.view().banner.text, Logic.TEXT.titlePending);
+  assert.equal(env.net.requests("PATCH", PATCH_A)[0].signal, undefined);
+
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+  const renaming = env.ctl.saveTitle();
+  await flush();
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1, "the newer write stays queued");
+
+  held.resolve();
+  const resetOutcome = await resetting;
+  const renameOutcome = await renaming;
+  await env.settle();
+
+  assert.equal(resetOutcome.ok, true);
+  assert.equal(renameOutcome.ok, true);
+  assert.deepEqual(env.net.requests("PATCH", PATCH_A).map((request) => request.body), [
+    { title: null },
+    { title: "Новое имя" },
+  ]);
+  assert.equal(itemOf(env, CONV_A).label, "Новое имя", "the later rename is the persisted title");
+  assert.equal(env.view().title.pending, false);
+});
+
+scenario("an_unconfirmed_title_write_guards_the_conversation_and_leaves_others_usable", async () => {
+  // The connection fails after the reset was sent: the server may or may not have
+  // committed. The page must not send the rename past it (it could commit first), must
+  // say so truthfully, must keep the draft, and must not block another conversation.
+  const env = makeEnv().signedIn(
+    [
+      conversation(CONV_A, 30, "Своё", { title_origin: "manual", can_reset_title: true }),
+      conversation(CONV_B, 0, "Второй"),
+    ],
+    {
+      [CONV_A]: historyBody(CONV_A, [message(1, "user", "Первый"), message(2, "assistant", "Да")]),
+      [CONV_B]: historyBody(CONV_B, [message(3, "user", "Второй"), message(4, "assistant", "Да")]),
+    }
+  );
+  await env.boot();
+
+  const held = deferred();
+  env.net.route("PATCH", PATCH_A, async () => {
+    await held.promise;
+    throw new TypeError("Failed to fetch");
+  });
+  const resetting = env.ctl.resetTitle();
+  await flush();
+  await env.timers.advance(SOFT_TIMEOUT);
+  await flush();
+  assert.equal(env.view().title.slow, true);
+
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+  const renaming = env.ctl.saveTitle();
+  await flush();
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1, "the rename is queued behind the reset");
+
+  held.resolve();
+  const resetOutcome = await resetting;
+  const renameOutcome = await renaming;
+  await env.settle();
+
+  assert.deepEqual([resetOutcome.ok, resetOutcome.reason], [false, "indeterminate"]);
+  assert.deepEqual([renameOutcome.ok, renameOutcome.reason], [false, "unconfirmed"]);
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1, "nothing was sent after the unknown outcome");
+  assert.equal(env.view().title.blocked, true);
+  assert.equal(env.view().title.blockedText, Logic.TEXT.titleUnconfirmed);
+  assert.equal(env.view().banner.text, Logic.TEXT.titleUnconfirmed);
+  // The draft and the editor survive; the reason is shown in the form.
+  assert.equal(env.view().title.editing, true);
+  assert.equal(env.view().title.draft, "Новое имя");
+  assert.equal(env.view().title.saving, false);
+  assert.equal(env.view().title.error.text, Logic.TEXT.titleUnconfirmed);
+  // The conversation's item carries the guard even when the person moves on.
+  const a = itemOf(env, CONV_A);
+  assert.equal(a.titleBlocked, true);
+  assert.equal(a.titleBlockedText, Logic.TEXT.titleUnconfirmedShort);
+  assert.equal(a.label, "Своё", "nothing claims the unconfirmed write happened");
+
+  // Saving again is refused without a request; the draft stays.
+  const again = await env.ctl.saveTitle();
+  assert.deepEqual([again.ok, again.reason], [false, "unconfirmed"]);
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1);
+  assert.equal(env.view().title.draft, "Новое имя");
+
+  // Cancelling keeps the guard (and the conversation warns again when reopened).
+  env.ctl.cancelTitleEdit();
+  assert.equal(env.view().title.editing, false);
+  env.ctl.beginTitleEdit();
+  assert.equal(env.view().title.error.text, Logic.TEXT.titleUnconfirmed);
+
+  // Another conversation is not guarded: its title write goes out and is applied.
+  await env.ctl.selectConversation(CONV_B);
+  env.net.route("PATCH", PATCH_B, json(200, conversation(CONV_B, 0, "Второй новый", {
+    title_origin: "manual",
+    can_reset_title: true,
+    last_message_at: iso(4),
+  })));
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Второй новый");
+  const other = await env.ctl.saveTitle();
+  assert.equal(other.ok, true);
+  assert.equal(itemOf(env, CONV_B).label, "Второй новый");
+});
+
+scenario("deleting_a_guarded_conversation_clears_it_and_leaves_the_other_usable", async () => {
+  // A conversation whose title write could not be confirmed can still be deleted; the
+  // guard belongs to that conversation only and disappears with it.
+  const env = makeEnv().signedIn(
+    [
+      conversation(CONV_A, 30, "Своё", { title_origin: "manual", can_reset_title: true }),
+      conversation(CONV_B, 0, "Второй"),
+    ],
+    {
+      [CONV_A]: historyBody(CONV_A, [message(1, "user", "Первый"), message(2, "assistant", "Да")]),
+      [CONV_B]: historyBody(CONV_B, [message(3, "user", "Второй"), message(4, "assistant", "Да")]),
+    }
+  );
+  await env.boot();
+
+  const held = deferred();
+  env.net.route("PATCH", PATCH_A, async () => {
+    await held.promise;
+    throw new TypeError("Failed to fetch");
+  });
+  const resetting = env.ctl.resetTitle();
+  await flush();
+  await env.timers.advance(SOFT_TIMEOUT);
+  await flush();
+  held.resolve();
+  await resetting;
+  await env.settle();
+  assert.equal(env.view().title.blocked, true);
+
+  env.net.route("DELETE", PATCH_A, removedBody());
+  env.net.route("GET", "/api/conversations", listBody([conversation(CONV_B, 0, "Второй")]));
+  env.ctl.askDeleteConversation(CONV_A);
+  const deleted = await env.ctl.deleteConversation();
+  await env.settle();
+
+  assert.equal(deleted.ok, true);
+  assert.ok(!env.view().list.items.some((item) => item.id === CONV_A));
+  assert.equal(env.view().currentId, null, "the deleted conversation was the open one");
+  // B is untouched and still renameable.
+  await env.ctl.selectConversation(CONV_B);
+  env.net.route("PATCH", PATCH_B, json(200, conversation(CONV_B, 0, "Второй новый", {
+    title_origin: "manual",
+    can_reset_title: true,
+    last_message_at: iso(4),
+  })));
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Второй новый");
+  const other = await env.ctl.saveTitle();
+  assert.equal(other.ok, true);
+  assert.equal(itemOf(env, CONV_B).label, "Второй новый");
+});
+
+scenario("every_5xx_for_a_title_write_is_indeterminate_and_guards_the_conversation", async () => {
+  // A1-01c: a 5xx does not prove that the title was not stored. The application's own
+  // "internal_error" is written after its database work committed, so it is exactly as
+  // indeterminate as a proxy's 502 -- both guard. Only a 4xx refusal is definitive.
+  const makeOne = async (responder) => {
+    const env = makeEnv().signedIn(
+      [conversation(CONV_A, 30, "Своё", { title_origin: "manual", can_reset_title: true })],
+      { [CONV_A]: historyBody(CONV_A, [message(1, "user", "Первый"), message(2, "assistant", "Да")]) }
+    );
+    await env.boot();
+    env.net.route("PATCH", PATCH_A, responder);
+    const reset = await env.ctl.resetTitle();
+    await env.settle();
+    assert.deepEqual([reset.ok, reset.reason], [false, "indeterminate"]);
+    assert.equal(env.view().title.blocked, true);
+    assert.equal(env.view().banner.text, Logic.TEXT.titleUnconfirmed);
+    assert.equal(env.net.requests("PATCH", PATCH_A).length, 1);
+    // The notice says the request may still be completing; it does not claim a rollback
+    // and does not promise that reloading cancels it.
+    assert.ok(Logic.TEXT.titleUnconfirmed.includes("может завершиться на сервере"));
+    assert.ok(Logic.TEXT.titleUnconfirmed.includes("проверить текущее название"));
+    assert.ok(!Logic.TEXT.titleUnconfirmed.includes("не сохранилось"));
+    return env;
+  };
+
+  // The application's own error catalogue, at 500 and 503.
+  await makeOne(apiError(500, "internal_error"));
+  await makeOne(apiError(503, "service_unavailable"));
+  // A proxy answering without the application's body.
+  await makeOne(text(502, "<html>Bad Gateway</html>"));
+});
+
+scenario("a_success_status_whose_body_is_not_the_conversations_is_indeterminate", async () => {
+  // A proxy or cache answered 200 with something that is not this application's
+  // conversation: the server's outcome is unknown, so nothing is marked applied.
+  const env = makeEnv().signedIn(
+    [conversation(CONV_A, 30, "Своё", { title_origin: "manual", can_reset_title: true })],
+    { [CONV_A]: historyBody(CONV_A, [message(1, "user", "Первый"), message(2, "assistant", "Да")]) }
+  );
+  await env.boot();
+
+  env.net.route("PATCH", PATCH_A, json(200, { ok: true }));
+  const reset = await env.ctl.resetTitle();
+  await env.settle();
+  assert.deepEqual([reset.ok, reset.reason], [false, "indeterminate"]);
+  assert.equal(env.view().title.blocked, true);
+  assert.equal(itemOf(env, CONV_A).label, "Своё", "nothing claims the unconfirmed write happened");
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1);
+  const again = await env.ctl.resetTitle();
+  assert.deepEqual([again.ok, again.reason], [false, "unconfirmed"]);
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1, "nothing is retried automatically");
+});
+
+// --- PP-01-A1-R3 (A1-01a): confirmed titles outlive the list page that showed them --------
+
+const manyId = (n) => "44444444-4444-4444-8444-" + String(n).padStart(12, "0");
+const EMPTY_HISTORY = (id) =>
+  historyBody(id, [message(1, "user", "Первый"), message(2, "assistant", "Да")]);
+
+scenario("a_confirmed_rename_survives_the_audited_fifty_item_list_transition", async () => {
+  // The audited reproduction, in full: a rename is held; A leaves the real 50-item list
+  // when another conversation is deleted and the page reads the list again (A is beyond
+  // its edge); a newer read begins and will carry A with its OLD title; the rename
+  // commits while A is not on the page; that older read is released and A reappears.
+  const others = Array.from({ length: 49 }, (_, index) => manyId(index + 1));
+  const env = makeEnv().signedIn(
+    [conversation(CONV_A, 40, "Первый"), ...others.map((id, index) => conversation(id, 39 - index, "Разговор"))],
+    { [CONV_A]: EMPTY_HISTORY(CONV_A) }
+  );
+  await env.boot();
+  assert.equal(env.view().list.items.length, 50);
+  assert.equal(env.view().currentId, CONV_A);
+
+  const heldRename = deferred();
+  env.net.route("PATCH", PATCH_A, async () => {
+    await heldRename.promise;
+    return json(200, conversation(CONV_A, 40, "Новое имя", {
+      title_origin: "manual",
+      can_reset_title: true,
+      last_message_at: iso(2),
+    }));
+  });
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+  const saving = env.ctl.saveTitle();
+  await flush();
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1);
+
+  // The server now lists 50 newer conversations: A is beyond the page, and one of the
+  // conversations that used to be listed is deleted. The page's own list read (started
+  // by the deletion) answers from that state.
+  const newest = [conversation(manyId(200), 0, "Совсем новый")];
+  const pageWithoutA = [
+    ...others.slice(0, 48).map((id, index) => conversation(id, 39 - index, "Разговор")),
+    conversation(manyId(201), 1, "Еще новее"),
+    ...newest,
+  ];
+  env.net.route("DELETE", `/api/conversations/${others[48]}`, removedBody());
+  env.net.route("GET", "/api/conversations", listBody(pageWithoutA));
+  env.ctl.askDeleteConversation(others[48]);
+  await env.ctl.deleteConversation();
+  await flush(); // (the rename is still held: settle would wait on that write)
+  assert.ok(!itemOf(env, CONV_A), "A is beyond the page the server now lists");
+  assert.equal(env.view().currentId, CONV_A, "the conversation being renamed is still open");
+
+  // An older read, begun before the rename's answer, carries A with the title it had
+  // before the rename and its own activity time. It is the newest read, so it applies.
+  const heldRead = deferred();
+  const staleActivity = iso(500);
+  const stalePage = [
+    ...others.slice(0, 48).map((id, index) => conversation(id, 39 - index, "Разговор")),
+    conversation(manyId(202), 1, "Другой новый"),
+    conversation(CONV_A, 40, "Первый", { last_message_at: staleActivity }),
+  ];
+  env.net.route("GET", "/api/conversations", async () => {
+    await heldRead.promise;
+    return listBody(stalePage);
+  });
+  const reading = env.ctl.reloadList();
+  await flush();
+
+  heldRename.resolve();
+  assert.equal((await saving).ok, true);
+  assert.ok(!itemOf(env, CONV_A), "the confirmation happened while A was not listed");
+
+  heldRead.resolve();
+  await reading;
+  await env.settle();
+
+  const a = itemOf(env, CONV_A);
+  assert.ok(a, "A is back in the newest read's own membership");
+  assert.equal(a.label, "Новое имя", "the confirmed title is not replaced by the older snapshot");
+  assert.equal(a.titleOrigin, "manual");
+  assert.equal(env.view().title.canReset, true);
+  // Everything that is not the title is the server's: order, membership and times.
+  assert.deepEqual(env.view().list.items.map((item) => item.id), stalePage.map((item) => item.id));
+  assert.equal(
+    a.lastText,
+    Logic.TEXT.lastMessageLabel + ": " + Logic.moscowMoment(Logic.parseTimestamp(staleActivity)),
+    "the read's activity time is kept, not the rename answer's"
+  );
+  assert.equal(
+    a.createdText,
+    Logic.TEXT.createdLabel + ": " + Logic.moscowMoment(Logic.parseTimestamp(conversation(CONV_A, 40).created_at))
+  );
+
+  // A read begun after the confirmation is authoritative again: a title changed in
+  // another tab is shown, so the confirmed metadata is not kept for ever.
+  env.net.route("GET", "/api/conversations", listBody([
+    conversation(CONV_A, 40, "Из другой вкладки", {
+      title_origin: "manual",
+      can_reset_title: true,
+      last_message_at: staleActivity,
+    }),
+  ]));
+  await env.ctl.reloadList();
+  await env.settle();
+  assert.equal(itemOf(env, CONV_A).label, "Из другой вкладки");
+});
+
+scenario("a_confirmed_reset_survives_an_off_page_list_transition", async () => {
+  const others = Array.from({ length: 5 }, (_, index) => manyId(index + 10));
+  const env = makeEnv().signedIn(
+    [conversation(CONV_A, 30, "Своё", { title_origin: "manual", can_reset_title: true }),
+     ...others.map((id, index) => conversation(id, 20 - index, "Разговор"))],
+    { [CONV_A]: EMPTY_HISTORY(CONV_A) }
+  );
+  await env.boot();
+
+  const heldReset = deferred();
+  env.net.route("PATCH", PATCH_A, async () => {
+    await heldReset.promise;
+    return json(200, conversation(CONV_A, 30, "Первый", { last_message_at: iso(2) }));
+  });
+  const resetting = env.ctl.resetTitle();
+  await flush();
+
+  // A leaves the page, exactly as the rename scenario.
+  env.net.route("GET", "/api/conversations", listBody(others.map((id, index) => conversation(id, 20 - index, "Разговор"))));
+  await env.ctl.reloadList();
+  await flush(); // (the reset is still held: settle would wait on that write)
+  assert.ok(!itemOf(env, CONV_A));
+
+  const heldRead = deferred();
+  env.net.route("GET", "/api/conversations", async () => {
+    await heldRead.promise;
+    return listBody([
+      ...others.map((id, index) => conversation(id, 20 - index, "Разговор")),
+      conversation(CONV_A, 30, "Своё", { title_origin: "manual", can_reset_title: true }),
+    ]);
+  });
+  const reading = env.ctl.reloadList();
+  await flush();
+
+  heldReset.resolve();
+  assert.equal((await resetting).ok, true);
+  heldRead.resolve();
+  await reading;
+  await env.settle();
+
+  const a = itemOf(env, CONV_A);
+  assert.equal(a.label, "Первый", "the older snapshot does not restore the reset title");
+  assert.equal(a.titleOrigin, "derived");
+  assert.equal(env.view().title.canReset, false);
+});
+
+scenario("deleting_a_conversation_while_its_title_write_is_pending_never_resurrects_it", async () => {
+  const env = makeEnv().signedIn(
+    [conversation(CONV_A, 30, "Своё", { title_origin: "manual", can_reset_title: true }),
+     conversation(CONV_B, 0, "Второй")],
+    { [CONV_A]: EMPTY_HISTORY(CONV_A), [CONV_B]: EMPTY_HISTORY(CONV_B) }
+  );
+  await env.boot();
+
+  const held = deferred();
+  env.net.route("PATCH", PATCH_A, async () => {
+    await held.promise;
+    return apiError(404, "conversation_not_found"); // it was deleted meanwhile
+  });
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+  const saving = env.ctl.saveTitle();
+  await flush();
+
+  env.net.route("DELETE", PATCH_A, removedBody());
+  env.net.route("GET", "/api/conversations", listBody([conversation(CONV_B, 0, "Второй")]));
+  env.ctl.askDeleteConversation(CONV_A);
+  const deleted = await env.ctl.deleteConversation();
+  await flush(); // (the rename is still held: settle would wait on that write)
+  assert.equal(deleted.ok, true);
+
+  held.resolve();
+  assert.deepEqual([(await saving).ok, (await saving).reason], [false, "gone"]);
+  await env.settle();
+
+  assert.ok(!itemOf(env, CONV_A), "a title answer never brings a deleted conversation back");
+  assert.equal(env.view().currentId, null);
+  // The other conversation is untouched and still renameable.
+  await env.ctl.selectConversation(CONV_B);
+  env.net.route("PATCH", PATCH_B, json(200, conversation(CONV_B, 0, "Второй новый", {
+    title_origin: "manual",
+    can_reset_title: true,
+    last_message_at: iso(4),
+  })));
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Второй новый");
+  assert.equal((await env.ctl.saveTitle()).ok, true);
+  assert.equal(itemOf(env, CONV_B).label, "Второй новый");
+});
+
+// --- PP-01-A1-R3 (A1-01b): a same-document restoration keeps the title write's life -------
+
+scenario("a_same_document_restoration_keeps_a_pending_title_write_queued", async () => {
+  const env = makeEnv().signedIn(
+    [conversation(CONV_A, 30, "Своё", { title_origin: "manual", can_reset_title: true })],
+    { [CONV_A]: EMPTY_HISTORY(CONV_A) }
+  );
+  await env.boot();
+  const listReads = gets(env, "/api/conversations");
+
+  const held = deferred();
+  env.net.route(
+    "PATCH",
+    PATCH_A,
+    async () => {
+      await held.promise;
+      return json(200, conversation(CONV_A, 30, "Борщ", { last_message_at: iso(2) }));
+    },
+    json(200, conversation(CONV_A, 30, "Новое имя", {
+      title_origin: "manual",
+      can_reset_title: true,
+      last_message_at: iso(2),
+    }))
+  );
+  const resetting = env.ctl.resetTitle();
+  await flush();
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1);
+
+  // The browser restores the same document. Who is signed in is asked again; the write
+  // that is out and its place in the queue are this document's memory and stay.
+  await env.ctl.restore();
+  await flush(60); // (the reset is still held: settle would wait on that write)
+  assert.equal(env.net.requests("GET", "/auth/me").length, 2, "a restoration asks who is signed in");
+  assert.equal(gets(env, "/api/conversations"), listReads, "a restoration is not a fresh page");
+  assert.equal(env.view().currentId, CONV_A);
+  assert.equal(env.view().title.pending, true, "the write that is out is still known");
+
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+  const renaming = env.ctl.saveTitle();
+  await flush();
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1, "the newer write stays queued across the restoration");
+
+  held.resolve();
+  assert.equal((await resetting).ok, true);
+  assert.equal((await renaming).ok, true);
+  await env.settle();
+  assert.deepEqual(env.net.requests("PATCH", PATCH_A).map((request) => request.body), [
+    { title: null },
+    { title: "Новое имя" },
+  ], "the server sees the writes in the page's order");
+  assert.equal(itemOf(env, CONV_A).label, "Новое имя");
+});
+
+scenario("a_same_document_restoration_keeps_an_unconfirmed_title_write_guarded", async () => {
+  const env = makeEnv().signedIn(
+    [conversation(CONV_A, 30, "Своё", { title_origin: "manual", can_reset_title: true }),
+     conversation(CONV_B, 0, "Второй")],
+    { [CONV_A]: EMPTY_HISTORY(CONV_A), [CONV_B]: EMPTY_HISTORY(CONV_B) }
+  );
+  await env.boot();
+
+  const held = deferred();
+  env.net.route("PATCH", PATCH_A, async () => {
+    await held.promise;
+    throw new TypeError("Failed to fetch");
+  });
+  const resetting = env.ctl.resetTitle();
+  await flush();
+  held.resolve();
+  assert.deepEqual([(await resetting).ok, (await resetting).reason], [false, "indeterminate"]);
+  await env.settle();
+  assert.equal(env.view().title.blocked, true);
+
+  await env.ctl.restore();
+  await env.settle();
+  assert.equal(env.view().title.blocked, true, "the restoration of this document keeps the guard");
+  assert.equal(env.view().title.blockedText, Logic.TEXT.titleUnconfirmed);
+
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+  const again = await env.ctl.saveTitle();
+  assert.deepEqual([again.ok, again.reason], [false, "unconfirmed"]);
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1, "no conflicting write while the guard is active");
+  assert.equal(env.view().title.draft, "Новое имя", "the draft survives the restoration");
+
+  // Another conversation is still usable after the restoration.
+  env.net.route("PATCH", PATCH_B, json(200, conversation(CONV_B, 0, "Второй новый", {
+    title_origin: "manual",
+    can_reset_title: true,
+    last_message_at: iso(4),
+  })));
+  await env.ctl.selectConversation(CONV_B);
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Второй новый");
+  assert.equal((await env.ctl.saveTitle()).ok, true);
+  assert.equal(itemOf(env, CONV_B).label, "Второй новый");
+});
+
+scenario("a_restored_page_of_another_person_discards_the_previous_title_state", async () => {
+  const env = makeEnv().signedIn(
+    [conversation(CONV_A, 30, "Своё", { title_origin: "manual", can_reset_title: true })],
+    { [CONV_A]: EMPTY_HISTORY(CONV_A) }
+  );
+  await env.boot();
+
+  const held = deferred();
+  env.net.route("PATCH", PATCH_A, async () => {
+    await held.promise;
+    return json(200, conversation(CONV_A, 30, "Новое имя", {
+      title_origin: "manual",
+      can_reset_title: true,
+      last_message_at: iso(2),
+    }));
+  });
+  const resetting = env.ctl.resetTitle();
+  await flush();
+
+  // The browser now carries somebody else's session: the restored page must start over.
+  env.net.route("GET", "/auth/me", me(86400, USER_B));
+  env.net.route("GET", "/api/conversations", listBody([conversation(CONV_C, 0, "Чужой")]));
+  env.net.route("GET", new RegExp("/api/conversations/" + CONV_C + "/messages(\\?|$)"), historyBody(CONV_C, []));
+  await env.ctl.restore();
+  await flush(60); // (the old reset is still held: settle would wait on it)
+
+  assert.equal(env.view().currentId, CONV_C);
+  assert.deepEqual(env.view().list.items.map((item) => item.id), [CONV_C], "nothing of the last person's list");
+  assert.equal(env.view().title.blocked, false, "the last person's guard is not reused");
+
+  // A delayed answer from the old authenticated context changes nothing.
+  held.resolve();
+  assert.deepEqual([(await resetting).ok, (await resetting).reason], [false, "stale"]);
+  await env.settle();
+  assert.deepEqual(env.view().list.items.map((item) => item.id), [CONV_C]);
+  assert.equal(env.view().currentId, CONV_C);
+  assert.equal(itemOf(env, CONV_C).label, "Чужой");
+  assert.equal(env.view().title.blocked, false);
+});
+
+// --- PP-01-A1-R4: the four invariants -------------------------------------------------------
+//
+// R4-01 authoritative object existence; R4-02 authentication freshness on a same-document
+// restoration; R4-03 fail-closed mutation outcome classification; R4-04 mutation response
+// identity and integrity.
+
+const A_MANUAL = (extra = {}) =>
+  conversation(CONV_A, 30, "Своё", { title_origin: "manual", can_reset_title: true, ...extra });
+
+// --- R4-01: an authoritative "it does not exist" is not undone by an older list read ------
+
+scenario("a_title_404_is_not_undone_by_a_list_read_taken_before_the_conversation_vanished", async () => {
+  // The audited reproduction: a rename of A is answered 404 (deleted elsewhere), A is
+  // dropped, and a list GET captured before the deletion arrives afterwards with A in it.
+  const env = makeEnv().signedIn(
+    [A_MANUAL(), conversation(CONV_B, 0, "Второй")],
+    { [CONV_A]: EMPTY_HISTORY(CONV_A), [CONV_B]: EMPTY_HISTORY(CONV_B) }
+  );
+  await env.boot();
+
+  const heldRead = deferred();
+  env.net.route("GET", "/api/conversations", async () => {
+    await heldRead.promise;
+    return listBody([A_MANUAL(), conversation(CONV_B, 0, "Второй")]);
+  });
+  const reading = env.ctl.reloadList();
+  await flush();
+  assert.equal(gets(env, "/api/conversations"), 2);
+
+  env.net.route("PATCH", PATCH_A, apiError(404, "conversation_not_found"));
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+  const saving = env.ctl.saveTitle();
+  assert.deepEqual([(await saving).ok, (await saving).reason], [false, "gone"]);
+  await flush(60); // (the held list read is still out: settle would wait on it)
+  assert.ok(!itemOf(env, CONV_A), "the authoritative 404 removes it at once");
+  assert.equal(env.view().currentId, null);
+
+  heldRead.resolve();
+  await reading;
+  await env.settle();
+  assert.ok(!itemOf(env, CONV_A), "an older snapshot never puts a conversation the server said is gone back");
+  assert.deepEqual(env.view().list.items.map((item) => item.id), [CONV_B], "current membership and order stay");
+  assert.equal(env.view().list.status, "ready", "the invalidated read is not left looking like it is still loading");
+
+  // A read that begins afterwards is the server's current list and applies normally.
+  env.net.route("GET", "/api/conversations", listBody([conversation(CONV_B, 0, "Второй (свежий)")]));
+  await env.ctl.reloadList();
+  await env.settle();
+  assert.deepEqual(env.view().list.items.map((item) => item.id), [CONV_B]);
+  assert.equal(itemOf(env, CONV_B).label, "Второй (свежий)");
+});
+
+scenario("a_reset_404_is_not_undone_by_a_list_read_taken_before_the_conversation_vanished", async () => {
+  // The same invariant on the reset path.
+  const env = makeEnv().signedIn(
+    [A_MANUAL(), conversation(CONV_B, 0, "Второй")],
+    { [CONV_A]: EMPTY_HISTORY(CONV_A), [CONV_B]: EMPTY_HISTORY(CONV_B) }
+  );
+  await env.boot();
+
+  const heldRead = deferred();
+  env.net.route("GET", "/api/conversations", async () => {
+    await heldRead.promise;
+    return listBody([A_MANUAL(), conversation(CONV_B, 0, "Второй")]);
+  });
+  const reading = env.ctl.reloadList();
+  await flush();
+
+  env.net.route("PATCH", PATCH_A, apiError(404, "conversation_not_found"));
+  const resetting = env.ctl.resetTitle();
+  assert.deepEqual([(await resetting).ok, (await resetting).reason], [false, "gone"]);
+  await flush(60); // (the held list read is still out)
+
+  heldRead.resolve();
+  await reading;
+  await env.settle();
+  assert.ok(!itemOf(env, CONV_A), "the reset path invalidates a pre-deletion read the same way");
+  assert.deepEqual(env.view().list.items.map((item) => item.id), [CONV_B]);
+});
+
+scenario("several_list_reads_out_before_an_authoritative_404_are_all_discarded", async () => {
+  const env = makeEnv().signedIn(
+    [A_MANUAL(), conversation(CONV_B, 0, "Второй")],
+    { [CONV_A]: EMPTY_HISTORY(CONV_A), [CONV_B]: EMPTY_HISTORY(CONV_B) }
+  );
+  await env.boot();
+
+  const firstRead = deferred();
+  const secondRead = deferred();
+  env.net.route(
+    "GET",
+    "/api/conversations",
+    async () => {
+      await firstRead.promise;
+      return listBody([A_MANUAL(), conversation(CONV_B, 0, "Второй")]);
+    },
+    async () => {
+      await secondRead.promise;
+      return listBody([A_MANUAL(), conversation(CONV_B, 0, "Второй")]);
+    }
+  );
+  const readingOne = env.ctl.reloadList();
+  await flush();
+  const readingTwo = env.ctl.reloadList();
+  await flush();
+  assert.equal(gets(env, "/api/conversations"), 3);
+
+  env.net.route("PATCH", PATCH_A, apiError(404, "conversation_not_found"));
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+  assert.deepEqual([(await env.ctl.saveTitle()).reason], ["gone"]);
+  await flush(60); // (both held reads are still out: settle would wait on them)
+
+  firstRead.resolve();
+  secondRead.resolve();
+  await Promise.all([readingOne, readingTwo]);
+  await env.settle();
+  assert.ok(!itemOf(env, CONV_A), "neither outstanding read resurrects the conversation");
+  assert.deepEqual(env.view().list.items.map((item) => item.id), [CONV_B]);
+  assert.equal(env.view().list.status, "ready");
+});
+
+scenario("a_delayed_title_success_does_not_resurrect_a_conversation_deleted_while_it_was_out", async () => {
+  const env = makeEnv().signedIn(
+    [A_MANUAL(), conversation(CONV_B, 0, "Второй")],
+    { [CONV_A]: EMPTY_HISTORY(CONV_A), [CONV_B]: EMPTY_HISTORY(CONV_B) }
+  );
+  await env.boot();
+
+  const held = deferred();
+  env.net.route("PATCH", PATCH_A, async () => {
+    await held.promise;
+    return json(200, conversation(CONV_A, 30, "Новое имя", {
+      title_origin: "manual",
+      can_reset_title: true,
+      last_message_at: iso(2),
+    }));
+  });
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+  const saving = env.ctl.saveTitle();
+  await flush();
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1);
+
+  env.net.route("DELETE", PATCH_A, removedBody());
+  env.net.route("GET", "/api/conversations", listBody([conversation(CONV_B, 0, "Второй")]));
+  env.ctl.askDeleteConversation(CONV_A);
+  assert.equal((await env.ctl.deleteConversation()).ok, true);
+  await flush();
+
+  held.resolve();
+  await saving;
+  await env.settle();
+  assert.ok(!itemOf(env, CONV_A), "a late success of a write never brings a deleted conversation back");
+  assert.deepEqual(env.view().list.items.map((item) => item.id), [CONV_B]);
+});
+
+// --- R4-02: a restoration's verification boundary -------------------------------------------
+
+scenario("a_restoration_supersedes_an_older_verification_that_arrives_before_the_new_one", async () => {
+  // The audited account switch: an /auth/me asked before the restoration is still out; the
+  // browser's session is now somebody else's. The restoration asks again; the older answer
+  // (the old account) arrives first and must decide nothing.
+  const env = makeEnv().signedIn([A_MANUAL()], { [CONV_A]: EMPTY_HISTORY(CONV_A) });
+  await env.boot();
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Черновик прежнего человека");
+  assert.equal(env.view().title.draft, "Черновик прежнего человека");
+
+  const oldAnswer = deferred();
+  const newAnswer = deferred();
+  env.net.route(
+    "GET",
+    "/auth/me",
+    async () => {
+      await oldAnswer.promise;
+      return me(86400, USER_A);
+    },
+    async () => {
+      await newAnswer.promise;
+      return me(86400, USER_B);
+    }
+  );
+  env.ctl.recheck(); // the older question, still out
+  await flush();
+  await env.ctl.restore(); // the restoration's own, fresh question
+  await flush();
+  assert.equal(gets(env, "/auth/me"), 3);
+
+  oldAnswer.resolve();
+  await flush(60);
+  assert.equal(env.view().screen, "verifying", "the superseded answer does not open the page");
+  assert.deepEqual(env.view().list.items, [], "nothing private is disclosed on the older answer");
+
+  env.net.route("GET", "/api/conversations", listBody([conversation(CONV_C, 0, "Чужой")]));
+  env.net.route("GET", new RegExp("/api/conversations/" + CONV_C + "/messages(\\?|$)"), historyBody(CONV_C, []));
+  newAnswer.resolve();
+  await flush(80);
+  await env.settle();
+  assert.equal(env.view().screen, "app");
+  assert.deepEqual(env.view().list.items.map((item) => item.id), [CONV_C]);
+  assert.equal(env.view().title.draft, "", "the previous person's draft is gone");
+});
+
+scenario("a_restoration_ignores_an_older_verification_that_arrives_after_the_new_one", async () => {
+  const env = makeEnv().signedIn([A_MANUAL()], { [CONV_A]: EMPTY_HISTORY(CONV_A) });
+  await env.boot();
+
+  const oldAnswer = deferred();
+  const newAnswer = deferred();
+  env.net.route(
+    "GET",
+    "/auth/me",
+    async () => {
+      await oldAnswer.promise;
+      return me(86400, USER_B); // the older question's late answer: somebody else
+    },
+    async () => {
+      await newAnswer.promise;
+      return me(86400, USER_A); // the restoration's: the same person
+    },
+    me(86400, USER_B) // (would be the answer of a page started over, if one wrongly began)
+  );
+  env.ctl.recheck();
+  await flush();
+  await env.ctl.restore();
+  await flush();
+
+  newAnswer.resolve();
+  await flush(80); // (the older question is still out: settle would wait on it)
+  assert.equal(env.view().screen, "app");
+  assert.deepEqual(env.view().list.items.map((item) => item.id), [CONV_A]);
+
+  oldAnswer.resolve();
+  await flush(80);
+  await env.settle();
+  assert.equal(env.view().screen, "app");
+  assert.deepEqual(env.view().list.items.map((item) => item.id), [CONV_A], "the stale answer changes nothing");
+  assert.equal(env.view().currentId, CONV_A);
+  assert.equal(gets(env, "/auth/me"), 3, "a superseded answer begins no new page");
+});
+
+scenario("a_queued_title_write_waits_for_the_restorations_verification", async () => {
+  const env = makeEnv().signedIn([A_MANUAL()], { [CONV_A]: EMPTY_HISTORY(CONV_A) });
+  await env.boot();
+
+  const heldReset = deferred();
+  env.net.route(
+    "PATCH",
+    PATCH_A,
+    async () => {
+      await heldReset.promise;
+      return json(200, conversation(CONV_A, 30, "Борщ", { last_message_at: iso(2) }));
+    },
+    json(200, conversation(CONV_A, 30, "Новое имя", {
+      title_origin: "manual",
+      can_reset_title: true,
+      last_message_at: iso(2),
+    }))
+  );
+  const resetting = env.ctl.resetTitle();
+  await flush();
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1);
+
+  const verification = deferred();
+  env.net.route("GET", "/auth/me", async () => {
+    await verification.promise;
+    return me(86400, USER_A);
+  });
+  await env.ctl.restore();
+  await flush();
+  assert.equal(env.view().screen, "verifying");
+
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+  const renaming = env.ctl.saveTitle();
+  await flush();
+
+  heldReset.resolve();
+  assert.equal((await resetting).ok, true);
+  await flush(60);
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1, "the queued write is not sent into an unverified context");
+
+  verification.resolve();
+  await flush(80);
+  assert.equal((await renaming).ok, true);
+  await env.settle();
+  assert.deepEqual(env.net.requests("PATCH", PATCH_A).map((request) => request.body), [
+    { title: null },
+    { title: "Новое имя" },
+  ], "the server sees the page's order once the same person is verified");
+});
+
+scenario("a_restoration_of_another_person_drops_the_queued_write_instead_of_sending_it", async () => {
+  const env = makeEnv().signedIn([A_MANUAL()], { [CONV_A]: EMPTY_HISTORY(CONV_A) });
+  await env.boot();
+
+  const heldReset = deferred();
+  env.net.route("PATCH", PATCH_A, async () => {
+    await heldReset.promise;
+    return json(200, conversation(CONV_A, 30, "Борщ", { last_message_at: iso(2) }));
+  });
+  const resetting = env.ctl.resetTitle();
+  await flush();
+
+  const verification = deferred();
+  env.net.route("GET", "/auth/me", async () => {
+    await verification.promise;
+    return me(86400, USER_B);
+  });
+  await env.ctl.restore();
+  await flush();
+
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+  const renaming = env.ctl.saveTitle();
+  await flush();
+
+  heldReset.resolve();
+  await resetting;
+  env.net.route("GET", "/api/conversations", listBody([conversation(CONV_C, 0, "Чужой")]));
+  env.net.route("GET", new RegExp("/api/conversations/" + CONV_C + "/messages(\\?|$)"), historyBody(CONV_C, []));
+  verification.resolve();
+  await flush(80);
+  const outcome = await renaming;
+  await env.settle();
+
+  assert.deepEqual([outcome.ok, outcome.reason], [false, "stale"]);
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1, "the previous person's queued write is never sent");
+  assert.deepEqual(env.view().list.items.map((item) => item.id), [CONV_C]);
+  assert.equal(env.view().currentId, CONV_C);
+});
+
+// A list read begun on the previous person's page, answered after a restoration started
+// another person's page, changes nothing (the epoch and the fresh list both decide).
+scenario("a_delayed_list_answer_of_the_previous_person_never_appears_after_a_restoration", async () => {
+  const env = makeEnv().signedIn([A_MANUAL()], { [CONV_A]: EMPTY_HISTORY(CONV_A) });
+  await env.boot();
+
+  const heldRead = deferred();
+  env.net.route("GET", "/api/conversations", async () => {
+    await heldRead.promise;
+    return listBody([A_MANUAL()]);
+  });
+  const reading = env.ctl.reloadList();
+  await flush();
+
+  env.net.route("GET", "/auth/me", me(86400, USER_B));
+  env.net.route("GET", "/api/conversations", listBody([conversation(CONV_C, 0, "Чужой")]));
+  env.net.route("GET", new RegExp("/api/conversations/" + CONV_C + "/messages(\\?|$)"), historyBody(CONV_C, []));
+  await env.ctl.restore();
+  await flush(80);
+  assert.deepEqual(env.view().list.items.map((item) => item.id), [CONV_C]);
+
+  heldRead.resolve();
+  await reading;
+  await env.settle();
+  assert.deepEqual(env.view().list.items.map((item) => item.id), [CONV_C], "the old page's list is discarded");
+  assert.equal(env.view().screen, "app");
+});
+
+// --- R4-03: only the application's pre-commit refusals are definitive -----------------------
+
+const RENAME_OK = json(200, conversation(CONV_A, 30, "Новое имя", {
+  title_origin: "manual",
+  can_reset_title: true,
+  last_message_at: iso(2),
+}));
+
+scenario("only_the_applications_pre_commit_refusals_release_a_title_write_queue", async () => {
+  const definitive = [
+    apiError(400, "invalid_request"),
+    apiError(400, "empty_title"),
+    apiError(400, "title_too_long"),
+    apiError(400, "invalid_title"),
+    apiError(403, "forbidden_origin"),
+    apiError(413, "request_too_large"),
+    apiError(415, "unsupported_media_type"),
+  ];
+  for (const answer of definitive) {
+    const env = makeEnv().signedIn([A_MANUAL()], { [CONV_A]: EMPTY_HISTORY(CONV_A) });
+    await env.boot();
+    env.net.route("PATCH", PATCH_A, answer, RENAME_OK);
+    const reset = await env.ctl.resetTitle();
+    assert.deepEqual([reset.ok, reset.reason], [false, "failed"], "definitive refusal " + answer.body.detail);
+    env.ctl.beginTitleEdit();
+    env.ctl.syncTitleDraft("Новое имя");
+    const rename = await env.ctl.saveTitle();
+    assert.equal(rename.ok, true, "the queue proceeds after " + answer.body.detail);
+    await env.settle();
+    assert.equal(itemOf(env, CONV_A).label, "Новое имя");
+  }
+
+  const ambiguous = [
+    text(408, "<html>Request Timeout</html>"),
+    text(429, "<html>Too Many Requests</html>"),
+    text(400, "<html>Bad Request</html>"),
+    apiError(409, "conversation_busy"),
+    apiError(400, "service_unavailable"),
+    apiError(400, "invalid_query"),
+  ];
+  for (const answer of ambiguous) {
+    const env = makeEnv().signedIn([A_MANUAL()], { [CONV_A]: EMPTY_HISTORY(CONV_A) });
+    await env.boot();
+    env.net.route("PATCH", PATCH_A, answer, RENAME_OK);
+    const reset = await env.ctl.resetTitle();
+    assert.deepEqual([reset.ok, reset.reason], [false, "indeterminate"], "ambiguous answer " + String(answer.status));
+    assert.equal(env.view().title.blocked, true);
+    env.ctl.beginTitleEdit();
+    env.ctl.syncTitleDraft("Новое имя");
+    const rename = await env.ctl.saveTitle();
+    assert.deepEqual([rename.ok, rename.reason], [false, "unconfirmed"], "the guard holds after " + String(answer.status));
+    await env.settle();
+    assert.equal(env.net.requests("PATCH", PATCH_A).length, 1, "no conflicting write after an ambiguous answer");
+    assert.equal(itemOf(env, CONV_A).label, "Своё");
+    assert.equal(env.view().title.draft, "Новое имя", "the draft survives");
+  }
+});
+
+scenario("a_proxy_408_after_an_earlier_reset_never_releases_a_newer_rename", async () => {
+  // The audited commit inversion: the earlier reset's answer is a proxy's 408, which proves
+  // nothing about the server. Releasing the queue would let the newer rename commit first
+  // and the earlier reset clear it afterwards.
+  const env = makeEnv().signedIn(
+    [A_MANUAL(), conversation(CONV_B, 0, "Второй")],
+    { [CONV_A]: EMPTY_HISTORY(CONV_A), [CONV_B]: EMPTY_HISTORY(CONV_B) }
+  );
+  await env.boot();
+
+  const held = deferred();
+  env.net.route(
+    "PATCH",
+    PATCH_A,
+    async () => {
+      await held.promise;
+      return text(408, "<html>Request Timeout</html>");
+    },
+    RENAME_OK
+  );
+  const resetting = env.ctl.resetTitle();
+  await flush();
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+  const renaming = env.ctl.saveTitle();
+  await flush();
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1);
+
+  held.resolve();
+  const resetOutcome = await resetting;
+  const renameOutcome = await renaming;
+  await env.settle();
+
+  assert.deepEqual([resetOutcome.ok, resetOutcome.reason], [false, "indeterminate"]);
+  assert.deepEqual([renameOutcome.ok, renameOutcome.reason], [false, "unconfirmed"]);
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1, "the newer rename is not sent past the unconfirmed reset");
+  assert.equal(env.view().title.blocked, true);
+  assert.equal(env.view().banner.text, Logic.TEXT.titleUnconfirmed);
+  assert.equal(env.view().title.draft, "Новое имя", "the draft stays where the person left it");
+
+  // Another conversation is still usable.
+  env.net.route("PATCH", PATCH_B, json(200, conversation(CONV_B, 0, "Второй новый", {
+    title_origin: "manual",
+    can_reset_title: true,
+    last_message_at: iso(4),
+  })));
+  await env.ctl.selectConversation(CONV_B);
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Второй новый");
+  assert.equal((await env.ctl.saveTitle()).ok, true);
+  assert.equal(itemOf(env, CONV_B).label, "Второй новый");
+});
+
+// --- R4-04: a mutation answer must be the requested conversation and the requested state ----
+
+scenario("a_title_answer_about_another_conversation_is_indeterminate_and_changes_nothing", async () => {
+  const env = makeEnv().signedIn(
+    [A_MANUAL(), conversation(CONV_B, 0, "Второй")],
+    { [CONV_A]: EMPTY_HISTORY(CONV_A), [CONV_B]: EMPTY_HISTORY(CONV_B) }
+  );
+  await env.boot();
+
+  env.net.route("PATCH", PATCH_A, json(200, conversation(CONV_B, 0, "Чужое", {
+    title_origin: "manual",
+    can_reset_title: true,
+    last_message_at: iso(4),
+  })));
+  const reset = await env.ctl.resetTitle();
+  await env.settle();
+
+  assert.deepEqual([reset.ok, reset.reason], [false, "indeterminate"]);
+  assert.equal(env.view().title.blocked, true);
+  assert.deepEqual(env.view().list.items.map((item) => item.id), [CONV_A, CONV_B], "nothing is duplicated");
+  assert.equal(itemOf(env, CONV_A).label, "Своё", "the requested conversation's title is not overwritten");
+  assert.equal(itemOf(env, CONV_B).label, "Второй", "the other conversation's metadata is not replaced");
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1);
+});
+
+scenario("a_rename_answer_that_is_not_the_requested_manual_title_is_indeterminate", async () => {
+  // Same conversation id, but the answer contradicts the write that was asked for (derived,
+  // different text): success status alone is not the operation's contract.
+  const env = makeEnv().signedIn([A_MANUAL()], { [CONV_A]: EMPTY_HISTORY(CONV_A) });
+  await env.boot();
+
+  env.net.route("PATCH", PATCH_A, json(200, conversation(CONV_A, 30, "Другое", {
+    title_origin: "derived",
+    last_message_at: iso(2),
+  })));
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+  const rename = await env.ctl.saveTitle();
+  await env.settle();
+
+  assert.deepEqual([rename.ok, rename.reason], [false, "indeterminate"]);
+  assert.equal(env.view().title.blocked, true);
+  assert.equal(env.view().title.draft, "Новое имя", "the draft and its editor stay");
+  assert.equal(itemOf(env, CONV_A).label, "Своё", "nothing is applied from the invalid answer");
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1);
+});
+
+scenario("a_reset_answer_that_claims_a_manual_title_is_indeterminate", async () => {
+  const env = makeEnv().signedIn([A_MANUAL()], { [CONV_A]: EMPTY_HISTORY(CONV_A) });
+  await env.boot();
+
+  env.net.route("PATCH", PATCH_A, json(200, conversation(CONV_A, 30, "Ручное", {
+    title_origin: "manual",
+    can_reset_title: true,
+    last_message_at: iso(2),
+  })));
+  const reset = await env.ctl.resetTitle();
+  await env.settle();
+
+  assert.deepEqual([reset.ok, reset.reason], [false, "indeterminate"]);
+  assert.equal(env.view().title.blocked, true);
+  assert.equal(itemOf(env, CONV_A).label, "Своё", "a reset answer still claiming a manual title changes nothing");
+  assert.equal(env.view().title.canReset, true);
+});
+
+// --- PP-01-A1-R5: one processing boundary (AD-01, Option B) --------------------------------
+//
+// F1 conversation lifecycle; F2 session lifecycle; F3 operation lifecycle; F4 response
+// consistency; AD-C1 idempotent authoritative absence; AD-C2 endpoint-specific 401.
+
+// F1 (I5/I6): a title answer refreshes only the three title fields. The answer may carry a
+// snapshot of the conversation older than the page's own activity; it must not re-date or
+// re-order anything.
+scenario("a_title_confirmation_changes_only_the_three_title_fields", async () => {
+  const env = makeEnv().signedIn([
+    conversation(CONV_A, 30, "Своё", {
+      title_origin: "manual",
+      can_reset_title: true,
+      created_at: iso(1),
+      updated_at: iso(30),
+      last_message_at: iso(30),
+    }),
+    conversation(CONV_B, 0, "Второй"),
+  ], { [CONV_A]: EMPTY_HISTORY(CONV_A), [CONV_B]: EMPTY_HISTORY(CONV_B) });
+  await env.boot();
+  const before = itemOf(env, CONV_A);
+  const createdBefore = before.createdText;
+  const lastBefore = before.lastText;
+
+  env.net.route("PATCH", PATCH_A, json(200, conversation(CONV_A, 0, "Новое имя", {
+    title_origin: "manual",
+    can_reset_title: true,
+    created_at: iso(1),
+    updated_at: iso(2),
+    last_message_at: iso(2),
+  })));
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+  assert.equal((await env.ctl.saveTitle()).ok, true);
+  await env.settle();
+
+  const after = itemOf(env, CONV_A);
+  assert.equal(after.label, "Новое имя");
+  assert.equal(after.titleOrigin, "manual");
+  assert.equal(after.createdText, createdBefore, "a title answer never changes the creation date");
+  assert.equal(after.lastText, lastBefore, "nor the latest-message date");
+  assert.deepEqual(env.view().list.items.map((item) => item.id), [CONV_A, CONV_B], "nor membership or order");
+});
+
+// OD-2: compatibility inference is confined to reads. The older title shape is still a
+// valid list answer...
+scenario("a_list_read_may_still_use_the_older_title_shape", async () => {
+  const older = conversation(CONV_A, 0, "Борщ");
+  delete older.title_origin;
+  delete older.can_reset_title;
+  const env = makeEnv().signedIn([older], { [CONV_A]: EMPTY_HISTORY(CONV_A) });
+  await env.boot();
+
+  assert.equal(itemOf(env, CONV_A).label, "Борщ");
+  assert.equal(itemOf(env, CONV_A).titleOrigin, "derived");
+});
+
+// F4 (I3/I9): ...but it is never evidence that a mutation succeeded. Every required part of
+// the PATCH summary is validated, with no inference and no repair.
+const INVALID_RENAME_ANSWERS = [
+  { name: "no title_origin", make: (body) => { delete body.title_origin; return body; } },
+  { name: "no can_reset_title", make: (body) => { delete body.can_reset_title; return body; } },
+  { name: "no last_message_at", make: (body) => { delete body.last_message_at; return body; } },
+  { name: "no created_at", make: (body) => { delete body.created_at; return body; } },
+  { name: "unparseable created_at", make: (body) => ({ ...body, created_at: "вчера" }) },
+  // C4: a calendar date the server cannot have serialized is not a plausible answer. These
+  // are all dates Date would silently normalize into a different day.
+  { name: "impossible created day", make: (body) => ({ ...body, created_at: "2026-02-29T12:00:00+00:00" }) },
+  { name: "impossible updated day", make: (body) => ({ ...body, updated_at: "2026-04-31T12:00:00+00:00" }) },
+  { name: "impossible last_message day", make: (body) => ({ ...body, last_message_at: "2026-11-31T12:00:00+00:00" }) },
+  { name: "year zero", make: (body) => ({ ...body, created_at: "0000-01-01T00:00:00+00:00" }) },
+  { name: "offset that rolls over", make: (body) => ({ ...body, updated_at: "2026-10-18T12:00:00+24:00" }) },
+  { name: "manual but not resettable", make: (body) => ({ ...body, can_reset_title: false }) },
+  { name: "derived but resettable", make: (body) => ({ ...body, title_origin: "derived", can_reset_title: true }) },
+  { name: "none but carrying text", make: (body) => ({ ...body, title_origin: "none", can_reset_title: false }) },
+  { name: "derived but carrying no text", make: (body) => ({ ...body, title_origin: "derived", title: null, can_reset_title: false }) },
+  { name: "none but resettable", make: (body) => ({ ...body, title_origin: "none", title: null, can_reset_title: true }) },
+];
+
+scenario("a_title_answer_outside_the_strict_summary_contract_is_never_confirmed", async () => {
+  for (const invalid of INVALID_RENAME_ANSWERS) {
+    const base = conversation(CONV_A, 30, "Новое имя", {
+      title_origin: "manual",
+      can_reset_title: true,
+      last_message_at: iso(2),
+    });
+    const env = makeEnv().signedIn([A_MANUAL()], { [CONV_A]: EMPTY_HISTORY(CONV_A) });
+    await env.boot();
+    env.net.route("PATCH", PATCH_A, json(200, invalid.make(base)));
+    if (base.title === null) {
+      const outcome = await env.ctl.resetTitle();
+      await env.settle();
+      assert.deepEqual([outcome.ok, outcome.reason], [false, "indeterminate"], invalid.name);
+    } else {
+      env.ctl.beginTitleEdit();
+      env.ctl.syncTitleDraft("Новое имя");
+      const outcome = await env.ctl.saveTitle();
+      await env.settle();
+      assert.deepEqual([outcome.ok, outcome.reason], [false, "indeterminate"], invalid.name);
+    }
+    assert.equal(env.view().title.blocked, true, invalid.name + ": guarded");
+    assert.equal(itemOf(env, CONV_A).label, "Своё", invalid.name + ": nothing applied");
+    assert.equal(env.net.requests("PATCH", PATCH_A).length, 1, invalid.name + ": nothing retried");
+  }
+});
+
+// The strict contract must not reject a legitimate authoritative reset: a conversation with
+// no derivable text comes back with no title at all, which is a valid (if sparse) summary.
+scenario("a_reset_to_no_title_at_all_is_a_confirmed_success", async () => {
+  const env = makeEnv().signedIn([A_MANUAL()], { [CONV_A]: EMPTY_HISTORY(CONV_A) });
+  await env.boot();
+
+  env.net.route("PATCH", PATCH_A, json(200, conversation(CONV_A, 30, null, {
+    title_origin: "none",
+    can_reset_title: false,
+    last_message_at: null,
+  })));
+  const outcome = await env.ctl.resetTitle();
+  await env.settle();
+
+  assert.equal(outcome.ok, true);
+  assert.equal(env.view().title.origin, "none");
+  assert.equal(env.view().title.canReset, false);
+  assert.equal(env.view().title.blocked, false);
+});
+
+// C4: a genuine leap day, an early year and fractional seconds are still a confirmed answer.
+scenario("a_strict_mutation_answer_accepts_a_leap_day_an_early_year_and_fractional_seconds", async () => {
+  const env = makeEnv().signedIn([A_MANUAL()], { [CONV_A]: EMPTY_HISTORY(CONV_A) });
+  await env.boot();
+
+  env.net.route("PATCH", PATCH_A, json(200, conversation(CONV_A, 30, "Новое имя", {
+    title_origin: "manual",
+    can_reset_title: true,
+    created_at: "2024-02-29T12:00:00+00:00",
+    updated_at: "0099-12-31T23:59:59+00:00",
+    last_message_at: "2024-02-29T12:00:00.123456+00:00",
+  })));
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+  assert.equal((await env.ctl.saveTitle()).ok, true);
+  await env.settle();
+
+  assert.equal(itemOf(env, CONV_A).label, "Новое имя");
+  assert.equal(env.view().title.blocked, false);
+});
+
+// C4: the strict parser validates the calendar before converting, and keeps the year the
+// text names. The compatibility parser used for reads is deliberately unchanged.
+scenario("strict_mutation_timestamps_validate_the_calendar_before_any_conversion", async () => {
+  const earlyLeap = (function () {
+    const date = new Date(0);
+    date.setUTCFullYear(96, 1, 29);
+    date.setUTCHours(12, 0, 0, 0);
+    return date.getTime();
+  })();
+  assert.equal(Logic.parseTimestampStrict("2024-02-29T12:00:00+00:00"), Date.UTC(2024, 1, 29, 12, 0, 0));
+  assert.equal(Logic.parseTimestampStrict("0096-02-29T12:00:00+00:00"), earlyLeap, "the year 96, not 1996");
+  assert.equal(Logic.parseTimestampStrict("2026-02-29T12:00:00+00:00"), null, "2026 is not a leap year");
+  assert.equal(Logic.parseTimestampStrict("2026-04-31T12:00:00+00:00"), null);
+  assert.equal(Logic.parseTimestampStrict("2026-11-31T12:00:00+00:00"), null);
+  assert.equal(Logic.parseTimestampStrict("0000-01-01T00:00:00+00:00"), null);
+  assert.equal(Logic.parseTimestampStrict("2026-10-18T24:00:00+00:00"), null);
+  assert.equal(Logic.parseTimestampStrict("2026-10-18T23:60:00+00:00"), null);
+  assert.equal(Logic.parseTimestampStrict("2026-10-18T23:59:60+00:00"), null);
+  assert.equal(Logic.parseTimestampStrict("2026-10-18T12:00:00+24:00"), null);
+  assert.equal(Logic.parseTimestampStrict("2026-10-18T12:00:00+03:60"), null);
+  // The compatibility parser still accepts the spellings it always did.
+  assert.notEqual(Logic.parseTimestamp("2026-02-29T12:00:00+00:00"), null);
+  assert.notEqual(Logic.parseTimestamp("2026-10-18T23:59:60+00:00"), null);
+  assert.equal(Logic.parseTimestamp("2026-13-01T00:00:00Z"), null);
+});
+
+// The closed outcome model of AD-01 §5, applied to a current operation. Each cell is a fresh
+// page, one reset of A, one answer. (The session-stale, operation-invalidated and
+// ordering-superseded cells are the dedicated scenarios below and in the R5 record.)
+scenario("the_title_outcome_matrix_applies_only_the_permitted_delta", async () => {
+  const cases = [
+    {
+      name: "confirmed",
+      answer: () => json(200, conversation(CONV_A, 30, "Борщ", { last_message_at: iso(2) })),
+      check: (env, outcome) => {
+        assert.equal(outcome.ok, true);
+        assert.equal(itemOf(env, CONV_A).label, "Борщ");
+      },
+    },
+    {
+      name: "refused",
+      answer: () => apiError(400, "invalid_title"),
+      check: (env, outcome) => {
+        assert.deepEqual([outcome.ok, outcome.reason], [false, "failed"]);
+        assert.equal(itemOf(env, CONV_A).label, "Своё");
+        assert.equal(env.view().title.blocked, false, "a definitive refusal releases the conversation");
+      },
+    },
+    {
+      name: "absent",
+      answer: () => apiError(404, "conversation_not_found"),
+      check: (env, outcome) => {
+        assert.deepEqual([outcome.ok, outcome.reason], [false, "gone"]);
+        assert.ok(!itemOf(env, CONV_A));
+        assert.equal(itemOf(env, CONV_B).label, "Второй", "unrelated state is preserved");
+      },
+    },
+    {
+      name: "indeterminate",
+      answer: () => text(503, "<html>Service Unavailable</html>"),
+      check: (env, outcome) => {
+        assert.deepEqual([outcome.ok, outcome.reason], [false, "indeterminate"]);
+        assert.equal(itemOf(env, CONV_A).label, "Своё");
+        assert.equal(env.view().title.blocked, true);
+        assert.equal(itemOf(env, CONV_B).label, "Второй");
+      },
+    },
+    {
+      name: "auth_indeterminate",
+      answer: () => json(401, {}),
+      check: (env, outcome) => {
+        assert.deepEqual([outcome.ok, outcome.reason], [false, "auth_unconfirmed"]);
+        assert.equal(env.view().screen, "app", "same-account verification lets the page through");
+        assert.equal(env.view().title.blocked, true);
+        assert.equal(itemOf(env, CONV_B).label, "Второй");
+      },
+    },
+    {
+      name: "auth_refused",
+      answer: () => apiError(401, "not_authenticated"),
+      check: (env, outcome) => {
+        assert.deepEqual([outcome.ok, outcome.reason], [false, "auth"]);
+        assert.equal(env.view().screen, "login");
+        assert.deepEqual(env.view().list.items, []);
+      },
+    },
+  ];
+
+  for (const test of cases) {
+    const env = makeEnv().signedIn(
+      [A_MANUAL(), conversation(CONV_B, 0, "Второй")],
+      { [CONV_A]: EMPTY_HISTORY(CONV_A), [CONV_B]: EMPTY_HISTORY(CONV_B) }
+    );
+    await env.boot();
+    env.net.route("PATCH", PATCH_A, test.answer());
+    const outcome = await env.ctl.resetTitle();
+    await env.settle();
+    test.check(env, outcome);
+    assert.equal(env.net.requests("PATCH", PATCH_A).length, 1, test.name + ": nothing retried");
+  }
+});
+
+// F2 (I1/I2): an operation token is never reused. A completion from an earlier session
+// cannot clear the current session's own pending record, so the slow-write feedback stays.
+scenario("a_stale_session_completion_never_clears_a_current_operation_record", async () => {
+  const env = makeEnv().signedIn([A_MANUAL()], { [CONV_A]: EMPTY_HISTORY(CONV_A) });
+  await env.boot();
+
+  const oldAnswer = deferred();
+  const newAnswer = deferred();
+  env.net.route(
+    "PATCH",
+    PATCH_A,
+    async () => {
+      await oldAnswer.promise;
+      return json(200, conversation(CONV_A, 30, "Старое имя", {
+        title_origin: "manual",
+        can_reset_title: true,
+        last_message_at: iso(2),
+      }));
+    },
+    async () => {
+      await newAnswer.promise;
+      return json(200, conversation(CONV_A, 30, "Новое имя", {
+        title_origin: "manual",
+        can_reset_title: true,
+        last_message_at: iso(2),
+      }));
+    }
+  );
+
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Старое имя");
+  const oldWrite = env.ctl.saveTitle();
+  await flush();
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1);
+
+  // The session ends under the write (an authoritative 401 on a read) and the same person
+  // signs in again: the page starts over and its own sequence numbers begin at 1 again.
+  env.net.route("GET", "/api/conversations", apiError(401, "not_authenticated"), listBody([A_MANUAL()]));
+  await env.ctl.reloadList();
+  await flush();
+  assert.equal(env.view().screen, "login");
+
+  await env.ctl.start();
+  await flush(80);
+  assert.equal(env.view().screen, "app");
+  assert.equal(env.view().currentId, CONV_A);
+
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+  const newWrite = env.ctl.saveTitle();
+  await flush();
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 2, "the new session's write is out");
+
+  // Past the soft timeout: the current write is shown as still out.
+  await env.timers.advance(20000);
+  await flush();
+  assert.equal(env.view().title.pending, true);
+  assert.equal(env.view().title.slow, true);
+  assert.equal(env.view().banner.text, Logic.TEXT.titlePending);
+
+  // The earlier session's completion arrives. It belongs to a different session and a
+  // different operation object; it cannot clear the current record.
+  oldAnswer.resolve();
+  const oldOutcome = await oldWrite;
+  await flush(80);
+  assert.deepEqual([oldOutcome.ok, oldOutcome.reason], [false, "stale"]);
+  assert.equal(env.view().title.pending, true, "the current write is still known");
+  assert.equal(env.view().title.slow, true, "its slow feedback is not lost");
+  assert.equal(itemOf(env, CONV_A).titlePending, true);
+
+  newAnswer.resolve();
+  assert.equal((await newWrite).ok, true);
+  await env.settle();
+  assert.equal(itemOf(env, CONV_A).label, "Новое имя");
+  assert.equal(env.view().title.pending, false);
+});
+
+// F3 (AD-C2): endpoint-specific 401 classification.
+scenario("the_applications_pre_write_401_ends_the_session", async () => {
+  const env = makeEnv().signedIn([A_MANUAL()], { [CONV_A]: EMPTY_HISTORY(CONV_A) });
+  await env.boot();
+
+  env.net.route("PATCH", PATCH_A, apiError(401, "not_authenticated"));
+  const outcome = await env.ctl.resetTitle();
+  await env.settle();
+
+  assert.deepEqual([outcome.ok, outcome.reason], [false, "auth"]);
+  assert.equal(env.view().screen, "login");
+  assert.deepEqual(env.view().list.items, []);
+});
+
+scenario("a_401_outside_the_pre_write_contract_is_indeterminate_and_verifies_the_session", async () => {
+  const env = makeEnv().signedIn(
+    [A_MANUAL(), conversation(CONV_B, 0, "Второй")],
+    { [CONV_A]: EMPTY_HISTORY(CONV_A), [CONV_B]: EMPTY_HISTORY(CONV_B) }
+  );
+  await env.boot();
+  const verifications = gets(env, "/auth/me");
+
+  // A status-only 401: it proves nothing about the write (AD-C2).
+  env.net.route("PATCH", PATCH_A, text(401, "<html>Unauthorized</html>"));
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+  const outcome = await env.ctl.saveTitle();
+  await env.settle();
+
+  assert.deepEqual([outcome.ok, outcome.reason], [false, "auth_unconfirmed"]);
+  assert.equal(env.view().screen, "app", "the session is verified, not declared over");
+  assert.equal(gets(env, "/auth/me"), verifications + 1, "a fresh verification is asked");
+  assert.equal(env.view().title.blocked, true, "the guard survives same-account verification");
+  assert.equal(env.view().title.draft, "Новое имя", "and so does the draft");
+  assert.equal(itemOf(env, CONV_A).label, "Своё", "nothing is applied and nothing is retried");
+  assert.equal(itemOf(env, CONV_B).label, "Второй", "unrelated conversations stay usable");
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1, "successful verification is not a mutation completion");
+
+  const again = await env.ctl.saveTitle();
+  assert.deepEqual([again.ok, again.reason], [false, "unconfirmed"]);
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1, "no conflicting write is released");
+});
+
+scenario("an_indeterminate_401_verified_as_another_account_preserves_isolation", async () => {
+  const env = makeEnv().signedIn([A_MANUAL()], { [CONV_A]: EMPTY_HISTORY(CONV_A) });
+  await env.boot();
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Черновик прежнего человека");
+
+  env.net.route("PATCH", PATCH_A, json(401, {}));
+  env.net.route("GET", "/auth/me", me(86400, USER_B));
+  env.net.route("GET", "/api/conversations", listBody([conversation(CONV_C, 0, "Чужой")]));
+  env.net.route("GET", new RegExp("/api/conversations/" + CONV_C + "/messages(\\?|$)"), historyBody(CONV_C, []));
+  const outcome = await env.ctl.saveTitle();
+  await env.settle();
+
+  assert.deepEqual([outcome.ok, outcome.reason], [false, "auth_unconfirmed"]);
+  assert.equal(env.view().screen, "app");
+  assert.deepEqual(env.view().list.items.map((item) => item.id), [CONV_C], "nothing of the last person's list");
+  assert.equal(env.view().title.blocked, false, "the last person's guard is not reused");
+  assert.equal(env.view().title.draft, "", "and neither is the draft");
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1);
+});
+
+scenario("an_indeterminate_401_whose_verification_finds_no_session_changes_nothing_it_should_not", async () => {
+  const env = makeEnv().signedIn([A_MANUAL()], { [CONV_A]: EMPTY_HISTORY(CONV_A) });
+  await env.boot();
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+
+  env.net.route("PATCH", PATCH_A, json(401, {}));
+  env.net.route("GET", "/auth/me", notAuthenticated());
+  const outcome = await env.ctl.saveTitle();
+  await env.settle();
+
+  assert.deepEqual([outcome.ok, outcome.reason], [false, "auth_unconfirmed"]);
+  assert.equal(env.view().screen, "login", "the established session lifecycle decides");
+  assert.deepEqual(env.view().list.items, []);
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1, "the mutation is never retried");
+});
+
+// F1/AD-C1: repeated authoritative absence is idempotent. A legitimate refill begun after
+// the first confirmation must apply even if a duplicate notification arrives meanwhile.
+scenario("a_repeated_absence_never_discards_a_legitimate_later_list_refill", async () => {
+  const env = makeEnv().signedIn(
+    [A_MANUAL(), conversation(CONV_B, 0, "Второй")],
+    { [CONV_A]: EMPTY_HISTORY(CONV_A), [CONV_B]: EMPTY_HISTORY(CONV_B) }
+  );
+  await env.boot();
+
+  env.net.route("PATCH", PATCH_A, apiError(404, "conversation_not_found"));
+  const gone = await env.ctl.resetTitle();
+  await flush();
+  assert.deepEqual([gone.ok, gone.reason], [false, "gone"]);
+
+  // A legitimate refill begins after that confirmation, and is held.
+  const heldRefill = deferred();
+  env.net.route("GET", "/api/conversations", async () => {
+    await heldRefill.promise;
+    return listBody([conversation(CONV_B, 0, "Второй, обновлённый")]);
+  });
+  const refilling = env.ctl.reloadList();
+  await flush();
+
+  // While it is out, the same authoritative absence is notified again (a delayed history
+  // read for A). It must not advance the generation and invalidate the refill.
+  env.net.route("GET", MESSAGES_A, apiError(404, "conversation_not_found"));
+  await env.ctl.selectConversation(CONV_A);
+  await flush();
+  assert.equal(env.view().currentId, null, "the duplicate notification is applied idempotently");
+
+  heldRefill.resolve();
+  await refilling;
+  await env.settle();
+
+  assert.deepEqual(env.view().list.items.map((item) => item.id), [CONV_B]);
+  assert.equal(env.view().list.items[0].label, "Второй, обновлённый", "the legitimate refill applied");
+  assert.equal(env.view().list.status, "ready");
+});
+
+// A conversation missing from a page is pagination, not absence: no marker is set and a
+// later authoritative page that contains it applies normally.
+scenario("a_conversation_missing_from_a_page_is_not_treated_as_deleted", async () => {
+  const env = makeEnv().signedIn([conversation(CONV_B, 0, "Второй")], {
+    [CONV_B]: EMPTY_HISTORY(CONV_B),
+  });
+  await env.boot();
+  assert.deepEqual(env.view().list.items.map((item) => item.id), [CONV_B]);
+
+  env.net.route("GET", "/api/conversations", listBody([A_MANUAL(), conversation(CONV_B, 0, "Второй")]));
+  await env.ctl.reloadList();
+  await env.settle();
+
+  assert.deepEqual(env.view().list.items.map((item) => item.id), [CONV_A, CONV_B]);
+});
+
+// An operation the page invalidated (the conversation was forgotten while the write was
+// out) cannot apply a success afterwards. Only the application's own absent answer is
+// applied, and that only idempotently.
+scenario("a_title_answer_for_an_invalidated_operation_changes_nothing", async () => {
+  const env = makeEnv().signedIn(
+    [A_MANUAL(), conversation(CONV_B, 0, "Второй")],
+    { [CONV_A]: EMPTY_HISTORY(CONV_A), [CONV_B]: EMPTY_HISTORY(CONV_B) }
+  );
+  await env.boot();
+
+  const held = deferred();
+  env.net.route("PATCH", PATCH_A, async () => {
+    await held.promise;
+    return json(200, conversation(CONV_A, 30, "Новое имя", {
+      title_origin: "manual",
+      can_reset_title: true,
+      last_message_at: iso(2),
+    }));
+  });
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+  const saving = env.ctl.saveTitle();
+  await flush();
+
+  // A history read confirms the conversation is gone while the title write is still out.
+  env.net.route("GET", MESSAGES_A, apiError(404, "conversation_not_found"));
+  await env.ctl.selectConversation(CONV_A);
+  await flush();
+  assert.ok(!itemOf(env, CONV_A));
+
+  held.resolve();
+  const outcome = await saving;
+  await env.settle();
+
+  assert.deepEqual([outcome.ok, outcome.reason], [false, "stale"]);
+  assert.ok(!itemOf(env, CONV_A), "a late success never resurrects an invalidated conversation");
+  assert.deepEqual(env.view().list.items.map((item) => item.id), [CONV_B]);
+  assert.equal(itemOf(env, CONV_B).label, "Второй");
+});
+
+// --- PP-01-A1-R5-C1: unified absence reconciliation and conversation lifetimes ------------
+//
+// C1: every authoritative absence (a read's 404, a title write's 404 or a confirmed DELETE)
+// goes through one reconciliation whose first applicable call owns the page-wide effects and
+// the one refill a deletion requires. C2: a title write or DELETE captures the conversation
+// lifetime that issued it, so a retired lifetime's queued work sends nothing and an old
+// completion cannot touch a newer lifetime that shares the conversation id.
+
+scenario("a_delayed_duplicate_delete_does_not_discard_a_legitimate_post_removal_refill", async () => {
+  // The R5 review's first defect: after a title 404 had already reconciled the removal the
+  // DELETE applied it a second time and started another list read, which invalidated the
+  // legitimate refill that was already out.
+  const env = makeEnv().signedIn(
+    [A_MANUAL(), conversation(CONV_B, 0, "Второй")],
+    { [CONV_A]: EMPTY_HISTORY(CONV_A), [CONV_B]: EMPTY_HISTORY(CONV_B) }
+  );
+  await env.boot();
+  assert.equal(gets(env, "/api/conversations"), 1);
+  assert.equal(env.view().currentId, CONV_A);
+
+  // The explicit DELETE is out and held.
+  const heldDelete = deferred();
+  env.net.route("DELETE", PATCH_A, async () => {
+    await heldDelete.promise;
+    return removedBody();
+  });
+  env.ctl.askDeleteConversation(CONV_A);
+  const deleting = env.ctl.deleteConversation();
+  await flush();
+  assert.equal(env.net.requests("DELETE", PATCH_A).length, 1);
+
+  // The title reset learns the conversation is gone first. This call is the first applicable
+  // confirmation, so it owns the deletion's one refill even though the DELETE is still out.
+  const heldRefill = deferred();
+  env.net.route("PATCH", PATCH_A, apiError(404, "conversation_not_found"));
+  env.net.route("GET", "/api/conversations", async () => {
+    await heldRefill.promise;
+    return listBody([conversation(CONV_B, 0, "Второй, обновлённый")]);
+  });
+  const gone = await env.ctl.resetTitle();
+  await flush();
+  assert.deepEqual([gone.ok, gone.reason], [false, "gone"]);
+  assert.equal(gets(env, "/api/conversations"), 2, "the first confirmation starts the refill");
+  assert.equal(env.view().list.status, "loading");
+
+  // The DELETE's delayed duplicate answer settles: it acknowledges the removal and schedules
+  // no work of its own.
+  heldDelete.resolve();
+  const deleted = await deleting;
+  await flush();
+  assert.equal(deleted.ok, true);
+  assert.equal(deleted.wasCurrent, false, "the duplicate leaves the current view alone");
+  assert.equal(gets(env, "/api/conversations"), 2, "a duplicate absence starts no further read");
+
+  heldRefill.resolve();
+  await env.settle();
+  assert.deepEqual(env.view().list.items.map((item) => item.id), [CONV_B]);
+  assert.equal(itemOf(env, CONV_B).label, "Второй, обновлённый", "the legitimate refill applied");
+  assert.equal(env.view().list.status, "ready");
+});
+
+scenario("a_deletion_confirmed_while_the_page_is_held_back_refills_the_list_exactly_once", async () => {
+  const env = makeEnv().signedIn(
+    [A_MANUAL(), conversation(CONV_B, 0, "Второй")],
+    { [CONV_A]: EMPTY_HISTORY(CONV_A), [CONV_B]: EMPTY_HISTORY(CONV_B) }
+  );
+  await env.boot();
+  const listReads = gets(env, "/api/conversations");
+
+  // The DELETE is dispatched while the page is open...
+  const heldDelete = deferred();
+  env.net.route("DELETE", PATCH_A, async () => {
+    await heldDelete.promise;
+    return removedBody();
+  });
+  env.ctl.askDeleteConversation(CONV_A);
+  const deleting = env.ctl.deleteConversation();
+  await flush();
+
+  // ...then the page is held back, and the deletion is confirmed while it is.
+  const heldMe = deferred();
+  env.net.route("GET", "/auth/me", async () => {
+    await heldMe.promise;
+    return me();
+  });
+  env.ctl.restore();
+  await flush(60); // (the verification is still out: settle would wait on it)
+  heldDelete.resolve();
+  const deleted = await deleting;
+  await flush(60);
+  assert.equal(deleted.ok, true);
+  assert.equal(gets(env, "/api/conversations"), listReads, "nothing is asked while the page is held back");
+
+  // The same person is confirmed: the one refill happens now, and only once.
+  env.net.route("GET", "/api/conversations", listBody([conversation(CONV_B, 0, "Второй, обновлённый")]));
+  heldMe.resolve();
+  await env.settle();
+  assert.equal(gets(env, "/api/conversations"), listReads + 1, "exactly one refill after the gate opens");
+  assert.deepEqual(env.view().list.items.map((item) => item.id), [CONV_B]);
+  assert.equal(itemOf(env, CONV_B).label, "Второй, обновлённый");
+});
+
+scenario("a_queued_rename_is_dropped_when_the_reset_ahead_of_it_finds_the_conversation_gone", async () => {
+  const env = makeEnv().signedIn(
+    [A_MANUAL(), conversation(CONV_B, 0, "Второй")],
+    { [CONV_A]: EMPTY_HISTORY(CONV_A), [CONV_B]: EMPTY_HISTORY(CONV_B) }
+  );
+  await env.boot();
+
+  const heldReset = deferred();
+  env.net.route("PATCH", PATCH_A, async () => {
+    await heldReset.promise;
+    return apiError(404, "conversation_not_found");
+  });
+  const resetting = env.ctl.resetTitle();
+  await flush();
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1);
+
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+  const renaming = env.ctl.saveTitle();
+  await flush();
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1, "the rename waits behind the reset");
+
+  heldReset.resolve();
+  assert.deepEqual([(await resetting).ok, (await resetting).reason], [false, "gone"]);
+  assert.deepEqual([(await renaming).ok, (await renaming).reason], [false, "stale"]);
+  await env.settle();
+
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1, "the retired lifetime sent nothing");
+  assert.ok(!itemOf(env, CONV_A));
+  assert.equal(env.view().currentId, null);
+});
+
+scenario("a_title_write_waiting_on_the_session_gate_is_never_sent_after_its_lifetime_is_retired", async () => {
+  const env = makeEnv().signedIn(
+    [A_MANUAL(), conversation(CONV_B, 0, "Второй")],
+    { [CONV_A]: EMPTY_HISTORY(CONV_A), [CONV_B]: EMPTY_HISTORY(CONV_B) }
+  );
+  await env.boot();
+
+  // A history read that will say the conversation is gone, taken before the page is held back.
+  const heldHistory = deferred();
+  env.net.route("GET", MESSAGES_A, async () => {
+    await heldHistory.promise;
+    return apiError(404, "conversation_not_found");
+  });
+  const reading = env.ctl.reloadThread();
+  await flush();
+
+  // The page is held back: who is signed in is asked and the answer is held.
+  const heldMe = deferred();
+  env.net.route("GET", "/auth/me", async () => {
+    await heldMe.promise;
+    return me();
+  });
+  env.ctl.restore();
+  await flush();
+
+  // A title write issued now waits on the gate; it is not sent.
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+  const saving = env.ctl.saveTitle();
+  await flush();
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 0, "the write is issued and held back");
+
+  // The read taken before the gate learns the conversation is gone: its lifetime is retired.
+  heldHistory.resolve();
+  await reading;
+  await flush();
+
+  // The same person is let through and the waiting write re-checks: it sends nothing.
+  heldMe.resolve();
+  await env.settle();
+  assert.deepEqual([(await saving).ok, (await saving).reason], [false, "stale"]);
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 0, "a retired queued write never reaches the server");
+  assert.equal(env.view().screen, "app");
+  assert.ok(!itemOf(env, CONV_A), "the absence is reconciled");
+  assert.equal(env.view().currentId, null);
+  assert.equal(env.view().title.pending, false);
+});
+
+scenario("a_relisted_conversation_gets_a_fresh_lifetime_and_an_old_404_cannot_touch_it", async () => {
+  const env = makeEnv().signedIn(
+    [A_MANUAL(), conversation(CONV_B, 0, "Второй")],
+    { [CONV_A]: EMPTY_HISTORY(CONV_A), [CONV_B]: EMPTY_HISTORY(CONV_B) }
+  );
+  await env.boot();
+
+  // An old rename is out; its answer will arrive after the conversation has been removed and
+  // listed again.
+  const heldOld = deferred();
+  env.net.route("PATCH", PATCH_A, async () => {
+    await heldOld.promise;
+    return apiError(404, "conversation_not_found");
+  });
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Старое имя");
+  const oldSaving = env.ctl.saveTitle();
+  await flush();
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1);
+
+  // The conversation is authoritatively removed...
+  env.net.route("GET", MESSAGES_A, apiError(404, "conversation_not_found"));
+  await env.ctl.selectConversation(CONV_A);
+  await flush();
+  assert.ok(!itemOf(env, CONV_A));
+
+  // ...and the server lists it again: a fresh lifetime, and the absence marker is revoked.
+  env.net.route("GET", "/api/conversations", listBody([A_MANUAL(), conversation(CONV_B, 0, "Второй")]));
+  await env.ctl.reloadList();
+  await flush();
+  assert.ok(itemOf(env, CONV_A), "the server lists it again");
+
+  env.net.route("GET", MESSAGES_A, EMPTY_HISTORY(CONV_A));
+  await env.ctl.selectConversation(CONV_A);
+  await flush();
+  assert.equal(env.view().currentId, CONV_A);
+
+  // A fresh write is issued and held; past the soft timeout it is visibly pending.
+  const heldNew = deferred();
+  env.net.route("PATCH", PATCH_A, async () => {
+    await heldNew.promise;
+    return json(200, conversation(CONV_A, 30, "Новое имя", {
+      title_origin: "manual",
+      can_reset_title: true,
+      last_message_at: iso(2),
+    }));
+  });
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+  const newSaving = env.ctl.saveTitle();
+  await flush();
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 2);
+  await env.timers.advance(20000);
+  await flush();
+  assert.equal(env.view().title.pending, true);
+  assert.equal(env.view().title.slow, true);
+
+  // The old write's 404 is stale: the marker it was retired by was revoked by the re-listing,
+  // so it describes a lifetime the server no longer lists and must not remove the fresh one.
+  heldOld.resolve();
+  const oldOutcome = await oldSaving;
+  await flush(80);
+  assert.deepEqual([oldOutcome.ok, oldOutcome.reason], [false, "stale"]);
+  assert.equal(env.view().title.pending, true, "the fresh write is still known");
+  assert.equal(env.view().title.slow, true, "and still shown as slow");
+  assert.equal(env.view().title.editing, true, "the fresh editor is not closed");
+  assert.equal(env.view().title.draft, "Новое имя", "and keeps its draft");
+  assert.ok(itemOf(env, CONV_A), "the conversation is still listed");
+
+  heldNew.resolve();
+  assert.equal((await newSaving).ok, true);
+  await env.settle();
+  assert.equal(itemOf(env, CONV_A).label, "Новое имя");
+});
+
+// C3: the status of a partial answer is kept. A 401 whose body could not be read is
+// indeterminate and starts a fresh verification; a 404 in the same state is not a removal.
+scenario("an_unreadable_401_answer_is_indeterminate_and_verifies_the_session", async () => {
+  const env = makeEnv().signedIn(
+    [A_MANUAL(), conversation(CONV_B, 0, "Второй")],
+    { [CONV_A]: EMPTY_HISTORY(CONV_A), [CONV_B]: EMPTY_HISTORY(CONV_B) }
+  );
+  await env.boot();
+  const verifications = gets(env, "/auth/me");
+
+  env.net.route("PATCH", PATCH_A, dropBody(401));
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+  const outcome = await env.ctl.saveTitle();
+  await env.settle();
+
+  assert.deepEqual([outcome.ok, outcome.reason], [false, "auth_unconfirmed"]);
+  assert.equal(env.view().screen, "app", "the session is verified, not declared over");
+  assert.equal(gets(env, "/auth/me"), verifications + 1, "a fresh verification is asked");
+  assert.equal(env.view().title.blocked, true, "the guard survives same-account verification");
+  assert.equal(env.view().title.draft, "Новое имя", "and so does the draft");
+  assert.equal(itemOf(env, CONV_A).label, "Своё", "nothing is applied");
+  assert.equal(itemOf(env, CONV_B).label, "Второй", "unrelated conversations stay usable");
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1, "nothing is retried");
+});
+
+scenario("an_unreadable_404_answer_is_not_an_authoritative_absence", async () => {
+  const env = makeEnv().signedIn(
+    [A_MANUAL(), conversation(CONV_B, 0, "Второй")],
+    { [CONV_A]: EMPTY_HISTORY(CONV_A), [CONV_B]: EMPTY_HISTORY(CONV_B) }
+  );
+  await env.boot();
+
+  env.net.route("PATCH", PATCH_A, dropBody(404));
+  const outcome = await env.ctl.resetTitle();
+  await env.settle();
+
+  assert.deepEqual([outcome.ok, outcome.reason], [false, "indeterminate"]);
+  assert.ok(itemOf(env, CONV_A), "an unreadable 404 proves nothing about existence");
+  assert.equal(itemOf(env, CONV_A).label, "Своё");
+  assert.equal(env.view().currentId, CONV_A);
+  assert.equal(env.view().title.blocked, true);
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1);
+});
+
+scenario("messages_are_separated_by_moscow_calendar_days_not_the_viewers", async () => {
+  const beforeMidnight = new Date(Date.UTC(2026, 9, 18, 20, 59)).toISOString().replace("Z", "+00:00");
+  const afterMidnight = new Date(Date.UTC(2026, 9, 18, 21, 0)).toISOString().replace("Z", "+00:00");
+  const env = makeEnv().signedIn([conversation(CONV_A, 0, "Борщ")], {
+    [CONV_A]: historyBody(CONV_A, [
+      message(1, "user", "До полуночи", { created_at: beforeMidnight }),
+      message(2, "assistant", "После полуночи", { created_at: afterMidnight }),
+    ]),
+  });
+  const view = await env.boot();
+
+  const separators = calendarSeparators(env);
+  assert.deepEqual(separators.map((item) => item.label), ["18.10.2026", "19.10.2026"]);
+  assert.deepEqual(separators.map((item) => item.zone), ["МСК", "МСК"]);
+  assert.deepEqual(messageItems(env).map((item) => item.time), ["23:59", "00:00"]);
+});
+
+scenario("loading_older_messages_recomputes_the_day_separators_without_duplicates", async () => {
+  const env = makeEnv().signedIn([conversation(CONV_A, 0, "Борщ")], {
+    [CONV_A]: historyBody(
+      CONV_A,
+      [message(3, "user", "Старее"), message(4, "assistant", "Новее")],
+      { hasMore: true, nextBefore: 3 }
+    ),
+  });
+  await env.boot();
+  assert.deepEqual(calendarSeparators(env).map((item) => item.label), ["18.10.2026"]);
+
+  env.net.route(
+    "GET",
+    /\/api\/conversations\/.*\/messages/,
+    historyBody(CONV_A, [message(1, "user", "Совсем старое"), message(2, "assistant", "Старое")])
+  );
+  await env.ctl.loadOlder();
+  await env.settle();
+
+  assert.deepEqual(calendarSeparators(env).map((item) => item.label), ["18.10.2026"]);
+  assert.deepEqual(messageItems(env).map((item) => item.text), ["Совсем старое", "Старое", "Старее", "Новее"]);
 });
 
 // ============================================================================================
@@ -1702,6 +4239,630 @@ scenario("an_unclear_message_cannot_be_taken_back_so_no_new_key_can_duplicate_it
     assert.equal(pendingItem(env), undefined);
     assert.equal(env.storage.record, null);
   }
+});
+
+// --- PP-01-A1-R5-C2: ownership at the absence application boundary --------------------------
+//
+// The R5-C1 reconciliation decided idempotence from the marker store alone. A completion that
+// belonged to a retired conversation lifetime could therefore still act on a newer lifetime
+// that shares the conversation id once a re-listing had revoked the marker; a detached thread
+// could remove a re-listed conversation; and a retired title acknowledgement could close a
+// temporary view owned by another request. Every absence now carries the identity of the state
+// it was issued against (thread object, turn record or conversation lifetime).
+
+// A live DELETE of the open conversation, held until the page has already reconciled the
+// removal, listed the conversation again, opened it and issued a fresh title write and a
+// fresh list read. The retired DELETE then settles in both of its confirmed forms.
+async function retiredDeleteAfterRelist(deleteAnswer) {
+  const env = makeEnv().signedIn(
+    [A_MANUAL(), conversation(CONV_B, 0, "Второй")],
+    { [CONV_A]: EMPTY_HISTORY(CONV_A), [CONV_B]: EMPTY_HISTORY(CONV_B) }
+  );
+  await env.boot();
+  assert.equal(env.view().currentId, CONV_A);
+
+  // The explicit DELETE is out and held.
+  const heldDelete = deferred();
+  env.net.route("DELETE", PATCH_A, async () => {
+    await heldDelete.promise;
+    return deleteAnswer();
+  });
+  env.ctl.askDeleteConversation(CONV_A);
+  const deleting = env.ctl.deleteConversation();
+  await flush();
+  assert.equal(env.net.requests("DELETE", PATCH_A).length, 1);
+
+  // A history read confirms the removal first. It owns the deletion's one refill, and the
+  // refill is an authoritative read begun after the marker: it lists the conversation again,
+  // so the marker is revoked and the retirement no longer describes anything current.
+  env.net.route("GET", MESSAGES_A, apiError(404, "conversation_not_found"));
+  env.net.route("GET", "/api/conversations", listBody([A_MANUAL(), conversation(CONV_B, 0, "Второй")]));
+  await env.ctl.reloadThread();
+  await flush(80); // (the held DELETE is still out: env.settle would wait on it)
+  assert.ok(itemOf(env, CONV_A), "the authoritative refill lists it again");
+
+  // The person opens it. A fresh lifetime begins with a fresh title write, which is held.
+  env.net.route("GET", MESSAGES_A, EMPTY_HISTORY(CONV_A));
+  await env.ctl.selectConversation(CONV_A);
+  await flush();
+  assert.equal(env.view().currentId, CONV_A);
+
+  const heldWrite = deferred();
+  env.net.route("PATCH", PATCH_A, async () => {
+    await heldWrite.promise;
+    return json(200, conversation(CONV_A, 30, "Новое имя", {
+      title_origin: "manual",
+      can_reset_title: true,
+      last_message_at: iso(2),
+    }));
+  });
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+  const saving = env.ctl.saveTitle();
+  await flush();
+  assert.equal(env.view().title.pending, true, "the fresh write is out");
+
+  // A legitimate newer list read is also out and held.
+  const heldList = deferred();
+  env.net.route("GET", "/api/conversations", async () => {
+    await heldList.promise;
+    return listBody([A_MANUAL(), conversation(CONV_B, 0, "Второй, обновлённый")]);
+  });
+  const reading = env.ctl.reloadList();
+  await flush();
+  const readsBefore = gets(env, "/api/conversations");
+
+  // The retired DELETE settles. It belongs to the lifetime the earlier confirmation retired
+  // and whose marker the re-listing revoked: it must change nothing.
+  heldDelete.resolve();
+  const deleted = await deleting;
+  await flush(80);
+
+  assert.equal(deleted.ok, true, "the server did delete it");
+  assert.equal(deleted.wasCurrent, false);
+  assert.equal(deleted.interaction, false, "its question is no longer the page's");
+  assert.equal(gets(env, "/api/conversations"), readsBefore, "it starts no read");
+  assert.equal(env.view().currentId, CONV_A, "the replacement view stays open");
+  assert.equal(env.view().title.editing, true, "its editor is untouched");
+  assert.equal(env.view().title.draft, "Новое имя", "and keeps the draft");
+  assert.equal(env.view().title.pending, true, "the fresh operation is still known");
+  assert.equal(env.view().title.blocked, false, "no guard is left on a newer lifetime");
+  assert.deepEqual(env.view().list.items.map((item) => item.id), [CONV_A, CONV_B], "membership is unchanged");
+  assert.equal(env.view().banner, null, "no current-view feedback is applied");
+
+  // The legitimate read that was out still applies.
+  heldList.resolve();
+  await reading;
+  await flush();
+  assert.equal(itemOf(env, CONV_B).label, "Второй, обновлённый", "the newer read is still authoritative");
+  assert.equal(env.view().list.status, "ready");
+
+  heldWrite.resolve();
+  assert.equal((await saving).ok, true, "the fresh write completes normally");
+  await env.settle();
+  assert.equal(itemOf(env, CONV_A).label, "Новое имя");
+}
+
+scenario("a_retired_delete_cannot_touch_a_relisted_lifetime_204", async () => {
+  await retiredDeleteAfterRelist(H.removedBody);
+});
+
+scenario("a_retired_delete_cannot_touch_a_relisted_lifetime_404", async () => {
+  await retiredDeleteAfterRelist(() => apiError(404, "conversation_not_found"));
+});
+
+// A latest-history read whose thread has been detached (the conversation was removed and
+// listed again, and a fresh view is open) cannot remove the re-listed conversation.
+scenario("a_detached_latest_history_absence_cannot_touch_a_relisted_conversation", async () => {
+  const env = makeEnv().signedIn(
+    [A_MANUAL(), conversation(CONV_B, 0, "Второй")],
+    { [CONV_A]: EMPTY_HISTORY(CONV_A), [CONV_B]: EMPTY_HISTORY(CONV_B) }
+  );
+  await env.boot();
+  assert.equal(env.view().currentId, CONV_A);
+
+  // A latest read of A is out and held; its answer will be an authoritative 404.
+  const heldLatest = deferred();
+  env.net.route(
+    "GET",
+    MESSAGES_A,
+    async () => {
+      await heldLatest.promise;
+      return apiError(404, "conversation_not_found");
+    },
+    EMPTY_HISTORY(CONV_A)
+  );
+  const lateLatest = env.ctl.reloadThread();
+  await flush();
+  assert.equal(env.net.requests("GET", MESSAGES_A).length, 2);
+
+  // The removal is reconciled by an applicable DELETE, and its refill already lists the
+  // conversation again: the marker is revoked.
+  env.net.route("DELETE", PATCH_A, H.removedBody());
+  env.net.route("GET", "/api/conversations", listBody([A_MANUAL(), conversation(CONV_B, 0, "Второй")]));
+  env.ctl.askDeleteConversation(CONV_A);
+  assert.equal((await env.ctl.deleteConversation()).ok, true);
+  await flush(80); // (the held latest read is still out: env.settle would wait on it)
+  assert.ok(itemOf(env, CONV_A), "the server lists it again");
+
+  // The person opens it: a fresh thread and a fresh view.
+  await env.ctl.selectConversation(CONV_A);
+  await flush();
+  assert.equal(env.view().currentId, CONV_A);
+  const readsBefore = gets(env, "/api/conversations");
+
+  // The late 404 belongs to the thread the page no longer holds.
+  heldLatest.resolve();
+  await lateLatest;
+  await env.settle();
+
+  assert.equal(env.view().currentId, CONV_A, "the detached read does not close the replacement view");
+  assert.ok(itemOf(env, CONV_A), "nor remove the re-listed conversation");
+  assert.equal(env.view().banner, null);
+  assert.equal(gets(env, "/api/conversations"), readsBefore, "and starts no read");
+});
+
+// An older-history read whose thread has been detached cannot remove a re-listed
+// conversation either.
+scenario("a_detached_older_history_absence_cannot_touch_a_relisted_conversation", async () => {
+  const env = makeEnv().signedIn(
+    [conversation(CONV_A, 30, "Борщ"), conversation(CONV_B, 0, "Второй")],
+    {
+      [CONV_A]: historyBody(CONV_A, [message(1, "user", "Старый вопрос"), message(2, "assistant", "Старый ответ")], {
+        hasMore: true,
+        nextBefore: 1,
+      }),
+      [CONV_B]: EMPTY_HISTORY(CONV_B),
+    }
+  );
+  await env.boot();
+  assert.equal(env.view().currentId, CONV_A);
+  assert.equal(env.view().thread.hasMore, true);
+
+  const heldOlder = deferred();
+  env.net.route(
+    "GET",
+    MESSAGES_A,
+    async () => {
+      await heldOlder.promise;
+      return apiError(404, "conversation_not_found");
+    },
+    EMPTY_HISTORY(CONV_A)
+  );
+  const older = env.ctl.loadOlder();
+  await flush();
+  assert.equal(env.net.requests("GET", MESSAGES_A).length, 2);
+
+  // The removal is confirmed and the refill already lists the conversation again.
+  env.net.route("DELETE", PATCH_A, H.removedBody());
+  env.net.route("GET", "/api/conversations", listBody([conversation(CONV_A, 30, "Борщ"), conversation(CONV_B, 0, "Второй")]));
+  env.ctl.askDeleteConversation(CONV_A);
+  assert.equal((await env.ctl.deleteConversation()).ok, true);
+  await flush(80); // (the held older read is still out: env.settle would wait on it)
+  assert.ok(itemOf(env, CONV_A), "the server lists it again");
+
+  // A fresh view of it is open when the detached older answer arrives.
+  await env.ctl.selectConversation(CONV_A);
+  await flush();
+  assert.equal(env.view().currentId, CONV_A);
+  const readsBefore = gets(env, "/api/conversations");
+
+  heldOlder.resolve();
+  await older;
+  await env.settle();
+
+  assert.equal(env.view().currentId, CONV_A, "the replacement view stays open");
+  assert.ok(itemOf(env, CONV_A), "the re-listed conversation stays listed");
+  assert.equal(env.view().banner, null);
+  assert.equal(gets(env, "/api/conversations"), readsBefore, "no extra read");
+});
+
+// Applicable ownership is still honoured off page: the person moves to another conversation
+// while A's older page is out, and A's authoritative 404 still removes A without touching the
+// open conversation.
+scenario("an_applicable_older_absence_still_removes_an_off_page_conversation", async () => {
+  const env = makeEnv().signedIn(
+    [conversation(CONV_A, 30, "Борщ"), conversation(CONV_B, 0, "Второй")],
+    {
+      [CONV_A]: historyBody(CONV_A, [message(1, "user", "Старый вопрос"), message(2, "assistant", "Старый ответ")], {
+        hasMore: true,
+        nextBefore: 1,
+      }),
+      [CONV_B]: EMPTY_HISTORY(CONV_B),
+    }
+  );
+  await env.boot();
+  assert.equal(env.view().currentId, CONV_A);
+  assert.equal(env.view().thread.hasMore, true);
+
+  const heldOlder = deferred();
+  env.net.route("GET", MESSAGES_A, async () => {
+    await heldOlder.promise;
+    return apiError(404, "conversation_not_found");
+  });
+  const older = env.ctl.loadOlder();
+  await flush();
+  assert.equal(env.net.requests("GET", MESSAGES_A).length, 2);
+
+  await env.ctl.selectConversation(CONV_B);
+  await flush();
+  assert.equal(env.view().currentId, CONV_B);
+
+  heldOlder.resolve();
+  await older;
+  await env.settle();
+
+  assert.equal(env.view().currentId, CONV_B, "the open conversation is not closed");
+  assert.deepEqual(env.view().list.items.map((item) => item.id), [CONV_B], "the off-page conversation is removed");
+  assert.equal(env.view().banner, null, "no feedback about a conversation that was not open");
+  assert.equal(gets(env, "/api/conversations"), 1, "an absence without a deletion refills nothing");
+});
+
+// A retired title acknowledgement is idempotent: it may not close a temporary view of the
+// same conversation owned by a different request. That view closes on its own history
+// answer, without another list generation advance or refill.
+scenario("a_retired_title_acknowledgement_does_not_close_a_temporary_view", async () => {
+  const env = makeEnv().signedIn(
+    [A_MANUAL(), conversation(CONV_B, 0, "Второй")],
+    { [CONV_A]: EMPTY_HISTORY(CONV_A), [CONV_B]: EMPTY_HISTORY(CONV_B) }
+  );
+  await env.boot();
+  assert.equal(env.view().currentId, CONV_A);
+
+  // A title write of A is out and held; its answer will be an authoritative 404.
+  const heldPatch = deferred();
+  env.net.route("PATCH", PATCH_A, async () => {
+    await heldPatch.promise;
+    return apiError(404, "conversation_not_found");
+  });
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+  const saving = env.ctl.saveTitle();
+  await flush();
+  assert.equal(env.net.requests("PATCH", PATCH_A).length, 1);
+
+  // A history read reconciles the removal first: the lifetime is retired and the view closes.
+  env.net.route("GET", MESSAGES_A, apiError(404, "conversation_not_found"));
+  await env.ctl.reloadThread();
+  await flush(80); // (the held PATCH is still out: env.settle would wait on it)
+  assert.ok(!itemOf(env, CONV_A));
+  assert.equal(env.view().currentId, null);
+  const readsBefore = gets(env, "/api/conversations");
+
+  // The person opens a temporary view of the same conversation. Its own history answer is
+  // held, so the view is open when the retired title acknowledgement arrives.
+  const heldTemp = deferred();
+  env.net.route("GET", MESSAGES_A, async () => {
+    await heldTemp.promise;
+    return apiError(404, "conversation_not_found");
+  });
+  const tempOpening = env.ctl.selectConversation(CONV_A);
+  await flush();
+  assert.equal(env.view().currentId, CONV_A);
+
+  heldPatch.resolve();
+  const outcome = await saving;
+  await flush(80);
+  assert.deepEqual([outcome.ok, outcome.reason], [false, "gone"]);
+  assert.equal(env.view().currentId, CONV_A, "the retired acknowledgement does not close the temporary view");
+  assert.equal(env.view().thread.status, "loading", "the view is still its own request's");
+  assert.equal(gets(env, "/api/conversations"), readsBefore, "no list generation advance and no refill");
+  assert.equal(env.view().banner, null, "no absence feedback is applied");
+
+  // The temporary view's own answer closes it, without a further read.
+  heldTemp.resolve();
+  await tempOpening;
+  await env.settle();
+  assert.equal(env.view().currentId, null);
+  assert.equal(gets(env, "/api/conversations"), readsBefore, "still no refill");
+});
+
+// --- PP-01-A1-R5-C3: the lifetime a completion belongs to -----------------------------------
+//
+// Two completions still acted on state they were not issued against: a temporary history
+// answer outlived the absence marker that made its view temporary, and a reconciliation
+// looked its pending turn up again by conversation id. Both are now owned by the record
+// they began with (the absence generation, the turn object), not by what the page holds
+// when they settle.
+
+// A temporary view's history answer was issued against an AD-C1 marker. Once an
+// authoritative re-listing revokes that marker the answer belongs to the removed lifetime,
+// not to the conversation the server lists again: it may not remove the conversation, clear
+// a confirmed title, a newer operation, its draft or its guard, or invalidate a legitimate
+// read begun after the re-listing.
+scenario("an_obsolete_temporary_history_absence_cannot_touch_a_relisted_conversation", async () => {
+  const env = makeEnv().signedIn(
+    [A_MANUAL(), conversation(CONV_B, 0, "Второй")],
+    { [CONV_A]: EMPTY_HISTORY(CONV_A), [CONV_B]: EMPTY_HISTORY(CONV_B) }
+  );
+  await env.boot();
+  assert.equal(env.view().currentId, CONV_A);
+
+  // The conversation is authoritatively removed: a history read reconciles it and the
+  // absence marker is current.
+  env.net.route("GET", MESSAGES_A, apiError(404, "conversation_not_found"));
+  await env.ctl.reloadThread();
+  await flush(80);
+  assert.ok(!itemOf(env, CONV_A));
+  assert.equal(env.view().currentId, null);
+
+  // A temporary view of it is opened; its own history read is held and will answer 404.
+  const heldTemp = deferred();
+  env.net.route("GET", MESSAGES_A, async () => {
+    await heldTemp.promise;
+    return apiError(404, "conversation_not_found");
+  });
+  const tempOpening = env.ctl.selectConversation(CONV_A);
+  await flush();
+  assert.equal(env.view().currentId, CONV_A, "the temporary view is open");
+  assert.equal(env.view().thread.status, "loading");
+
+  // An authoritative re-listing lists it again: the marker is revoked.
+  env.net.route("GET", "/api/conversations", listBody([A_MANUAL(), conversation(CONV_B, 0, "Второй")]));
+  await env.ctl.reloadList();
+  assert.ok(itemOf(env, CONV_A), "the server lists the conversation again");
+  assert.equal(env.view().currentId, CONV_A, "the temporary view is still open");
+
+  // A legitimate list read begins and is held; its answer carries a newer B.
+  const heldList = deferred();
+  env.net.route("GET", "/api/conversations", async () => {
+    await heldList.promise;
+    return listBody([A_MANUAL(), conversation(CONV_B, 0, "Второй, обновлённый")]);
+  });
+  const reading = env.ctl.reloadList();
+  await flush();
+  const readsBefore = gets(env, "/api/conversations");
+
+  // A title write of the re-listed conversation is confirmed while that read is out...
+  env.net.route("PATCH", PATCH_A, json(200, conversation(CONV_A, 30, "Новое имя", {
+    title_origin: "manual",
+    can_reset_title: true,
+    last_message_at: iso(2),
+  })));
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Новое имя");
+  assert.equal((await env.ctl.saveTitle()).ok, true);
+  assert.equal(itemOf(env, CONV_A).label, "Новое имя", "the confirmed title is on the item");
+
+  // ...and a newer write is out and held, with its draft.
+  const heldWrite = deferred();
+  env.net.route("PATCH", PATCH_A, async () => {
+    await heldWrite.promise;
+    return json(200, conversation(CONV_A, 30, "Ещё имя", {
+      title_origin: "manual",
+      can_reset_title: true,
+      last_message_at: iso(2),
+    }));
+  });
+  env.ctl.beginTitleEdit();
+  env.ctl.syncTitleDraft("Ещё имя");
+  const saving = env.ctl.saveTitle();
+  await flush();
+  assert.equal(env.view().title.pending, true, "the fresh write is out");
+  assert.equal(env.view().title.draft, "Ещё имя");
+  const bannerBefore = env.view().banner; // the confirmed rename's own truthful feedback
+
+  // The answer the re-listed conversation deserves: a read issued after the marker was
+  // revoked is applicable. The obsolete answer settling is what asks for it (R5-C4).
+  env.net.route("GET", MESSAGES_A, EMPTY_HISTORY(CONV_A));
+  const messageReadsBefore = env.net.requests("GET", MESSAGES_A).length;
+
+  // The obsolete temporary answer settles. It belongs to the marker the re-listing revoked.
+  heldTemp.resolve();
+  await tempOpening;
+  await flush(80);
+
+  assert.equal(env.view().currentId, CONV_A, "it does not close the re-listed view");
+  assert.ok(itemOf(env, CONV_A), "nor remove the re-listed conversation");
+  assert.equal(itemOf(env, CONV_A).label, "Новое имя", "nor clear the confirmed title");
+  assert.equal(env.view().title.editing, true, "a fresh operation keeps its editor");
+  assert.equal(env.view().title.draft, "Ещё имя", "and its draft");
+  assert.equal(env.view().title.pending, true, "the fresh operation is still known");
+  assert.equal(env.view().title.blocked, false, "no guard is left");
+  assert.deepEqual(env.view().banner, bannerBefore, "no absence feedback is applied");
+  assert.equal(gets(env, "/api/conversations"), readsBefore, "it starts no list read and invalidates none");
+  // The stale answer may not leave the selected view waiting for ever: one fresh applicable
+  // read was issued and its history is now the view's, so the composer is usable again.
+  assert.equal(
+    env.net.requests("GET", MESSAGES_A).length,
+    messageReadsBefore + 1,
+    "exactly one fresh applicable history read follows the obsolete settlement"
+  );
+  assert.equal(env.view().thread.status, "ready", "the history leaves the loading state");
+  assert.equal(env.view().thread.error, null, "no history error is shown");
+  assert.equal(env.view().composer.locked, false, "the composer is usable again");
+  assert.equal(
+    env.view().thread.items.filter(function (entry) { return entry.type === "message"; }).length,
+    2,
+    "the fresh history is displayed"
+  );
+
+  // The legitimate read that was out still applies.
+  heldList.resolve();
+  await reading;
+  await flush();
+  assert.equal(itemOf(env, CONV_B).label, "Второй, обновлённый", "the newer read is authoritative");
+  assert.equal(itemOf(env, CONV_A).label, "Новое имя", "the confirmed title is kept by the read begun before it");
+
+  // The fresh write completes normally.
+  heldWrite.resolve();
+  assert.equal((await saving).ok, true);
+  await flush();
+  assert.equal(itemOf(env, CONV_A).label, "Ещё имя");
+});
+
+// R5-C4: the fresh read a stale temporary-history settlement asks for can fail. The view must
+// not stay in an indefinite loading state: it takes the established history-error state, whose
+// retry reads the history again.
+scenario("a_failed_history_recovery_exposes_the_established_retry", async () => {
+  const env = makeEnv().signedIn(
+    [A_MANUAL(), conversation(CONV_B, 0, "Второй")],
+    { [CONV_A]: EMPTY_HISTORY(CONV_A), [CONV_B]: EMPTY_HISTORY(CONV_B) }
+  );
+  await env.boot();
+  assert.equal(env.view().currentId, CONV_A);
+
+  // The conversation is authoritatively removed and the page holds the absence marker.
+  env.net.route("GET", MESSAGES_A, apiError(404, "conversation_not_found"));
+  await env.ctl.reloadThread();
+  await flush(80);
+  assert.ok(!itemOf(env, CONV_A));
+  assert.equal(env.view().currentId, null);
+
+  // A temporary view of it is opened; its own held answer will be a stale 404.
+  const heldTemp = deferred();
+  env.net.route("GET", MESSAGES_A, async () => {
+    await heldTemp.promise;
+    return apiError(404, "conversation_not_found");
+  });
+  const tempOpening = env.ctl.selectConversation(CONV_A);
+  await flush();
+  assert.equal(env.view().currentId, CONV_A);
+
+  // An authoritative re-listing revokes the marker; the recovery read then fails.
+  env.net.route("GET", "/api/conversations", listBody([A_MANUAL(), conversation(CONV_B, 0, "Второй")]));
+  await env.ctl.reloadList();
+  env.net.route("GET", MESSAGES_A, apiError(503, "service_unavailable"));
+
+  heldTemp.resolve();
+  await tempOpening;
+  await flush(80);
+
+  assert.equal(env.view().currentId, CONV_A, "the re-listed view is still open");
+  assert.ok(itemOf(env, CONV_A), "and the conversation is still listed");
+  assert.equal(env.view().thread.status, "error", "the failed recovery takes the history-error state");
+  assert.ok(env.view().thread.error, "with a reason for the person");
+  assert.equal(env.view().composer.locked, true, "there is nothing truthful to write into yet");
+  assert.equal(env.view().composer.hint, Logic.TEXT.historyUnavailable, "the hint offers the established retry");
+
+  // The retry mechanism reads the history again; success restores the composer.
+  env.net.route("GET", MESSAGES_A, EMPTY_HISTORY(CONV_A));
+  await env.ctl.reloadThread();
+  await env.settle();
+  assert.equal(env.view().thread.status, "ready");
+  assert.equal(env.view().thread.error, null);
+  assert.equal(env.view().composer.locked, false);
+});
+
+// R5-C4: recovery must attach to a read that is already applicable rather than issue a second
+// one. While the fresh read is out, asking for the history again joins it.
+scenario("a_history_recovery_does_not_duplicate_an_already_running_read", async () => {
+  const env = makeEnv().signedIn(
+    [A_MANUAL(), conversation(CONV_B, 0, "Второй")],
+    { [CONV_A]: EMPTY_HISTORY(CONV_A), [CONV_B]: EMPTY_HISTORY(CONV_B) }
+  );
+  await env.boot();
+
+  env.net.route("GET", MESSAGES_A, apiError(404, "conversation_not_found"));
+  await env.ctl.reloadThread();
+  await flush(80);
+  assert.equal(env.view().currentId, null);
+
+  const heldTemp = deferred();
+  env.net.route("GET", MESSAGES_A, async () => {
+    await heldTemp.promise;
+    return apiError(404, "conversation_not_found");
+  });
+  const tempOpening = env.ctl.selectConversation(CONV_A);
+  await flush();
+
+  env.net.route("GET", "/api/conversations", listBody([A_MANUAL(), conversation(CONV_B, 0, "Второй")]));
+  await env.ctl.reloadList();
+
+  // The recovery read is held and is the fresh applicable history read.
+  const heldRecovery = deferred();
+  env.net.route("GET", MESSAGES_A, async () => {
+    await heldRecovery.promise;
+    return EMPTY_HISTORY(CONV_A);
+  });
+  const readsBefore = env.net.requests("GET", MESSAGES_A).length;
+
+  heldTemp.resolve();
+  await tempOpening;
+  await flush();
+  assert.equal(
+    env.net.requests("GET", MESSAGES_A).length,
+    readsBefore + 1,
+    "the stale settlement asks for exactly one fresh read"
+  );
+
+  // Asking again while it is out joins it: no second request.
+  const again = env.ctl.reloadThread();
+  await flush();
+  assert.equal(
+    env.net.requests("GET", MESSAGES_A).length,
+    readsBefore + 1,
+    "an already-running applicable history read is not duplicated"
+  );
+
+  heldRecovery.resolve();
+  await again;
+  await env.settle();
+  assert.equal(env.view().thread.status, "ready", "the joined read supplies the history");
+  assert.equal(env.view().composer.locked, false);
+});
+
+// A reconciliation belongs to the pending-turn record it began with. A replacement turn
+// (the same conversation id, a different record) owns its own checking state; the old
+// reconciliation must not clear it when its history operation settles.
+scenario("a_reconciliation_does_not_clear_a_replacement_turns_checking_state", async () => {
+  const env = makeEnv().signedIn([conversation(CONV_A, 0)], { [CONV_A]: EMPTY_HISTORY(CONV_A) });
+  await env.boot();
+
+  // The send's outcome is unknown: the page reconciles it with a history read it holds.
+  const heldHistory = deferred();
+  env.net.route("POST", URL_A, apiError(503, "service_unavailable"));
+  env.net.route("GET", MESSAGES_A, async () => {
+    await heldHistory.promise;
+    return EMPTY_HISTORY(CONV_A);
+  });
+  const answer = await env.ctl.send("Первый вопрос");
+  await answer.done;
+  await flush();
+  const state = env.ctl._state();
+  assert.equal(state.pending[CONV_A].checking, true, "the reconciliation shows its check");
+  assert.equal(pendingItem(env).busy, true);
+  assert.equal(pendingItem(env).note, Logic.TEXT.checking);
+  const hold = env.net.requests("GET", MESSAGES_A).length;
+
+  // A replacement turn for the same conversation is in its own check.
+  const replacement = {
+    owner: USER_A,
+    conversationId: CONV_A,
+    key: "web-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    text: "Второй вопрос",
+    baseline: 2,
+    phase: "uncertain",
+    reason: "network",
+    sentAt: START,
+    startedAt: START,
+    attempts: 0,
+    failure: null,
+    checking: true,
+    timer: null,
+    waitCode: null,
+    saved: true,
+  };
+  state.pending[CONV_A] = replacement;
+
+  // The original reconciliation settles.
+  heldHistory.resolve();
+  await flush(80);
+
+  assert.equal(env.net.requests("GET", MESSAGES_A).length, hold, "the original read settled");
+  assert.equal(state.pending[CONV_A], replacement, "the replacement is still the pending turn");
+  assert.equal(replacement.checking, true, "the original reconciliation does not clear the replacement's check");
+  const item = pendingItem(env);
+  assert.equal(item.text, "Второй вопрос");
+  assert.equal(item.busy, true, "the replacement's own check is still visible");
+  assert.equal(item.note, Logic.TEXT.checking);
+
+  // Its own operation settles it, and only that.
+  env.net.route("POST", URL_A, turnBody(CONV_A, 3, "Второй вопрос", 4, "Ответ"));
+  await env.ctl.retry(CONV_A);
+  await env.settle();
+  assert.equal(env.ctl._state().pending[CONV_A], undefined);
+  assert.ok(userTexts(env).includes("Второй вопрос"));
 });
 
 // --- the second audit: an application 5xx is not a verdict -------------------------------------------------
@@ -1978,7 +5139,7 @@ scenario("a_late_history_of_a_conversation_the_person_left_changes_nothing_here"
   await env.settle();
   const view = env.view();
   assert.equal(view.currentId, CONV_B);
-  assert.deepEqual(view.thread.items.map((i) => i.id), [7, 8]);
+  assert.deepEqual(messageItems(env).map((i) => i.id), [7, 8]);
   assert.equal(view.composer.locked, false, "this conversation's own history decides");
   assert.deepEqual(env.ctl._state().threads[CONV_A].messages.map((m) => m.id), [1, 2], "kept for the conversation it belongs to");
 });
@@ -2135,7 +5296,7 @@ scenario("coming_back_to_the_page_asks_whether_the_session_is_still_there", asyn
   assert.equal(env.view().screen, "verifying", "held back from the moment it is asked");
   await env.settle();
   assert.deepEqual([asks(), env.view().screen], [before + 1, "app"]);
-  assert.equal(env.view().thread.items.length, 2);
+  assert.equal(messageItems(env).length, 2);
 
   env.net.route("GET", "/auth/me", fail()); // cannot tell: the conversations stay out of sight, nothing is claimed
   env.ctl.recheck();
@@ -2882,7 +6043,7 @@ scenario("a_conversation_without_a_name_is_named_when_its_first_message_is_known
   await (await longer.ctl.send("Новое")).done;
   await longer.settle();
   assert.equal(longer.ctl._state().list.items[0].title, null);
-  assert.ok(longer.view().list.items[0].label.startsWith("Разговор от "), "the date, as before");
+  assert.ok(longer.view().list.items[0].label.startsWith("Диалог от "), "the date, as before");
 });
 
 scenario("the_title_rule_is_the_same_for_every_kind_of_whitespace_and_every_length", async () => {
@@ -2957,7 +6118,7 @@ scenario("when_the_favorites_cannot_be_read_the_conversations_work_and_the_list_
 
   assert.deepEqual([view.favorites.status, view.favorites.error.text], ["error", Logic.TEXT.network]);
   assert.equal(view.composer.locked, false);
-  assert.deepEqual(view.thread.items.map((i) => i.text), ["Старый вопрос", "Старый ответ"]);
+  assert.deepEqual(messageItems(env).map((i) => i.text), ["Старый вопрос", "Старый ответ"]);
 
   await env.ctl.reloadFavorites();
   await env.settle();
@@ -4540,7 +7701,7 @@ scenario("a_photo_with_a_message_is_kept_as_an_address_on_this_site_and_nothing_
     ]),
   });
   await env.boot();
-  const items = env.view().thread.items;
+  const items = messageItems(env);
   assert.deepEqual(items.map((i) => i.photo), [{ url }, null, { url }]);
   assert.ok(!JSON.stringify(items).includes("data:"));
 });
@@ -4565,8 +7726,8 @@ scenario("a_photo_address_that_is_not_the_servers_own_route_is_not_a_photo", asy
       [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что это?", { attachments: photoOf(url) })]),
     });
     await env.boot();
-    assert.equal(env.view().thread.items[0].photo, null, String(url));
-    assert.equal(env.view().thread.items[0].text, "Что это?");
+    assert.equal(messageItems(env)[0].photo, null, String(url));
+    assert.equal(messageItems(env)[0].text, "Что это?");
   }
   const url = `/api/attachments/${PHOTO_ID}`;
   for (const type of ["image/gif", "text/html", "image/svg+xml", "", null, 5]) {
@@ -4574,14 +7735,14 @@ scenario("a_photo_address_that_is_not_the_servers_own_route_is_not_a_photo", asy
       [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что это?", { attachments: photoOf(url, type) })]),
     });
     await env.boot();
-    assert.equal(env.view().thread.items[0].photo, null, String(type));
+    assert.equal(messageItems(env)[0].photo, null, String(type));
   }
   for (const list of [null, "x", {}, [], [null], [{}], [{ url }]]) {
     const env = makeEnv().signedIn([conversation(CONV_A, 0)], {
       [CONV_A]: historyBody(CONV_A, [message(1, "user", "Что это?", { attachments: list })]),
     });
     await env.boot();
-    assert.equal(env.view().thread.items[0].photo, null, JSON.stringify(list));
+    assert.equal(messageItems(env)[0].photo, null, JSON.stringify(list));
   }
 });
 
@@ -4622,7 +7783,7 @@ scenario("deleting_a_conversation_is_asked_first_and_the_open_one_becomes_a_new_
   assert.equal(env.net.requests("GET", "/api/conversations").length, 2, "the list is read again after the deletion");
   assert.deepEqual([view.currentId, view.list.items.length, view.thread.items.length], [null, 0, 0]);
   assert.equal(view.list.status, "ready");
-  assert.equal(view.chatTitle, "Новый разговор");
+  assert.equal(view.chatTitle, "Новый диалог");
   assert.deepEqual(view.banner, { kind: "info", text: Logic.TEXT.deleted, correlationId: null });
   assert.deepEqual(env.ctl._state().pending, {}, "the unresolved turn goes with the conversation");
   assert.equal(env.storage.record, null);
@@ -4647,7 +7808,7 @@ scenario("deleting_another_conversation_keeps_the_open_one_and_removes_only_it",
   assert.equal(view.currentId, CONV_B);
   assert.deepEqual(view.list.items.map((item) => item.id), [CONV_B]);
   assert.equal(view.list.status, "ready");
-  assert.deepEqual(view.thread.items.map((item) => item.text), ["Про суп", "Суп так"]);
+  assert.deepEqual(messageItems(env).map((item) => item.text), ["Про суп", "Суп так"]);
   assert.equal(view.banner, null);
   assert.equal(view.list.deleting, null);
 });
@@ -6517,7 +9678,7 @@ scenario("a_profile_that_cannot_be_read_does_not_hold_up_the_conversations", asy
   assert.equal(view.screen, "app");
   assert.equal(view.list.status, "ready");
   assert.equal(view.currentId, CONV_A);
-  assert.equal(view.thread.items.length, 2);
+  assert.equal(messageItems(env).length, 2);
   assert.equal(view.profile.status, "error");
   assert.equal(view.profile.loaded, false);
   assert.equal(view.profile.textSize, "normal", "the browser's own size is the fallback");
@@ -6631,7 +9792,7 @@ scenario("a_profile_name_is_checked_before_anything_is_sent", async () => {
   await env.boot();
   const asked = env.net.log.length;
 
-  for (const value of ["", "   ", "x".repeat(201), "😀".repeat(201), "a​b", "a‮b", "a\nb", "a\u0007b"]) {
+  for (const value of ["", "   ", "x".repeat(201), "😀".repeat(201), "a\u200bb", "a\u202eb", "a\nb", "a\u0007b"]) {
     const result = await env.ctl.saveProfile({ displayName: value, textSize: "normal" });
     assert.deepEqual([result.ok, result.reason], [false, "invalid"], JSON.stringify(value));
     assert.ok(/[А-Яа-я]/.test(env.view().profile.fieldError), JSON.stringify(value));
@@ -6957,14 +10118,14 @@ scenario("the_profile_data_note_describes_message_retention_and_conversation_cle
   const recipes = Logic.TEXT.profileDataRecipes;
 
   assert.match(messages, /Сообщения и фотографии к ним хранятся 365 дней с момента создания/);
-  assert.match(messages, /Разговор не удаляется только из-за возраста/);
-  assert.match(messages, /старый разговор, в котором есть более новые сообщения, остается/);
+  assert.match(messages, /Диалог не удаляется только из-за возраста/);
+  assert.match(messages, /старый диалог, в котором есть более новые сообщения, остается/);
   assert.match(messages, /не осталось сообщений и им не пользовались 365 дней/);
-  assert.doesNotMatch(messages, /^Разговоры, сообщения и фотографии к ним хранятся/);
+  assert.doesNotMatch(messages, /^Диалоги, сообщения и фотографии к ним хранятся/);
 
   assert.match(recipes, /Ответы помощника с рецептами — это сообщения/);
   assert.match(recipes, /каждый хранится 365 дней с момента создания/);
-  assert.match(recipes, /даже если сам разговор остается/);
+  assert.match(recipes, /даже если сам диалог остается/);
   assert.match(recipes, /[Рр]ецепты, сохраненные в избранное, хранятся, пока вы сами их не удалите/);
 });
 

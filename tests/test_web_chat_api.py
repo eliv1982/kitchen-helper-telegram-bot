@@ -7,23 +7,50 @@ input, the shape of every success, and the headers of all of it. The assistant i
 always a ScriptedBackend; nothing reaches a provider.
 """
 
+import asyncio
 import json
 import re
+import shutil
+import subprocess
+import threading
 from contextlib import contextmanager
 from datetime import timedelta
-from uuid import uuid4
+from pathlib import Path
+from uuid import UUID, uuid4
 
 import pytest
 import sqlalchemy as sa
 
+from house_helper.persistence import conversations
 from house_helper.persistence.models import Conversation, Message, TurnRequest, User
+from house_helper.web import chat_api
 from tests.auth_support import ORIGIN, logout_as
-from tests.chat_support import ScriptedBackend, chat_app, error_of, post_headers
+from tests.chat_support import ScriptedBackend, chat_app, error_of, post_headers, reached
+from tests.web_support import TIMEOUT
 
 pytestmark = pytest.mark.asyncio
 
 CORRELATION_ID = re.compile(r"hh-[0-9a-f]{16}")
 JSON = {"Content-Type": "application/json"}
+
+# PP-01-A1-R5: the strict client contract is a JavaScript function; real route answers are
+# fed to it by tests/js/crosscheck.js (the same Node harness the Web logic tests use).
+NODE = shutil.which("node")
+CROSSCHECK = Path(__file__).parent / "js" / "crosscheck.js"
+
+
+def title_mutation_outcomes(cases):
+    request = json.dumps({"task": "title_mutation", "cases": cases})
+    completed = subprocess.run(
+        [NODE, str(CROSSCHECK)],
+        input=request,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=120,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+    return json.loads(completed.stdout)["outcomes"]
 
 
 @contextmanager
@@ -51,6 +78,7 @@ def count(harness, model) -> int:
 ROUTES = [
     pytest.param("get", "/api/conversations", None, id="list"),
     pytest.param("post", "/api/conversations", {}, id="create"),
+    pytest.param("patch", "/api/conversations/{id}", {"title": "Борщ"}, id="rename"),
     pytest.param("delete", "/api/conversations/{id}", None, id="delete"),
     pytest.param("get", "/api/conversations/{id}/messages", None, id="history"),
     pytest.param("post", "/api/conversations/{id}/messages", {"text": "привет"}, id="send"),
@@ -64,6 +92,8 @@ async def call(harness, method, path, body, *, client=None, conversation_id=None
         return await client.get(path, headers=headers)
     if method == "delete":
         return await client.delete(path, headers=headers)
+    if method == "patch":
+        return await client.patch(path, json=body, headers=post_headers(**headers))
     return await client.post(path, json=body, headers=post_headers("key-1", **headers))
 
 
@@ -191,7 +221,7 @@ async def test_a_stranger_gets_the_same_answer_whether_it_is_unknown_foreign_or_
             )
             answers[name] = (read.status_code, write.status_code, error_of(read)["message"])
 
-        assert set(answers.values()) == {(404, 404, "Разговор не найден.")}
+        assert set(answers.values()) == {(404, 404, "Диалог не найден.")}
 
 
 async def test_a_conversation_id_in_capitals_is_the_same_conversation(tmp_path):
@@ -355,9 +385,19 @@ async def test_creating_a_conversation(tmp_path):
 
         body = response.json()
         assert response.status_code == 201
-        assert set(body) == {"id", "title", "created_at", "updated_at"}
+        assert set(body) == {
+            "id",
+            "title",
+            "title_origin",
+            "can_reset_title",
+            "created_at",
+            "updated_at",
+            "last_message_at",
+        }
         assert body["title"] is None  # nothing the user said is kept outside the 365 days
+        assert body["title_origin"] == "none" and body["can_reset_title"] is False
         assert body["created_at"] == body["updated_at"] == chat.clock().isoformat()
+        assert body["last_message_at"] is None
         stored = chat.conversation(body["id"])
         assert stored.user_id == chat.user_id  # the session's user, not a parameter
         assert stored.title is None
@@ -380,7 +420,531 @@ async def test_conversations_are_listed_by_latest_activity(tmp_path):
 
         listed = (await chat.client.get("/api/conversations")).json()
         assert [c["id"] for c in listed["conversations"]] == [first, third, second]
-        assert listed["conversations"][0]["updated_at"] == chat.clock().isoformat()
+        assert listed["conversations"][0]["last_message_at"] == chat.clock().isoformat()
+
+
+# --- PP-01-A1: the conversation title and its two dates ------------------------------------
+
+
+def title_headers():
+    return {**JSON, "Origin": ORIGIN}
+
+
+async def test_renaming_a_conversation_persists_and_is_the_same_title_telegram_reads(tmp_path):
+    async with chat_app(tmp_path, ScriptedBackend("Борщ.")) as chat:
+        conversation = await chat.create()
+        await chat.send(conversation, "Как сварить борщ?", "k-1")
+        before = chat.conversation(conversation)
+
+        response = await chat.client.patch(
+            f"/api/conversations/{conversation}",
+            json={"title": "  Мой борщ  "},
+            headers=title_headers(),
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["title"] == "Мой борщ"  # trimmed, stored, not truncated
+        assert body["title_origin"] == "manual" and body["can_reset_title"] is True
+        assert body["created_at"] == before.created_at.isoformat()
+        assert body["updated_at"] == before.updated_at.isoformat()  # not conversation activity
+        assert body["last_message_at"] is not None
+        stored = chat.conversation(conversation)
+        assert stored.title == "Мой борщ"
+        assert stored.updated_at == before.updated_at  # the row itself did not move
+        listed = (await chat.client.get("/api/conversations")).json()["conversations"]
+        assert listed[0]["title"] == "Мой борщ" and listed[0]["title_origin"] == "manual"
+
+
+async def test_reset_restores_the_derived_title_and_is_safe_to_repeat(tmp_path):
+    async with chat_app(tmp_path, ScriptedBackend()) as chat:
+        conversation = await chat.create()
+        await chat.send(conversation, "Как сварить борщ?", "k-1")
+
+        renamed = await chat.client.patch(
+            f"/api/conversations/{conversation}", json={"title": "Своё"}, headers=title_headers()
+        )
+        assert renamed.json()["title_origin"] == "manual"
+
+        reset = await chat.client.patch(
+            f"/api/conversations/{conversation}", json={"title": None}, headers=title_headers()
+        )
+        assert reset.status_code == 200
+        assert reset.json()["title"] == "Как сварить борщ?"  # derived from the first message
+        assert reset.json()["title_origin"] == "derived" and reset.json()["can_reset_title"] is False
+        assert chat.conversation(conversation).title is None
+
+        again = await chat.client.patch(
+            f"/api/conversations/{conversation}", json={"title": None}, headers=title_headers()
+        )
+        assert again.status_code == 200 and again.json()["title"] == "Как сварить борщ?"
+        assert again.json()["can_reset_title"] is False
+
+
+@pytest.mark.skipif(NODE is None, reason="Node.js is not installed")
+async def test_the_real_title_patch_shape_is_accepted_by_the_strict_client_contract(tmp_path):
+    """PP-01-A1-R5 (OD-2): the client applies a title answer only when it obeys the strict
+    summary contract. The real PATCH route's rename and reset answers are fed to that same
+    client code (tests/js/crosscheck.js) and are classified as confirmed."""
+    async with chat_app(tmp_path, ScriptedBackend()) as chat:
+        conversation = await chat.create()
+        await chat.send(conversation, "Как сварить борщ?", "k-1")
+
+        renamed = await chat.client.patch(
+            f"/api/conversations/{conversation}", json={"title": "Мой борщ"}, headers=title_headers()
+        )
+        reset = await chat.client.patch(
+            f"/api/conversations/{conversation}", json={"title": None}, headers=title_headers()
+        )
+        assert renamed.status_code == 200 and reset.status_code == 200
+
+        outcomes = title_mutation_outcomes(
+            [
+                {
+                    "status": renamed.status_code,
+                    "body": renamed.json(),
+                    "request": {"title": "Мой борщ"},
+                    "id": conversation,
+                },
+                {
+                    "status": reset.status_code,
+                    "body": reset.json(),
+                    "request": {"title": None},
+                    "id": conversation,
+                },
+            ]
+        )
+
+        assert outcomes == [{"type": "confirmed"}, {"type": "confirmed"}]
+
+
+@pytest.mark.parametrize(
+    ("title", "code"),
+    [
+        ("", "empty_title"),
+        ("   ", "empty_title"),
+        ("Борщ\nс грибами", "invalid_title"),
+        ("Борщ\tс грибами", "invalid_title"),
+        ("a\u0000b", "invalid_title"),
+        ("a\u200bb", "invalid_title"),  # an invisible format character, not an emoji joiner
+        ("x" * 201, "title_too_long"),
+    ],
+)
+async def test_a_title_that_cannot_be_stored_is_refused_and_nothing_changes(tmp_path, title, code):
+    async with chat_app(tmp_path, ScriptedBackend()) as chat:
+        conversation = await chat.create()
+        before = chat.conversation(conversation)
+
+        response = await chat.client.patch(
+            f"/api/conversations/{conversation}", json={"title": title}, headers=title_headers()
+        )
+
+        assert response.status_code == 400
+        assert error_of(response)["detail"] == code
+        after = chat.conversation(conversation)
+        assert (after.title, after.updated_at) == (before.title, before.updated_at)
+
+
+async def test_every_kind_of_valid_title_is_kept_exactly(tmp_path):
+    async with chat_app(tmp_path, ScriptedBackend()) as chat:
+        conversation = await chat.create()
+        titles = [
+            "Борщ",
+            "Borscht",
+            "Борщ 🍲",
+            "Семья 👨\u200d👩\u200d👧",
+            "Флаг 🏴\U000e0067\U000e0062\U000e0065\U000e006e\U000e0067\U000e007f",
+            "я" * 200,
+            "Плов",
+            "Плов",  # duplicates are allowed
+        ]
+        for title in titles:
+            response = await chat.client.patch(
+                f"/api/conversations/{conversation}", json={"title": title}, headers=title_headers()
+            )
+            assert response.status_code == 200, response.text
+            assert response.json()["title"] == title
+
+
+@pytest.mark.parametrize("body", [{}, {"title": 5}, {"title": "x", "other": 1}, {"name": "x"}])
+async def test_the_rename_body_names_only_one_title_of_the_right_kind(tmp_path, body):
+    async with chat_app(tmp_path, ScriptedBackend()) as chat:
+        conversation = await chat.create()
+
+        response = await chat.client.patch(
+            f"/api/conversations/{conversation}", json=body, headers=title_headers()
+        )
+
+        assert response.status_code == 400
+        assert error_of(response)["detail"] == "invalid_request"
+
+
+async def test_a_rename_cannot_reach_another_account_or_a_conversation_that_is_not_there(tmp_path):
+    async with chat_app(tmp_path, ScriptedBackend()) as chat:
+        theirs = await chat.create(await chat.second_user())
+        before = chat.conversation(theirs)
+
+        for conversation in (theirs, str(uuid4())):
+            response = await chat.client.patch(
+                f"/api/conversations/{conversation}", json={"title": "Чужое"}, headers=title_headers()
+            )
+            assert response.status_code == 404
+            assert error_of(response)["detail"] == "conversation_not_found"
+
+        after = chat.conversation(theirs)
+        assert (after.title, after.updated_at) == (before.title, before.updated_at)
+
+
+async def test_a_rename_is_refused_without_the_pages_origin(tmp_path):
+    async with chat_app(tmp_path, ScriptedBackend()) as chat:
+        conversation = await chat.create()
+
+        response = await chat.client.patch(
+            f"/api/conversations/{conversation}",
+            json={"title": "Борщ"},
+            headers={**JSON, "Origin": "https://evil.example"},
+        )
+
+        assert response.status_code == 403
+        assert error_of(response)["detail"] == "forbidden_origin"
+        assert chat.conversation(conversation).title is None
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        pytest.param({"Content-Type": "application/json"}, id="missing"),
+        pytest.param(
+            {"Content-Type": "application/json", "Sec-Fetch-Site": "same-origin"},
+            id="missing-with-same-origin-fetch-metadata",
+        ),
+        pytest.param(
+            {"Content-Type": "application/json", "Sec-Fetch-Site": "none"},
+            id="missing-with-address-bar-fetch-metadata",
+        ),
+        pytest.param({"Content-Type": "application/json", "Origin": "null"}, id="null"),
+        pytest.param(
+            {"Content-Type": "application/json", "Origin": ORIGIN + ".evil.example"},
+            id="prefix-foreign",
+        ),
+    ],
+)
+async def test_a_rename_requires_exactly_one_matching_origin(tmp_path, headers):
+    """PP-01-A1's A1-02: the PATCH is refused without the application's own Origin, and
+    Fetch Metadata is never accepted in its place (the other mutations keep their rule)."""
+    async with chat_app(tmp_path, ScriptedBackend()) as chat:
+        conversation = await chat.create()
+
+        response = await chat.client.patch(
+            f"/api/conversations/{conversation}", json={"title": "Борщ"}, headers=headers
+        )
+
+        assert response.status_code == 403
+        assert error_of(response)["detail"] == "forbidden_origin"
+        assert chat.conversation(conversation).title is None
+
+
+@pytest.mark.parametrize(
+    "origins",
+    [
+        pytest.param((ORIGIN, ORIGIN), id="duplicate-matching"),
+        pytest.param((ORIGIN, "https://evil.example"), id="conflicting"),
+        pytest.param(("https://evil.example", ORIGIN), id="conflicting-reversed"),
+    ],
+)
+async def test_a_rename_refuses_repeated_origin_headers(tmp_path, origins):
+    """The header is read with getlist, so repeated values are seen rather than collapsed
+    by a single-value accessor: two Origins are not "one matching Origin"."""
+    async with chat_app(tmp_path, ScriptedBackend()) as chat:
+        conversation = await chat.create()
+
+        response = await chat.client.patch(
+            f"/api/conversations/{conversation}",
+            json={"title": "Борщ"},
+            headers=[("Content-Type", "application/json"), *(("Origin", value) for value in origins)],
+        )
+
+        assert response.status_code == 403
+        assert error_of(response)["detail"] == "forbidden_origin"
+        assert chat.conversation(conversation).title is None
+
+
+async def test_a_rename_with_the_matching_origin_is_accepted(tmp_path):
+    async with chat_app(tmp_path, ScriptedBackend()) as chat:
+        conversation = await chat.create()
+
+        response = await chat.client.patch(
+            f"/api/conversations/{conversation}",
+            json={"title": "Борщ"},
+            headers={"Content-Type": "application/json", "Origin": ORIGIN},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["title"] == "Борщ"
+        assert chat.conversation(conversation).title == "Борщ"
+
+
+async def test_a_rename_neither_reorders_the_list_nor_touches_anything_else(tmp_path):
+    async with chat_app(tmp_path, ScriptedBackend("Ответ.")) as chat:
+        first = await chat.create()
+        chat.clock.advance(minutes=1)
+        second = await chat.create()
+        await chat.send(first, "Первый", "k-1")
+        await chat.send(second, "Второй", "k-2")
+        before = [c["id"] for c in (await chat.client.get("/api/conversations")).json()["conversations"]]
+        messages_before = (await chat.history(first)).json()["messages"]
+
+        response = await chat.client.patch(
+            f"/api/conversations/{first}", json={"title": "Своё"}, headers=title_headers()
+        )
+
+        assert response.status_code == 200
+        after = [c["id"] for c in (await chat.client.get("/api/conversations")).json()["conversations"]]
+        assert after == before  # a rename is not activity
+        assert (await chat.history(first)).json()["messages"] == messages_before
+        assert count(chat, Message) == 4 and count(chat, TurnRequest) == 2
+
+
+@contextmanager
+def hold_title_mutation(monkeypatch, name):
+    """Hold persistence.conversations.<name> before it touches the database.
+
+    The real PATCH handler runs the function on a database worker in its own transaction;
+    this makes that transaction start after the test has issued another title write, so
+    the audited inversion (an older write committing last) is reproduced through the real
+    route and the real persistence path, with no sleeps."""
+    entered, proceed = threading.Event(), threading.Event()
+    real = getattr(conversations, name)
+
+    def gated(*args, **kwargs):
+        entered.set()
+        assert proceed.wait(TIMEOUT), "the test never let the call go on"
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(conversations, name, gated)
+    try:
+        yield entered, proceed
+    finally:
+        monkeypatch.setattr(conversations, name, real)
+
+
+async def test_an_overlapping_reset_can_commit_after_a_newer_rename_through_the_real_route(
+    tmp_path, monkeypatch
+):
+    """A1-01 (A1-01-R2): the audited commit inversion, on the real handler and database.
+
+    A reset is held before its transaction starts; a newer rename is accepted and
+    committed; the reset then runs and is the last write, clearing the title. This is
+    persisted state, not response ordering, and it is exactly what the page's serialized
+    title queue exists to prevent: the page does not send the rename until the reset's
+    definitive answer. The test is engine-agnostic and runs on SQLite and PostgreSQL."""
+    async with chat_app(tmp_path, ScriptedBackend()) as chat:
+        conversation = await chat.create()
+        first = await chat.client.patch(
+            f"/api/conversations/{conversation}", json={"title": "Борщ"}, headers=title_headers()
+        )
+        assert first.status_code == 200
+
+        with hold_title_mutation(monkeypatch, "reset_conversation_title") as (entered, proceed):
+            resetting = asyncio.create_task(
+                chat.client.patch(
+                    f"/api/conversations/{conversation}",
+                    json={"title": None},
+                    headers=title_headers(),
+                )
+            )
+            await reached(entered)
+            renamed = await chat.client.patch(
+                f"/api/conversations/{conversation}",
+                json={"title": "Новое имя"},
+                headers=title_headers(),
+            )
+            assert renamed.status_code == 200
+            assert chat.conversation(conversation).title == "Новое имя"
+
+            proceed.set()
+            reset = await resetting
+            assert reset.status_code == 200
+
+        # The older reset committed last: the persisted title is cleared.
+        assert chat.conversation(conversation).title is None
+
+
+async def test_the_pages_order_reset_then_rename_leaves_the_rename_as_the_persisted_title(
+    tmp_path,
+):
+    """A1-01 (A1-01-R2): when each write's definitive answer is known before the next is
+    sent -- what the page's queue enforces -- the later rename is the persisted title,
+    whatever the reset answered. The reverse order resets the title."""
+    async with chat_app(tmp_path, ScriptedBackend()) as chat:
+        conversation = await chat.create()
+
+        renamed = await chat.client.patch(
+            f"/api/conversations/{conversation}", json={"title": "Своё"}, headers=title_headers()
+        )
+        assert renamed.status_code == 200
+        reset = await chat.client.patch(
+            f"/api/conversations/{conversation}", json={"title": None}, headers=title_headers()
+        )
+        assert reset.status_code == 200 and reset.json()["title"] is None
+        assert chat.conversation(conversation).title is None
+
+        again = await chat.client.patch(
+            f"/api/conversations/{conversation}", json={"title": "Позже"}, headers=title_headers()
+        )
+        assert again.status_code == 200
+        assert chat.conversation(conversation).title == "Позже"
+
+
+async def test_a_failure_while_building_the_answer_comes_after_the_commit_and_the_title_is_stored(
+    tmp_path, monkeypatch
+):
+    """A1-01c (A1-01-R3): the PATCH handler commits the title before it builds its
+    JSONResponse. An exception while formatting that answer becomes the application's own
+    500 ``internal_error`` -- but the title has already been stored. A client must treat
+    any 5xx as an indeterminate outcome, never as proof that the transaction rolled back.
+    The persisted title is checked independently of the HTTP result; the test is
+    engine-agnostic (SQLite and PostgreSQL)."""
+    async with chat_app(tmp_path, ScriptedBackend()) as chat:
+        conversation = await chat.create()
+        first = await chat.client.patch(
+            f"/api/conversations/{conversation}", json={"title": "Старое"}, headers=title_headers()
+        )
+        assert first.status_code == 200
+
+        formatted = []
+
+        def lose_the_answer(summary):
+            # Called after database.run returned: its session block has committed.
+            formatted.append(summary.title)
+            raise RuntimeError("the answer could not be built")
+
+        monkeypatch.setattr(chat_api, "_conversation_json", lose_the_answer)
+        response = await chat.client.patch(
+            f"/api/conversations/{conversation}", json={"title": "Новое имя"}, headers=title_headers()
+        )
+
+        assert response.status_code == 500
+        assert error_of(response)["detail"] == "internal_error"
+        assert formatted == ["Новое имя"], "the answer was built from the committed summary"
+        # The HTTP result is a failure; the database says the write was stored.
+        assert chat.conversation(conversation).title == "Новое имя"
+
+
+async def test_a_database_failure_before_the_commit_is_a_definitive_refusal(
+    tmp_path, monkeypatch
+):
+    """A1-01c (A1-01-R3): a failure raised by the mutation itself, before the session block
+    commits, rolls back and is answered by the application as a 503. Unlike a 5xx written
+    after the commit, this one proves the title was not stored; the page may continue after
+    it. The two cases are indistinguishable from a 5xx body alone, which is why the page
+    treats every 5xx as indeterminate."""
+    async with chat_app(tmp_path, ScriptedBackend()) as chat:
+        conversation = await chat.create()
+        first = await chat.client.patch(
+            f"/api/conversations/{conversation}", json={"title": "Старое"}, headers=title_headers()
+        )
+        assert first.status_code == 200
+
+        def refuse(*args, **kwargs):
+            raise sa.exc.OperationalError(
+                "UPDATE conversations", {}, Exception("connection lost")
+            )
+
+        monkeypatch.setattr(conversations, "set_conversation_title", refuse)
+        response = await chat.client.patch(
+            f"/api/conversations/{conversation}", json={"title": "Новое имя"}, headers=title_headers()
+        )
+
+        assert response.status_code == 503
+        assert error_of(response)["detail"] == "service_unavailable"
+        assert chat.conversation(conversation).title == "Старое"
+
+
+# The page's closed set of definitive title-PATCH refusals (chat-logic.js
+# TITLE_REFUSAL_STATUSES). Each case is issued through the real route; the stored title and
+# its updated_at prove that the refusal was made before any write. A 4xx outside this set is
+# not needed to prove the negative -- the page treats it as indeterminate -- but every code
+# here must keep answering exactly the status the page's table expects.
+DEFINITIVE_TITLE_REFUSALS = [
+    pytest.param("json", {"title": ""}, title_headers(), 400, "empty_title", id="empty"),
+    pytest.param("json", {"title": "x" * 201}, title_headers(), 400, "title_too_long", id="too-long"),
+    pytest.param("json", {"title": "a\nb"}, title_headers(), 400, "invalid_title", id="characters"),
+    pytest.param("json", {"other": 1}, title_headers(), 400, "invalid_request", id="shape"),
+    pytest.param(
+        "content",
+        b'{"title": "x"}',
+        {"Origin": ORIGIN, "Content-Type": "text/plain"},
+        415,
+        "unsupported_media_type",
+        id="media-type",
+    ),
+    pytest.param(
+        "json", {"title": "x"}, {"Content-Type": "application/json"}, 403, "forbidden_origin", id="origin"
+    ),
+    pytest.param(
+        "content",
+        b'{"title": "' + b"x" * (40 * 1024) + b'"}',
+        title_headers(),
+        413,
+        "request_too_large",
+        id="too-large",
+    ),
+]
+
+
+@pytest.mark.parametrize(("kind", "body", "headers", "status", "code"), DEFINITIVE_TITLE_REFUSALS)
+async def test_every_definitive_title_refusal_is_answered_before_any_write(
+    tmp_path, kind, body, headers, status, code
+):
+    """PP-01-A1-R4 (R4-03): the client may release a conversation's title queue only after
+    one of these answers. The real route proves each is raised before the transaction
+    touches the row: the stored title and updated_at are exactly what they were."""
+    async with chat_app(tmp_path, ScriptedBackend()) as chat:
+        conversation = await chat.create()
+        stored = await chat.client.patch(
+            f"/api/conversations/{conversation}", json={"title": "Старое"}, headers=title_headers()
+        )
+        assert stored.status_code == 200
+        before = chat.conversation(conversation)
+
+        if kind == "json":
+            response = await chat.client.patch(
+                f"/api/conversations/{conversation}", json=body, headers=headers
+            )
+        else:
+            response = await chat.client.patch(
+                f"/api/conversations/{conversation}", content=body, headers=headers
+            )
+
+        assert response.status_code == status
+        assert error_of(response)["detail"] == code
+        after = chat.conversation(conversation)
+        assert (after.title, after.updated_at) == (before.title, before.updated_at)
+
+
+async def test_a_conversation_not_found_refusal_is_also_before_any_write(tmp_path):
+    """PP-01-A1-R4 (R4-03): the other definitive answer, the application's own 404. The
+    client treats it as "gone" (the conversation is removed) rather than retrying it."""
+    async with chat_app(tmp_path, ScriptedBackend()) as chat:
+        response = await chat.client.patch(
+            f"/api/conversations/{uuid4()}", json={"title": "Борщ"}, headers=title_headers()
+        )
+
+        assert response.status_code == 404
+        assert error_of(response)["detail"] == "conversation_not_found"
+
+
+async def test_deleting_the_conversation_deletes_its_stored_title_with_it(tmp_path):
+    async with chat_app(tmp_path, ScriptedBackend()) as chat:
+        conversation = await chat.create()
+        await chat.client.patch(
+            f"/api/conversations/{conversation}", json={"title": "Своё"}, headers=title_headers()
+        )
+
+        assert (await chat.client.delete(f"/api/conversations/{conversation}", headers=title_headers())).status_code == 204
+
+        assert chat.rows(Conversation, Conversation.id == UUID(conversation)) == []
 
 
 async def test_the_list_is_bounded_and_says_when_there_is_more(tmp_path):
@@ -720,7 +1284,7 @@ async def test_characters_that_cannot_be_stored_are_refused_not_a_server_error(t
 
 @pytest.mark.parametrize(
     "text",
-    ["a\tb", "a\nb", "a\r\nb", "🍅", "\U0001f468‍\U0001f373", "é", "   ", "﻿x", "x￾"],
+    ["a\tb", "a\nb", "a\r\nb", "🍅", "\U0001f468\u200d\U0001f373", "é", "   ", "﻿x", "x￾"],
 )
 async def test_ordinary_unusual_text_is_kept_as_it_is(tmp_path, text):
     async with chat_app(tmp_path, ScriptedBackend()) as chat:
