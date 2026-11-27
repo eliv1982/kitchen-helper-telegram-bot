@@ -426,18 +426,41 @@ def test_the_checklist_ticks_the_timer_for_the_first_run_and_keeps_the_separate_
 # in test_deploy_kit.py).
 
 
-def current_state() -> tuple:
-    """(introduction, {item: state}) of 'Current deployment state' in docs/STATUS.md, whitespace-flattened."""
+def deployment_states() -> dict:
+    """{'current': (introduction, rows), 'historical': (introduction, rows)} for the two '### ' subsections
+    of 'Current deployment state' in docs/STATUS.md, whitespace-flattened.
+
+    Each subsection is parsed on its own, so the current record and the historical record are never pooled:
+    a table key in one cannot overwrite a key in the other, and the result does not depend on their order.
+    A subsection is 'current' when its heading starts with 'Current' and 'historical' when it starts with
+    'Historical record'."""
     text = read(STATUS)
     start = text.index("## Current deployment state")
     end = text.find("\n## ", start + 1)
     lines = text[start: end if end != -1 else len(text)].splitlines()
-    rows = {}
+    chunks, label = {}, None
     for line in lines:
-        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-        if line.startswith("|") and len(cells) == 2 and not set(cells[0]) <= set("-: "):
-            rows[cells[0]] = flat(cells[1])
-    return flat(" ".join(line for line in lines if not line.startswith("|"))), rows
+        if line.startswith("### "):
+            heading = line[4:].strip()
+            if heading.startswith("Current"):
+                label = "current"
+                chunks[label] = []
+            elif heading.startswith("Historical record"):
+                label = "historical"
+                chunks[label] = []
+            else:
+                label = None
+        elif label:
+            chunks[label].append(line)
+    states = {}
+    for name, chunk in chunks.items():
+        rows = {}
+        for line in chunk:
+            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+            if line.startswith("|") and len(cells) == 2 and not set(cells[0]) <= set("-: "):
+                rows[cells[0]] = flat(cells[1])
+        states[name] = (flat(" ".join(line for line in chunk if not line.startswith("|"))), rows)
+    return states
 
 
 def readme_row(name: str) -> str:
@@ -445,14 +468,17 @@ def readme_row(name: str) -> str:
 
 
 def test_the_documented_state_keeps_production_cleanup_pending_work_and_the_accepted_alpha_apart():
-    introduction, rows = current_state()
+    states = deployment_states()
+    current_introduction = states["current"][0]
+    historical_introduction, rows = states["historical"]
     header = flat(read(RUNBOOK).split("\n## ", 1)[0])
-    # 1. Production is the accepted two-user Functional Alpha: every document that gives the state names the same
-    # image and schema, and the image tag is the first twelve characters of the commit STATUS.md names.
+    # 1. Production is live, and the accepted two-user Functional Alpha (now the historical record of 2026-10-31
+    # inside the same section) keeps its documented image and schema: every document that gives that state names the
+    # same image and schema, and the image tag is the first twelve characters of the commit STATUS.md names.
     assert "technical deployment" in header
-    assert re.search(r"technical instance of House Helper is live", introduction)
-    assert re.search(r"Functional Alpha", introduction) and re.search(r"ACCEPTED", introduction)
-    assert re.search(r"closed two-user alpha", introduction)  # still not a public demo or public sign-up
+    assert re.search(r"House Helper is live at", current_introduction)
+    assert re.search(r"Functional Alpha", historical_introduction) and re.search(r"ACCEPTED", historical_introduction)
+    assert re.search(r"closed two-user alpha", historical_introduction)  # still not a public demo or public sign-up
     for where, text in (
         ("RUNBOOK status paragraph", header),
         ("STATUS.md, Image", rows["Image"]),
@@ -489,7 +515,7 @@ def test_the_documented_state_keeps_production_cleanup_pending_work_and_the_acce
     assert re.search(r"History, state of 2026-10-25.*not installed or activated on the VPS", backups) and "pending" in backups
     assert re.search(r"final acceptance", readme_row("Backups and monitoring"), re.I)
     assert "accepted by the owner as final on 2026-10-28" in header and "describe procedures" in header
-    assert re.search(r"both users' real Telegram sign-in", introduction)
+    assert re.search(r"both users' real Telegram sign-in", historical_introduction)
     # 4. The Functional Alpha is ACCEPTED on 2026-10-31, and nothing here says otherwise.
     assert re.search(r"ACCEPTED by the owner on 2026-10-31", rows["Functional Alpha"])
     assert "cross-device" in rows["Functional Alpha"]
