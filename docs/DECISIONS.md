@@ -432,6 +432,42 @@ another release, changes KHD-50, or reclassifies the FIX-01 behavioral baseline.
   architecture, Scope Lock or implementation; AG-03, AG-04, PP-01-A2; any extension of the
   exception to another release.
 
+## Operational decisions — HH-OPS-01 first post-release checkpoint (2026-11-28)
+
+The Owner accepted the first post-release operational checkpoint and recorded the HH-OPS-01
+housekeeping decisions on 2026-11-28. These are **operational decisions only**: none authorizes a
+deletion of a protected recovery artifact, WP-2C plaintext retirement, a healthcheck implementation,
+a mount relocation, PostgreSQL container recreation, key access, a Production command or a Git
+operation. Evidence and deferred obligations are in
+[`docs/product/HH-OPS-01_WP-5A_Interim_Closure_Record.md`](product/HH-OPS-01_WP-5A_Interim_Closure_Record.md).
+
+| ID | Decision | Status |
+|---|---|---|
+| **KHD-57** | **Recovery key protection approach (WP-2B-K1) — DEFERRED.** Completion is deferred until after the Owner returns from vacation. The preferred mechanism is a **client-side encrypted key archive independently retained on Yandex Disk**, plus an **independent high-entropy passphrase recovery record retained securely offline**. Archive integrity and key recoverability must be verified before the protection step is accepted. An unencrypted private key must **not** be stored in cloud storage, and private-key contents, passwords or sensitive key material must **not** be disclosed in repository documentation. The previously documented but outdated identity-location information is corrected only with a **non-sensitive reference** to the Owner-controlled WSL identity. | **ACCEPTED as direction; DEFERRED** — WP-2B-K1 remains open |
+| **KHD-58** | **Maintenance pin retention.** Retain image `house-helper:d02b34ed369c` and checkout `d02b34ed369c986fcb8c9a1074c5d4491097d2fa`. The scheduled purge, backup, verification and schema contracts do not require repinning. The isolated rehearsal defect is fixed in the `maintenance.py` blob `35a167525daf58183beca9f1ebabe4a849f9b557`; future isolated rehearsals must use that fixed implementation or an independently accepted successor, and must **not** use the older timer checkout's rehearsal implementation. | **ACCEPTED** — no repinning required |
+| **KHD-59** | **PostgreSQL configuration checkout retention.** Retain the protected configuration checkout `/home/elvi/apps/house_helper-staging-ddca096`. The active bind mounts and the backup Compose reference depend on this exact checkout path, and the configuration blobs match later revisions. **No mount relocation or PostgreSQL recreation is authorized.** | **ACCEPTED** |
+| **KHD-60** | **PostgreSQL healthcheck diagnosis.** The confirmed cause of the repeated peer-authentication failures is that `pg_isready` executes as root while requesting the PostgreSQL role `postgres`. This is **monitoring noise, not an application authentication failure.** The proposed future correction is `gosu postgres pg_isready -U postgres -d postgres`; it requires a separately approved maintenance window, implementation verification and PostgreSQL container recreation. Authentication rules must **not** be weakened. | **DIAGNOSED; correction PROPOSED, NOT AUTHORIZED** |
+| **KHD-61** | **Deferred cleanup and no-remediation decisions.** Retain the historical SQLite stack and its database volume. Defer minor historical production scratch files and build logs, the local disposable acceptance environment, local experimental Docker images and volumes, and other workstation resources. No remediation of the single HH-REL-01 startup duplicate-key Telegram admission-ledger event is authorized. Docker build-cache cleanup is a separate host-wide maintenance task, not part of the House Helper cleanup authorization. **WP-2C plaintext retirement remains DEFERRED / NOT AUTHORIZED.** | **ACCEPTED; deferrals recorded** |
+
+### Why / alternatives / boundaries
+
+- **Recovery before cleanup:** Archive A (the rehearsed plaintext), the production ciphertext A′,
+  the rehearsal record and the rollback image stay protected. WP-2C needs its own authorization
+  after key protection, so no cleanup decision here can remove them.
+- **Independent key recovery:** the verified ciphertext copy on the same workstation is not
+  independent. The chosen mechanism adds a separate Yandex Disk copy and an offline passphrase
+  record, and the step is accepted only after integrity and recoverability are verified.
+- **Operational improvement must justify operational intervention:** the `pg_isready` cause is
+  diagnosed and a correction proposed, but no maintenance window is approved and no container is
+  recreated. Authentication rules are not weakened as a shortcut.
+- **No silent remediation:** the single admission-ledger duplicate-key event is attributed to the
+  expected savepoint-based conflict handling and left unremediated; no reset or repair is authorized.
+- **Different component revisions are not defects:** serving, maintenance and rollback images
+  legitimately differ; the maintenance pin is retained rather than "reconciled" to the serving image.
+- **Not decided here:** any deletion of a protected artifact; WP-2C activation; the healthcheck
+  implementation; mount relocation or PostgreSQL recreation; key access or disclosure; any
+  Production command; any Git operation.
+
 ## Change discipline
 
 Add a new decision (date, rationale, alternatives and approval source) only after an actual decision. For a change to an earlier decision, reference its ID and record the replacement instead of silently rewriting history. Link full Stage 2A/2B originals when recovered.
